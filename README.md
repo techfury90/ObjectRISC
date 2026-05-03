@@ -109,7 +109,16 @@ examples/cc/run_c.sh examples/cc/factab.c    # 1!..7! table
 examples/cc/run_c.sh examples/cc/primes.c    # primes < 50
 examples/cc/run_c.sh examples/cc/fizzbuzz.c  # 1..20 fizzbuzz
 examples/cc/run_c.sh examples/cc/pascal.c    # Pascal's triangle
+examples/cc/run_c.sh examples/cc/hello_or.c  # __or in C
 ```
+
+The `hello_or.c` variant uses the `__or` qualifier to control the
+OR file directly from C: `register __or void *o1_var __asm__("o1")`
+binds a C variable to a named Object Register slot, and
+assignments compile to `omov` / `onull` instructions. The firmware
+ConsoleWrite call still uses inline asm for the `call #0x320`
+sequence — the broader `__or` calling convention (returns in O1,
+arguments in O1..O4) is in progress.
 
 The demos collectively exercise: recursion, loops with
 conditionals, if/else-if chains, stack-allocated arrays of int and

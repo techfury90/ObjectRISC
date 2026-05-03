@@ -89,15 +89,38 @@ clocal(NODE *p)
 
 	case FORCE:
 		/*
-		 * Lower `return X;` into the form `R2 = X` so the
-		 * return value lands in V0/R2 (RETREG) per Vol VII §2.1.
-		 * Without this, pcc allocates the return temp to whatever
-		 * it pleases and the caller can't find the value.
+		 * Lower `return X;` into the form `<retreg> = X`. The
+		 * return register is V0/R2 (RETREG) for ordinary
+		 * scalars, R2:R3 for longlong, and O1 for `__or`-
+		 * qualified return types per Vol VII §2.1.
+		 *
+		 * The return-value temp doesn't carry the function's
+		 * qualifiers (cgram.y constructs cftnod from just the
+		 * type), so we look at cftnsp — the symbol of the
+		 * function we're currently compiling — to see whether
+		 * the return type was `__or`-qualified.
+		 *
+		 * NOTE: even with this hook, the OREF return path still
+		 * fails because pcc's RETURN handling routes through a
+		 * tempnode (cftnod) that gets allocated in CLASSA and
+		 * spilled to byte memory; the FORCE then tries to
+		 * ASSIGN(O1, OREG -K(fp)) which has no architecturally
+		 * valid pattern (you can't load an OR from byte
+		 * memory). Fixing this end-to-end requires changing
+		 * cgram.y's RETURN to give cftnod the right qualifier
+		 * so pcc allocates it in CLASSC. Captured in TODO.
 		 */
 		p->n_op = ASSIGN;
 		p->n_right = p->n_left;
 		p->n_left = block(REG, NIL, NIL, p->n_type, 0, 0);
-		p->n_left->n_rval = RETREG(p->n_type);
+		p->n_left->n_qual = p->n_qual;
+		if (ISOREF(p->n_qual) ||
+		    (cftnsp && ISOREF(cftnsp->squal))) {
+			p->n_left->n_qual = OREF;
+			p->n_left->n_rval = O1;
+		} else {
+			p->n_left->n_rval = RETREG(p->n_type);
+		}
 		break;
 	}
 	return p;

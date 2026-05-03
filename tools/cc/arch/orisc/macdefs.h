@@ -328,8 +328,16 @@ typedef long long OFFSZ;
  * bit per mip/manifest.h) must live in the OR file (CLASSC) — that
  * is the architectural commitment Volume III enforces. Everything
  * else falls through to gclass on the basic type.
+ *
+ * We also check for REG nodes whose physical reg number is in the
+ * CLASSC range — that catches the case where pftn binds the
+ * variable to an OR via `register __or T *p __asm__("oN")` and the
+ * qualifier gets lost in transit.
  */
 #define PCLASS(p)	(ISOREF((p)->n_qual) \
+			    ? (1 << CLASSC) \
+			    : ((p)->n_op == REG && (p)->n_rval >= 48 \
+			       && (p)->n_rval < 64) \
 			    ? (1 << CLASSC) \
 			    : (1 << gclass((p)->n_type)))
 #define DECRA(x,y)	(((x) >> (y*6)) & 63)   /* decode encoded regs */

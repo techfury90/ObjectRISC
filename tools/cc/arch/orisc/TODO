@@ -68,16 +68,49 @@ Done
   mip/manifest.h's qualifier-bit set (alongside CON and VOL),
   added the matching `ISOREF()` macro, and registered `__or` as a
   C_QUALIFIER keyword in scan.l. PCLASS in macdefs.h checks the
-  bit and routes to CLASSC. The pipeline ACCEPTS the qualifier:
-  `__or int *p` parses cleanly, the bit flows through n_qual to
-  pass2, and PCLASS would route to the OR file IF a node carried
-  the qualifier at allocation time. But the front-end's NAME
-  lowering still goes through STREF(FP, name) for `__or` autos
-  the same as for plain pointers, so the bit gets lost before it
-  matters. Globals are emitted as ordinary symbols. End-to-end
-  no-op, but a real foundation.
+  bit and routes to CLASSC.
 
-  Phase 2 (still pending) — the multi-session work:
+- `__or` Phase 2a — explicit-binding `register __or T *p
+  __asm__("oN")` is fully functional. The `__asm__` binding
+  lands the variable in the named OR slot; the assignment path
+  picks the right pattern.
+
+  Working examples (see examples/cc/hello_or.c):
+
+      register __or void *o1_var __asm__("o1");
+      register __or void *o3_data __asm__("o3");
+      o1_var = o3_data;   /* → omov o1, o3 */
+      o1_var = 0;         /* → onull o1 */
+
+  Combined with inline asm for firmware CALLs, this is enough to
+  write a Hello, world! that invokes ConsoleWrite directly from
+  C without the asm bridge — the OR-file ops are real C, only
+  the firmware call sequence is asm.
+
+  Implementation:
+    - PCLASS extended to recognize both OREF-qualified nodes AND
+      bare REG nodes whose physical reg number is in CLASSC's
+      range (48..63), since the explicit `__asm__("oN")` path
+      lands the value in CLASSC without flowing the qualifier.
+    - table.c: ASSIGN INCREG SCREG SCREG → omov,
+      OPLTYPE INCREG SZERO → onull,
+      OPLTYPE INCREG SCREG → omov.
+    - clocal FORCE detects OREF returns by inspecting
+      cftnsp->squal (the function-symbol's qualifier word — the
+      cftnod return-temp itself doesn't carry the qualifier, so
+      we look at the function being compiled). Sets the FORCE
+      destination to O1 with OREF preserved.
+
+  Open issue: even with the FORCE hook, an `__or T * f()`
+  function that returns a constant fails because pcc spills
+  cftnod (the return temp) to byte memory before FORCE runs.
+  The resulting ASSIGN(O1, OREG -K(fp)) has no architecturally
+  valid pattern (you can't load an OR from byte memory — the
+  capability invariant). Fixing this requires changing
+  cgram.y's RETURN handling to give cftnod the OREF qualifier
+  so pcc allocates it in CLASSC. Left for Phase 2b.
+
+  Phase 2b/c/... (still pending) — the multi-session work:
     1. clocal lowering for `__or` autos: skip the AUTO/PARAM
        STREF rewrite, become REG nodes in CLASSC. Effectively
        implicit-`register` semantics.

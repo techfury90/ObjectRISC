@@ -426,6 +426,17 @@ struct optab table[] = {
 		"	addu AL, AR, r0	; reg move\n", },
 
 /*
+ * Object RISC: ASSIGN between two OR slots — emits OMOV. Triggered
+ * when both operands are REG nodes in CLASSC (e.g., variables
+ * declared `register __or T *p __asm__("oN")`).
+ */
+{ ASSIGN,	FOREFF|INCREG,
+	SCREG,	TANY,
+	SCREG,	TANY,
+		0,	RDEST,
+		"	omov AL, AR\n", },
+
+/*
  * Compares. EQ/NE generate beq/bne on the operand pair directly,
  * with a delay-slot nop. Other relations fall back to the OPLOG
  * generic, which subtracts and tests against zero.
@@ -569,6 +580,27 @@ struct optab table[] = {
 	SANY,	TANY,
 		NAREG,	RESC1,
 		"	move A1, AL\n", },
+
+/*
+ * Object RISC: OR-file leaf loads.
+ * Null constant -> OR slot: emits onull (the only architecturally-
+ * valid way to materialize a fresh reference from a literal). Any
+ * other integer constant assigned to an OR is a programmer error
+ * (you can't synthesize a capability-bearing reference from bits)
+ * and would be caught by the type checker once that lands.
+ */
+{ OPLTYPE,	INCREG,
+	SANY,	TANY,
+	SZERO,	TANY,
+		NCREG,	RESC1,
+		"	onull A1\n", },
+
+/* OR -> OR (treat as leaf-load via omov). */
+{ OPLTYPE,	INCREG,
+	SANY,	TANY,
+	SCREG,	TANY,
+		NCREG,	RESC1,
+		"	omov A1, AL\n", },
 
 /*
  * Goto. Object RISC `j` has a delay slot.
