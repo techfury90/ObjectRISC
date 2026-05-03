@@ -112,13 +112,17 @@ examples/cc/run_c.sh examples/cc/pascal.c    # Pascal's triangle
 examples/cc/run_c.sh examples/cc/hello_or.c  # __or in C
 ```
 
-The `hello_or.c` variant uses the `__or` qualifier to control the
-OR file directly from C: `register __or void *o1_var __asm__("o1")`
-binds a C variable to a named Object Register slot, and
-assignments compile to `omov` / `onull` instructions. The firmware
-ConsoleWrite call still uses inline asm for the `call #0x320`
-sequence — the broader `__or` calling convention (returns in O1,
-arguments in O1..O4) is in progress.
+The `hello_or.c` and `print_or.c` variants use the `__or`
+qualifier to control the OR file directly from C:
+`register __or void *p __asm__("o5")` binds a C variable to a
+named Object Register slot. Assignments between `__or` variables
+compile to `omov`; assigning `0` compiles to `onull`. Combined
+with extended inline asm — `asm("olw %0, 0(%1)" : "=r"(out) :
+"r"(or_var))` — you can read or write through OR pointers, invoke
+firmware primitives via `call #N`, and otherwise treat OR slots
+as first-class C lvalues. The broader `__or` calling convention
+(args in O1..O4, returns in O1) and OL/OS-via-OR as native pcc
+patterns are in progress.
 
 The demos collectively exercise: recursion, loops with
 conditionals, if/else-if chains, stack-allocated arrays of int and

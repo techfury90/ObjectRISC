@@ -106,9 +106,22 @@ Done
   cftnod (the return temp) to byte memory before FORCE runs.
   The resulting ASSIGN(O1, OREG -K(fp)) has no architecturally
   valid pattern (you can't load an OR from byte memory — the
-  capability invariant). Fixing this requires changing
-  cgram.y's RETURN handling to give cftnod the OREF qualifier
-  so pcc allocates it in CLASSC. Left for Phase 2b.
+  capability invariant). Already attempted: setting
+  cftnod->n_qual = p->n_qual in cgram.y RETURN handler. That
+  preserves the qualifier but doesn't help, because pcc's
+  regalloc decides class via gclass(n_type) which can't see
+  qualifiers. Properly fixing needs either (a) a new basic type
+  for OREF (extends MAXTYPES, invasive) or (b) plumbing n_qual
+  through the regalloc class-decision path. Left for Phase 2b.
+
+  Companion success: OL/OS through `__or` pointers via extended
+  inline asm. With pcc's GCC-style
+  `asm("olw %0, 0(%1)" : "=r"(out) : "r"(or_var))`, the `__or`
+  operand binds to the OR slot the variable lives in and the
+  `olw` instruction takes that register name verbatim. See
+  examples/cc/print_or.c for a Hello-world that doesn't need
+  console_io.s — the OR moves are pure C, the OL and the
+  firmware-CALL sequence are inline asm.
 
   Phase 2b/c/... (still pending) — the multi-session work:
     1. clocal lowering for `__or` autos: skip the AUTO/PARAM
