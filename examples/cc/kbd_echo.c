@@ -11,14 +11,23 @@
  *
  * OR hygiene
  * ----------
- * print_str → console_write reads from O3 via the VA-range heuristic
- * in console_io.s. Two things in this demo clobber O3:
- *   - ReceiveQueuePoll's overlay sets O1..O4 from the dispatched
- *     SEND's OR payload.
- *   - The subscribe / unsubscribe SENDs explicitly null O3 so the
- *     wire payload's OR-slot-2 is empty.
- * So we copy O3 once into O15 at startup and copy it back into O3
- * before every print.
+ * Three registers need active save/restore around the poll loop —
+ * print_int and print_char both use stack buffers, which console_io's
+ * VA heuristic reaches via O2 (the stack object), not O3:
+ *
+ *   O2 — stack ref. console_write picks this for any buffer in the
+ *        stack VA range, so print_char / print_int fail silently
+ *        without it.
+ *   O3 — data ref. console_write picks this for data-segment
+ *        buffers (string literals), so print_str needs it.
+ *   O4 — our self-service, the target of ReceiveQueuePoll itself.
+ *        Without it the *next* poll's `omov o1, o4` sees null and
+ *        returns EFAULT silently.
+ *
+ * ReceiveQueuePoll's overlay sets O1..O4 from the wire payload
+ * (always [sub_ref, 0, 0, 0] for our key events), so all three of
+ * O2/O3/O4 get nuked on every successful poll. We park them once
+ * in O13/O14/O15 at startup and copy back after each poll.
  *
  * Wire protocol — see tools/devices/README.md for the canonical writeup.
  *
@@ -48,17 +57,22 @@
 int
 main(void)
 {
+	register void *__or o2_stack       __asm__("o2");
 	register void *__or o3_data        __asm__("o3");
 	register void *__or o4_self        __asm__("o4");
 	register void *__or o6_kbd         __asm__("o6");
 	register void *__or o7_subref      __asm__("o7");
+	register void *__or o13_stack_save __asm__("o13");
+	register void *__or o14_self_save  __asm__("o14");
 	register void *__or o15_data_save  __asm__("o15");
 	int status;
 	int code, mods;
 
-	/* Stash the boot-time data ref so we can restore O3 before each
-	 * print_str — see "OR hygiene" in the file header. */
-	o15_data_save = o3_data;
+	/* Stash the boot-time stack, data, and self-service refs — see
+	 * "OR hygiene" in the file header. */
+	o13_stack_save = o2_stack;
+	o14_self_save  = o4_self;
+	o15_data_save  = o3_data;
 
 	/* Step 1. Derive an R|S self-ref to hand the terminal as our
 	 * subscription cap. */
@@ -85,7 +99,7 @@ main(void)
 		:
 		: "r1", "r2", "r3", "r4"
 	);
-	o3_data = o15_data_save;
+	/* attach doesn't touch ORs — no restoration needed. */
 	if (status != 0) {
 		print_str("attach failed: status=");
 		print_int(status);
@@ -108,7 +122,8 @@ main(void)
 		: "r"(o6_kbd), "r"(o7_subref)
 		: "r1", "r4", "r5", "r6", "r7"
 	);
-	o3_data = o15_data_save;
+	o2_stack = o13_stack_save;
+	o3_data  = o15_data_save;
 
 	print_str("kbd_echo ready — focus the terminal and type "
 	          "(ESC to quit)\n");
@@ -128,7 +143,9 @@ main(void)
 			:
 			: "r1", "r2", "r3", "r4"
 		);
-		o3_data = o15_data_save;
+		o2_stack = o13_stack_save;  /* restore for stack-buffer prints */
+		o3_data  = o15_data_save;   /* restore for data-buffer prints */
+		o4_self  = o14_self_save;   /* restore for the next poll */
 		if (status != 0) {
 			print_str("poll failed: status=");
 			print_int(status);

@@ -168,12 +168,19 @@ pack16(int hi, int lo)
 	return ((hi & 0xFFFF) << 16) | (lo & 0xFFFF);
 }
 
-/* Restore O3 to the saved data ref (parked in O15 by main). Most asm
- * blocks here clobber O3 — call this before any print_str. */
+/* Restore O2 (stack), O3 (data), O4 (self-svc) after any block that
+ * polls or SENDs. The poll's queue overlay sets O1..O4 from the wire
+ * payload, so:
+ *   - O2 (stack ref) — needed by print_int / print_char (stack bufs)
+ *   - O3 (data ref) — needed by print_str (data-segment string lits)
+ *   - O4 (self-svc) — needed by the next ReceiveQueuePoll
+ * All three are parked in O13/O14/O15 by main once at startup. */
 static void
-restore_o3(void)
+restore_or_state(void)
 {
+	asm volatile("omov o2, o13");
 	asm volatile("omov o3, o15");
+	asm volatile("omov o4, o14");
 }
 
 const char title_str[] = "PAINT — Object RISC vector demo";
@@ -181,7 +188,11 @@ const char title_str[] = "PAINT — Object RISC vector demo";
 int
 main(void)
 {
+	register void *__or o2_stack       __asm__("o2");
 	register void *__or o3_data        __asm__("o3");
+	register void *__or o4_self        __asm__("o4");
+	register void *__or o13_stack_save __asm__("o13");
+	register void *__or o14_self_save  __asm__("o14");
 	register void *__or o15_data_save  __asm__("o15");
 	int code, mods;
 	int x = 320, y = 200;
@@ -189,21 +200,23 @@ main(void)
 	int color = 1;
 	int title_off, title_len;
 
-	o15_data_save = o3_data;
+	o13_stack_save = o2_stack;
+	o14_self_save  = o4_self;
+	o15_data_save  = o3_data;
 
 	if (attach_self_queue_16() != 0) {
-		restore_o3();
+		restore_or_state();
 		print_str("attach failed\n");
 		return 1;
 	}
-	restore_o3();
+	restore_or_state();
 
 	kbd_subscribe();
-	restore_o3();
+	restore_or_state();
 
 	vec_cmd(VEC_CLEAR,     0, 0);
 	vec_cmd(VEC_SET_COLOR, color, 0);
-	restore_o3();
+	restore_or_state();
 
 	/* Render a title via the grid service. The data ref's storage
 	 * starts at VA 0x40000 (CONTRACT.md §2); subtract that to get
@@ -211,13 +224,13 @@ main(void)
 	title_off = (int)title_str - 0x40000;
 	title_len = (int)strlen(title_str);
 	grid_text(title_off, title_len, 2, 0);
-	restore_o3();
+	restore_or_state();
 
 	print_str("paint demo running — focus the terminal\n");
 
 	while (1) {
 		if (kbd_poll(&code, &mods) != 0) break;
-		restore_o3();
+		restore_or_state();
 		if (code == KEY_ESCAPE) break;
 
 		if (code == KEY_UP)         { y -= STEP; if (y < 0) y = 0; }
@@ -250,7 +263,7 @@ main(void)
 			vec_cmd(VEC_CLEAR, 0, 0);
 			vec_cmd(VEC_SET_COLOR, color, 0);
 		}
-		restore_o3();
+		restore_or_state();
 
 		print_str("cursor (");
 		print_int(x);
@@ -261,7 +274,7 @@ main(void)
 		print_str("\n");
 	}
 
-	restore_o3();
+	restore_or_state();
 	print_str("paint demo exiting\n");
 	return 0;
 }

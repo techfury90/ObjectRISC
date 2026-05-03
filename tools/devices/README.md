@@ -236,6 +236,21 @@ terminal clears its subscriber list. (v1 is coarse — a null SEND
 removes *all* subscriptions; per-CPU unsubscribe will land when
 multiple subscribers are needed.)
 
+**OR hygiene for subscribers.** ReceiveQueuePoll's overlay sets
+`O1..O4` from the wire payload (Vol VI §6) — for our key events
+that's `[sub_ref, 0, 0, 0]`. Programs that later use:
+
+- `print_int` / `print_char` (stack-buffer console_write) need
+  `O2` (stack ref);
+- `print_str` (data-segment console_write) needs `O3` (data ref);
+- the *next* poll itself needs `O4` (self-service ref);
+
+…must save those before the first poll and restore after each
+one. `examples/cc/kbd_echo.c` shows the canonical pattern: park
+`O2/O3/O4` into `O13/O14/O15` once at startup, copy them back
+after each poll. Symptoms when you forget: prints silently
+produce empty output, then the next poll returns `EFAULT`.
+
 **Codepoints.** Plain ASCII bytes 0x00–0x7F come through verbatim
 in `R4`. Special keys use a portable encoding ≥ `0x100`:
 
