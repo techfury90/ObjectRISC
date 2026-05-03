@@ -65,7 +65,7 @@ Pure Python 3.10+, standard library only. No build step.
 
 ### Validation
 
-113 tests across thirteen categories — integer, logical, memory,
+114 tests across thirteen categories — integer, logical, memory,
 control flow, object registers, object memory, firmware, traps,
 CALL, golden programs, multi-CPU (with link boot), loadable modules,
 and receive queues:
@@ -94,9 +94,22 @@ Hello world on a graphical terminal connected to a real
 wire-format crossbar in its own process:
 
 ```sh
-tools/oriscrun \
-    --terminal pid=16 \
-    --cpu pid=0:program=examples/hello_terminal.orx,service=16=1@9
+examples/run_hello_terminal.sh
+```
+
+Parallel π(N) across four CPUs, results streamed live to the
+terminal. The coordinator partitions [2..2000] into quarters,
+dispatches work via SEND with a derived reply cap, and prints each
+worker's count and elapsed cycles as the reply arrives:
+
+```sh
+examples/run_parallel_primes.sh
+# Parallel pi(2000) across 4 CPUs:
+# CPU 0: 95 primes in 14759 cycles
+# CPU 1: 73 primes in 21024 cycles
+# CPU 2: 71 primes in 24978 cycles
+# CPU 3: 64 primes in 27567 cycles
+# Total: pi(2000) = 303
 ```
 
 ## Status
