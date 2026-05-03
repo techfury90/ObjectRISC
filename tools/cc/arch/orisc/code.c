@@ -120,7 +120,7 @@ bfcode(struct symtab **sp, int cnt)
 {
 	struct symtab *sym;
 	NODE *p, *q;
-	int i, gpr, opr;
+	int i, gpr;
 
 	/* Hidden struct-return arg occupies R4 if present. */
 	if (cftnsp->stype == STRTY+FTN || cftnsp->stype == UNIONTY+FTN) {
@@ -128,7 +128,7 @@ bfcode(struct symtab **sp, int cnt)
 	}
 
 	gpr = R4;
-	opr = O1;
+	/* opr (= O1) starts here once __or qualifier lands. */
 
 	for (i = 0; i < cnt; i++) {
 		sym = sp[i];
@@ -224,18 +224,23 @@ moveargs(NODE *p, int *gpr, int *opr, int *stacksize)
 	/*
 	 * For now, route everything to the GPR file. Once the `__or`
 	 * qualifier lands and we can identify reference-typed values,
-	 * those will route to *opr instead.
+	 * those will route to *opr instead. (void) the unused opr to
+	 * silence the warning until then.
 	 */
+	(void)opr;
 	if (*gpr <= R7) {
 		q = block(REG, NIL, NIL, r->n_type, r->n_df, r->n_ap);
 		q->n_rval = (*gpr)++;
 		r = buildtree(ASSIGN, q, r);
 	} else {
-		/* Stack overflow arg — bump stacksize, remember offset. */
+		/* Stack overflow arg — bump stacksize, remember offset.
+		 * tsize returns bits; convert to bytes. SETOFF aligns
+		 * up to a multiple of the type's natural width. */
+		int sz = tsize(r->n_type, r->n_df, r->n_ap) / SZCHAR;
 		r = block(FUNARG, r, NIL, r->n_type, r->n_df, r->n_ap);
-		*stacksize = ALIGN(*stacksize, (tlen(r) - 1));
+		SETOFF(*stacksize, sz);
 		r->n_rval = *stacksize;
-		*stacksize += tlen(r);
+		*stacksize += sz;
 	}
 
 	if (p->n_op == CM) {

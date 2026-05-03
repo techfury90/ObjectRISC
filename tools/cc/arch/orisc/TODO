@@ -3,6 +3,24 @@ Object RISC backend for pcc — work list
 Done
 ====
 
+- Build wiring. configure.ac knows the orisc target (`orisc-*-*`
+  with `targmach=orisc, targos=none, endian=big, abi=orx`).
+  os/none/ccconfig.h emits `-D__orisc__ -D__OBJECT_RISC__` for
+  cpp. `./configure --target=orisc-unknown-none` succeeds; `make`
+  builds `orisc-unknown-none-cpp` and `orisc-unknown-none-ccom`.
+
+- End-to-end smoke test: `int main(void) { return 0; }` compiles
+  through pcc → orisc assembly → asmorisc → .orx → simorisc loads
+  and runs it. Main returns to RA=0 and traps "main returned
+  without TaskExit" — the documented expected outcome for naive C
+  without a startup runtime. Cycle count = 32 (prologue +
+  epilogue + the no-op work of returning a constant). Compiler
+  invocation:
+
+      orisc-unknown-none-ccom < hello.c > hello.s
+      asmorisc hello.s -o hello.orx
+      simorisc hello.orx
+
 - macdefs.h first cut. Type sizes, big-endian, register file
   declarations (32 GPRs as CLASSA, GPR pairs as CLASSB for 64-bit
   longlong, 16 ORs as CLASSC), RSTATUS / ROVERLAP / GCLASS,
@@ -44,9 +62,23 @@ Done
   basic move/load, and all Object RISC novel ops (OMOV/OEQ/OL*/
   OS*/OREFLD/OREFST/OFENCE/SEND).
 
-This brings the orisc backend to "files are in the right shape and
-will link if pcc were built for it." Codegen does NOT work yet —
-table.c is empty, and many local2.c hooks are comperr-stubs.
+This brings the orisc backend to "compiles trivial C end-to-end."
+Real codegen happens, the ABI prologue/epilogue is correct, the
+output assembles and loads. The big remaining gaps are listed
+below.
+
+Known issues / quality-of-output:
+- The register allocator spills callee-preserved regs through
+  caller-saved regs (r1..r8) instead of recognizing them as
+  unused. Cosmetic but verbose.
+- Return value lowering is incomplete — `return 7` stores 7 to a
+  local but never moves it to R2. Need to add the FORCE pattern
+  in table.c (or efcode in code.c) that copies the return value
+  into R2 before the epilogue.
+- No startup file (crt0). Functions return to RA=0 and trap.
+  Need a tiny crt0 that calls main, then does
+  `addiu r4, r0, R2_value; call #0x001` (TaskExit) with main's
+  return value.
 
 Remaining (in rough order)
 ==========================

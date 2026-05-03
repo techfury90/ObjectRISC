@@ -137,8 +137,7 @@ defzero(struct symtab *sp)
 	int off;
 	char *name;
 
-	if ((name = sp->soname) == NULL)
-		name = exname(sp->sname);
+	name = getexname(sp);
 	off = tsize(sp->stype, sp->sdf, sp->sap);
 	off = (off + SZCHAR - 1) / SZCHAR;
 

@@ -60,16 +60,24 @@ offcalc(struct interpass_prolog *ipp)
 }
 
 /*
- * Emit the function prologue per Vol VII §2.3:
+ * Emit the function prologue. Mirrors the MIPS port's frame setup,
+ * adapted to our naming and to drop the .ent/.frame/.cpload pseudo-
+ * ops asmorisc doesn't recognize.
  *
  *     funcname:
- *         addiu sp, sp, -F
- *         sw    r31, F-4(sp)         ; save link register
- *         sw    rN,  F-K(sp)         ; per saved callee-preserved
+ *         addiu sp, sp, -16              ; reserve 16-byte fixed area
+ *         sw    r31, 4(sp)               ; save link register
+ *         sw    fp, 0(sp)                ; save caller's FP
+ *         addu  fp, sp, r0               ; FP <- SP (anchors locals/saves)
+ *         addiu sp, sp, -addto           ; reserve locals + reg-save area
+ *         sw    rN, -regoff(fp)          ; per used callee-preserved
  *
- * No FP convention here — we use SP-relative addressing throughout.
- * Asmorisc has no .globl directive; visibility is implicit, all
- * top-level labels resolve.
+ * The 16 bytes at the top of OUR frame (above FP) hold caller's
+ * outgoing-arg spill area per Vol VII §2.2. Callee-preserved regs
+ * and locals live below FP. The frame pointer is set up
+ * unconditionally; the Vol VII §2.1 "FP optional" clause
+ * acknowledges that fixed-frame functions can skip it, but pcc's
+ * codegen consistently emits FP-relative addressing for autos.
  */
 void
 prologue(struct interpass_prolog *ipp)
@@ -78,50 +86,66 @@ prologue(struct interpass_prolog *ipp)
 	int i, j;
 
 	ftype = ipp->ipp_type;
+
+	/* Asmorisc has no .globl; visibility is implicit. The .entry
+	 * directive (CONTRACT.md §4.2) names the program's entry
+	 * point — emit it for `main` so the loader knows where to
+	 * start. */
+	if (strcmp(ipp->ipp_name, "main") == 0)
+		printf("\t.entry main\n");
+
 	printf("%s:\n", ipp->ipp_name);
 
 	addto = offcalc(ipp);
 
-	if (addto) {
+	printf("\taddiu sp, sp, -%d\n", ARGINIT/SZCHAR);
+	printf("\tsw r31, 4(sp)\n");
+	printf("\tsw fp, 0(sp)\n");
+	printf("\taddu fp, sp, r0\n");
+
+	if (addto)
 		printf("\taddiu sp, sp, -%d\n", addto);
-		printf("\tsw r31, %d(sp)\n", addto - 4);
-		for (i = p2env.p_regs[0], j = 0; i; i >>= 1, j++)
-			if (i & 1)
-				printf("\tsw r%d, %d(sp) ; save callee-preserved\n",
-				    j, addto - regoff[j]);
-	}
+
+	for (i = p2env.p_regs[0], j = 0; i; i >>= 1, j++)
+		if (i & 1)
+			printf("\tsw r%d, -%d(fp) ; save callee-preserved\n",
+			    j, regoff[j]);
 }
 
 /*
- * Emit the function epilogue per Vol VII §2.3:
+ * Emit the function epilogue.
  *
- *         lw    rN,  F-K(sp)         ; restore each callee-preserved
- *         lw    r31, F-4(sp)
+ *         lw    rN, -regoff(fp)          ; restore each callee-preserved
+ *         addiu sp, fp, 16               ; deallocate locals + reach RA slot
+ *         lw    r31, -12(sp)             ; restore RA from old slot
+ *         lw    fp, -16(sp)              ; restore caller's FP
  *         jr    r31
- *         addiu sp, sp, F            ; (delay slot) deallocate frame
+ *         nop
+ *
+ * Layout reasoning: after `addiu sp, fp, 16`, sp is at the address
+ * just above the saved-RA slot — i.e., the entry sp. RA was saved at
+ * fp+4 (relative to old fp = old sp), which is now sp-12 because
+ * we just bumped sp by 16. Same for FP at fp+0 → sp-16.
  */
 void
 eoftn(struct interpass_prolog *ipp)
 {
-	int addto, i, j;
+	int i, j;
 
-	addto = offcalc(ipp);
+	(void)offcalc(ipp);
 
 	if (ipp->ipp_ip.ip_lbl == 0)
 		return;	/* no code generated */
 
-	if (addto) {
-		for (i = p2env.p_regs[0], j = 0; i; i >>= 1, j++)
-			if (i & 1)
-				printf("\tlw r%d, %d(sp)\n",
-				    j, addto - regoff[j]);
-		printf("\tlw r31, %d(sp)\n", addto - 4);
-		printf("\tjr r31\n");
-		printf("\taddiu sp, sp, %d\n", addto);
-	} else {
-		printf("\tjr r31\n");
-		printf("\tnop\n");
-	}
+	for (i = p2env.p_regs[0], j = 0; i; i >>= 1, j++)
+		if (i & 1)
+			printf("\tlw r%d, -%d(fp)\n", j, regoff[j]);
+
+	printf("\taddiu sp, fp, %d\n", ARGINIT/SZCHAR);
+	printf("\tlw r31, %d(sp)\n", 4 - ARGINIT/SZCHAR);
+	printf("\tlw fp, %d(sp)\n", 0 - ARGINIT/SZCHAR);
+	printf("\tjr r31\n");
+	printf("\tnop\n");
 }
 
 /*
@@ -271,7 +295,7 @@ conput(FILE *fp, NODE *p)
 		if (p->n_name[0] != '\0')
 			fprintf(fp, "%s", p->n_name);
 		else
-			fprintf(fp, CONFMT, p->n_lval);
+			fprintf(fp, CONFMT, getlval(p));
 		return;
 	default:
 		comperr("conput: bad op %d", p->n_op);
@@ -309,24 +333,24 @@ adrput(FILE *io, NODE *p)
 	case NAME:
 		if (p->n_name[0] != '\0')
 			fputs(p->n_name, io);
-		if (p->n_lval != 0)
-			fprintf(io, "+" CONFMT, p->n_lval);
+		if (getlval(p) != 0)
+			fprintf(io, "+" CONFMT, getlval(p));
 		return;
 
 	case OREG:
 		r = p->n_rval;
-		if (p->n_lval)
-			fprintf(io, CONFMT, p->n_lval);
+		if (getlval(p))
+			fprintf(io, CONFMT, getlval(p));
 		fprintf(io, "(%s)", rnames[r]);
 		return;
 
 	case ICON:
 		if (p->n_name[0] != '\0') {
 			fputs(p->n_name, io);
-			if (p->n_lval != 0)
-				fprintf(io, "+" CONFMT, p->n_lval);
+			if (getlval(p) != 0)
+				fprintf(io, "+" CONFMT, getlval(p));
 		} else {
-			fprintf(io, CONFMT, p->n_lval);
+			fprintf(io, CONFMT, getlval(p));
 		}
 		return;
 

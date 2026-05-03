@@ -23,3 +23,6 @@ ObjectRISC copy.pdf
 # Validation suite scratch builds (default --build-dir lives in /tmp anyway,
 # but if someone overrides it they probably don't want it tracked)
 build/
+
+# autoconf cache (regenerated on `autoconf`)
+tools/cc/autom4te.cache/

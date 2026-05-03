@@ -283,6 +283,10 @@ case "$target_os" in
 	    nova) targmach=nova ;;
 	    i86) targmach=i86 ;;
 	    pdp7) targmach=pdp7 ;;
+	    # Object RISC — bare-metal target. The "OS" is whatever
+	    # the .orx loader (simorisc) provides via firmware
+	    # primitives. Big-endian per Volume I.
+	    orisc) targmach=orisc targos=none endian=big abi=orx ;;
 	esac
 	;;
 esac

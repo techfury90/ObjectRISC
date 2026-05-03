@@ -37,8 +37,8 @@ offstar(NODE *p, int shape)
 
 	if (p->n_op == PLUS || p->n_op == MINUS) {
 		if (p->n_right->n_op == ICON &&
-		    p->n_right->n_lval >= -(1L << 15) &&
-		    p->n_right->n_lval < (1L << 15)) {
+		    getlval(p->n_right) >= -(1L << 15) &&
+		    getlval(p->n_right) < (1L << 15)) {
 			if (isreg(p->n_left) == 0)
 				(void)geninsn(p->n_left, INAREG);
 			/* Converted in ormake() */
