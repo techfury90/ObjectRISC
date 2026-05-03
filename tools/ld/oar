@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""oar — Object RISC archiver.
+
+Bundles `.oro` object files into a single `.ora` archive (CONTRACT.md
+§1.2). The archive carries a symbol-to-member index so the linker can
+selectively pull in just the members that satisfy unresolved external
+references.
+
+This is essentially `ar(1)` + `ranlib(1)` rolled into one tool: every
+`oar c` automatically rebuilds the symbol index, so there's no
+analogue of `ranlib`'s "you forgot to rebuild the index" failure mode.
+
+Usage:
+    oar c archive.ora member1.oro [member2.oro ...]   # create
+    oar t archive.ora                                 # list members
+    oar s archive.ora                                 # show symbol index
+    oar x archive.ora [member.oro]                    # extract (all or one)
+"""
+
+import argparse
+import struct
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# .ora container constants (must agree with orld and CONTRACT.md §1.2).
+ORA_MAGIC          = b"ORISCARC"
+ORA_FORMAT_VERSION = 1
+ORA_HEADER_SIZE    = 0x20
+ORA_MEMBER_DIR_ENT = 12
+ORA_SYM_INDEX_ENT  = 8
+
+# .oro constants — duplicated locally so oar is self-contained.
+ORO_MAGIC          = b"ORISCOBJ"
+ORO_HEADER_SIZE    = 0x20
+ORO_SYMBOL_SIZE    = 16
+
+ORO_SEC_UNDEF = 0
+ORO_BIND_GLOBAL = 1
+
+
+# ---------------------------------------------------------------------------
+# .oro parsing — just the bits oar needs (defined-globals).
+# ---------------------------------------------------------------------------
+
+def extract_defined_globals(blob: bytes, src: Path) -> List[str]:
+    """Return the list of defined global symbol names in `blob` (a
+    full `.oro` file)."""
+    if len(blob) < ORO_HEADER_SIZE or blob[:8] != ORO_MAGIC:
+        raise SystemExit(f"oar: {src}: not a .oro object file")
+    text_size, data_size, sym_count, _ = struct.unpack(">IIII",
+                                                       blob[0x10:0x20])
+    cursor = ORO_HEADER_SIZE + text_size + data_size
+    sym_bytes = blob[cursor:cursor + sym_count * ORO_SYMBOL_SIZE]
+    cursor += sym_count * ORO_SYMBOL_SIZE
+    # Skip relocation table to reach string table.
+    rel_count = struct.unpack(">I", blob[0x1C:0x20])[0]
+    cursor += rel_count * 12
+    str_bytes = blob[cursor:]
+
+    defined: List[str] = []
+    for i in range(sym_count):
+        off = i * ORO_SYMBOL_SIZE
+        name_off, _value, section, binding, _type = struct.unpack_from(
+            ">IIBBB", sym_bytes, off)
+        if binding != ORO_BIND_GLOBAL or section == ORO_SEC_UNDEF:
+            continue
+        end = str_bytes.index(b'\x00', name_off)
+        defined.append(str_bytes[name_off:end].decode('utf-8'))
+    return defined
+
+
+# ---------------------------------------------------------------------------
+# Archive layout
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Member:
+    name: str
+    blob: bytes
+    defined_globals: List[str]
+
+
+def create_archive(out_path: Path, member_paths: List[Path]) -> None:
+    members: List[Member] = []
+    seen_names: set = set()
+    seen_symbols: dict = {}    # symbol -> member name (for duplicate check)
+
+    for p in member_paths:
+        blob = p.read_bytes()
+        # Members are stored under their basename — trim the path. That
+        # keeps the archive portable; conflicts (two inputs with the same
+        # basename) become an explicit error rather than a silent
+        # last-wins.
+        name = p.name
+        if name in seen_names:
+            raise SystemExit(f"oar: duplicate member name {name!r} (from {p})")
+        seen_names.add(name)
+
+        defined = extract_defined_globals(blob, p)
+        for sym in defined:
+            if sym in seen_symbols:
+                raise SystemExit(
+                    f"oar: symbol {sym!r} defined in two members: "
+                    f"{seen_symbols[sym]!r} and {name!r}")
+            seen_symbols[sym] = name
+
+        members.append(Member(name=name, blob=blob, defined_globals=defined))
+
+    # Build string table containing every member name and every global
+    # symbol exactly once. Reserve offset 0 for the empty string by
+    # convention.
+    str_buf = bytearray(b'\x00')
+    name_offsets: dict = {}
+
+    def intern(name: str) -> int:
+        if name in name_offsets:
+            return name_offsets[name]
+        off = len(str_buf)
+        str_buf.extend(name.encode('utf-8') + b'\x00')
+        name_offsets[name] = off
+        return off
+
+    # Member directory entries first (we need their stable indices for
+    # the symbol index).
+    member_dir = []      # list of (name_off, data_off_placeholder, data_size)
+    for m in members:
+        member_dir.append([intern(m.name), 0, len(m.blob)])
+
+    # Symbol index entries: one row per (defined global, member-index).
+    sym_index = []       # list of (name_off, member_idx)
+    for member_idx, m in enumerate(members):
+        for sym in m.defined_globals:
+            sym_index.append((intern(sym), member_idx))
+
+    member_dir_size = ORA_MEMBER_DIR_ENT * len(members)
+    sym_index_size = ORA_SYM_INDEX_ENT * len(sym_index)
+    str_table_size = len(str_buf)
+    index_size = member_dir_size + sym_index_size + str_table_size
+
+    # Resolve the absolute file offsets for member data: they start
+    # right after the index.
+    cursor = ORA_HEADER_SIZE + index_size
+    for i, m in enumerate(members):
+        member_dir[i][1] = cursor
+        cursor += len(m.blob)
+
+    # Pack everything.
+    hdr = (ORA_MAGIC
+           + struct.pack(">II", ORA_FORMAT_VERSION, 0)
+           + struct.pack(">III", len(members), len(sym_index), index_size)
+           + struct.pack(">I", 0))
+    assert len(hdr) == ORA_HEADER_SIZE
+
+    member_dir_buf = b''.join(struct.pack(">III", n, o, s)
+                              for (n, o, s) in member_dir)
+    sym_index_buf = b''.join(struct.pack(">II", n, m) for (n, m) in sym_index)
+    member_data = b''.join(m.blob for m in members)
+
+    out_path.write_bytes(hdr + member_dir_buf + sym_index_buf
+                         + bytes(str_buf) + member_data)
+
+
+# ---------------------------------------------------------------------------
+# Reading an existing archive
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ArchiveView:
+    members: List[Tuple[str, int, int]]    # (name, file_off, size)
+    symbols: List[Tuple[str, int]]         # (name, member_idx)
+    raw: bytes
+
+
+def load_archive(path: Path) -> ArchiveView:
+    raw = path.read_bytes()
+    if len(raw) < ORA_HEADER_SIZE or raw[:8] != ORA_MAGIC:
+        raise SystemExit(f"oar: {path}: not a .ora archive "
+                         f"(magic {raw[:8]!r} != {ORA_MAGIC!r})")
+    version, flags, mcount, scount, idx_size, _ = struct.unpack(">IIIIII",
+                                                                raw[0x08:0x20])
+    if version != ORA_FORMAT_VERSION:
+        raise SystemExit(f"oar: {path}: unsupported .ora version {version}")
+
+    cursor = ORA_HEADER_SIZE
+    mdir_bytes = raw[cursor:cursor + ORA_MEMBER_DIR_ENT * mcount]
+    cursor += ORA_MEMBER_DIR_ENT * mcount
+    sidx_bytes = raw[cursor:cursor + ORA_SYM_INDEX_ENT * scount]
+    cursor += ORA_SYM_INDEX_ENT * scount
+    str_bytes_len = idx_size - ORA_MEMBER_DIR_ENT * mcount \
+        - ORA_SYM_INDEX_ENT * scount
+    str_bytes = raw[cursor:cursor + str_bytes_len]
+
+    def name_at(off: int) -> str:
+        end = str_bytes.index(b'\x00', off)
+        return str_bytes[off:end].decode('utf-8')
+
+    members: List[Tuple[str, int, int]] = []
+    for i in range(mcount):
+        name_off, data_off, data_size = struct.unpack_from(
+            ">III", mdir_bytes, i * ORA_MEMBER_DIR_ENT)
+        members.append((name_at(name_off), data_off, data_size))
+
+    symbols: List[Tuple[str, int]] = []
+    for i in range(scount):
+        name_off, member_idx = struct.unpack_from(
+            ">II", sidx_bytes, i * ORA_SYM_INDEX_ENT)
+        symbols.append((name_at(name_off), member_idx))
+
+    return ArchiveView(members=members, symbols=symbols, raw=raw)
+
+
+# ---------------------------------------------------------------------------
+# Operations
+# ---------------------------------------------------------------------------
+
+def cmd_create(args) -> int:
+    if not args.members:
+        sys.exit("oar: c: at least one member is required")
+    create_archive(args.archive, [Path(p) for p in args.members])
+    return 0
+
+
+def cmd_list(args) -> int:
+    arc = load_archive(args.archive)
+    for (name, off, size) in arc.members:
+        print(f"  {size:>8}  {name}    (at 0x{off:x})")
+    return 0
+
+
+def cmd_symbols(args) -> int:
+    arc = load_archive(args.archive)
+    width = max((len(s[0]) for s in arc.symbols), default=10)
+    for (name, member_idx) in arc.symbols:
+        member_name = arc.members[member_idx][0]
+        print(f"  {name:<{width}s}  {member_name}")
+    return 0
+
+
+def cmd_extract(args) -> int:
+    arc = load_archive(args.archive)
+    targets = set(args.members) if args.members else None
+    extracted = 0
+    for (name, off, size) in arc.members:
+        if targets is not None and name not in targets:
+            continue
+        Path(name).write_bytes(arc.raw[off:off + size])
+        extracted += 1
+    if targets is not None and extracted < len(targets):
+        missing = targets - {n for (n, _, _) in arc.members}
+        sys.exit(f"oar: x: members not in archive: {sorted(missing)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(
+        prog="oar",
+        description="Object RISC archiver (.oro... -> .ora)")
+    sub = ap.add_subparsers(dest="op", required=True, metavar="OP")
+
+    sp = sub.add_parser("c", help="create an archive")
+    sp.add_argument("archive", type=Path)
+    sp.add_argument("members", nargs="+", help="input .oro files")
+    sp.set_defaults(fn=cmd_create)
+
+    sp = sub.add_parser("t", help="list members")
+    sp.add_argument("archive", type=Path)
+    sp.set_defaults(fn=cmd_list)
+
+    sp = sub.add_parser("s", help="show symbol index")
+    sp.add_argument("archive", type=Path)
+    sp.set_defaults(fn=cmd_symbols)
+
+    sp = sub.add_parser("x", help="extract members (default: all)")
+    sp.add_argument("archive", type=Path)
+    sp.add_argument("members", nargs="*",
+                    help="member names to extract (omit for all)")
+    sp.set_defaults(fn=cmd_extract)
+
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

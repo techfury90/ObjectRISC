@@ -1038,6 +1038,110 @@ file-private. All six pass; the linker passes the C demo suite as
 well — every one of the eleven `examples/cc/*.c` programs builds
 end-to-end through the new pipeline.
 
+## Phase 15 — Archives and a real libc
+
+The linker landed in Phase 14, which made the next move obvious:
+something to actually link *against*. Promote the ad-hoc
+`print_str`/`print_int` helpers we'd been hand-compiling into a
+proper C library, and design the archive format that keeps the
+"only pay for what you use" property along the way.
+
+### The `.ora` archive format
+
+A direct cousin of `ar(1)` + `ranlib(1)`, rolled into one file.
+[`CONTRACT.md`](CONTRACT.md) §1.2 pins the layout: a header, a
+member directory (one entry per `.oro` inside), a symbol-to-member
+index built up front, a string table, and the member blobs
+concatenated at the end. The symbol index is what makes archives
+useful: the linker scans its set of unresolved external references
+and consults each `.ora`'s index to pull in just the members that
+satisfy them. Members nothing references stay where they are.
+
+[`tools/ld/oar`](tools/ld/oar) is the archiver, with the four
+classic operations:
+
+    oar c lib.ora a.oro b.oro c.oro    # create
+    oar t lib.ora                      # list members
+    oar s lib.ora                      # dump the symbol index
+    oar x lib.ora a.oro                # extract one member
+
+`oar c` rebuilds the index every time, so there's no `ranlib`-
+shaped failure mode where the index drifts out of sync with the
+members.
+
+### Linker support
+
+[`orld`](tools/ld/orld) gains a small "archive resolution" loop
+that runs before the existing link logic. It walks the explicit
+`.oro` inputs, computes the unresolved-externals set, and for each
+unresolved symbol consults each `.ora`'s index to find a member
+that defines it. Pulling a member in can introduce new unresolved
+references (the member uses something *it* didn't define), so the
+loop iterates until no progress. After that, the existing link
+path runs unchanged: merge symbols, lay out sections, apply
+relocations, write `.orx`.
+
+The interesting subtlety: archive members that don't get pulled in
+*can* contain symbols (or even relocations) that would conflict
+with the explicit inputs. The
+`08_archive_selective_inclusion` test deliberately puts a
+duplicate `_start` in an unused archive member; if selective
+inclusion ever broke, the link would fail. Three new tests
+(`07`–`09`) cover the basic case, selective inclusion, and
+transitive pull-in.
+
+### liborisc
+
+The library itself lives in [`tools/cc/lib/`](tools/cc/lib):
+
+- `io.c` — `print_str`, `print_char`, `print_int`, `print_hex`
+- `string.c` — `strlen`, `strcmp`, `strcpy`, `memcpy`, `memset`,
+  `memcmp`, `atoi`
+
+Each file becomes its own member of `liborisc.ora`, contributing
+its global symbols to the archive index. `build.sh` is a
+six-line driver that compiles every `.c` here through pcc plus
+`asmorisc -r` and bundles the outputs via `oar c`. The C demo
+runner [`examples/cc/run_c.sh`](examples/cc/run_c.sh) auto-runs
+`build.sh` the first time it doesn't find the archive.
+
+[`liborisc.h`](tools/cc/lib/liborisc.h) is the C-side prototype
+header. It's separate from the existing
+[`tools/cc/arch/orisc/orisc.h`](tools/cc/arch/orisc/orisc.h)
+(which holds the OR-file inspection and OL/OS macros) — most
+programs include both.
+
+### Migration
+
+`examples/cc/lib.c` — the ad-hoc `print_str`/`print_int` source
+that every demo's `run_c.sh` had been compiling and linking
+manually — is gone. Its functions live in `tools/cc/lib/io.c`
+now and reach demos through the archive. Eleven existing demos
+keep working unchanged (their `extern void print_str(...)`
+declarations resolve through the archive); a new
+[`strings_demo.c`](examples/cc/strings_demo.c) exercises
+`strlen`, `strcmp`, `strcpy`, `memset`, `atoi`, and `print_hex`
+to prove the archive-pulled string functions actually link.
+
+### What's not in v1
+
+- **`malloc`/`free`** — would need a heap design and probably
+  ObjAllocStore-backed bookkeeping; left for when something
+  actually needs dynamic allocation.
+- **`printf`** — needs varargs, which pcc's orisc backend hasn't
+  exercised yet. The `print_*` family covers everything the
+  demos need.
+- **Math, file I/O, time, anything else** — none of the demos
+  reach for it. Easy to add as new `.c` files when they do.
+
+### Status
+
+9/9 linker tests pass (six original + three archive). All 11
+existing C demos work through the new archive-based pipeline,
+plus the new `strings_demo`. `liborisc.ora` is 5140 bytes; a
+hello-world that uses only `print_str` pulls in `io.oro` (1709
+bytes) and skips `string.oro` entirely.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
@@ -1049,7 +1153,9 @@ end-to-end through the new pipeline.
 - A linker (`tools/ld/orld`) that combines `.oro` object files
   into executable `.orx`, with per-file local symbol scoping,
   cross-file global resolution, and a small set of relocations
-  covering everything the toolchain emits.
+  covering everything the toolchain emits. An archiver
+  (`tools/ld/oar`) bundles `.oro` files into `.ora` archives that
+  the linker pulls from selectively.
 - A validation suite spanning thirteen categories (integer, logical,
   memory, control, oreg, omem, firmware, traps, call, golden,
   multi-CPU including link boot, loadable modules, receive queues),
@@ -1064,6 +1170,9 @@ end-to-end through the new pipeline.
   callee sides of the calling convention both wired). The C
   pipeline now goes through the linker — no more per-unit label
   mangling.
+- A small C library (`liborisc.ora`) covering console I/O and the
+  standard string/memory primitives, archived for selective
+  inclusion so programs only pay for what they call.
 - A generic link-boot loader that lets you spin up extra CPUs whose
   code is decided at runtime — announce on the crossbar, receive a
   module by SEND, map and JR.

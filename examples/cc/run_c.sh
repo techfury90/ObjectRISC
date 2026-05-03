@@ -41,27 +41,30 @@ fi
 TMP=$(mktemp -d)
 trap "rm -rf $TMP" EXIT
 
-# 1) Compile the user's program (cpp + ccom).
-"$CPP"  -I tools/cc/arch/orisc "$src"             > "$TMP/program.i"
-"$CCOM"                                            < "$TMP/program.i" \
+LIBORISC="tools/cc/lib/liborisc.ora"
+if [ ! -f "$LIBORISC" ]; then
+    bash tools/cc/lib/build.sh >/dev/null
+fi
+
+# 1) Compile the user's program (cpp + ccom). Both -I dirs:
+#    arch/orisc for orisc.h (OR-file macros), lib for liborisc.h
+#    (libc prototypes).
+"$CPP"  -I tools/cc/arch/orisc -I tools/cc/lib "$src" > "$TMP/program.i"
+"$CCOM"                                                < "$TMP/program.i" \
     > "$TMP/program.s"
 
-# 2) Compile the shared library (lib.c → print_str/print_int).
-"$CPP"  -I tools/cc/arch/orisc examples/cc/lib.c   > "$TMP/lib.i"
-"$CCOM"                                            < "$TMP/lib.i" \
-    > "$TMP/lib.s"
-
-# 3) Assemble each translation unit separately to a relocatable .oro.
+# 2) Assemble each translation unit separately to a relocatable .oro.
 #    asmorisc -r scopes pcc's L\d+ local labels per-file, so no name
-#    collisions across units (no sed mangling needed).
-python3 tools/asm/asmorisc -r tools/cc/arch/orisc/crt0.s        -o "$TMP/crt0.oro"
-python3 tools/asm/asmorisc -r tools/cc/arch/orisc/console_io.s  -o "$TMP/console_io.oro"
-python3 tools/asm/asmorisc -r "$TMP/lib.s"                      -o "$TMP/lib.oro"
-python3 tools/asm/asmorisc -r "$TMP/program.s"                  -o "$TMP/program.oro"
+#    collisions across units.
+python3 tools/asm/asmorisc -r tools/cc/arch/orisc/crt0.s       -o "$TMP/crt0.oro"
+python3 tools/asm/asmorisc -r tools/cc/arch/orisc/console_io.s -o "$TMP/console_io.oro"
+python3 tools/asm/asmorisc -r "$TMP/program.s"                 -o "$TMP/program.oro"
 
-# 4) Link the four .oro files into a single .orx.
+# 3) Link with the libc archive. orld pulls in only the members
+#    that satisfy unresolved externals — programs that don't call
+#    print_int or strlen don't pay for them.
 python3 tools/ld/orld -o "$TMP/program.orx" \
-    "$TMP/crt0.oro" "$TMP/console_io.oro" "$TMP/lib.oro" "$TMP/program.oro"
+    "$TMP/crt0.oro" "$TMP/console_io.oro" "$TMP/program.oro" "$LIBORISC"
 
-# 5) Run.
+# 4) Run.
 exec python3 tools/sim/simorisc "$@" "$TMP/program.orx"

@@ -36,6 +36,12 @@ ORO_HEADER_SIZE    = 0x20
 ORO_SYMBOL_SIZE    = 16
 ORO_RELOC_SIZE     = 12
 
+# .ora archive container — must agree with oar.
+ORA_MAGIC          = b"ORISCARC"
+ORA_HEADER_SIZE    = 0x20
+ORA_MEMBER_DIR_ENT = 12
+ORA_SYM_INDEX_ENT  = 8
+
 ORO_SEC_UNDEF = 0
 ORO_SEC_TEXT  = 1
 ORO_SEC_DATA  = 2
@@ -89,6 +95,10 @@ class ObjectFile:
 
 def load_oro(path: Path) -> ObjectFile:
     blob = path.read_bytes()
+    return _parse_oro(path, blob)
+
+
+def _parse_oro(path: Path, blob: bytes) -> ObjectFile:
     if len(blob) < ORO_HEADER_SIZE:
         raise SystemExit(f"orld: {path}: too short for .oro header")
     if blob[:8] != ORO_MAGIC:
@@ -133,6 +143,121 @@ def load_oro(path: Path) -> ObjectFile:
 
     return ObjectFile(path=path, text=text, data=data,
                       symbols=symbols, relocs=relocs)
+
+
+# ---------------------------------------------------------------------------
+# Archive (.ora) handling
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Archive:
+    """A loaded .ora archive: every member's blob is sliced out lazily,
+    every defined-global → member-index mapping is built up front."""
+    path: Path
+    raw: bytes
+    members: List[Tuple[str, int, int]]   # (name, file_off, size)
+    sym_to_member: Dict[str, int]         # exported symbol -> member index
+
+
+def load_archive(path: Path) -> Archive:
+    raw = path.read_bytes()
+    if len(raw) < ORA_HEADER_SIZE or raw[:8] != ORA_MAGIC:
+        raise SystemExit(f"orld: {path}: not a .ora archive")
+    version, flags, mcount, scount, idx_size, _ = struct.unpack(
+        ">IIIIII", raw[0x08:0x20])
+    if version != 1:
+        raise SystemExit(f"orld: {path}: unsupported .ora version {version}")
+
+    cursor = ORA_HEADER_SIZE
+    mdir_bytes = raw[cursor:cursor + ORA_MEMBER_DIR_ENT * mcount]
+    cursor += ORA_MEMBER_DIR_ENT * mcount
+    sidx_bytes = raw[cursor:cursor + ORA_SYM_INDEX_ENT * scount]
+    cursor += ORA_SYM_INDEX_ENT * scount
+    str_bytes_len = idx_size - ORA_MEMBER_DIR_ENT * mcount \
+        - ORA_SYM_INDEX_ENT * scount
+    str_bytes = raw[cursor:cursor + str_bytes_len]
+
+    def name_at(off: int) -> str:
+        end = str_bytes.index(b'\x00', off)
+        return str_bytes[off:end].decode('utf-8')
+
+    members: List[Tuple[str, int, int]] = []
+    for i in range(mcount):
+        name_off, data_off, data_size = struct.unpack_from(
+            ">III", mdir_bytes, i * ORA_MEMBER_DIR_ENT)
+        members.append((name_at(name_off), data_off, data_size))
+
+    sym_to_member: Dict[str, int] = {}
+    for i in range(scount):
+        name_off, member_idx = struct.unpack_from(
+            ">II", sidx_bytes, i * ORA_SYM_INDEX_ENT)
+        name = name_at(name_off)
+        if name in sym_to_member:
+            raise SystemExit(
+                f"orld: {path}: symbol {name!r} listed twice in archive index")
+        sym_to_member[name] = member_idx
+
+    return Archive(path=path, raw=raw, members=members,
+                   sym_to_member=sym_to_member)
+
+
+def load_archive_member(arc: Archive, member_idx: int) -> ObjectFile:
+    """Slice out one member of `arc` and parse it as a .oro."""
+    name, off, size = arc.members[member_idx]
+    blob = arc.raw[off:off + size]
+    member_path = Path(f"{arc.path.name}({name})")
+    return _parse_oro(member_path, blob)
+
+
+def resolve_via_archives(objs: List[ObjectFile],
+                          archives: List[Archive]) -> List[ObjectFile]:
+    """Standard library-link loop. Compute the set of unresolved external
+    references over `objs`; for each one, find an archive member that
+    defines it, pull that member into `objs`, repeat. Pulling in a member
+    can introduce new unresolved externals, hence the loop."""
+    if not archives:
+        return objs
+
+    objs = list(objs)        # we mutate
+
+    def defined_globals(objs_list: List[ObjectFile]) -> set:
+        out = set()
+        for obj in objs_list:
+            for sym in obj.symbols:
+                if (sym.binding == ORO_BIND_GLOBAL
+                        and sym.section != ORO_SEC_UNDEF):
+                    out.add(sym.name)
+        return out
+
+    def undefined_externals(objs_list: List[ObjectFile]) -> set:
+        out = set()
+        for obj in objs_list:
+            for sym in obj.symbols:
+                if sym.section == ORO_SEC_UNDEF:
+                    out.add(sym.name)
+        return out
+
+    pulled_in: set = set()       # (archive_path, member_idx) to avoid dupes
+
+    while True:
+        defined = defined_globals(objs)
+        unresolved = undefined_externals(objs) - defined
+        if not unresolved:
+            return objs
+        progress = False
+        for sym in sorted(unresolved):
+            for arc in archives:
+                if sym in arc.sym_to_member:
+                    key = (str(arc.path), arc.sym_to_member[sym])
+                    if key in pulled_in:
+                        continue
+                    pulled_in.add(key)
+                    objs.append(load_archive_member(
+                        arc, arc.sym_to_member[sym]))
+                    progress = True
+                    break
+        if not progress:
+            return objs    # leave the rest for link()'s own error
 
 
 # ---------------------------------------------------------------------------
@@ -371,12 +496,21 @@ def main(argv) -> int:
     out_path = args.output or args.inputs[0].with_suffix(".orx")
 
     objs: List[ObjectFile] = []
+    archives: List[Archive] = []
     for path in args.inputs:
         try:
-            objs.append(load_oro(path))
+            blob = path.read_bytes()
         except FileNotFoundError:
             sys.exit(f"orld: {path}: no such file")
+        if blob[:8] == ORA_MAGIC:
+            archives.append(load_archive(path))
+        elif blob[:8] == ORO_MAGIC:
+            objs.append(_parse_oro(path, blob))
+        else:
+            sys.exit(f"orld: {path}: unknown file type "
+                     f"(magic {blob[:8]!r}; expected .oro or .ora)")
 
+    objs = resolve_via_archives(objs, archives)
     text, data, entry = link(objs, args.entry)
     out_path.write_bytes(write_orx(text, data, entry))
 

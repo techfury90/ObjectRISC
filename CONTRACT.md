@@ -108,6 +108,52 @@ known to fit in the low 16 bits unsigned.
 `BRANCH16` and `J26` patches expect the existing low bits to be
 zero (the assembler has emitted a placeholder).
 
+## 1.2 The `.ora` Archive Format
+
+A bundle of one or more `.oro` object files plus a symbol-to-member
+index. Functions like `ar(1)` plus `ranlib(1)` rolled into one file:
+the linker (`orld`) consults the symbol index to pull in only the
+members that satisfy unresolved external references, and ignores the
+rest. Big-endian throughout.
+
+| Offset | Size | Field                                                                |
+|--------|------|----------------------------------------------------------------------|
+| `0x00` | 8    | Magic: ASCII bytes `ORISCARC` (`0x4F 0x52 0x49 0x53 0x43 0x41 0x52 0x43`) |
+| `0x08` | 4    | Format version, currently `1`                                        |
+| `0x0C` | 4    | Flags, currently `0`                                                 |
+| `0x10` | 4    | Member count (M)                                                     |
+| `0x14` | 4    | Symbol-index entry count (S)                                         |
+| `0x18` | 4    | Index size in bytes (member dir + symbol index + string table)       |
+| `0x1C` | 4    | Reserved (zero)                                                      |
+| `0x20` | 12·M | Member directory — M entries of 12 bytes each (layout below)         |
+| `0x20+12M` | 8·S | Symbol index — S entries of 8 bytes each (layout below)          |
+| `0x20+12M+8S` | rest of index | String table — concatenated NUL-terminated names      |
+| `0x20 + index_size` | … | Member data — each member is a complete `.oro` file inline   |
+
+### Member directory entry (12 bytes)
+
+| Offset | Size | Field                                                      |
+|--------|------|------------------------------------------------------------|
+| `0x00` | 4    | Name offset within the string table                        |
+| `0x04` | 4    | Member offset (absolute byte offset in the `.ora` file)    |
+| `0x08` | 4    | Member size in bytes                                       |
+
+### Symbol index entry (8 bytes)
+
+| Offset | Size | Field                                                      |
+|--------|------|------------------------------------------------------------|
+| `0x00` | 4    | Name offset within the string table                        |
+| `0x04` | 4    | Member index (zero-based) that defines this symbol         |
+
+The index lists every defined global from every member, so `orld`
+can decide selective inclusion in a single pass: scan its list of
+unresolved externals, look each up in the index, pull in the
+member that defines it, repeat until no new externals appear.
+
+Local symbols, undefined symbols, and the per-member relocation
+records are not in the archive index — they live inside each `.oro`
+member as usual.
+
 ## 2. The Initial Task State
 
 When the simulator loads an `.orx`, it sets up the initial task as if

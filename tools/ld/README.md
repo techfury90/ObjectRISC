@@ -1,10 +1,11 @@
-# orld — Object RISC linker
+# orld — Object RISC linker (and oar — the archiver)
 
-Combines one or more `.oro` object files (produced by `asmorisc -r`)
-into a single executable `.orx`. Concatenates text and data sections,
-resolves cross-file global symbols, applies the relocation records
-each input carries, and writes a final `.orx` with the right entry
-offset.
+Combines `.oro` object files (produced by `asmorisc -r`) and
+optionally `.ora` archives (produced by `oar`) into a single
+executable `.orx`. Concatenates text and data sections, resolves
+cross-file global symbols, applies the relocation records each
+input carries, pulls only the needed members out of any archives,
+and writes the final `.orx` with the right entry offset.
 
 `asmorisc` without `-r` is still a fully working "concatenate +
 emit `.orx`" assembler — adding the linker doesn't take that mode
@@ -15,10 +16,32 @@ away. The new pipeline is opt-in.
     tools/ld/orld -o program.orx crt0.oro lib.oro program.oro
     tools/ld/orld --entry main -o program.orx lib.oro program.oro
     tools/ld/orld --map link.map -o program.orx *.oro
+    tools/ld/orld -o program.orx crt0.oro program.oro liborisc.ora
 
+Inputs can be `.oro` object files or `.ora` archives in any order.
 `--entry SYM` chooses the entry point; defaults to `_start` (the
 symbol `tools/cc/arch/orisc/crt0.s` defines). `--map FILE` writes a
 section/symbol layout map for debugging.
+
+## Archives (`.ora`)
+
+`oar` builds `.ora` archives — bundles of `.oro` members plus a
+symbol index so `orld` can pull in only what's needed:
+
+    tools/ld/oar c liborisc.ora io.oro string.oro    # create
+    tools/ld/oar t liborisc.ora                      # list members
+    tools/ld/oar s liborisc.ora                      # show symbol index
+    tools/ld/oar x liborisc.ora io.oro               # extract one member
+
+Selective inclusion means a libc with hundreds of `.oro` members
+costs the program nothing for the ones it doesn't reference. The
+linker walks its set of unresolved external symbols, pulls in the
+member that defines each one, and repeats until no progress is
+made — handling transitive dependencies automatically.
+
+The C library `liborisc.ora` (built from
+[`tools/cc/lib/`](../cc/lib/)) is the production user of this; the
+demo runner pulls it into every C demo's link line.
 
 ## The pipeline
 
@@ -91,11 +114,18 @@ The cases:
 - `05_duplicate_global` — linker errors on `helper` defined twice.
 - `06_explicit_local` — `.local helper` makes the same name file-private
   in both files; both link cleanly.
+- `07_archive_basic` — link against an `.ora`; one of two members
+  satisfies the call.
+- `08_archive_selective_inclusion` — an unused archive member with
+  a deliberately-poison symbol must NOT get pulled in.
+- `09_archive_transitive` — archive member A calls archive member B;
+  the linker pulls both in via two iterations of the resolution loop.
 
 ## Files
 
 | File                       | Role                                           |
 |----------------------------|------------------------------------------------|
 | `orld`                     | The linker                                     |
+| `oar`                      | The archiver (create/list/show/extract `.ora`) |
 | `tests/run-tests.sh`       | Runs every `*.sh` test in this directory       |
 | `tests/0*.sh`              | Per-feature test cases                         |

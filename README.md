@@ -61,13 +61,15 @@ vendored pcc and needs `./configure && make` once (see
 | Tool                                         | Purpose                                              |
 |----------------------------------------------|------------------------------------------------------|
 | [`tools/asm/asmorisc`](tools/asm)            | Assembler — `.s` → `.orx`, or `.s` → `.oro` with `-r` |
-| [`tools/ld/orld`](tools/ld)                  | Linker — `.oro`… → `.orx`                            |
+| [`tools/ld/orld`](tools/ld)                  | Linker — `.oro` and `.ora` inputs → `.orx`           |
+| [`tools/ld/oar`](tools/ld)                   | Archiver — bundle `.oro` files into `.ora` archives  |
 | [`tools/sim/simorisc`](tools/sim)            | Simulator — runs `.orx` binaries, single or multi-CPU |
 | [`tools/sim/oriscbar`](tools/sim)            | Standalone wire-level crossbar daemon                |
 | [`tools/devices/oriscterm`](tools/devices)   | Tk-based terminal device that connects to `oriscbar` |
 | [`tools/devices/linkbootd`](tools/devices)   | Python-side link-boot server                         |
 | [`tools/oriscrun`](tools/oriscrun)           | Launcher: spawns crossbar + devices + CPU processes  |
 | [`tools/cc`](tools/cc/arch/orisc)            | Vendored pcc with an Object RISC backend (`arch/orisc/`) |
+| [`tools/cc/lib`](tools/cc/lib)               | C library (liborisc.ora) — console I/O, string/memory primitives |
 
 ### Validation
 
@@ -135,6 +137,7 @@ examples/cc/run_c.sh examples/cc/inspect.c   # OEQ/OISN/OLEN/OTAG/OHOME/OCAP
 examples/cc/run_c.sh examples/cc/print_clean.c     # __or via calling convention
 examples/cc/run_c.sh examples/cc/print_via_or_arg.c # callee takes __or arg
 examples/cc/run_c.sh examples/cc/or_callee_inspect.c # OISN/OLEN inside __or callee
+examples/cc/run_c.sh examples/cc/strings_demo.c    # exercises liborisc string fns
 ```
 
 The `hello_or.c` and `print_or.c` variants use the `__or`
@@ -161,9 +164,9 @@ The demos collectively exercise: recursion, loops with
 conditionals, if/else-if chains, stack-allocated arrays of int and
 char, computed array indexing, pointer arithmetic, string literals,
 integer arithmetic (add/sub/mul/div/mod/and/or/xor), bitwise
-operations, multi-file compilation (each program links against
-`examples/cc/lib.c` for shared `print_str`/`print_int`), and
-external calls.
+operations, multi-file linkage (programs link against the
+[`liborisc.ora`](tools/cc/lib) C library for `print_str` /
+`print_int` / `strlen` / `memcpy` / etc.), and external calls.
 
 Each program links against `crt0.s` (provides `.entry _start`,
 calls main, TaskExits with main's R2 as the exit code) and

@@ -19,8 +19,9 @@ What works end-to-end (compiles, assembles, runs on `simorisc`):
   family), branches and jumps (with proper architectural delay
   slots), and direct/indirect calls.
 - Pointer arithmetic, character arrays with `.ascii` coalescing,
-  multi-file linkage against `examples/cc/lib.c`'s
-  `print_str`/`print_int`.
+  multi-file linkage through `tools/ld/orld` against the
+  [`liborisc.ora`](../../lib/) C library
+  (console I/O + the standard string/memory primitives).
 - The `__or` storage-class qualifier, in three forms:
   - **Explicit register binding.**
     `register __or void *p __asm__("oN")` lands a C variable
@@ -73,7 +74,7 @@ the wrapper [`examples/cc/run_c.sh`](../../../../examples/cc/run_c.sh),
 which drives the full pipeline (cpp → ccom → `asmorisc -r` per
 translation unit → `orld` → simorisc) and links each program
 against [`crt0.s`](crt0.s), [`console_io.s`](console_io.s), and
-[`examples/cc/lib.c`](../../../../examples/cc/lib.c).
+the [`liborisc.ora`](../../lib/) C library archive.
 
 ## Try it
 
@@ -90,6 +91,7 @@ From the repo root:
     examples/cc/run_c.sh examples/cc/print_clean.c     # __or via calling convention
     examples/cc/run_c.sh examples/cc/print_via_or_arg.c # callee takes __or arg
     examples/cc/run_c.sh examples/cc/or_callee_inspect.c # OISN/OLEN inside __or callee
+    examples/cc/run_c.sh examples/cc/strings_demo.c    # liborisc strlen/strcmp/memset/atoi
 
 ## Files
 
