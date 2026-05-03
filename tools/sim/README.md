@@ -43,7 +43,7 @@ multiple CPUs talk to each other:
 ### Firmware primitives
 - **`0x001 TaskExit`** — terminates the current task; on a CPU's last
   task this contributes to the simulator's exit code.
-- **`0x100 ObjAlloc`** / **`0x102 ObjAllocStore`** — allocate
+- **`0x100 ObjAlloc`** / **`0x106 ObjAllocStore`** — allocate
   byte-typed and OR-typed (OBJSTORE) objects.
 - **`0x101 ObjFree`** — bumps generation, recycles slot.
 - **`0x103 ObjDerive`** — produces a weaker reference.

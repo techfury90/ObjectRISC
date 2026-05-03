@@ -323,6 +323,23 @@ existing one, change the home processor of an object, or mutate any
 other field of the descriptor. Such operations are reached only through
 `CALL` to the appropriate firmware primitive.
 
+A ninth operation in this same encoding family takes no operands and
+introduces no new register dependency:
+
+| Mnemonic | Effect                                                           |
+|----------|------------------------------------------------------------------|
+| `OFENCE` | Order all preceding object-system memory accesses (`OL*`/`OS*`/`OREFLD`/`OREFST`) before all subsequent ones, and likewise order them with respect to mapped-page accesses (`LB`/`SW`/etc.) targeting the same underlying storage. |
+
+`OFENCE` is the architecture's only memory-ordering primitive. The
+issue arises because object-register access and ordinary mapped-page
+access reach storage by different paths — the descriptor cache versus
+the TLB — and an implementation may, in principle, reorder operations
+between the two paths when no architectural dependency exists. Code
+that mixes the two and depends on a specific ordering must interpose
+an `OFENCE`. A single-issue in-order implementation may retire
+`OFENCE` as a no-op; a more aggressive implementation must drain its
+out-of-order queues across the boundary.
+
 ## 9. Loads and Stores Through Object Registers
 
 | Mnemonic                       | Effect                                       |
@@ -370,7 +387,50 @@ installed by firmware.
 Object-register loads, like general-register loads, expose a one-cycle
 load-use delay to the compiler.
 
-## 10. The SEND Instruction
+## 10. Loads and Stores of References
+
+| Mnemonic                       | Effect                                       |
+|--------------------------------|----------------------------------------------|
+| `OREFLD Od, offset(Os)`        | load a 64-bit object reference from object storage |
+| `OREFST Od, offset(Os)`        | store a 64-bit object reference into object storage |
+
+These two instructions are the architecture's solution to a problem
+the rest of the spec deliberately created: the prohibition on storing
+object references through general-register `SB`/`SH`/`SW` (which would
+let user code freely manufacture references by writing arbitrary bit
+patterns and reloading them as references). `OREFLD`/`OREFST` provide
+a path for references to enter and leave object memory, but only
+through *OR-typed storage* — storage whose descriptor carries the
+`OBJSTORE` flag (Volume III Section 3.3). On such storage:
+
+1. Integer `OL*`/`OS*` instructions trap with `capability-violation`.
+2. `OREFLD`/`OREFST` succeed if the reference, generation, bounds, and
+   capability checks of Section 9 all pass, and additionally the
+   offset is 8-byte aligned.
+
+Conversely, `OREFLD`/`OREFST` on byte-typed storage (the common case)
+trap with `capability-violation`.
+
+The two paths together preserve the capability invariant: bits that
+sit in OR-typed storage were placed there by some prior `OREFST` of
+a real reference held in an object register. They cannot be observed
+or reconstructed as integers (the integer access path traps), and
+they cannot be written from arbitrary bit patterns (the byte-store
+path also traps). The set of derivable references therefore remains
+exactly the set the firmware has minted, precisely as Volume III
+Section 5 requires.
+
+`OREFLD`/`OREFST` are the natural target instructions for compiler
+spill/reload of object registers, for reference fields embedded in
+heap structures, and for handler state passed between dispatches
+through a service object's storage. Their encoding is given in
+Volume III's CONTRACT addendum and in Volume V Section 2.6.
+
+The 8-byte alignment requirement is enforced as
+`address-misaligned-d`. The remaining fault conditions match Section 9
+exactly.
+
+## 11. The SEND Instruction
 
 ```
 SEND Os
@@ -411,7 +471,7 @@ combined with software-managed continuations and replies. A reply
 capability is itself an object reference passed in `O1`–`O4`, on which
 the recipient may in turn `SEND`.
 
-## 11. The CALL Instruction
+## 12. The CALL Instruction
 
 ```
 CALL #imm26
@@ -445,7 +505,7 @@ implementation raises `reserved-call`, which firmware in turn handles
 by terminating the offending task or returning an error code at its
 discretion.
 
-## 12. Privileged Instructions
+## 13. Privileged Instructions
 
 The following instructions are valid only in supervisor or firmware
 mode. Execution in user mode raises `privileged-instruction`.
@@ -476,7 +536,7 @@ The TLB-management instructions are not normally invoked by hand-
 written code; firmware uses them in the trap handlers responsible for
 maintaining per-task page tables.
 
-## 13. Traps, Exceptions, and the Restart Model
+## 14. Traps, Exceptions, and the Restart Model
 
 All exceptions on Object RISC are *precise*: when a trap handler is
 entered, every instruction earlier in program order than the faulting
@@ -526,13 +586,14 @@ register. `ERET` resuming from such a trap re-executes the branch,
 which is the only way to ensure that the branch's effect on control
 flow is correctly preserved.
 
-## 14. Reserved Encodings
+## 15. Reserved Encodings
 
-This revision allocates thirty-three of the sixty-four major opcodes,
-twenty-two of the sixty-four `SPECIAL` function codes, and nine of the
-sixteen `OBJECT` function codes (eight inspection/movement operations
-plus `OFENCE` at funct `0x8`). Every unallocated encoding raises
-`reserved-instruction` when executed.
+This revision allocates thirty-five of the sixty-four major opcodes
+(adding `OREFLD` at `0x36` and `OREFST` at `0x37` to the previous
+revision's set), twenty-two of the sixty-four `SPECIAL` function
+codes, and nine of the sixteen `OBJECT` function codes (eight
+inspection/movement operations plus `OFENCE` at funct `0x8`). Every
+unallocated encoding raises `reserved-instruction` when executed.
 
 The following ranges are reserved for anticipated extensions; conforming
 implementations shall not allocate them to local additions:
@@ -573,8 +634,8 @@ denotes a reserved encoding that raises `reserved-instruction`.
 | `0x10`–`0x1F` | reserved (FP) | `0x33` | `OLW`  |
 |          |            | `0x34`   | `OLBU`     |
 |          |            | `0x35`   | `OLHU`     |
-|          |            | `0x36`   | —          |
-|          |            | `0x37`   | —          |
+|          |            | `0x36`   | `OREFLD`   |
+|          |            | `0x37`   | `OREFST`   |
 |          |            | `0x38`   | `OSB`      |
 |          |            | `0x39`   | `OSH`      |
 |          |            | `0x3A`   | —          |

@@ -8,7 +8,7 @@ main:
     addiu r4, r0, 8
     addiu r5, r0, 0
     addiu r6, r0, 0x43            ; R|W|C
-    call  #0x102                  ; ObjAllocStore -> O1 = OR-storage ref
+    call  #0x106                  ; ObjAllocStore -> O1 = OR-storage ref
     bne   r2, r0, fail
     nop
     omov  o9, o1                  ; preserve OR-storage ref

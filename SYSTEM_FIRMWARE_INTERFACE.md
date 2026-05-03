@@ -279,6 +279,29 @@ calling task or returns `ENOSYS` per its policy.
 > Errors: `ENOMEM`, `EINVAL` (length zero or larger than implementation
 > maximum).
 
+#### 5.1.1 `0x106  ObjAllocStore` — *Restartable.*
+
+> Like `ObjAlloc` but the new object's storage is *OR-typed*: its
+> descriptor is allocated with the `OBJSTORE` flag set (Volume III
+> Section 3.3). Integer `OL*`/`OS*` instructions trap on it; only
+> `OREFLD`/`OREFST` (Volume II Section 10) may read or write the
+> storage. This is the architectural mechanism by which object
+> references can be saved to memory without breaching the capability
+> invariant — see Volume III Section 5.4.
+>
+> Args:
+> - `R4`: requested length in bytes; must be a non-zero multiple of
+>   8 (one OR slot) and ≤ 2^24.
+> - `R5`: type tag.
+> - `R6`: initial maximum capabilities.
+>
+> Returns:
+> - `O1`: reference to the new OR-typed object.
+> - `R2`: status.
+>
+> Errors: `EINVAL` (length zero, not a multiple of 8, or too large),
+> `ENOMEM`.
+
 **`0x101  ObjFree`** — *Non-restartable.*
 
 > Increment the descriptor's generation counter and return its storage

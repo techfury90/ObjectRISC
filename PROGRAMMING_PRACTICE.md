@@ -124,33 +124,46 @@ altogether and proceed directly with its body, returning by `jr r31`.
 
 ### 2.4 Object Register Discipline
 
-Object registers are *not spillable to integer memory*. The
+Object registers are *not spillable to byte-typed memory*. The
 architecture deliberately prohibits the bit-pattern reconstruction of
 an object reference from arbitrary memory contents — to do so would
 defeat the capability invariant Volume III establishes — and provides
-no instruction by which an object register's contents may be written
-to or loaded from a general-register address.
+no instruction by which an object register's bits may be written to
+or loaded from a byte-typed storage region with `SB`/`SH`/`SW` or
+their object-relative analogues.
 
-The practical consequence is that the four callee-preserved object
-registers `O9`–`O12` are preserved *by convention*: the callee must
-not modify them. There is no save-and-restore at the prologue. Code
-that requires more object registers than the working set provides
-must, in order of preference:
+References *are*, however, freely spillable to *OR-typed* storage —
+the architectural mechanism Volume III Section 5.4 describes:
 
-1. Restructure to use fewer simultaneous references.
-2. Marshal references through a heap-allocated array object, storing
-   each reference at a known byte offset and reloading it through
-   `OL`/`OS` when needed (an indirection but a cheap one).
-3. Invoke the firmware primitives `ORegSpill` and `ORegRestore`
-   (Volume VI Section 5.3, primitive numbers `0x121` and `0x122`),
-   which save and restore a named object register through the calling
-   task's private firmware-managed spill buffer. The buffer holds
-   sixteen slots in any conforming firmware.
+1. Allocate a backing object once at task setup through
+   `ObjAllocStore` (Volume VI Section 5.1.1) with length `8 × N`
+   for an N-slot spill area.
+2. At the prologue of any function that needs more than the
+   conventional working set of object registers, spill to the
+   backing object with `OREFST`.
+3. At the epilogue, reload with `OREFLD`.
 
-In our experience the conventional working set of fifteen object
-registers is adequate for substantially all hand-written and compiler-
-generated code, and the spill primitives are rarely exercised outside
-of deeply recursive algorithms over object graphs.
+`OREFLD`/`OREFST` are ordinary object-register-relative loads and
+stores; the offsets are 16-bit immediates in the encoding, so the
+compiler treats them like `LW`/`SW` for register allocation purposes.
+Unlike the firmware spill primitives this discussion previously
+recommended, no `CALL` is required, and the spill buffer can be
+indexed dynamically (the offset is just an immediate, not a fixed
+firmware-internal slot index).
+
+The four callee-preserved object registers `O9`–`O12` are preserved
+*by convention*: the callee must not modify them. With OR-typed
+spill in hand, this is no longer a hard wall — a function that needs
+more than four references live across calls allocates an OBJSTORE
+spill object on the stack (or in its frame) and uses it.
+
+The firmware primitives `ORegSpill` and `ORegRestore` (Volume VI
+Section 5.3, primitive numbers `0x121` and `0x122`) remain available
+for legacy code, but new code should prefer `OREFLD`/`OREFST` against
+an `ObjAllocStore`'d spill object. The CALL overhead is gone; the
+ordering relative to other object-register operations is well-defined
+by `OFENCE` rather than by the implicit semantics of a firmware
+trap.
 
 ### 2.5 Variadic Arguments
 
@@ -276,6 +289,88 @@ would dominate any plausible savings; we expect higher-level languages
 on Object RISC to provide tracing collection in their runtimes when
 their semantics demand it.
 
+### 3.4 Loadable Modules
+
+Code is data: the architecture imposes no special distinction between
+an object that holds instructions and an object that holds bytes. A
+program that wishes to load a fragment of code at runtime — a plug-in
+handler, a JIT-compiled function, a shared library brought in on
+demand — does so by constructing a code object the same way it would
+construct any other.
+
+The canonical sequence is five steps:
+
+```
+    ; Step 1: allocate a fresh byte-typed object large enough for the
+    ; module image. Initial caps include W so we can write into it.
+    addiu r4, r0, MODULE_SIZE   ; length in bytes
+    addiu r5, r0, 0x4100        ; type tag = LoadableModule
+    addiu r6, r0, 0x07          ; caps = R|W|X (writable while loading)
+    call  #0x100                ; ObjAlloc
+    bne   r2, r0, fail
+    nop
+    omov  o9, o1                ; preserve the module object
+
+    ; Step 2: copy the image into the object. The image is read from
+    ; wherever it lives — a SEND payload, a remote service, a region
+    ; of the boot text — and stored word by word with OSW.
+    ; (Loop body omitted.)
+
+    ; Step 3: derive an immutable executable reference. The W bit is
+    ; dropped; the resulting reference is sealed and may be shared.
+    omov  o1, o9
+    addiu r4, r0, 0x05          ; mask = R|X (no W)
+    call  #0x103                ; ObjDerive
+    bne   r2, r0, fail
+    nop
+    omov  o10, o1               ; preserve the sealed code reference
+
+    ; Step 4: map the sealed object into the local processor's virtual
+    ; address space so that branch targets within the module resolve.
+    ; The mapping inherits the reference's caps (R|X), so the mapped
+    ; pages are unwritable.
+    omov  o1, o10
+    addiu r4, r0, MODULE_VA     ; virtual address
+    addiu r5, r0, 0x05          ; protection = R|X
+    call  #0x110                ; MapObject
+
+    ; Step 5: install the module's entry point as a SEND handler on
+    ; some target object. The "code object" argument to InstallHandler
+    ; is the sealed reference we just mapped.
+    omov  o1, o_target          ; the object whose handler this serves
+    omov  o2, o10               ; sealed code object
+    addiu r4, r0, ENTRY_OFFSET  ; offset of the handler's first inst
+    call  #0x200                ; InstallHandler
+```
+
+A few points are worth noting:
+
+- The deliberate dropping of `W` between Steps 2 and 3 is what
+  separates a loadable module from a writable buffer. After Step 3,
+  the only references to the object's bytes-as-instructions carry
+  `R|X` and cannot be modified; this is what allows the descriptor
+  cache and the instruction cache (Volume V) to assume the module's
+  contents are stable for as long as the sealed reference exists.
+- `InstallHandler` checks that the supplied code object is currently
+  mapped executable on the receiving processor. This is what permits
+  the same primitive that handles the boot text to handle loadable
+  modules — there is no special "loadable" handler-installation path.
+- A module that is to be unloaded is unloaded by `ObjFree` on the
+  *original* writable reference (which, having `V`, can revoke the
+  sealed derivative). After revocation, the next dispatch attempting
+  to enter the module traps `ESTALE` rather than executing freed
+  bytes.
+- Modules may carry their own state by allocating `OBJSTORE` objects
+  (Volume III Section 5.4) at load time and storing the references in
+  a table accessed through the handler's *self* reference (Section
+  4.1). This is the architectural answer to "static data segment" for
+  dynamically loaded code.
+
+We expect this pattern to be the foundation for plug-in device
+drivers, for language runtimes that emit code at runtime, and for any
+operating-system facility that benefits from extending its dispatch
+surface without rebuilding its boot image.
+
 ## 4. Inter-Processor Communication Idioms
 
 ### 4.1 The Self Convention for Handlers
@@ -323,21 +418,37 @@ issuing task observes any subsequent state.
 ### 4.3 Synchronous Reply
 
 The pattern that most resembles a remote procedure call layers a
-reply object on top of `SEND`:
+reply object on top of `SEND`. The architecture provides no native
+"call-with-reply" primitive; the pattern below is the canonical
+construction and is what the reference toolchain emits for
+synchronous cross-processor calls.
 
 1. The caller allocates a small object to hold the reply, with
    capabilities `R|W|S|V`.
 2. The caller attaches a receive queue to the reply object via
-   `ReceiveQueueAttach`, so that incoming `SEND`s to the reply are
-   delivered to a queue rather than to a handler.
+   `ReceiveQueueAttach` (Volume VI Section 6, primitive number
+   `0x203`). The queue replaces handler dispatch on the reply object:
+   incoming `SEND`s to the reply are buffered for the caller to
+   collect rather than spawning a fresh task.
 3. The caller derives a send-only capability (`S` alone) on the reply
-   object, suitable for passing to the callee.
+   object, suitable for passing to the callee. The callee receives
+   only the right to send back; it cannot read, modify, or revoke the
+   reply object.
 4. The caller issues a `SEND` to the service, including the send-only
-   reply capability in the payload.
-5. The caller polls the reply queue via `ReceiveQueuePoll` with an
-   appropriate timeout.
+   reply capability in the payload as one of the reference slots.
+5. The caller polls the reply queue via `ReceiveQueuePoll` (primitive
+   number `0x204`) with an appropriate timeout. The poll blocks the
+   calling task until a message arrives or the timeout expires.
 6. On reply, the caller reads the response payload from the registers
-   loaded by `ReceiveQueuePoll`, frees the reply object, and returns.
+   loaded by `ReceiveQueuePoll`, frees the reply object with
+   `ObjFree`, and returns.
+
+This pattern is preferable to installing a handler on the reply
+object: handler dispatch spawns a fresh task per delivery, which
+introduces both a context-switch cost and a synchronization burden on
+the caller (the spawned reply handler needs to communicate with the
+caller through some shared state). The receive-queue approach keeps
+the reply on the caller's task and incurs only the unblock cost.
 
 The full sequence is given in the worked example of Section 5.
 

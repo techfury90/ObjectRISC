@@ -428,3 +428,259 @@ The Transputer-style link-boot bootstrap, where one processor sends
 firmware images to wake the others over the crossbar, is the natural
 target once loadable code objects exist. That gets us one step closer
 to a real Object RISC system that boots itself.
+
+---
+
+# Addendum — Since the Initial Commit
+
+The work that followed the initial commit closed the two open
+consequences flagged above, took the simulator from a single Python
+process to a small distributed system of cooperating processes, and
+fed the lessons learned back into the architecture volumes themselves.
+
+## Phase 8 — Loadable modules and OR-typed storage
+
+Two architecturally distinct gaps were addressed in one stretch of
+work, because each enables the other.
+
+### Loadable modules
+
+The simulator's `InstallHandler` originally required the handler code
+to live in the boot text — there was no path by which a fresh code
+object could become an executable handler at runtime. The fix had
+three parts:
+
+1. `InstallHandler` was generalized to accept any code object that is
+   currently mapped executable on the local CPU. Whether that mapping
+   was set up at boot or by `MapObject` at runtime is irrelevant.
+2. `MapObject` was generalized accordingly, accepting any reference
+   with the X cap and threading the resulting VA→object mapping into
+   the same translation list that boot mappings use.
+3. The five-step pattern *allocate → write → derive-without-W →
+   map → install handler* (now Volume VII §3.4) was given as a
+   first-class idiom.
+
+[`tools/sim/tests/validation/12_modules/`](tools/sim/tests/validation/12_modules)
+— seven tests covering allocation, copy-and-seal, map, install, and
+the full end-to-end pattern (`07_loadable_handler.s`) where one task
+loads a module from a region of bytes and successfully invokes it
+through `SEND`.
+
+### OR-typed storage and the OBJSTORE flag
+
+The capability invariant prohibits ORs from being stored to or loaded
+from byte-typed memory. The architecture's original answer — the
+firmware primitives `ORegSpill`/`ORegRestore` — paid a `CALL` per
+spill and was awkward for arbitrarily indexed spill slots.
+
+The cleaner answer turned out to be a flag on the descriptor itself:
+
+- A new descriptor flag, `OBJSTORE` (bit 6), marks an object as
+  OR-typed. Integer accesses (`OL*`/`OS*`) on an OBJSTORE object
+  trap; only the new `OREFLD`/`OREFST` instructions may access it.
+- `OREFLD` and `OREFST` (major opcodes 0x36 and 0x37) load and store
+  a single 64-bit reference at an 8-byte-aligned offset. They behave
+  like ordinary OR-relative loads/stores: full descriptor-cache
+  participation, full bounds and capability checking, full delay-slot
+  semantics.
+- A new firmware primitive `0x106 ObjAllocStore` allocates an
+  OBJSTORE-flagged object whose length must be a multiple of 8. The
+  flag is fixed at allocation time and cannot be flipped.
+
+The capability invariant is preserved because the bits never become
+observable as integers; the OR file ←→ OBJSTORE storage path moves
+references through dedicated instructions that the architecture
+verifies the same way it verifies any other OR operation.
+
+In passing, the `OFENCE` instruction — also in the OBJECT funct
+group — got promoted from "implicit at every primitive boundary" to
+an explicit instruction. It orders all prior OR-mediated accesses
+before all subsequent ones, which matters when the same object is
+visible through both an OR and a mapped page (a situation that arises
+naturally with loadable modules).
+
+[`tools/sim/tests/validation/12_modules/`](tools/sim/tests/validation/12_modules)
+also covers `OREFLD`/`OREFST` and `ObjAllocStore`, including the
+trap on integer access to an OBJSTORE object and the symmetric trap
+on `OREFLD` against a byte-typed object.
+
+## Phase 9 — Receive queues, link boot, and an embarrassment
+
+### Receive queues
+
+The Vol VII RPC pattern from the initial commit (caller allocates a
+reply object, derives a send-only cap, polls for the response) had a
+correctness problem in the dispatch model: receiving the reply on the
+caller's side meant *spawning a new handler task* on the reply
+object, which then needed to communicate the result back to the
+original caller through some shared channel. The handler-spawning
+dispatch model wasn't the right fit for "I am the recipient and I am
+already a task waiting for you."
+
+The architectural answer was a per-object receive queue, attached
+through `0x203 ReceiveQueueAttach` and polled through `0x204
+ReceiveQueuePoll`. An object with a queue attached buffers incoming
+SENDs into the queue rather than dispatching a handler; a task that
+holds the V cap on the object can poll the queue (with a timeout)
+and receive the next message into its own register state, blocking
+in the scheduler until something arrives.
+
+This is the canonical implementation of the RPC reply path now
+described in Vol VII §4.3, and it is what
+[`tools/sim/tests/validation/13_queues/06_rpc_round_trip.s`](tools/sim/tests/validation/13_queues/06_rpc_round_trip.s)
+exercises end-to-end across two processors.
+
+### Link boot
+
+With loadable modules in place, the Transputer-style link-boot path
+became implementable: one CPU holds a service object whose handler
+accepts a code-image payload, allocates an OBJSTORE-style data
+buffer, copies the image in, derives an executable reference, maps
+it, and installs it as a handler on a fresh service object exposed
+back to the booting CPU. The boot CPU never carries the loaded
+program in its own text segment.
+
+[`tools/sim/tests/validation/11_multicpu/11_link_boot.s`](tools/sim/tests/validation/11_multicpu/11_link_boot.s)
+exercises this pattern, with one CPU shipping a code image to a
+second CPU that loads it, runs it, and reports back. The test
+deliberately does *not* share boot text between the two CPUs; the
+booted code arrives entirely over the wire.
+
+### A primitive-number collision
+
+While reviewing the manual against the as-built simulator, we
+discovered that we had assigned `ObjAllocStore` the primitive number
+`0x102` — which Vol VI had already given to `ObjRevoke`. The fix was
+to relocate `ObjAllocStore` to `0x106` (the next free slot in the
+Memory Management range). Simulator dispatch, four validation tests,
+the integration contract, and the simulator's README were updated;
+all 113 validation tests still passed afterward. The episode was a
+useful reminder that the integration contract is part of the
+architecture surface and must be treated as such.
+
+## Phase 10 — Wire-level crossbar and multi-process simulation
+
+The crossbar in the initial commit was a Python dictionary mapping
+destination port to a queue of pending messages. It exercised the
+architectural model but bypassed the wire format Vol IV had
+specified. Two pieces of work changed this.
+
+### The wire format goes live
+
+A `Crossbar` abstract interface was introduced with two
+implementations:
+
+- `InProcessCrossbar` — the original direct-dispatch model, kept for
+  speed and for in-the-loop debugging.
+- `SocketCrossbar` — a real wire-level crossbar that serializes every
+  cross-CPU message into a `SEND_DELIVER`, `OBJ_READ_REQ/RESP`, or
+  `OBJ_WRITE_REQ/RESP` packet per Vol IV §3 (8-byte header, payload
+  words, trailing XOR checksum, all big-endian) and ships it over a
+  UNIX domain socket.
+
+`pack_packet` / `unpack_packet` and the per-message-type builders
+became first-class infrastructure with unit-test coverage in
+[`tools/sim/tests/test_wire_format.py`](tools/sim/tests/test_wire_format.py).
+The `--trace` flag was extended to print packet hex dumps alongside
+the instruction trace.
+
+The architecturally important consequence: a remote `OL`/`OS` now
+genuinely blocks the issuing CPU at the scheduler level, waiting for
+an `OBJ_READ_RESP` or `OBJ_WRITE_RESP` packet to arrive from the
+home CPU's autonomous "memory controller." There is no synchronous
+shortcut.
+
+### Multiple processes
+
+Once the wire format was real, splitting CPUs into separate processes
+became a small additional step. The result was three new tools and a
+new mode for the simulator:
+
+- `oriscbar` — a standalone crossbar daemon. Listens on a UNIX
+  domain socket; routes packets between connected ports; survives
+  CPUs and devices coming and going.
+- `simorisc --bar <socket>` — runs a single CPU as a client process
+  of an external `oriscbar`. Multiple `simorisc` processes connected
+  to the same `oriscbar` form a multi-CPU system distributed across
+  Unix processes.
+- `oriscterm` — a graphical terminal device, a Tk window with a
+  monospace text widget and a virtual keyboard. Connects to
+  `oriscbar` as a port; exposes a service object that accepts
+  console-write SENDs and produces input events.
+- `oriscrun` — the launcher. Spawns the crossbar, the requested
+  device processes, and the requested CPU processes; threads the
+  right service references into each CPU's initial state; forwards
+  each child's output to a single console with per-process prefixes.
+
+The hello-on-terminal demo reduces to one command:
+
+```
+$ tools/oriscrun \
+    --terminal pid=16 \
+    --cpu pid=0:program=examples/hello_terminal.orx,service=16=1@9
+```
+
+The hello world appears in the Tk window, having traveled from a
+CPU process, through the crossbar daemon, into the terminal process,
+across a wire format that matches the architecture spec to the byte.
+
+## Phase 11 — The manual revision
+
+The work above produced enough learning to warrant updating the
+architecture volumes themselves. The volumes maintain their 1986
+voice (the architecture group writing for an architecture audience),
+but the content reflects the architectural commitments validated by
+the implementation:
+
+- **Vol II** gained an `OFENCE` row in §8 and a new §10 documenting
+  `OREFLD`/`OREFST`. The opcode map (Appendix A) lists 0x36 and 0x37
+  as live; the major-opcode tally rose from thirty-three to
+  thirty-five.
+- **Vol III** gained the `OBJSTORE` flag in the descriptor flags
+  table (§3.3) and a new §5.4 explaining OR-typed storage as the
+  proper mechanism for compiler spill, reference-bearing heap
+  structures, and handler state via service objects.
+- **Vol VI** gained `0x106 ObjAllocStore` (§5.1.1).
+- **Vol VII**'s OR-discipline section (§2.4) was rewritten: the OR
+  spill problem is now described as solved by `OREFLD`/`OREFST`
+  against an `ObjAllocStore`'d backing object, with the
+  `ORegSpill`/`ORegRestore` primitives demoted to legacy. A new §3.4
+  covers the loadable-modules pattern; §4.3 was tightened to
+  describe the receive-queue RPC pattern as the canonical
+  construction.
+
+The integration contract was re-checked against the revised volumes
+and the simulator's source for consistency. Both PDF builds (Computer
+Modern, Palatino) were regenerated.
+
+## Where things stand now
+
+- 7 architecture volumes plus the integration contract, revised to
+  reflect everything learned in implementation.
+- An assembler and a simulator (~3,000 lines of Python, stdlib only)
+  with single-CPU, in-process multi-CPU, and multi-process modes.
+- A validation suite spanning thirteen categories (integer, logical,
+  memory, control, oreg, omem, firmware, traps, call, golden,
+  multi-CPU including link boot, loadable modules, receive queues),
+  all passing.
+- A wire-level crossbar daemon (`oriscbar`), separate-process CPU
+  runtime (`simorisc --bar`), and graphical terminal device
+  (`oriscterm`) demonstrating the architecture's communication model
+  as a small distributed system.
+
+The two open consequences from the initial commit are both closed:
+
+1. *Object references cannot be stored to or loaded from integer
+   memory* — addressed by the `OBJSTORE` flag and `OREFLD`/`OREFST`,
+   which preserve the capability invariant by routing references
+   through dedicated, statically-checkable instructions.
+2. *Handler code objects must equal the boot text* — addressed by
+   generalizing `InstallHandler` and `MapObject` to accept any
+   executably-mapped reference, enabling loadable modules, link
+   boot, and ultimately the multi-process device model.
+
+The asymmetry of the handler dispatch convention (`O1` overridden,
+wire OR[0..2] → handler `O2..O4`, wire OR[3] → side-channel) remains
+flagged for a future revision, as does the small set of privileged
+instructions still stubbed in the simulator. Neither blocks any
+present use of the architecture.

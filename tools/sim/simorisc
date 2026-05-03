@@ -1655,10 +1655,10 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjAlloc(cpu)
     elif prim == 0x101:
         primitive_ObjFree(cpu)
-    elif prim == 0x102:
-        primitive_ObjAllocStore(cpu)
     elif prim == 0x103:
         primitive_ObjDerive(cpu)
+    elif prim == 0x106:
+        primitive_ObjAllocStore(cpu)
     elif prim == 0x110:
         primitive_MapObject(cpu)
     elif prim == 0x200:

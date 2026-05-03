@@ -174,7 +174,8 @@ without changing the descriptor's size.
 
 ### 3.3 Descriptor Flags
 
-The `flags` byte encodes the descriptor's lifecycle state:
+The `flags` byte encodes the descriptor's lifecycle state and storage
+type:
 
 | Bit | Name              | Meaning                                       |
 |-----|-------------------|-----------------------------------------------|
@@ -184,11 +185,16 @@ The `flags` byte encodes the descriptor's lifecycle state:
 | 3   | `PINNED`          | Storage may not be moved or paged             |
 | 4   | `DEVICE`          | Object overlays a device register window      |
 | 5   | `EXECUTABLE`      | Storage holds executable code                 |
-| 6–7 | reserved          | Must be zero                                  |
+| 6   | `OBJSTORE`        | Storage is OR-typed; only `OREFLD`/`OREFST` may access it (Section 5.4) |
+| 7   | reserved          | Must be zero                                  |
 
 A `FORWARDED` descriptor reinterprets its `base` and `length` fields
 as the new home processor and new local index, respectively, of the
-object's true location; see Section 6.4.
+object's true location; see Section 6.4. An `OBJSTORE` descriptor
+constrains the access path: integer `OL*`/`OS*` instructions trap on
+it, and `OREFLD`/`OREFST` succeed only on it. The flag is set at
+allocation through the `ObjAllocStore` primitive (Volume VI Section
+3.2.1) and is immutable for the slot's lifetime.
 
 ## 4. The Object Descriptor Cache
 
@@ -320,6 +326,43 @@ chooses not to mandate.
 
 `ObjFree(ref)` is `ObjRevoke` followed by the release of the storage
 back to the home processor's free pool. It also requires the `V` bit.
+
+### 5.4 OR-Typed Storage
+
+The capability invariant of Section 5.2 — that no operation strengthens
+capabilities, that all references trace back to a firmware mint —
+would be defeated if user code could spill an object register to
+integer memory and reload it. The bit pattern of a reference, once
+observable through ordinary loads, can be reconstructed and stored
+back into an object register from arbitrary bytes; the path for
+forging references would be open.
+
+Object RISC closes this path with a second class of object: storage
+whose descriptor carries the `OBJSTORE` flag (Section 3.3). Such
+storage is *OR-typed*:
+
+- Integer `OL*`/`OS*` instructions on an OBJSTORE object trap with
+  `capability-violation`. The bytes are not observable as integers
+  and cannot be written from arbitrary patterns.
+- The `OREFLD` and `OREFST` instructions (Volume II Section 10) read
+  and write 8-byte object references in OBJSTORE storage. They trap
+  with `capability-violation` on byte-typed storage, so the two
+  worlds cannot be conflated.
+
+The set of references derivable from a program's state therefore
+remains exactly the set its predecessor states could derive: the bits
+sitting in OBJSTORE storage at any moment were placed there by some
+prior `OREFST` of a real reference held in an object register, and
+the only references that ever sit in object registers were minted
+by firmware.
+
+OBJSTORE storage is the architectural target for compiler
+spill/reload of object registers, for reference fields embedded in
+heap-allocated structures, for handler state passed between dispatches
+through a service object's storage, and for any use case that
+previously had to be hand-marshaled through a firmware primitive.
+Allocation is via `ObjAllocStore` (Volume VI Section 5.1.1) with
+length constrained to a multiple of 8 bytes (one OR slot).
 
 ## 6. Object Lifecycle
 

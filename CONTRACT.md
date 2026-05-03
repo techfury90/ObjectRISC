@@ -139,7 +139,7 @@ Returns:
 - `R2` = `OK` on success, `EINVAL` for zero or oversized length,
   `ENOMEM` on allocator failure.
 
-### 3.2.1 `0x102 ObjAllocStore`
+### 3.2.1 `0x106 ObjAllocStore`
 
 Like `ObjAlloc` but the new object's storage is *OR-typed*
 (`OBJSTORE` flag set in the descriptor): integer `OL*`/`OS*` trap
@@ -601,9 +601,12 @@ The 64-bit object reference (Volume III Section 2.1):
         16                 8                24              8     8
 ```
 
-The simulator only models a single processor, so `home proc` is always
-`0` for all references it produces. `caps` are the eight bits R, W, X,
-S, V, M, C, reserved (LSB to MSB). `rsv` is always `0`.
+In multi-CPU mode, `home proc` carries the `PROCID` of the CPU on
+which the object was allocated; references to remote objects keep
+that home value as they cross the crossbar, and the home CPU's
+descriptor table is the authoritative source for length, generation,
+and capabilities. `caps` are the eight bits R, W, X, S, V, M, C,
+reserved (LSB to MSB). `rsv` is always `0`.
 
 The null reference is the all-zeroes 64-bit value.
 
