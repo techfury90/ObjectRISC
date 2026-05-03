@@ -322,11 +322,35 @@ class Terminal:
         return bytes(out)
 
     def send_packet(self, packet: bytes) -> None:
-        try:
-            self.sock.sendall(struct.pack(">I", len(packet)) + packet)
-        except OSError as e:
-            self._log(f"send failed: {e}")
-            self.connected = False
+        # Manual sendall + select-based wait. The socket is non-blocking
+        # so a raw sendall would raise BlockingIOError as soon as the
+        # kernel send buffer fills up — which is what happens when a
+        # CPU pours rapid 1-byte SENDs at us (cmd_cat of a moderate
+        # file generates one console SEND per byte, each of which
+        # makes us issue an OBJ_READ_REQ). When the buffer fills we
+        # block on the socket becoming writable again, then continue.
+        import select
+        data = struct.pack(">I", len(packet)) + packet
+        sent = 0
+        while sent < len(data):
+            try:
+                n = self.sock.send(data[sent:])
+                if n == 0:
+                    self._log("send returned 0; peer closed")
+                    self.connected = False
+                    return
+                sent += n
+            except BlockingIOError:
+                # Wait up to 5s for the socket to become writable.
+                _, w, _ = select.select([], [self.sock], [], 5.0)
+                if not w:
+                    self._log("send blocked >5s; giving up")
+                    self.connected = False
+                    return
+            except OSError as e:
+                self._log(f"send failed: {e}")
+                self.connected = False
+                return
 
     def _poll(self) -> None:
         # Drain bytes from socket.

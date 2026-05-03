@@ -101,15 +101,19 @@ cmd_cat(const char *path)
 {
 	char buf[READ_BUF];
 	int fd = hf_open(path, HF_O_RDONLY);
-	int n, i;
+	int n;
 	if (fd < 0) {
 		term_print("cat: cannot open '");
 		term_print(path);
 		term_print("'\n");
 		return;
 	}
+	/* One SEND per chunk (term_print_n), not per byte. The
+	 * single-byte path through term_print_char issues a SEND +
+	 * OBJ_READ round-trip per byte and overruns oriscterm's
+	 * receive socket on any non-trivial file. */
 	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
-		for (i = 0; i < n; i++) term_print_char(buf[i]);
+		term_print_n(buf, n);
 	}
 	hf_close(fd);
 }
@@ -119,7 +123,7 @@ cmd_ls(const char *path)
 {
 	char buf[READ_BUF];
 	int fd = hf_opendir(path);
-	int n, i;
+	int n;
 	if (fd < 0) {
 		term_print("ls: cannot open '");
 		term_print(path);
@@ -127,7 +131,7 @@ cmd_ls(const char *path)
 		return;
 	}
 	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
-		for (i = 0; i < n; i++) term_print_char(buf[i]);
+		term_print_n(buf, n);
 	}
 	hf_close(fd);
 }

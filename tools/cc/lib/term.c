@@ -201,6 +201,22 @@ term_print(const char *s)
 	}
 }
 
+/* Like term_print but takes an explicit byte count instead of
+ * walking for a NUL — meant for binary-ish data the caller already
+ * knows the length of (e.g. the result of hf_read). One SEND for the
+ * whole buffer, vs one SEND per byte via term_print_char. */
+void
+term_print_n(const char *buf, int count)
+{
+	unsigned int va = (unsigned int)buf;
+	if (count <= 0) return;
+	if (va >= STACK_BOTTOM) {
+		_term_console_write(1, (int)(va - STACK_BOTTOM), count);
+	} else {
+		_term_console_write(0, (int)(va - DATA_VA), count);
+	}
+}
+
 void
 term_print_char(char c)
 {

@@ -237,11 +237,29 @@ class LinkBootD:
         return bytes(out)
 
     def send_packet(self, packet: bytes) -> None:
-        try:
-            self.sock.sendall(struct.pack(">I", len(packet)) + packet)
-        except OSError as e:
-            self._log(f"send failed: {e}")
-            self.shutdown_requested = True
+        # Backpressure-aware send: socket is non-blocking, so a busy
+        # receiver eventually fills the kernel buffer and sendall
+        # raises BlockingIOError. Block via select until writable.
+        import select
+        data = struct.pack(">I", len(packet)) + packet
+        sent = 0
+        while sent < len(data):
+            try:
+                n = self.sock.send(data[sent:])
+                if n == 0:
+                    self.shutdown_requested = True
+                    return
+                sent += n
+            except BlockingIOError:
+                _, w, _ = select.select([], [self.sock], [], 5.0)
+                if not w:
+                    self._log("send blocked >5s; giving up")
+                    self.shutdown_requested = True
+                    return
+            except OSError as e:
+                self._log(f"send failed: {e}")
+                self.shutdown_requested = True
+                return
 
     def _log(self, msg: str) -> None:
         if self.verbose:
