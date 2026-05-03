@@ -32,7 +32,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[4]   # /Users/lando/ObjectRISC
+ROOT = Path(__file__).resolve().parents[4]   # repo root
 ASMORISC = ROOT / "tools" / "asm" / "asmorisc"
 SIMORISC = ROOT / "tools" / "sim" / "simorisc"
 VALIDATION_DIR = Path(__file__).resolve().parent
