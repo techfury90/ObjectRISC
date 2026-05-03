@@ -166,21 +166,20 @@ bfcode(struct symtab **sp, int cnt)
 			default:
 				if (ISOREF(sym->squal) && opr <= O4) {
 					/* `__or` parameter — arg arrived in
-					 * O[opr]. Callee-side binding is not
-					 * yet implemented: pcc's tempnode is
-					 * class-blind and produces a CLASSA
-					 * temp, which then fails to coalesce
-					 * with the CLASSC OR source. Until we
-					 * either add an OREF basic type or
-					 * teach tempnode about qualifiers,
-					 * `__or` parameters can only be used
-					 * via explicit `register __or T *p
-					 * __asm__("oN")` bindings inside the
-					 * body. The caller-side calling
-					 * convention (moveargs → O1..O4) does
-					 * work, so external assembly callees
-					 * see the right value in O[opr]. */
-					(void)opr;
+					 * O[opr]. Bind the symtab entry
+					 * directly to that physical OR slot,
+					 * the same way `register __or T *p
+					 * __asm__("oN")` does for explicit
+					 * declarations. No tempnode, no
+					 * ASSIGN — body NAME references
+					 * resolve via clocal's REGISTER case
+					 * straight to the OR slot. (SINREG is
+					 * defined in ccom/pass1.h and aliased
+					 * to SLOCAL1 in cxxcom/pass1.h so
+					 * this file builds for both.) */
+					sym->sclass = REGISTER;
+					sym->sflags |= SINREG;
+					sym->soffset = opr++;
 				} else if (!ISOREF(sym->squal) && gpr <= R7) {
 					q = block(REG, NIL, NIL, sym->stype,
 					    sym->sdf, sym->sap);

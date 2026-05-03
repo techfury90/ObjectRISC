@@ -112,7 +112,9 @@ examples/cc/run_c.sh examples/cc/pascal.c    # Pascal's triangle
 examples/cc/run_c.sh examples/cc/hello_or.c  # __or in C
 examples/cc/run_c.sh examples/cc/print_or.c  # __or + inline asm
 examples/cc/run_c.sh examples/cc/inspect.c   # OEQ/OISN/OLEN/OTAG/OHOME/OCAP
-examples/cc/run_c.sh examples/cc/print_clean.c # __or via calling convention
+examples/cc/run_c.sh examples/cc/print_clean.c     # __or via calling convention
+examples/cc/run_c.sh examples/cc/print_via_or_arg.c # callee takes __or arg
+examples/cc/run_c.sh examples/cc/or_callee_inspect.c # OISN/OLEN inside __or callee
 ```
 
 The `hello_or.c` and `print_or.c` variants use the `__or`
@@ -123,9 +125,15 @@ compile to `omov`; assigning `0` compiles to `onull`. Combined
 with extended inline asm — `asm("olw %0, 0(%1)" : "=r"(out) :
 "r"(or_var))` — you can read or write through OR pointers, invoke
 firmware primitives via `call #N`, and otherwise treat OR slots
-as first-class C lvalues. The broader `__or` calling convention
-(args in O1..O4, returns in O1) and OL/OS-via-OR as native pcc
-patterns are in progress.
+as first-class C lvalues.
+
+The `__or` calling convention is wired both ways: callers pass
+`__or` args in O1..O4 (`print_clean.c`), and pure-C callees
+that take `__or` parameters can use them inside the body
+without explicit register binding (`print_via_or_arg.c`,
+`or_callee_inspect.c`). OL/OS-via-OR as native pcc patterns
+(rather than via inline asm) and `__or` returns in O1 are
+still pending.
 
 The demos collectively exercise: recursion, loops with
 conditionals, if/else-if chains, stack-allocated arrays of int and
