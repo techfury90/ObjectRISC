@@ -101,6 +101,21 @@ wire-format crossbar in its own process:
 examples/run_hello_terminal.sh
 ```
 
+A generic link-boot loader: CPU 0 (master) ships an 8-instruction
+module to a CPU running a content-free `linkboot.orx`, which
+discovers the master via an announce SEND, copies the module
+across the wire, maps it executable, and JRs in:
+
+```sh
+examples/linkboot/run.sh
+# [xbar] oriscbar READY ...
+# [cpu1] Booted!
+```
+
+See [`examples/linkboot/README.md`](examples/linkboot/README.md)
+for the announce/boot protocol, the unrolled-OLW copy strategy,
+and the limits.
+
 C compiled by our in-tree pcc port. Build pcc once (`cd tools/cc &&
 ./configure --target=orisc-unknown-none && make` into a build dir
 of your choice — `/tmp/pcc-build` is the default), then run any
