@@ -180,6 +180,14 @@ class TaskExitSignal(Exception):
 
 
 class BlockedSignal(Exception):
+    """Base class for "hold the CPU at this instruction" signals. Two
+    subclasses cover the cases we currently need; both are caught at the
+    instruction-dispatch site (CALL or OL/OS) and observed by the
+    scheduler to suspend and later resume the CPU."""
+    pass
+
+
+class BlockedOnQueue(BlockedSignal):
     """Raised by ReceiveQueuePoll when its target queue is empty and the
     timeout is non-zero. The scheduler holds the CPU at the CALL until
     the queue receives a message (or timeout expires); on resume it
@@ -190,8 +198,207 @@ class BlockedSignal(Exception):
         self.timeout = timeout
 
 
+class BlockedOnResponse(BlockedSignal):
+    """Raised by remote OL/OS instructions after queueing an OBJ_READ_REQ
+    or OBJ_WRITE_REQ on the home CPU. The scheduler holds the CPU at the
+    OL/OS instruction until a matching response arrives; on resume it
+    either writes the loaded value into the destination register
+    (`OBJ_READ_RESP` with flags=OK), no-ops (`OBJ_WRITE_RESP` with
+    flags=OK), or raises a Trap (any non-OK flags)."""
+    def __init__(self, trans_id: int, *, target_reg: Optional[int] = None,
+                 width: int = 0, signed: bool = False, is_write: bool = False):
+        self.trans_id = trans_id
+        self.target_reg = target_reg
+        self.width = width
+        self.signed = signed
+        self.is_write = is_write
+
+
 # ---------------------------------------------------------------------------
-# Pending SEND message (host-side representation of SEND_DELIVER)
+# Wire-level packet format (Volume IV §3, §4)
+# ---------------------------------------------------------------------------
+#
+# Every packet is:
+#   header (8 bytes) | payload (length × 4 bytes) | checksum (4 bytes)
+#
+# The header layout (Volume IV §3.1) is:
+#   src_pid (8) | dst_pid (8) | type (8) | flags (8) | trans_id (16) | length (16)
+# where length is the number of payload words (not bytes), big-endian throughout.
+# The trailing checksum is the bitwise XOR of every header and payload word.
+#
+# Message types are taken from Volume IV §4. Phase 1 implements only
+# SEND_DELIVER (0x20) on the wire; Phase 2 will add OBJ_READ_REQ/RESP (0x10/11)
+# and OBJ_WRITE_REQ/RESP (0x12/13) so that remote OL/OS likewise flow as
+# real packets.
+
+# Packet type codes.
+PKT_OBJ_READ_REQ    = 0x10
+PKT_OBJ_READ_RESP   = 0x11
+PKT_OBJ_WRITE_REQ   = 0x12
+PKT_OBJ_WRITE_RESP  = 0x13
+PKT_SEND_DELIVER    = 0x20
+PKT_SEND_ACK        = 0x21
+PKT_DESC_REQ        = 0x30
+PKT_DESC_RESP       = 0x31
+PKT_DESC_FORWARD    = 0x32
+PKT_DESC_INVALIDATE = 0x33
+PKT_LINK_FLOW_CREDIT= 0xF0
+PKT_LINK_ERROR      = 0xF1
+PKT_LINK_HEARTBEAT  = 0xFE
+PKT_LINK_RESET      = 0xFF
+
+
+def pack_packet(src_pid: int, dst_pid: int, msg_type: int, flags: int,
+                trans_id: int, payload_words: List[int]) -> bytes:
+    """Build a wire-format packet per Volume IV §3.1 + §3.2."""
+    length_words = len(payload_words)
+    header_bytes = struct.pack(">BBBBHH",
+                               src_pid & 0xFF, dst_pid & 0xFF,
+                               msg_type & 0xFF, flags & 0xFF,
+                               trans_id & 0xFFFF, length_words & 0xFFFF)
+    payload_bytes = b''.join(struct.pack(">I", w & 0xFFFFFFFF)
+                             for w in payload_words)
+    # Checksum = XOR of header and payload words (header is two 32-bit words).
+    h0, h1 = struct.unpack(">II", header_bytes)
+    chk = h0 ^ h1
+    for w in payload_words:
+        chk ^= w & 0xFFFFFFFF
+    return header_bytes + payload_bytes + struct.pack(">I", chk & 0xFFFFFFFF)
+
+
+def unpack_packet(data: bytes) -> Dict:
+    """Parse a wire-format packet and validate its size/checksum.
+    Returns dict with src_pid, dst_pid, type, flags, trans_id, payload (list of words).
+    Raises ValueError on malformed input."""
+    if len(data) < 12:
+        raise ValueError(f"packet too short: {len(data)} bytes")
+    src, dst, mtype, flags, trans_id, length_words = \
+        struct.unpack(">BBBBHH", data[:8])
+    expected_total = 8 + length_words * 4 + 4
+    if len(data) != expected_total:
+        raise ValueError(
+            f"packet length mismatch: header says {length_words} payload "
+            f"words, total bytes {len(data)} != expected {expected_total}")
+    payload_bytes = data[8:8 + length_words * 4]
+    payload_words = list(struct.unpack(f">{length_words}I", payload_bytes)
+                         if length_words else [])
+    h0, h1 = struct.unpack(">II", data[:8])
+    chk = h0 ^ h1
+    for w in payload_words:
+        chk ^= w
+    expected_chk = struct.unpack(">I", data[-4:])[0]
+    if (chk & 0xFFFFFFFF) != expected_chk:
+        raise ValueError(
+            f"checksum mismatch: computed {chk:#010x}, "
+            f"packet says {expected_chk:#010x}")
+    return {
+        "src_pid": src, "dst_pid": dst, "type": mtype, "flags": flags,
+        "trans_id": trans_id, "payload": payload_words,
+    }
+
+
+def build_send_deliver(src_pid: int, dst_pid: int, trans_id: int,
+                       recipient_ref: int, int_payload: List[int],
+                       or_payload: List[int]) -> bytes:
+    """Construct a SEND_DELIVER packet (Volume IV §4.2) from an in-memory
+    PendingSend's contents. Object references travel low-half-first
+    (Volume IV §4.1)."""
+    payload: List[int] = []
+    payload.append(recipient_ref & 0xFFFFFFFF)
+    payload.append((recipient_ref >> 32) & 0xFFFFFFFF)
+    for w in int_payload[:4]:
+        payload.append(w & 0xFFFFFFFF)
+    for ref in or_payload[:4]:
+        payload.append(ref & 0xFFFFFFFF)
+        payload.append((ref >> 32) & 0xFFFFFFFF)
+    return pack_packet(src_pid, dst_pid, PKT_SEND_DELIVER, 0, trans_id, payload)
+
+
+def parse_send_deliver(packet: Dict) -> Tuple[int, List[int], List[int]]:
+    """Inverse of build_send_deliver. Returns (recipient_ref, int_payload, or_payload)."""
+    if packet["type"] != PKT_SEND_DELIVER:
+        raise ValueError(f"expected SEND_DELIVER ({PKT_SEND_DELIVER:#x}), "
+                         f"got {packet['type']:#x}")
+    p = packet["payload"]
+    if len(p) != 14:
+        raise ValueError(f"SEND_DELIVER payload must be 14 words; got {len(p)}")
+    recipient_ref = p[0] | (p[1] << 32)
+    int_payload = list(p[2:6])
+    or_payload = []
+    for i in range(4):
+        ref = p[6 + 2*i] | (p[7 + 2*i] << 32)
+        or_payload.append(ref)
+    return recipient_ref, int_payload, or_payload
+
+
+# OBJ_READ_REQ / OBJ_READ_RESP / OBJ_WRITE_REQ / OBJ_WRITE_RESP
+# (Volume IV §4.1). The home processor performs the validity, bounds,
+# and capability checks itself; on failure the response carries a fault
+# code in the low six bits of the `flags` byte instead of data.
+
+# Response fault codes (Vol IV §4.1, low 6 bits of the response flags byte).
+RESP_OK         = 0x00
+RESP_STALE      = 0x01
+RESP_BOUNDS     = 0x02
+RESP_CAP        = 0x03
+RESP_BUS_ERROR  = 0x04
+RESP_FORWARDED  = 0x3F
+
+
+def build_obj_read_req(src_pid: int, dst_pid: int, trans_id: int,
+                       ref: int, offset: int, width: int) -> bytes:
+    payload = [
+        ref & 0xFFFFFFFF,
+        (ref >> 32) & 0xFFFFFFFF,
+        offset & 0xFFFFFFFF,
+        width & 0xFFFFFFFF,
+    ]
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_REQ, 0, trans_id, payload)
+
+
+def build_obj_read_resp(src_pid: int, dst_pid: int, trans_id: int,
+                        flags: int, data: bytes) -> bytes:
+    """Pad data to a 4-byte word boundary; pack words as the payload."""
+    if flags == RESP_OK:
+        pad = (-len(data)) % 4
+        padded = data + bytes(pad)
+        words = list(struct.unpack(f">{len(padded)//4}I", padded)) if padded else []
+    else:
+        words = []
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_RESP, flags, trans_id, words)
+
+
+def build_obj_write_req(src_pid: int, dst_pid: int, trans_id: int,
+                        ref: int, offset: int, width: int, data: bytes) -> bytes:
+    pad = (-len(data)) % 4
+    padded = data + bytes(pad)
+    data_words = list(struct.unpack(f">{len(padded)//4}I", padded)) if padded else []
+    payload = [
+        ref & 0xFFFFFFFF,
+        (ref >> 32) & 0xFFFFFFFF,
+        offset & 0xFFFFFFFF,
+        width & 0xFFFFFFFF,
+    ] + data_words
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_WRITE_REQ, 0, trans_id, payload)
+
+
+def build_obj_write_resp(src_pid: int, dst_pid: int, trans_id: int,
+                         flags: int) -> bytes:
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_WRITE_RESP, flags, trans_id, [])
+
+
+# Map response-flag fault codes to architectural trap causes for the
+# issuer to raise upon receiving a non-OK response.
+RESP_FLAG_TO_CAUSE = {
+    RESP_STALE:     CAUSE_STALE_REF,
+    RESP_BOUNDS:    CAUSE_BOUNDS,
+    RESP_CAP:       CAUSE_CAP_VIOLATION,
+    RESP_BUS_ERROR: CAUSE_BUS_ERROR_D,
+}
+
+
+# ---------------------------------------------------------------------------
+# Pending SEND message (host-side parsed form of a SEND_DELIVER packet)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -200,13 +407,108 @@ class PendingSend:
     int_payload: List[int]               # 4 ints (R4..R7 of issuer at SEND time)
     or_payload: List[int]                # 4 OR refs (O1..O4 of issuer at SEND time)
     src_pid: int                         # which CPU issued this SEND
+    trans_id: int = 0                    # per-source transaction id
+
+    def to_wire(self, dst_pid: int) -> bytes:
+        return build_send_deliver(self.src_pid, dst_pid, self.trans_id,
+                                  self.recipient_ref, self.int_payload,
+                                  self.or_payload)
+
+    @classmethod
+    def from_wire(cls, data: bytes) -> 'PendingSend':
+        pkt = unpack_packet(data)
+        recipient_ref, int_payload, or_payload = parse_send_deliver(pkt)
+        return cls(recipient_ref=recipient_ref,
+                   int_payload=int_payload,
+                   or_payload=or_payload,
+                   src_pid=pkt["src_pid"],
+                   trans_id=pkt["trans_id"])
+
+
+# ---------------------------------------------------------------------------
+# Crossbar interface and in-process implementation
+# ---------------------------------------------------------------------------
+#
+# Everything that crosses between CPUs (and, in a future revision, between
+# CPUs and devices) goes through a Crossbar. The Crossbar owns nothing
+# semantic about the protocol — it inspects each packet's `dst_pid` field
+# and hands the packet off to that destination's Port. A Port is anything
+# that can receive packets: today, only CPUs implement Port; tomorrow,
+# device processes will too.
+#
+# The InProcessCrossbar implementation routes by direct method dispatch
+# inside one Python process. A SocketCrossbar (next phase) will route
+# bytes over a UNIX domain socket to peer CPU processes.
+
+class Port:
+    """A participant on the crossbar. Any object that can receive packet
+    bytes addressed to a particular pid is a Port."""
+    def receive_packet(self, packet: bytes) -> None:
+        raise NotImplementedError
+
+
+class Crossbar:
+    """Interface for the crossbar interconnect.
+
+    `send_packet(packet)` routes one wire-format packet to the Port
+    registered for its `dst_pid` field. Implementations may be
+    in-process, over a socket, or over a real fabric — the rest of the
+    simulator only sees this method."""
+    def send_packet(self, packet: bytes) -> None:
+        raise NotImplementedError
+
+    def attach_port(self, pid: int, port: Port) -> None:
+        raise NotImplementedError
+
+
+class InProcessCrossbar(Crossbar):
+    """Default implementation: an in-memory routing table. Each call to
+    `send_packet` immediately delivers to the destination Port's
+    `receive_packet`. No latency model, no flow control, no real link
+    arbitration — just direct dispatch sufficient for ISA-level
+    simulation."""
+    def __init__(self, trace_enabled: bool = False):
+        self.ports: Dict[int, Port] = {}
+        self.trace_enabled = trace_enabled
+
+    def attach_port(self, pid: int, port: Port) -> None:
+        self.ports[pid] = port
+
+    def send_packet(self, packet: bytes) -> None:
+        try:
+            pkt = unpack_packet(packet)
+        except ValueError as e:
+            if self.trace_enabled:
+                print(f"  ; CROSSBAR drop (malformed): {e}", file=sys.stderr)
+            return
+        dst = pkt["dst_pid"]
+        if dst not in self.ports:
+            if self.trace_enabled:
+                print(f"  ; CROSSBAR drop: dst CPU{dst} not connected",
+                      file=sys.stderr)
+            return
+        if self.trace_enabled:
+            self._trace(packet, pkt)
+        self.ports[dst].receive_packet(packet)
+
+    def _trace(self, packet: bytes, pkt: Dict) -> None:
+        type_name = {
+            PKT_OBJ_READ_REQ:    "OBJ_READ_REQ",
+            PKT_OBJ_READ_RESP:   "OBJ_READ_RESP",
+            PKT_OBJ_WRITE_REQ:   "OBJ_WRITE_REQ",
+            PKT_OBJ_WRITE_RESP:  "OBJ_WRITE_RESP",
+            PKT_SEND_DELIVER:    "SEND_DELIVER",
+        }.get(pkt["type"], f"type=0x{pkt['type']:02x}")
+        print(f"  ; CROSSBAR CPU{pkt['src_pid']} -> CPU{pkt['dst_pid']} "
+              f"{type_name} trans={pkt['trans_id']} len={len(pkt['payload'])}w "
+              f"bytes={packet.hex()}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # CPU state (per-processor)
 # ---------------------------------------------------------------------------
 
-class CPU:
+class CPU(Port):
     def __init__(self, pid: int = 0, system: Optional['System'] = None):
         self.pid      = pid
         self.system   = system
@@ -232,12 +534,61 @@ class CPU:
         # Multi-CPU bookkeeping.
         self.active = False                  # True when a task is running
         self.exit_code: Optional[int] = None # set by TaskExit
-        self.inbox: List[PendingSend] = []   # SEND_DELIVERs awaiting dispatch
+        # inbox holds raw SEND_DELIVER packet bytes per Volume IV. The
+        # crossbar deposits packets here; dispatch_handler pops bytes,
+        # parses to a PendingSend, and runs the registered handler.
+        # Per-object queues installed by ReceiveQueueAttach hold packet
+        # bytes too (in Descriptor.queue).
+        self.inbox: List[bytes] = []
+        # Wire-level request/response queues for OBJ_READ/WRITE traffic.
+        # `requests` holds OBJ_READ_REQ / OBJ_WRITE_REQ packets that this
+        # CPU is the home of; the scheduler drains them autonomously each
+        # tick (the CPU's "memory controller"). `responses` holds the
+        # corresponding *_RESP packets addressed to this CPU as the
+        # original issuer; a blocked CPU watches these for matching
+        # trans_ids.
+        self.requests:  List[bytes] = []
+        self.responses: List[bytes] = []
         self.boot_state: Optional[Dict] = None  # snapshot used to relaunch handler tasks
-        self.blocked_on: Optional[BlockedSignal] = None  # ReceiveQueuePoll wait state
+        self.blocked_on: Optional[BlockedSignal] = None  # poll/response wait state
+        self.next_trans_id = 0               # per-CPU SEND/OL/OS transaction id counter
 
         # Trace control.
         self.trace_enabled = False
+
+    # ---- Port interface -----------------------------------------------------
+
+    def receive_packet(self, packet: bytes) -> None:
+        """Crossbar entry point. Decode the packet's type and route it to
+        the appropriate per-CPU queue: SEND_DELIVER goes to a
+        descriptor's receive queue if attached, else to the inbox; object
+        memory requests/responses go to the requests/responses queues."""
+        try:
+            pkt = unpack_packet(packet)
+        except ValueError:
+            return
+        t = pkt["type"]
+        if t == PKT_SEND_DELIVER:
+            try:
+                recipient_ref, _, _ = parse_send_deliver(pkt)
+            except ValueError:
+                return
+            idx = ref_index(recipient_ref)
+            if 0 < idx < len(self.descriptors) and \
+                    self.descriptors[idx] is not None and \
+                    self.descriptors[idx].queue is not None:
+                desc = self.descriptors[idx]
+                if len(desc.queue) >= desc.queue_max_depth:
+                    return  # full; drop
+                desc.queue.append(packet)
+            else:
+                self.inbox.append(packet)
+        elif t in (PKT_OBJ_READ_REQ, PKT_OBJ_WRITE_REQ):
+            self.requests.append(packet)
+        elif t in (PKT_OBJ_READ_RESP, PKT_OBJ_WRITE_RESP):
+            self.responses.append(packet)
+        # Other packet types currently dropped silently (e.g., DESC_*,
+        # LINK_*); future revisions may dispatch them here too.
 
     # ---- GPR/OR helpers -----------------------------------------------------
 
@@ -443,40 +794,24 @@ class System:
         self.cpus = [CPU(pid=i, system=self) for i in range(n_cpus)]
         self.n_cpus = n_cpus
         self.trace_enabled = False
+        self.crossbar: Crossbar = InProcessCrossbar()
+        for cpu in self.cpus:
+            self.crossbar.attach_port(cpu.pid, cpu)
 
     # ---- inter-CPU SEND queue ----------------------------------------------
 
     def queue_send(self, msg: PendingSend) -> None:
+        """Serialize a PendingSend to a wire-format SEND_DELIVER packet and
+        push it onto the crossbar. Routing (inbox vs descriptor queue) is
+        the receiving CPU's responsibility — see CPU.receive_packet."""
         home = ref_home(msg.recipient_ref)
         if home >= self.n_cpus:
-            # Dropped: home does not exist.
             if self.trace_enabled:
                 print(f"  ; SEND dropped: recipient home {home} not configured",
                       file=sys.stderr)
             return
-        target_cpu = self.cpus[home]
-        idx = ref_index(msg.recipient_ref)
-        # If the recipient has a receive queue installed, deliver there
-        # (pull mode) and skip the per-CPU inbox/handler dispatch path.
-        if 0 < idx < len(target_cpu.descriptors) and \
-                target_cpu.descriptors[idx] is not None and \
-                target_cpu.descriptors[idx].queue is not None:
-            desc = target_cpu.descriptors[idx]
-            if len(desc.queue) >= desc.queue_max_depth:
-                if self.trace_enabled:
-                    print(f"  ; CPU{msg.src_pid} -> CPU{home}: SEND dropped "
-                          f"(receive queue full at idx={idx})", file=sys.stderr)
-                return
-            desc.queue.append(msg)
-            if self.trace_enabled:
-                print(f"  ; CPU{msg.src_pid} -> CPU{home}: SEND queued to "
-                      f"receive-queue idx={idx} (depth={len(desc.queue)})",
-                      file=sys.stderr)
-            return
-        target_cpu.inbox.append(msg)
-        if self.trace_enabled:
-            print(f"  ; CPU{msg.src_pid} -> CPU{home}: SEND queued "
-                  f"(recipient idx={idx})", file=sys.stderr)
+        packet = msg.to_wire(dst_pid=home)
+        self.crossbar.send_packet(packet)
 
     # ---- handler dispatch --------------------------------------------------
 
@@ -485,7 +820,14 @@ class System:
         fresh task. Returns True iff a handler was launched."""
         if cpu.active or not cpu.inbox:
             return False
-        msg = cpu.inbox.pop(0)
+        packet = cpu.inbox.pop(0)
+        try:
+            msg = PendingSend.from_wire(packet)
+        except ValueError as e:
+            if self.trace_enabled:
+                print(f"  ; CPU{cpu.pid}: malformed inbox packet ({e}); dropped",
+                      file=sys.stderr)
+            return False
         idx = ref_index(msg.recipient_ref)
         if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
             if self.trace_enabled:
@@ -537,17 +879,98 @@ class System:
                   file=sys.stderr)
         return True
 
+    # ---- autonomous request handling ---------------------------------------
+
+    def _process_requests(self, cpu: CPU) -> None:
+        """Drain any OBJ_READ_REQ / OBJ_WRITE_REQ packets in this CPU's
+        request queue, perform the bounds/cap/generation checks against
+        the local descriptor table, and emit corresponding *_RESP packets
+        to the originating CPU. This is the firmware/memory-controller
+        contribution per Volume IV §4.1."""
+        while cpu.requests:
+            packet = cpu.requests.pop(0)
+            try:
+                pkt = unpack_packet(packet)
+            except ValueError as e:
+                if self.trace_enabled:
+                    print(f"  ; CPU{cpu.pid}: malformed request packet ({e})",
+                          file=sys.stderr)
+                continue
+            if pkt["type"] == PKT_OBJ_READ_REQ:
+                self._handle_obj_read_req(cpu, pkt)
+            elif pkt["type"] == PKT_OBJ_WRITE_REQ:
+                self._handle_obj_write_req(cpu, pkt)
+
+    def _validate_at_home(self, cpu: CPU, ref: int, offset: int, width: int,
+                          required_cap: int, expect_objstore: bool = False
+                          ) -> Tuple[Optional[Descriptor], int]:
+        """Run the home-side validation (Vol IV §4.1) and return
+        (descriptor or None, fault_code). On fault `descriptor` is None
+        and the caller responds with the fault code in flags."""
+        idx = ref_index(ref)
+        if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+            return None, RESP_STALE
+        desc = cpu.descriptors[idx]
+        if not desc.live or desc.generation != ref_generation(ref):
+            return None, RESP_STALE
+        if (ref_caps(ref) & required_cap) != required_cap:
+            return None, RESP_CAP
+        if desc.objstore != expect_objstore:
+            return None, RESP_CAP
+        if offset < 0 or offset + width > desc.length or width <= 0:
+            return None, RESP_BOUNDS
+        if width in (2, 4, 8) and (offset & (width - 1)):
+            # No dedicated misalignment fault code in Vol IV §4.1; reuse
+            # BUS_ERROR for now.
+            return None, RESP_BUS_ERROR
+        return desc, RESP_OK
+
+    def _handle_obj_read_req(self, cpu: CPU, pkt: Dict) -> None:
+        p = pkt["payload"]
+        ref = p[0] | (p[1] << 32)
+        offset = p[2] if p[2] < 0x80000000 else p[2] - 0x100000000  # signed
+        width = p[3]
+        issuer = pkt["src_pid"]
+        desc, fault = self._validate_at_home(cpu, ref, offset, width, CAP_R)
+        if fault != RESP_OK:
+            response = build_obj_read_resp(cpu.pid, issuer, pkt["trans_id"],
+                                           fault, b'')
+        else:
+            data = bytes(desc.storage[offset:offset+width])
+            response = build_obj_read_resp(cpu.pid, issuer, pkt["trans_id"],
+                                           RESP_OK, data)
+        self.crossbar.send_packet(response)
+
+    def _handle_obj_write_req(self, cpu: CPU, pkt: Dict) -> None:
+        p = pkt["payload"]
+        ref = p[0] | (p[1] << 32)
+        offset = p[2] if p[2] < 0x80000000 else p[2] - 0x100000000
+        width = p[3]
+        issuer = pkt["src_pid"]
+        desc, fault = self._validate_at_home(cpu, ref, offset, width, CAP_W)
+        if fault == RESP_OK:
+            # Reconstruct data from payload words 4..end, take only `width` bytes.
+            data_words = p[4:]
+            raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in data_words)
+            desc.storage[offset:offset+width] = raw[:width]
+        response = build_obj_write_resp(cpu.pid, issuer, pkt["trans_id"], fault)
+        self.crossbar.send_packet(response)
+
     # ---- blocked-CPU resume ------------------------------------------------
 
     def _try_unblock(self, cpu: CPU) -> bool:
-        """If the CPU's blocked queue has a message, deliver it and
-        advance past the CALL. If the timeout has expired, return
-        ETIMEOUT and advance. Otherwise tick the timeout down (no-op
-        for infinite waits). Returns True if the CPU made progress."""
+        """Resume a blocked CPU if its wait condition is now satisfied.
+        Returns True if the CPU made progress (delivered a message,
+        advanced past a fault, or decremented a timeout)."""
         b = cpu.blocked_on
+        if isinstance(b, BlockedOnQueue):
+            return self._try_unblock_queue(cpu, b)
+        if isinstance(b, BlockedOnResponse):
+            return self._try_unblock_response(cpu, b)
+        return False
+
+    def _try_unblock_queue(self, cpu: CPU, b: 'BlockedOnQueue') -> bool:
         idx = b.descriptor_idx
-        # The descriptor must still be valid; if the program freed its
-        # queue object somehow, treat as ESTALE.
         if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
             cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0)
             cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
@@ -570,7 +993,43 @@ class System:
             cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
             cpu.blocked_on = None
             return True
-        return True   # made progress (decremented the timer)
+        return True   # decremented the timer
+
+    def _try_unblock_response(self, cpu: CPU, b: 'BlockedOnResponse') -> bool:
+        """Look for a response packet matching this CPU's outstanding
+        request trans_id; on match either deliver into the destination
+        register (read) or simply ack (write), then advance PC. On a
+        non-OK response flag, raise the corresponding architectural
+        Trap (which the scheduler catches)."""
+        for i, packet in enumerate(cpu.responses):
+            try:
+                pkt = unpack_packet(packet)
+            except ValueError:
+                continue
+            if pkt["trans_id"] != b.trans_id:
+                continue
+            cpu.responses.pop(i)
+            flags = pkt["flags"] & 0x3F
+            if flags != RESP_OK:
+                cpu.blocked_on = None
+                cause = RESP_FLAG_TO_CAUSE.get(flags, CAUSE_BUS_ERROR_D)
+                raise Trap(cause, cpu.pc,
+                           f"remote O{'S' if b.is_write else 'L'} fault "
+                           f"flags={flags:#x}")
+            if not b.is_write:
+                # Reassemble the loaded value from the response data words.
+                payload = pkt["payload"]
+                raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in payload)
+                raw = raw[:b.width]
+                v = int.from_bytes(raw, "big")
+                if b.signed and v & (1 << (b.width*8 - 1)):
+                    v -= 1 << (b.width*8)
+                cpu.set_gpr(b.target_reg, to_u32(v))
+            cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.blocked_on = None
+            return True
+        return False  # no matching response yet
 
     # ---- scheduler ---------------------------------------------------------
 
@@ -581,16 +1040,36 @@ class System:
         ticks = 0
         while ticks < max_cycles:
             any_progress = False
+            # First, drain inbound OBJ_READ_REQ / OBJ_WRITE_REQ packets on
+            # every CPU. This represents the home processor's autonomous
+            # memory-controller behaviour and runs regardless of the CPU's
+            # task state — even idle or blocked CPUs answer remote reads.
             for cpu in self.cpus:
-                # Blocked CPUs: see if their queue has a message (or timeout
-                # expired) and resume past the CALL accordingly.
+                if cpu.requests:
+                    self._process_requests(cpu)
+                    any_progress = True
+            for cpu in self.cpus:
+                # Blocked CPUs: see if their queue/response is now ready
+                # and resume past the CALL or OL/OS accordingly.
                 if cpu.blocked_on is not None:
-                    if self._try_unblock(cpu):
-                        any_progress = True
+                    try:
+                        if self._try_unblock(cpu):
+                            any_progress = True
+                    except Trap as t:
+                        report_trap(cpu, t)
+                        return 3
                     continue
                 if cpu.active:
                     try:
                         step(cpu)
+                    except BlockedSignal as b:
+                        # Raised mid-instruction (e.g., remote OL/OS).
+                        # PC is unchanged; the scheduler will resume
+                        # from the same instruction once the response
+                        # arrives.
+                        cpu.blocked_on = b
+                        any_progress = True
+                        continue
                     except TaskExitSignal as e:
                         cpu.active = False
                         cpu.exit_code = e.code & 0xFF
@@ -888,10 +1367,11 @@ def primitive_ReceiveQueueAttach(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK)
 
 
-def _deliver_queue_msg(cpu: CPU, msg: PendingSend) -> None:
-    """Populate registers from a queue message per Volume VI Section 6:
-    R3..R6 receive the integer payload; O1..O4 receive the OR payload
-    verbatim (no self-override, unlike handler dispatch)."""
+def _deliver_queue_msg(cpu: CPU, packet: bytes) -> None:
+    """Populate registers from a queued SEND_DELIVER packet per Volume VI
+    Section 6: R3..R6 receive the integer payload; O1..O4 receive the OR
+    payload verbatim (no self-override, unlike handler dispatch)."""
+    msg = PendingSend.from_wire(packet)
     cpu.set_gpr(2, ERR_OK)
     for i in range(4):
         cpu.set_gpr(3 + i, msg.int_payload[i])
@@ -930,7 +1410,7 @@ def primitive_ReceiveQueuePoll(cpu: CPU) -> None:
 
     # Block. The scheduler holds the CPU at this CALL until the queue
     # receives a message (delivered then) or the timeout expires.
-    raise BlockedSignal(
+    raise BlockedOnQueue(
         descriptor_idx=idx,
         timeout=-1 if timeout == 0xFFFFFFFF else timeout,
     )
@@ -1340,32 +1820,58 @@ def step(cpu: CPU) -> None:
                        "O-load/store rt' high bit reserved must be zero")
         rt5 = rt_full & 0x1F
         offset = sext16(word & 0xFFFF)
-        if   op == 0x31:
-            desc, off, _ = cpu.deref_obj(os_, offset, 1, CAP_R, pc)
-            v = desc.storage[off]
-            cpu.set_gpr(rt5, v - 0x100 if v & 0x80 else v)
-        elif op == 0x32:
-            desc, off, _ = cpu.deref_obj(os_, offset, 2, CAP_R, pc)
-            v = struct.unpack(">H", bytes(desc.storage[off:off+2]))[0]
-            cpu.set_gpr(rt5, v - 0x10000 if v & 0x8000 else v)
-        elif op == 0x33:
-            desc, off, _ = cpu.deref_obj(os_, offset, 4, CAP_R, pc)
-            cpu.set_gpr(rt5, struct.unpack(">I", bytes(desc.storage[off:off+4]))[0])
-        elif op == 0x34:
-            desc, off, _ = cpu.deref_obj(os_, offset, 1, CAP_R, pc)
-            cpu.set_gpr(rt5, desc.storage[off])
-        elif op == 0x35:
-            desc, off, _ = cpu.deref_obj(os_, offset, 2, CAP_R, pc)
-            cpu.set_gpr(rt5, struct.unpack(">H", bytes(desc.storage[off:off+2]))[0])
-        elif op == 0x38:
-            desc, off, _ = cpu.deref_obj(os_, offset, 1, CAP_W, pc)
-            desc.storage[off] = cpu.get_gpr(rt5) & 0xFF
-        elif op == 0x39:
-            desc, off, _ = cpu.deref_obj(os_, offset, 2, CAP_W, pc)
-            desc.storage[off:off+2] = struct.pack(">H", cpu.get_gpr(rt5) & 0xFFFF)
-        elif op == 0x3B:
-            desc, off, _ = cpu.deref_obj(os_, offset, 4, CAP_W, pc)
-            desc.storage[off:off+4] = struct.pack(">I", cpu.get_gpr(rt5))
+        # Width and signedness per opcode.
+        op_meta = {
+            0x31: (1, True,  False),  # OLB
+            0x32: (2, True,  False),  # OLH
+            0x33: (4, False, False),  # OLW
+            0x34: (1, False, False),  # OLBU
+            0x35: (2, False, False),  # OLHU
+            0x38: (1, False, True),   # OSB
+            0x39: (2, False, True),   # OSH
+            0x3B: (4, False, True),   # OSW
+        }
+        width, signed, is_write = op_meta[op]
+        ref = cpu.get_opr(os_)
+        # Issuer-side fast-fail checks (no need to send a packet).
+        if ref == 0:
+            raise Trap(CAUSE_NULL_DEREF, pc, f"null O{os_} dereference")
+        required_cap = CAP_W if is_write else CAP_R
+        if (ref_caps(ref) & required_cap) != required_cap:
+            raise Trap(CAUSE_CAP_VIOLATION, pc,
+                       f"O{os_} caps {ref_caps(ref):#x} lacks {required_cap:#x}")
+        home = ref_home(ref)
+        if cpu.system is None or home == cpu.pid:
+            # Local fast path: full validation, direct read/write.
+            desc, off, _ = cpu.deref_obj(os_, offset, width,
+                                         required_cap, pc)
+            if is_write:
+                val = cpu.get_gpr(rt5) & ((1 << (width*8)) - 1)
+                desc.storage[off:off+width] = val.to_bytes(width, "big")
+            else:
+                raw = bytes(desc.storage[off:off+width])
+                v = int.from_bytes(raw, "big")
+                if signed and v & (1 << (width*8 - 1)):
+                    v -= 1 << (width*8)
+                cpu.set_gpr(rt5, to_u32(v))
+        else:
+            # Remote: build OBJ_READ_REQ or OBJ_WRITE_REQ, queue it on the
+            # home CPU's request queue, and block at this OL/OS instruction
+            # until the corresponding *_RESP arrives.
+            trans_id = cpu.next_trans_id & 0xFFFF
+            cpu.next_trans_id = (cpu.next_trans_id + 1) & 0xFFFF
+            if is_write:
+                val = cpu.get_gpr(rt5) & ((1 << (width*8)) - 1)
+                data = val.to_bytes(width, "big")
+                packet = build_obj_write_req(cpu.pid, home, trans_id,
+                                             ref, offset, width, data)
+            else:
+                packet = build_obj_read_req(cpu.pid, home, trans_id,
+                                            ref, offset, width)
+            cpu.system.crossbar.send_packet(packet)
+            raise BlockedOnResponse(trans_id, target_reg=rt5,
+                                    width=width, signed=signed,
+                                    is_write=is_write)
     elif op in (0x36, 0x37):  # OREFLD / OREFST
         os_  = (word >> 22) & 0xF
         od   = (word >> 18) & 0xF
@@ -1410,12 +1916,11 @@ def step(cpu: CPU) -> None:
             int_payload=[cpu.get_gpr(4 + i) for i in range(4)],
             or_payload =[cpu.get_opr(1 + i) for i in range(4)],
             src_pid=cpu.pid,
+            trans_id=cpu.next_trans_id & 0xFFFF,
         )
+        cpu.next_trans_id = (cpu.next_trans_id + 1) & 0xFFFF
         if cpu.system is not None:
             cpu.system.queue_send(msg)
-        else:
-            # No system context: drop, but at least record in trace.
-            pass
     elif op == 0x3D:  # CALL — no delay slot.
         prim = target26
         try:
@@ -1488,6 +1993,7 @@ def main(argv: List[str]) -> int:
 
     system = System(args.processors)
     system.trace_enabled = args.trace
+    system.crossbar.trace_enabled = args.trace
     for cpu in system.cpus:
         cpu.trace_enabled = args.trace
         init_cpu(cpu, text_bytes, data_bytes, entry, stack_size)
