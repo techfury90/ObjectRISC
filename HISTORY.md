@@ -1142,6 +1142,102 @@ plus the new `strings_demo`. `liborisc.ora` is 5140 bytes; a
 hello-world that uses only `print_str` pulls in `io.oro` (1709
 bytes) and skips `string.oro` entirely.
 
+## Phase 16 — A two-way terminal with capability-shaped services
+
+Up through Phase 15, oriscterm did one thing: write text. CPUs
+SENDed bytes to its console object and the bytes appeared on
+screen. No keyboard, no cursor control, no graphics, no anything.
+
+Phase 16 turns it into a small graphics workstation in the spirit
+of mid-1980s Tektronix / Apollo terminals — and does it the
+Object-RISC way, by giving the terminal multiple capability-shaped
+service objects rather than overloading a single console with
+escape-sequence cliches.
+
+### Keyboard input — the two-way piece
+
+A second service object at index `2`. CPUs subscribe by SENDing a
+derived `R|S` self-ref to it; the terminal records the ref and
+SENDs a key event back through it on every keystroke. Each event
+carries the codepoint in `R4` and a modifier mask in `R5`.
+
+Codepoints: plain ASCII bytes pass through verbatim; special keys
+(arrows, function keys, BackSpace/Return/Tab/etc.) use a portable
+encoding ≥ `0x100`, so the wire format can describe arrow keys
+without conflating them with control characters. Modifiers are a
+four-bit mask (Shift, Ctrl, Alt, Meta) decoded best-effort from
+Tk's `event.state`.
+
+The C demo `kbd_echo.c` subscribes, attaches a queue, polls
+forever, and prints each event. It also surfaces a small "OR
+hygiene" lesson worth flagging: `print_str` → `console_write`
+reads from `O3`, but both the subscribe SEND (which nulls O3 to
+clear the wire's reply-cap slot) and the queue dispatch (which
+overlays O1..O4 from the wire payload) clobber it. The demo saves
+the boot O3 into O15 once and copies it back before every print.
+This pattern shows up in every Phase 16 demo.
+
+### Multiple capability-shaped service objects
+
+The terminal now exposes five service indices, each a separate
+capability that CPUs can hold independently:
+
+| Index | Service     | Role                                                      |
+|-------|-------------|-----------------------------------------------------------|
+| `1`   | console     | Append text to the scrolling pane (existing)              |
+| `2`   | keyboard    | Subscribe to / unsubscribe from key events (new)          |
+| `3`   | grid        | Write text at a fixed (col, row) on the canvas (new)      |
+| `4`   | vector      | Lines, rectangles, ovals on the canvas (new)              |
+| `5`   | raster      | Bitmap blit (protocol pinned, implementation deferred)    |
+
+The terminal window now has two regions: the existing scrolling
+text pane on top (driven by service 1) and a graphics Canvas
+below (driven by services 3 and 4). Both share the same monospace
+font, so the grid service's character cells line up visually with
+the text pane's columns.
+
+Each service has its own SEND payload convention, documented in
+[`tools/devices/README.md`](tools/devices/README.md). Vector
+commands are immediate (R4 = command, R5/R6 = packed coords);
+grid follows the same pull-bytes-via-OBJ_READ_REQ pattern as
+console but with explicit (col, row) positioning. The vector
+palette is a small fixed 9-colour set picked for an
+"early-1980s graphics terminal" feel — index 0 is the
+background, 1 is the default foreground, 2–8 are the usual
+spectrum.
+
+### The painting demo
+
+`examples/cc/paint.c` wires keyboard + grid + vector together as
+an interactive painting program. Arrow keys move a logical cursor;
+letter keys drop dots / lines / rectangles / ovals at it; `C`
+cycles colour; space clears; ESC exits. A grid-positioned title
+("PAINT — Object RISC vector demo") lands at column 2, row 0 of
+the canvas to demonstrate the grid service.
+
+The demo also surfaces a real register-pressure limit in the orisc
+backend. Inline asm with too many `"r"` constraints in one block
+trips pcc's allocator with "couldn't find available register" —
+direct fallout of Phase 12's decision to mark R16..R23 as
+unallocatable to suppress dead callee-save sequences. The fix
+inside paint.c: factor each SEND into its own helper function so
+each call site uses ≤ 4 input operands. The longer-term fix is
+the optimizer learning to elide dead saves so we can re-enable
+the callee-save band; not for this commit.
+
+### What's not yet done
+
+- **Raster blit.** The protocol's reserved (index 5, SEND
+  payload pinned in oriscterm) but the implementation just logs
+  and drops. Lands when something actually needs it.
+- **Mouse events.** Easy to add (Tk gives us `<Button-N>` and
+  `<Motion>` for free) but no demo wants them yet.
+- **Window control** (title, resize, query dimensions). Useful
+  but pure plumbing; deferred.
+- **Multiple keyboard subscribers.** Currently a null SEND
+  removes all subscriptions — coarse, fine for the demo. Would
+  refine to per-CPU unsubscribe when multiple subs are needed.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
@@ -1161,9 +1257,11 @@ bytes) and skips `string.oro` entirely.
   multi-CPU including link boot, loadable modules, receive queues),
   all passing.
 - A wire-level crossbar daemon (`oriscbar`), separate-process CPU
-  runtime (`simorisc --bar`), and graphical terminal device
-  (`oriscterm`) demonstrating the architecture's communication model
-  as a small distributed system.
+  runtime (`simorisc --bar`), and a graphical terminal
+  (`oriscterm`) that's now genuinely two-way and graphical:
+  five capability-shaped service objects (console, keyboard,
+  grid-positioned text, vector drawing, raster) on the same
+  port, each a separate ref a CPU can choose to hold.
 - A vendored pcc with an Object RISC backend that compiles real C
   programs end-to-end, including a working `__or` storage-class
   qualifier on parameters and register-bound variables (caller and

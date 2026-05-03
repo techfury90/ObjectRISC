@@ -46,18 +46,41 @@ PKT_SEND_DELIVER   = 0x20
 # Service objects exposed by oriscterm. Each is a separate capability:
 # CPUs hold an OR per service they want to use, and the dispatch goes
 # by the recipient ref's index field (Vol III §2.1).
-CONSOLE_INDEX      = 1       # text console — CPU writes here
-KEYBOARD_INDEX     = 2       # keyboard subscription — CPU registers here
-                             # to receive keystroke events back
+CONSOLE_INDEX  = 1       # text console — append bytes to the text pane
+KEYBOARD_INDEX = 2       # keyboard subscription — receive key events back
+GRID_INDEX     = 3       # grid text — write at (col, row) on the canvas
+VECTOR_INDEX   = 4       # vector graphics — line / rect / oval / clear
+RASTER_INDEX   = 5       # raster blit (protocol pinned, impl deferred)
 
 # Generation is fixed at 1 by simorisc convention (--service spec).
 SERVICE_GENERATION = 1
 
 # Caps the terminal grants when it synthesizes refs to its own service
-# objects. Equivalent to the ones simorisc's `populate_service_objects`
-# uses for inter-CPU service refs.
-CONSOLE_MAX_CAPS   = 0x5B   # R|W|S|V|C
-KEYBOARD_MAX_CAPS  = 0x5B   # R|W|S|V|C
+# objects.
+SERVICE_MAX_CAPS = 0x5B   # R|W|S|V|C
+
+# ---- vector service command codes (R4 in the SEND payload) -----------------
+VEC_LINE         = 0x00
+VEC_RECT_FILL    = 0x01
+VEC_RECT_OUTLINE = 0x02
+VEC_OVAL_FILL    = 0x03
+VEC_OVAL_OUTLINE = 0x04
+VEC_CLEAR        = 0x05
+VEC_SET_COLOR    = 0x06
+
+# Tiny palette — picked for an "early-1980s graphics terminal" feel.
+# Index 0 is the background, 1 is the default stroke colour.
+VEC_PALETTE = {
+    0:  "#0a0a14",   # background (matches the text widget's bg)
+    1:  "#d8d8d8",   # default foreground
+    2:  "#ff5555",   # red
+    3:  "#55ff55",   # green
+    4:  "#5599ff",   # blue
+    5:  "#ffd866",   # yellow
+    6:  "#66ddff",   # cyan
+    7:  "#ff66ff",   # magenta
+    8:  "#ffffff",   # bright white
+}
 
 # Special-key codepoints — used in keyboard SEND payloads (R4) for
 # keys that don't map to a printable ASCII byte. Anything ≥ 0x100 is
@@ -204,7 +227,10 @@ class Terminal:
                              f"(magic={magic:#x}, status={status:#x})")
         self.sock.setblocking(False)
 
-        # Build the UI.
+        # Build the UI. Two panes: the existing scrolling text pane on
+        # top (for stream-style console output and human-readable
+        # status), and a graphics Canvas below (for grid-positioned
+        # text and vector drawing — services 3 and 4).
         self.root = tk.Tk()
         self.root.title(f"Object RISC Terminal · pid={my_pid}")
         # Bring the window to the front on launch — when oriscterm is
@@ -213,20 +239,39 @@ class Terminal:
         self.root.lift()
         self.root.attributes('-topmost', True)
         self.root.after(150, lambda: self.root.attributes('-topmost', False))
+
         font = tkfont.Font(family="Menlo", size=14)
-        self.text = tk.Text(self.root, width=60, height=20,
+        self.text = tk.Text(self.root, width=60, height=10,
                             bg="#0a0a14", fg="#d8d8d8",
                             insertbackground="#d8d8d8",
                             font=font, padx=12, pady=12,
                             wrap="word", borderwidth=0,
                             highlightthickness=0)
-        self.text.pack(fill="both", expand=True)
+        self.text.pack(side="top", fill="x")
         self.text.insert("end",
             f"oriscterm online · pid={my_pid}\n"
-            f"  console object idx={CONSOLE_INDEX}\n"
-            f"  keyboard object idx={KEYBOARD_INDEX}\n")
+            f"  console  idx={CONSOLE_INDEX}    keyboard idx={KEYBOARD_INDEX}\n"
+            f"  grid     idx={GRID_INDEX}    vector   idx={VECTOR_INDEX}\n")
         self.text.see("end")
         self.text.configure(state="disabled")
+
+        # The graphics Canvas. Character-cell metrics come from the
+        # same monospace font as the text pane, so the grid service can
+        # land bytes at integer (col, row) positions that visually
+        # match what the text pane shows.
+        self.cell_w = font.measure("M")
+        self.cell_h = font.metrics("linespace")
+        self.canvas_cols = 60
+        self.canvas_rows = 24
+        self.canvas_w = self.cell_w * self.canvas_cols
+        self.canvas_h = self.cell_h * self.canvas_rows
+        self.canvas = tk.Canvas(self.root,
+                                width=self.canvas_w, height=self.canvas_h,
+                                bg=VEC_PALETTE[0],
+                                borderwidth=0, highlightthickness=0)
+        self.canvas.pack(side="bottom", fill="both", expand=True)
+        self.canvas_font = font
+        self.vec_color = VEC_PALETTE[1]   # current stroke / fill color
 
         # Capture every keystroke at the toplevel so we get them whether
         # focus is on the (disabled) text widget or the root.
@@ -317,6 +362,13 @@ class Terminal:
             self._handle_console_send(int_payload, or_payload)
         elif target == KEYBOARD_INDEX:
             self._handle_keyboard_send(int_payload, or_payload)
+        elif target == GRID_INDEX:
+            self._handle_grid_send(int_payload, or_payload)
+        elif target == VECTOR_INDEX:
+            self._handle_vector_send(int_payload, or_payload)
+        elif target == RASTER_INDEX:
+            self._log(f"SEND to raster service (idx {RASTER_INDEX}) — "
+                      f"protocol pinned but implementation not yet landed")
         else:
             self._log(f"SEND to unknown obj idx={target}")
 
@@ -336,10 +388,106 @@ class Terminal:
         src_pid = ref_home(source_ref)
         trans = self.next_trans_id & 0xFFFF
         self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
-        self.pending_reads[trans] = ("display", length, reply_cap)
+        self.pending_reads[trans] = {"action": "console", "len": length,
+                                     "reply_cap": reply_cap}
         req = build_obj_read_req(self.my_pid, src_pid, trans,
                                  source_ref, offset, length)
         self.send_packet(req)
+
+    # ---- grid (idx 3) — positioned text on the canvas ---------------------
+
+    def _handle_grid_send(self, int_payload, or_payload) -> None:
+        """SEND payload convention for the grid service:
+            O2 = byte source (any byte-typed object the terminal can OL)
+            R4 = byte offset into the source
+            R5 = byte length
+            R6 = grid column (cell x)
+            R7 = grid row    (cell y)
+        The terminal pulls the bytes via OBJ_READ_REQ (same dance as
+        the console service) and renders them on the Canvas at the
+        given character-cell position.
+        """
+        source_ref = or_payload[1]
+        offset = int_payload[0]
+        length = int_payload[1]
+        col    = int_payload[2]
+        row    = int_payload[3]
+        if source_ref == 0 or length == 0:
+            return
+        src_pid = ref_home(source_ref)
+        trans = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        # Stash the (col, row) so the read-resp handler knows where to
+        # drop the rendered text.
+        self.pending_reads[trans] = {"action": "grid", "len": length,
+                                     "col": col, "row": row}
+        req = build_obj_read_req(self.my_pid, src_pid, trans,
+                                 source_ref, offset, length)
+        self.send_packet(req)
+
+    # ---- vector (idx 4) — immediate drawing primitives --------------------
+
+    def _handle_vector_send(self, int_payload, or_payload) -> None:
+        """SEND payload convention for the vector service:
+            R4 = command code (VEC_*)
+            R5..R7 = command-specific arguments (see below)
+
+        Two-coordinate ops pack (x, y) into a single 32-bit word as
+        (x << 16) | y; sizes pack the same way as (w << 16) | h.
+
+            VEC_LINE          R5=(x1<<16)|y1, R6=(x2<<16)|y2
+            VEC_RECT_FILL     R5=(x<<16)|y,   R6=(w<<16)|h
+            VEC_RECT_OUTLINE  R5=(x<<16)|y,   R6=(w<<16)|h
+            VEC_OVAL_FILL     R5=(x<<16)|y,   R6=(w<<16)|h
+            VEC_OVAL_OUTLINE  R5=(x<<16)|y,   R6=(w<<16)|h
+            VEC_CLEAR         (no args)
+            VEC_SET_COLOR     R5 = palette index (0..8)
+        """
+        cmd = int_payload[0]
+        a   = int_payload[1]
+        b   = int_payload[2]
+        # int_payload[3] (R7) currently unused; reserved.
+
+        def unpack_pair(w):
+            # 16-bit signed halves so negative coords work too.
+            hi = (w >> 16) & 0xFFFF
+            lo = w & 0xFFFF
+            if hi >= 0x8000: hi -= 0x10000
+            if lo >= 0x8000: lo -= 0x10000
+            return hi, lo
+
+        if cmd == VEC_CLEAR:
+            self.canvas.delete("all")
+            return
+
+        if cmd == VEC_SET_COLOR:
+            idx = a & 0xFF
+            self.vec_color = VEC_PALETTE.get(idx, VEC_PALETTE[1])
+            return
+
+        if cmd == VEC_LINE:
+            x1, y1 = unpack_pair(a)
+            x2, y2 = unpack_pair(b)
+            self.canvas.create_line(x1, y1, x2, y2,
+                                    fill=self.vec_color, width=1)
+            return
+
+        if cmd in (VEC_RECT_FILL, VEC_RECT_OUTLINE,
+                   VEC_OVAL_FILL, VEC_OVAL_OUTLINE):
+            x, y = unpack_pair(a)
+            w, h = unpack_pair(b)
+            x2, y2 = x + w, y + h
+            fill = self.vec_color if cmd in (VEC_RECT_FILL, VEC_OVAL_FILL) else ""
+            outline = self.vec_color
+            if cmd in (VEC_RECT_FILL, VEC_RECT_OUTLINE):
+                self.canvas.create_rectangle(x, y, x2, y2,
+                                             fill=fill, outline=outline)
+            else:
+                self.canvas.create_oval(x, y, x2, y2,
+                                        fill=fill, outline=outline)
+            return
+
+        self._log(f"vector: unknown command 0x{cmd:02x}")
 
     # ---- keyboard (idx 2) — subscribe / unsubscribe ------------------------
 
@@ -373,19 +521,32 @@ class Terminal:
         if info is None:
             self._log(f"unexpected OBJ_READ_RESP trans={trans}")
             return
-        action, expected_len, reply_cap = info
         flags = pkt["flags"] & 0x3F
+        text = ""
         if flags != 0:
             self._append(f"[read failed: flags=0x{flags:02x}]")
         else:
             words = pkt["payload"]
             raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in words)
-            text = raw[:expected_len].decode("utf-8", errors="replace")
-            if action == "display":
-                self._append(text)
-        # If the sender provided a reply capability, send a header-only
-        # ack SEND_DELIVER through it so the sender can unblock from a
-        # poll on its reply queue and exit cleanly.
+            text = raw[:info["len"]].decode("utf-8", errors="replace")
+
+        if info["action"] == "console" and flags == 0:
+            self._append(text)
+        elif info["action"] == "grid" and flags == 0:
+            x = info["col"] * self.cell_w
+            y = info["row"] * self.cell_h
+            # Anchor "nw" puts the top-left of the text at (x, y), so a
+            # cell at (col, row) occupies cell_w × cell_h at (col*cw,
+            # row*ch) — overlapping prior text at the same position is
+            # the caller's responsibility.
+            self.canvas.create_text(x, y, text=text, anchor="nw",
+                                    fill=self.vec_color,
+                                    font=self.canvas_font)
+
+        # If the console request carried a reply capability, send a
+        # header-only ack SEND_DELIVER through it so the sender can
+        # unblock from a poll on its reply queue and exit cleanly.
+        reply_cap = info.get("reply_cap", 0)
         if reply_cap != 0:
             ack_trans = self.next_trans_id & 0xFFFF
             self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF

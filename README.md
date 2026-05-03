@@ -140,6 +140,15 @@ examples/cc/run_c.sh examples/cc/or_callee_inspect.c # OISN/OLEN inside __or cal
 examples/cc/run_c.sh examples/cc/strings_demo.c    # exercises liborisc string fns
 ```
 
+Two interactive C demos that use oriscterm's keyboard and
+graphics capabilities — each opens a Tk window and waits for
+keypresses (ESC to exit):
+
+```sh
+examples/cc/run_kbd_echo.sh    # echoes every keystroke (codepoint + mods)
+examples/cc/run_paint.sh       # arrow + letter keys → vector drawing on canvas
+```
+
 The `hello_or.c` and `print_or.c` variants use the `__or`
 qualifier to control the OR file directly from C:
 `register __or void *p __asm__("o5")` binds a C variable to a

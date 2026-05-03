@@ -95,8 +95,17 @@ synthesizes refs to them.
 
 | Index | Service     | What it does                                                |
 |-------|-------------|-------------------------------------------------------------|
-| `1`   | **console** | CPU SENDs here to write text to the screen                  |
+| `1`   | **console** | CPU SENDs here to append text to the scrolling text pane    |
 | `2`   | **keyboard**| CPU SENDs here to subscribe to (or unsubscribe from) keystroke events |
+| `3`   | **grid**    | CPU SENDs here to write text at a fixed (col, row) on the graphics canvas |
+| `4`   | **vector**  | CPU SENDs here to draw lines, rectangles, ovals on the graphics canvas |
+| `5`   | **raster**  | (protocol pinned, implementation deferred) bitmap blit      |
+
+The terminal window has two regions: a scrolling text pane on top
+(driven by service `1`) and a fixed-size graphics canvas below
+(driven by services `3` and `4`). Both share the same monospace
+font, so the grid service's character cells line up visually with
+the text pane's columns.
 
 Usage:
 
@@ -261,6 +270,73 @@ in `R4`. Special keys use a portable encoding ≥ `0x100`:
 The modifier bits decode best-effort from Tk's `event.state`; rely
 on the codepoint as the primary indicator and use modifiers as
 hints rather than ground truth on macOS edge cases.
+
+### The grid-write protocol
+
+The grid service (index `3`) writes text at a specific
+character-cell position on the graphics canvas. Same two-phase
+shape as the console service — SEND a reference, terminal pulls
+the bytes via OBJ_READ_REQ — but with explicit (col, row)
+positioning instead of "wherever the next text cell happens to
+be."
+
+| Slot                 | Meaning                                                |
+|----------------------|--------------------------------------------------------|
+| `O1` (recipient)     | The grid-service reference                             |
+| `O2` (data ref)      | Byte-typed object holding the text to draw             |
+| `O3`, `O4`           | Unused                                                 |
+| `R4`                 | Byte offset into the data object                       |
+| `R5`                 | Byte length to draw                                    |
+| `R6`                 | Grid column (0 = leftmost)                             |
+| `R7`                 | Grid row    (0 = topmost)                              |
+
+Cell metrics come from the canvas's monospace font — the same one
+the text pane uses — so column N lands at pixel `N * cell_width`
+and row N lands at `N * cell_height`. Multiple writes to the same
+cell stack visually (the terminal doesn't clear before drawing);
+clear the canvas with the vector service's `VEC_CLEAR` if you need
+a fresh slate.
+
+### The vector-drawing protocol
+
+The vector service (index `4`) accepts immediate drawing commands
+— no buffer reads, just SEND with the command code in `R4` and
+arguments in `R5`/`R6`. Two-coordinate ops pack `(x, y)` into a
+single 32-bit word as `(x << 16) | y`; sizes pack as
+`(w << 16) | h`. The 16-bit halves are signed, so coordinates can
+go negative if you really want.
+
+| `R4`   | Command            | `R5`             | `R6`             | `R7`         |
+|--------|--------------------|------------------|------------------|--------------|
+| `0x00` | `VEC_LINE`         | `(x1<<16)\|y1`   | `(x2<<16)\|y2`   | unused       |
+| `0x01` | `VEC_RECT_FILL`    | `(x<<16)\|y`     | `(w<<16)\|h`     | unused       |
+| `0x02` | `VEC_RECT_OUTLINE` | `(x<<16)\|y`     | `(w<<16)\|h`     | unused       |
+| `0x03` | `VEC_OVAL_FILL`    | `(x<<16)\|y`     | `(w<<16)\|h`     | unused       |
+| `0x04` | `VEC_OVAL_OUTLINE` | `(x<<16)\|y`     | `(w<<16)\|h`     | unused       |
+| `0x05` | `VEC_CLEAR`        | unused           | unused           | unused       |
+| `0x06` | `VEC_SET_COLOR`    | palette index    | unused           | unused       |
+
+The palette is a small fixed 9-colour set (index 0 is the canvas
+background, 1 is the default foreground, 2–8 are red / green /
+blue / yellow / cyan / magenta / bright-white). `VEC_SET_COLOR`
+sets the current pen colour; subsequent draws use it until the
+next `SET_COLOR`.
+
+`examples/cc/paint.c` (run with
+[`run_paint.sh`](../../examples/cc/run_paint.sh)) is an
+interactive demo wiring up keyboard + grid + vector together —
+arrow keys move a logical cursor, letter keys drop dots / lines /
+rectangles / ovals at it, `C` cycles colour, space clears, ESC
+exits.
+
+### The raster service
+
+The raster service (index `5`) is reserved for bitmap blits — a
+SEND carries a byte buffer interpreted as one palette index per
+pixel along with a destination rectangle. The protocol is pinned
+in the source but not yet implemented; SENDs to it currently log
+and drop. v1 will land alongside the first demo that actually
+needs raster (probably a small framebuffer animation).
 
 ## linkbootd
 
