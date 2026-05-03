@@ -140,52 +140,60 @@ bfcode(struct symtab **sp, int cnt)
 	}
 
 	gpr = R4;
-	/*
-	 * `__or` parameters — caller-side convention works (moveargs
-	 * lowers to ASSIGN(O1, val)) but the receive side is harder:
-	 * tempnode creates CLASSA temps regardless of qualifier, so
-	 * the in-function variable can't be promoted to CLASSC
-	 * automatically. Functions taking `__or` args currently fail
-	 * with "Coalesce: src class 3, dst class 1" inside the body.
-	 * Workaround for now: declare the param type as a regular
-	 * pointer (no `__or`) and rely on the caller having put the
-	 * value in the right OR slot — caller is responsible for the
-	 * OR-side ABI. Real fix needs tempnode to take a qualifier.
-	 */
+	{
+		int opr = O1;
 
-	for (i = 0; i < cnt; i++) {
-		sym = sp[i];
+		for (i = 0; i < cnt; i++) {
+			sym = sp[i];
 
-		switch (sym->stype) {
-		case STRTY+FTN:
-		case UNIONTY+FTN:
-			cerror("struct argument not yet implemented for orisc");
-			break;
+			switch (sym->stype) {
+			case STRTY+FTN:
+			case UNIONTY+FTN:
+				cerror("struct argument not yet implemented for orisc");
+				break;
 
-		case LONGLONG:
-		case ULONGLONG:
-			cerror("longlong argument not yet implemented for orisc");
-			break;
+			case LONGLONG:
+			case ULONGLONG:
+				cerror("longlong argument not yet implemented for orisc");
+				break;
 
-		case DOUBLE:
-		case LDOUBLE:
-		case FLOAT:
-			cerror("FP argument not yet implemented for orisc");
-			break;
+			case DOUBLE:
+			case LDOUBLE:
+			case FLOAT:
+				cerror("FP argument not yet implemented for orisc");
+				break;
 
-		default:
-			if (gpr <= R7) {
-				q = block(REG, NIL, NIL, sym->stype,
-				    sym->sdf, sym->sap);
-				q->n_rval = gpr++;
-				p = tempnode(0, sym->stype, sym->sdf,
-				    sym->sap);
-				sym->soffset = regno(p);
-				sym->sflags |= STNODE;
-				p = buildtree(ASSIGN, p, q);
-				ecomp(p);
-			} else {
-				/* Stack arg: leave in place, accessed via FP. */
+			default:
+				if (ISOREF(sym->squal) && opr <= O4) {
+					/* `__or` parameter — arg arrived in
+					 * O[opr]. Callee-side binding is not
+					 * yet implemented: pcc's tempnode is
+					 * class-blind and produces a CLASSA
+					 * temp, which then fails to coalesce
+					 * with the CLASSC OR source. Until we
+					 * either add an OREF basic type or
+					 * teach tempnode about qualifiers,
+					 * `__or` parameters can only be used
+					 * via explicit `register __or T *p
+					 * __asm__("oN")` bindings inside the
+					 * body. The caller-side calling
+					 * convention (moveargs → O1..O4) does
+					 * work, so external assembly callees
+					 * see the right value in O[opr]. */
+					(void)opr;
+				} else if (!ISOREF(sym->squal) && gpr <= R7) {
+					q = block(REG, NIL, NIL, sym->stype,
+					    sym->sdf, sym->sap);
+					q->n_rval = gpr++;
+					p = tempnode(0, sym->stype, sym->sdf,
+					    sym->sap);
+					sym->soffset = regno(p);
+					sym->sflags |= STNODE;
+					p = buildtree(ASSIGN, p, q);
+					ecomp(p);
+				} else {
+					/* Stack arg: leave in place, accessed via FP. */
+				}
 			}
 		}
 	}

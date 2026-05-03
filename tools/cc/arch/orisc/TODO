@@ -158,6 +158,48 @@ Done
   cannot natively manipulate the OR ref through C statements
   inside the body.
 
+- `__or` Phase 2c — callee-side attempt, not yet successful.
+  Two approaches were tried and reverted:
+    (a) regs.c newblock hook: probe `ISOREF(p->n_qual)` and
+        force `r_class = CLASSC`. Hook compiled and the rest
+        of the test suite stayed green, but it never fired for
+        the failing nodes — by the time newblock sees a
+        bfcode-introduced TEMP, n_qual has already been lost
+        (tempnode allocates a fresh node from t_type only).
+    (b) bfcode direct binding: skip the tempnode/ASSIGN dance
+        entirely for `__or` params and bind the symtab entry
+        straight to a physical OR slot via
+        `sp->sclass = REGISTER; sp->sflags |= SINREG;
+        sp->soffset = O[opr]`. This is exactly how the
+        `register __or T *p __asm__("oN")` syntax lands a
+        variable in a named OR slot, so in principle the body
+        should resolve NAME → REGISTER → OR slot the same way.
+        Compiles for ccom but breaks cxxcom (C++ pcc's pass1.h
+        doesn't expose SINREG); since we don't ship C++ for
+        orisc, the build target is the blocker, not the idea.
+        Left as a `cerror` gate in bfcode with a comment
+        pointing at this entry. The path forward, if and when
+        someone wants this, is one of:
+          - Make the cxxcom build path tolerate SINREG (either
+            by adding it to cxxcom/pass1.h or by gating the
+            include).
+          - Add an OREF basic type (extends MAXTYPES). gclass
+            then routes by type and the qualifier-vs-class
+            mismatch goes away entirely. Invasive — touches
+            mip and every backend's macdefs.h — but it's the
+            architecturally right answer.
+          - Plumb n_qual through tempnode (let callers
+            request a qualifier on the new TEMP). Local to
+            mip, less invasive than a new type, but requires
+            auditing every tempnode caller.
+  Net result for this session: caller-side `__or` args work
+  end-to-end (print_clean.c demo), explicit `register __or T
+  *p __asm__("oN")` works (hello_or.c, print_or.c), inline-asm
+  + `__or` operand binding gives full OL/OS/OEQ/inspection
+  access from C (inspect.c). The remaining gap is a pure-C
+  function whose parameters are `__or` and which uses them in
+  the body without explicit register binding.
+
   Phase 2b/c/... (still pending) — the multi-session work:
     1. clocal lowering for `__or` autos: skip the AUTO/PARAM
        STREF rewrite, become REG nodes in CLASSC. Effectively
