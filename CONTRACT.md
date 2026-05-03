@@ -268,7 +268,27 @@ Returns:
     that `R3` carries the first integer payload word, *not* a return
     value — the status occupies `R2` alone.
 
-### 3.9 `0x320 ConsoleWrite`
+### 3.9 `0x301 ReadCycles`
+
+Read the calling CPU's retired-instruction counter — its local
+"cycle count" in the simulator. This is a measurement primitive
+useful for benchmarks and bring-up; it is not modelled as a
+production architectural facility.
+
+Inputs: none.
+
+Returns:
+- `R2` = `0` (always succeeds; no error path).
+- `R3` = the calling CPU's cycle count, low 32 bits.
+
+The counter starts at zero on simulator boot, advances by one per
+retired instruction (including `nop`, including the instruction
+implementing this `CALL`), and wraps at 2^32. For benchmark loops
+that take more than ~4 billion instructions to complete, sample
+twice and check for wrap explicitly; for everything that fits in a
+single 32-bit window, subtract.
+
+### 3.10 `0x320 ConsoleWrite`
 
 Inputs:
 - `O1` = source object reference. Must be non-null and carry `R`. Must

@@ -1399,6 +1399,10 @@ def primitive_TaskExit(cpu: CPU) -> None:
     code = cpu.get_gpr(4) & 0xFF
     raise TaskExitSignal(code)
 
+def primitive_ReadCycles(cpu: CPU) -> None:
+    cpu.set_gpr(2, 0)
+    cpu.set_gpr(3, cpu.cycles & 0xFFFFFFFF)
+
 def primitive_ConsoleWrite(cpu: CPU, faulting_pc: int) -> None:
     o1   = cpu.get_opr(1)
     off  = cpu.get_gpr(4)
@@ -1667,6 +1671,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ReceiveQueueAttach(cpu)
     elif prim == 0x204:
         primitive_ReceiveQueuePoll(cpu)
+    elif prim == 0x301:
+        primitive_ReadCycles(cpu)
     elif prim == 0x320:
         primitive_ConsoleWrite(cpu, faulting_pc)
     else:
@@ -2049,15 +2055,25 @@ def step(cpu: CPU) -> None:
         # Validate against the home CPU's descriptor table only when that
         # CPU is reachable from this process (in-process multi-CPU mode).
         # In socket-mode the home lives behind the crossbar; the home
-        # validates on receipt and silently drops on mismatch.
+        # validates on receipt and silently drops on mismatch. Note that
+        # `system.cpus` is positionally indexed, not pid-indexed: in
+        # socket mode it has a single entry whose pid may be any value,
+        # so we must search by pid rather than index by it.
         home = ref_home(ref)
-        if cpu.system is not None and home < len(cpu.system.cpus):
-            descriptors = (cpu.descriptors if home == cpu.pid
-                           else cpu.system.cpus[home].descriptors)
+        target_descriptors = None
+        if cpu.system is not None:
+            if home == cpu.pid:
+                target_descriptors = cpu.descriptors
+            else:
+                for c in cpu.system.cpus:
+                    if c.pid == home:
+                        target_descriptors = c.descriptors
+                        break
+        if target_descriptors is not None:
             idx = ref_index(ref)
-            if idx >= len(descriptors) or descriptors[idx] is None:
+            if idx >= len(target_descriptors) or target_descriptors[idx] is None:
                 raise Trap(CAUSE_STALE_REF, pc, f"SEND stale O{os_}")
-            desc = descriptors[idx]
+            desc = target_descriptors[idx]
             if not desc.live or desc.generation != ref_generation(ref):
                 raise Trap(CAUSE_STALE_REF, pc, f"SEND stale O{os_}")
         # Build payload: int = R4..R7, OR = O1..O4 (per Vol II Section 10).

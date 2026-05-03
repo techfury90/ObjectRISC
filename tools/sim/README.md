@@ -55,6 +55,8 @@ multiple CPUs talk to each other:
 - **`0x203 ReceiveQueueAttach`** / **`0x204 ReceiveQueuePoll`** —
   per-object receive queues; poll blocks the CPU until a SEND arrives
   (or timeout).
+- **`0x301 ReadCycles`** — returns the calling CPU's
+  retired-instruction count (`R3`). Useful for benchmarking.
 - **`0x320 ConsoleWrite`** — writes object storage bytes to host
   stdout.
 - Every other primitive number returns `R2 = 4` (`ENOSYS`).
