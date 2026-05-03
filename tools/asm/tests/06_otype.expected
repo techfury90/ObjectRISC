@@ -1,0 +1,18 @@
+; ----- header -----
+  0x0000: 4f 52 49 53 43 00 00 00
+  0x0008: 00 00 00 01 00 00 00 00
+  0x0010: 00 00 00 00 00 00 00 30
+  0x0018: 00 00 00 00 00 00 00 00
+; ----- text -----
+  text+0x0000 (pc 0x00010000): c08c0000    ; omov o2, o3
+  text+0x0004 (pc 0x00010004): c1000010    ; onull o4
+  text+0x0008 (pc 0x00010008): c1594020    ; oeq r10, o5, o6
+  text+0x000c (pc 0x0001000c): c1c16030    ; oisn r11, o7
+  text+0x0010 (pc 0x00010010): c2018040    ; olen r12, o8
+  text+0x0014 (pc 0x00010014): c241a050    ; otag r13, o9
+  text+0x0018 (pc 0x00010018): c281c060    ; ohome r14, o10
+  text+0x001c (pc 0x0001001c): c2c1e070    ; ocap r15, o11
+  text+0x0020 (pc 0x00010020): cc840008    ; olw r4, 8(o2)
+  text+0x0024 (pc 0x00010024): ecc5fffc    ; osw r5, -4(o3)
+  text+0x0028 (pc 0x00010028): f0400000    ; send o1
+  text+0x002c (pc 0x0001002c): f4000042    ; call #0x42

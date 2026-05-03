@@ -1,0 +1,24 @@
+Test programs for asmorisc.
+
+Each <name>.s is the input source.  The corresponding <name>.expected is
+the *exact* output produced by `asmorisc --hex <name>.orx`.  The test
+runner asserts byte-for-byte equality and additionally verifies that
+`--disasm` round-trips: re-assembling the disassembled form must yield
+the original .orx exactly.
+
+  01_formats     R, I, J, and O instruction formats in one program.
+  02_hello       The canonical Hello, World! from the contract.
+  03_branches    Forward and backward conditional branches; the `b`
+                 pseudo-instruction.  Tests label resolution in both
+                 directions.
+  04_directives  Every directive: .text, .data, .entry, .byte, .half,
+                 .word, .string, .asciz, .align, .skip.
+  05_pseudo      All pseudo-instructions: nop, move, b (in 03), li for
+                 a 16-bit-fitting immediate and a 32-bit immediate, la.
+  06_otype       Every O-type instruction: omov, onull, oeq, oisn,
+                 olen, otag, ohome, ocap, olw, osw, send, and the
+                 J-format CALL.
+
+Run all tests:
+
+  sh tests/run-tests.sh

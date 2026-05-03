@@ -1,0 +1,1778 @@
+#!/usr/bin/env python3
+"""
+asmorisc — Assembler for the Object RISC architecture.
+
+Reads an Object RISC assembly source file and produces an .orx binary
+per CONTRACT.md Section 1. Also offers --disasm and --hex modes for
+inspection and round-trip verification.
+
+Implementation notes:
+  * Two-pass: first pass enumerates labels with section offsets and
+    expands pseudo-instructions to a fixed instruction count; second
+    pass emits encoded words / data bytes with labels resolved.
+  * Instruction encoders are kept in explicit dispatch tables so the
+    correspondence with CONTRACT.md Section 5 is direct.
+  * Big-endian throughout — header fields, instruction words, .word/.half.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import struct
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+# ---------------------------------------------------------------------------
+# Binary header constants (CONTRACT.md Section 1)
+
+MAGIC = b"ORISC\x00\x00\x00"
+HEADER_SIZE = 0x20
+FORMAT_VERSION = 1
+
+
+# ---------------------------------------------------------------------------
+# Register tables (CONTRACT.md Section 4.3)
+
+GPR_ALIASES = {
+    "zero": 0, "at": 1,
+    "v0": 2, "v1": 3,
+    "a0": 4, "a1": 5, "a2": 6, "a3": 7,
+    "t0": 8, "t1": 9, "t2": 10, "t3": 11,
+    "t4": 12, "t5": 13, "t6": 14, "t7": 15,
+    "s0": 16, "s1": 17, "s2": 18, "s3": 19,
+    "s4": 20, "s5": 21, "s6": 22, "s7": 23,
+    "t8": 24, "t9": 25, "t10": 26, "t11": 27, "t12": 28,
+    "sp": 29, "fp": 30, "ra": 31,
+}
+
+OBJ_ALIASES = {
+    "null": 0,
+}
+
+
+def parse_register(tok: str, file: str, line: int, col: int) -> tuple[str, int]:
+    """Parse a register token. Returns (kind, number) where kind is 'r' or 'o'."""
+    name = tok.lower()
+    if name in GPR_ALIASES:
+        return ("r", GPR_ALIASES[name])
+    if name in OBJ_ALIASES:
+        return ("o", OBJ_ALIASES[name])
+    m = re.fullmatch(r"r(\d+)", name)
+    if m:
+        n = int(m.group(1))
+        if 0 <= n <= 31:
+            return ("r", n)
+    m = re.fullmatch(r"o(\d+)", name)
+    if m:
+        n = int(m.group(1))
+        if 0 <= n <= 15:
+            return ("o", n)
+    raise AsmError(f"not a register: {tok!r}", file, line, col)
+
+
+def parse_gpr(tok: str, file: str, line: int, col: int) -> int:
+    kind, n = parse_register(tok, file, line, col)
+    if kind != "r":
+        raise AsmError(f"expected GPR, got object register {tok!r}", file, line, col)
+    return n
+
+
+def parse_obj(tok: str, file: str, line: int, col: int) -> int:
+    kind, n = parse_register(tok, file, line, col)
+    if kind != "o":
+        raise AsmError(f"expected object register, got GPR {tok!r}", file, line, col)
+    return n
+
+
+# ---------------------------------------------------------------------------
+# Errors
+
+class AsmError(Exception):
+    def __init__(self, msg: str, file: Optional[str] = None,
+                 line: Optional[int] = None, col: Optional[int] = None):
+        super().__init__(msg)
+        self.msg = msg
+        self.file = file
+        self.line = line
+        self.col = col
+
+    def __str__(self) -> str:
+        loc = ""
+        if self.file is not None:
+            loc = f"{self.file}"
+            if self.line is not None:
+                loc += f":{self.line}"
+                if self.col is not None:
+                    loc += f":{self.col}"
+            loc += ": "
+        return f"{loc}{self.msg}"
+
+
+# ---------------------------------------------------------------------------
+# Lexer / line splitter
+
+@dataclass
+class SourceLine:
+    file: str
+    line: int       # 1-based
+    text: str       # original text without trailing newline
+    payload: str    # text with comment stripped
+
+
+def read_lines(paths: list[Path]) -> list[SourceLine]:
+    out: list[SourceLine] = []
+    for p in paths:
+        text = p.read_text()
+        for i, raw in enumerate(text.splitlines(), start=1):
+            # Strip comment (everything from first ';' that isn't inside a string).
+            payload = strip_comment(raw)
+            out.append(SourceLine(file=str(p), line=i, text=raw, payload=payload))
+    return out
+
+
+def strip_comment(s: str) -> str:
+    in_str = False
+    esc = False
+    for i, ch in enumerate(s):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if ch == ';' and not in_str:
+            return s[:i]
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Numeric and string literal parsers
+
+def parse_int(tok: str, file: str, line: int, col: int) -> int:
+    t = tok.strip()
+    neg = False
+    if t.startswith("+"):
+        t = t[1:]
+    elif t.startswith("-"):
+        neg = True
+        t = t[1:]
+    try:
+        if len(t) >= 3 and t[0] == "'" and t[-1] == "'":
+            inner = t[1:-1]
+            if inner.startswith("\\"):
+                # use C escape rules
+                b = decode_string('"' + inner + '"')
+                if len(b) != 1:
+                    raise ValueError
+                v = b[0]
+            else:
+                if len(inner) != 1:
+                    raise ValueError
+                v = ord(inner)
+        elif t.startswith(("0x", "0X")):
+            v = int(t, 16)
+        elif t.startswith(("0b", "0B")):
+            v = int(t, 2)
+        else:
+            v = int(t, 10)
+    except ValueError:
+        raise AsmError(f"bad integer literal: {tok!r}", file, line, col)
+    return -v if neg else v
+
+
+_ESCAPES = {
+    "n": 0x0A, "t": 0x09, "r": 0x0D,
+    "\\": 0x5C, '"': 0x22, "'": 0x27,
+    "0": 0x00,
+}
+
+
+def decode_string(tok: str) -> bytes:
+    """Decode a double-quoted string literal with C-style escapes."""
+    if not (tok.startswith('"') and tok.endswith('"')):
+        raise ValueError(f"not a string literal: {tok!r}")
+    out = bytearray()
+    i = 1
+    while i < len(tok) - 1:
+        ch = tok[i]
+        if ch == "\\":
+            if i + 1 >= len(tok) - 1:
+                raise ValueError("dangling escape in string literal")
+            nxt = tok[i + 1]
+            if nxt == "x":
+                if i + 3 >= len(tok) - 1:
+                    raise ValueError("incomplete \\x escape")
+                hh = tok[i + 2:i + 4]
+                out.append(int(hh, 16))
+                i += 4
+                continue
+            if nxt in _ESCAPES:
+                out.append(_ESCAPES[nxt])
+                i += 2
+                continue
+            raise ValueError(f"unknown escape \\{nxt}")
+        out.append(ord(ch))
+        i += 1
+    return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# Field-checking helpers
+
+def check_unsigned(value: int, width: int, file: str, line: int, col: int,
+                   what: str) -> int:
+    lo, hi = 0, (1 << width) - 1
+    if not (lo <= value <= hi):
+        raise AsmError(
+            f"{what} {value} out of range [0, {hi}] for {width}-bit unsigned field",
+            file, line, col)
+    return value & hi
+
+
+def check_signed(value: int, width: int, file: str, line: int, col: int,
+                 what: str) -> int:
+    lo, hi = -(1 << (width - 1)), (1 << (width - 1)) - 1
+    if not (lo <= value <= hi):
+        raise AsmError(
+            f"{what} {value} out of range [{lo}, {hi}] for {width}-bit signed field",
+            file, line, col)
+    return value & ((1 << width) - 1)
+
+
+def check_simm_or_uimm(value: int, width: int, file: str, line: int, col: int,
+                       what: str) -> int:
+    """Accept either a signed or unsigned 16-bit pattern; a 16-bit immediate
+    such as 0xFFFF means -1 here, and -1 means 0xFFFF — both encode the same."""
+    lo = -(1 << (width - 1))
+    hi = (1 << width) - 1
+    if not (lo <= value <= hi):
+        raise AsmError(
+            f"{what} {value} out of range [{lo}, {hi}] for {width}-bit field",
+            file, line, col)
+    return value & ((1 << width) - 1)
+
+
+# ---------------------------------------------------------------------------
+# Encoding tables (CONTRACT.md Section 5)
+
+# R-type SPECIAL funct codes
+SPECIAL_FUNCT = {
+    "sll":   0x00, "srl":   0x02, "sra":   0x03,
+    "sllv":  0x04, "srlv":  0x06, "srav":  0x07,
+    "jr":    0x08, "jalr":  0x09,
+    "mfhi":  0x10, "mflo":  0x12,
+    "mult":  0x18, "multu": 0x19,
+    "div":   0x1A, "divu":  0x1B,
+    "add":   0x20, "addu":  0x21,
+    "sub":   0x22, "subu":  0x23,
+    "and":   0x24, "or":    0x25,
+    "xor":   0x26, "nor":   0x27,
+    "slt":   0x2A, "sltu":  0x2B,
+}
+
+# Major opcodes
+MAJOR = {
+    "j":     0x02, "jal":   0x03,
+    "beq":   0x04, "bne":   0x05,
+    "blez":  0x06, "bgtz":  0x07,
+    "addi":  0x08, "addiu": 0x09,
+    "slti":  0x0A, "sltiu": 0x0B,
+    "andi":  0x0C, "ori":   0x0D,
+    "xori":  0x0E, "lui":   0x0F,
+    "lb":    0x20, "lh":    0x21, "lw":    0x23,
+    "lbu":   0x24, "lhu":   0x25,
+    "sb":    0x28, "sh":    0x29, "sw":    0x2B,
+    "olb":   0x31, "olh":   0x32, "olw":   0x33,
+    "olbu":  0x34, "olhu":  0x35,
+    "osb":   0x38, "osh":   0x39, "osw":   0x3B,
+    "send":  0x3C, "call":  0x3D,
+}
+
+# REGIMM rt sub-codes
+REGIMM_RT = {
+    "bltz":   0x00, "bgez":   0x01,
+    "bltzal": 0x10, "bgezal": 0x11,
+}
+
+# OBJECT funct codes (low 4 bits of funct field)
+OBJECT_FUNCT = {
+    "omov":  0x0, "onull": 0x1,
+    "oeq":   0x2, "oisn":  0x3,
+    "olen":  0x4, "otag":  0x5,
+    "ohome": 0x6, "ocap":  0x7,
+}
+
+
+# ---------------------------------------------------------------------------
+# Bit-field assembly helpers
+
+def encode_r(opcode: int, rs: int, rt: int, rd: int, shamt: int, funct: int) -> int:
+    return ((opcode & 0x3F) << 26 |
+            (rs & 0x1F) << 21 |
+            (rt & 0x1F) << 16 |
+            (rd & 0x1F) << 11 |
+            (shamt & 0x1F) << 6 |
+            (funct & 0x3F))
+
+
+def encode_i(opcode: int, rs: int, rt: int, imm16: int) -> int:
+    return ((opcode & 0x3F) << 26 |
+            (rs & 0x1F) << 21 |
+            (rt & 0x1F) << 16 |
+            (imm16 & 0xFFFF))
+
+
+def encode_j(opcode: int, target26: int) -> int:
+    return ((opcode & 0x3F) << 26 | (target26 & 0x03FF_FFFF))
+
+
+def encode_o_rr(opcode: int, os: int, ot: int, rd: int, rs: int, funct4: int) -> int:
+    """O-type register-register form (CONTRACT.md Section 5.8)."""
+    return ((opcode & 0x3F) << 26 |
+            (os & 0xF) << 22 |
+            (ot & 0xF) << 18 |
+            (rd & 0x1F) << 13 |
+            (rs & 0x1F) << 8 |
+            (funct4 & 0xF) << 4 |
+            0)  # rsv = 0
+
+
+def encode_o_ls(opcode: int, os: int, rt: int, offset16: int) -> int:
+    """O-type load/store form (CONTRACT.md Section 5.9).
+    rt' is 6 bits at [21:16]; high bit reserved (0); low 5 bits are GPR num."""
+    return ((opcode & 0x3F) << 26 |
+            (os & 0xF) << 22 |
+            (rt & 0x1F) << 16 |
+            (offset16 & 0xFFFF))
+
+
+def encode_send(os: int) -> int:
+    """SEND layout (CONTRACT.md Section 5.10)."""
+    return ((MAJOR["send"]) << 26 | (os & 0xF) << 22)
+
+
+# ---------------------------------------------------------------------------
+# IR — one entry per emitted instruction or data chunk
+
+@dataclass
+class Inst:
+    """One emitted machine word."""
+    file: str
+    line: int
+    col: int
+    section: str
+    offset: int            # byte offset within section
+    mnemonic: str
+    operands: list         # raw operand objects (parsed during pass 1)
+    encoder: Callable      # second-pass: (Inst, Assembler) -> int
+
+
+@dataclass
+class DataBlob:
+    file: str
+    line: int
+    col: int
+    section: str
+    offset: int
+    data: bytes
+
+
+@dataclass
+class Assembler:
+    text: list = field(default_factory=list)   # list[Inst|DataBlob]
+    data: list = field(default_factory=list)
+    text_size: int = 0
+    data_size: int = 0
+    labels: dict = field(default_factory=dict)  # name -> (section, offset)
+    entry_label: Optional[str] = None
+    entry_file: Optional[str] = None
+    entry_line: Optional[int] = None
+
+    def section_list(self, sec: str) -> list:
+        return self.text if sec == "text" else self.data
+
+    def cur_size(self, sec: str) -> int:
+        return self.text_size if sec == "text" else self.data_size
+
+    def bump(self, sec: str, n: int) -> None:
+        if sec == "text":
+            self.text_size += n
+        else:
+            self.data_size += n
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer for a single source line
+
+_TOKEN_RE = re.compile(
+    r"""
+    \s+ |                                              # whitespace
+    (?P<string>"(?:\\.|[^"\\])*") |                    # string literal
+    (?P<char>'(?:\\.|[^'\\])') |                       # char literal
+    (?P<sym>[A-Za-z_.][A-Za-z0-9_.]*:?) |              # identifier / label
+    (?P<num>-?(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+)) |  # number
+    (?P<hash>\#) |                                     # call '#' sigil
+    (?P<punct>[(),])                                   # punctuation
+    """,
+    re.VERBOSE,
+)
+
+
+@dataclass
+class Token:
+    kind: str
+    text: str
+    col: int  # 1-based
+
+
+def tokenize(line: str) -> list[Token]:
+    out: list[Token] = []
+    i = 0
+    while i < len(line):
+        m = _TOKEN_RE.match(line, i)
+        if not m:
+            raise AsmError(f"unexpected character {line[i]!r}",
+                           file=None, line=None, col=i + 1)
+        # Whitespace match has no group set.
+        if m.lastgroup is None:
+            i = m.end()
+            continue
+        out.append(Token(kind=m.lastgroup, text=m.group(m.lastgroup), col=m.start() + 1))
+        i = m.end()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Operand parsing helpers used by encoders.
+
+def expect_n(toks: list[Token], n: int, mnemonic: str,
+             file: str, line: int) -> None:
+    """Confirm the operand list has exactly n comma-separated operands.
+
+    The token list at this point is the full post-mnemonic operand stream:
+    operands separated by commas, with optional () groups for memory operands.
+    """
+    # We do this check in operand-extractor functions instead; this stub
+    # exists so the caller pattern reads consistently if needed.
+    pass
+
+
+def split_top_commas(toks: list[Token]) -> list[list[Token]]:
+    """Split tokens at top-level commas (commas outside parentheses)."""
+    groups: list[list[Token]] = [[]]
+    depth = 0
+    for t in toks:
+        if t.kind == "punct" and t.text == "(":
+            depth += 1
+            groups[-1].append(t)
+        elif t.kind == "punct" and t.text == ")":
+            depth -= 1
+            groups[-1].append(t)
+        elif t.kind == "punct" and t.text == "," and depth == 0:
+            groups.append([])
+        else:
+            groups[-1].append(t)
+    if groups == [[]]:
+        return []
+    return groups
+
+
+def parse_mem_operand(group: list[Token], file: str, line: int) -> tuple[Optional[int], int, str]:
+    """Parse an `offset(base)` operand. Returns (offset_or_None, base_kind_value)."""
+    # Find the open paren at the top level.
+    if not group or group[-1].kind != "punct" or group[-1].text != ")":
+        raise AsmError(f"expected memory operand `offset(base)`",
+                       file, line, group[0].col if group else 1)
+    # find matching open paren
+    open_idx = None
+    depth = 0
+    for i in range(len(group) - 1, -1, -1):
+        if group[i].kind == "punct" and group[i].text == ")":
+            depth += 1
+        elif group[i].kind == "punct" and group[i].text == "(":
+            depth -= 1
+            if depth == 0:
+                open_idx = i
+                break
+    if open_idx is None:
+        raise AsmError("unbalanced parentheses in memory operand",
+                       file, line, group[0].col)
+    offset_toks = group[:open_idx]
+    base_toks = group[open_idx + 1:-1]
+    if not base_toks:
+        raise AsmError("missing base register in memory operand",
+                       file, line, group[open_idx].col)
+    if len(base_toks) != 1:
+        raise AsmError("base register must be a single token",
+                       file, line, base_toks[1].col)
+    base_tok = base_toks[0]
+    return offset_toks, base_tok
+
+
+# ---------------------------------------------------------------------------
+# Encoder generation per mnemonic
+
+def emit(asm: Assembler, sec: str, file: str, line: int, col: int,
+         mnemonic: str, operands, encoder) -> Inst:
+    if sec != "text":
+        raise AsmError(f"instruction in .data section", file, line, col)
+    inst = Inst(file=file, line=line, col=col, section=sec,
+                offset=asm.text_size, mnemonic=mnemonic,
+                operands=operands, encoder=encoder)
+    asm.text.append(inst)
+    asm.text_size += 4
+    return inst
+
+
+def emit_data(asm: Assembler, sec: str, file: str, line: int, col: int,
+              data: bytes) -> None:
+    blob = DataBlob(file=file, line=line, col=col, section=sec,
+                    offset=asm.cur_size(sec), data=data)
+    asm.section_list(sec).append(blob)
+    asm.bump(sec, len(data))
+
+
+# ---------------------------------------------------------------------------
+# Pass 1: parse lines, define labels, build IR.
+
+def pass1(lines: list[SourceLine]) -> Assembler:
+    asm = Assembler()
+    section = "text"
+
+    for srcline in lines:
+        try:
+            tokens = tokenize(srcline.payload)
+        except AsmError as e:
+            e.file = srcline.file
+            e.line = srcline.line
+            raise
+
+        if not tokens:
+            continue
+
+        # Drain leading labels.
+        while tokens and tokens[0].kind == "sym" and tokens[0].text.endswith(":"):
+            label_tok = tokens.pop(0)
+            name = label_tok.text[:-1]
+            if not name:
+                raise AsmError("empty label", srcline.file, srcline.line, label_tok.col)
+            if name in asm.labels:
+                prev_sec, prev_off = asm.labels[name]
+                raise AsmError(f"duplicate label {name!r} (previously defined at "
+                               f"{prev_sec}+0x{prev_off:x})",
+                               srcline.file, srcline.line, label_tok.col)
+            asm.labels[name] = (section, asm.cur_size(section))
+
+        if not tokens:
+            continue
+
+        head = tokens[0]
+        rest = tokens[1:]
+
+        if head.kind != "sym":
+            raise AsmError(f"unexpected token {head.text!r}",
+                           srcline.file, srcline.line, head.col)
+
+        mnemonic = head.text
+        lname = mnemonic.lower()
+
+        # Handle directives.
+        if mnemonic.startswith("."):
+            section = handle_directive(asm, section, srcline, mnemonic, rest)
+            continue
+
+        # Handle real instructions / pseudo-instructions in the current section.
+        handle_instruction(asm, section, srcline, lname, rest)
+
+    return asm
+
+
+def handle_directive(asm: Assembler, section: str, src: SourceLine,
+                     name: str, rest: list[Token]) -> str:
+    n = name.lower()
+    file, line = src.file, src.line
+
+    if n == ".text":
+        if rest:
+            raise AsmError(".text takes no operands", file, line, rest[0].col)
+        return "text"
+    if n == ".data":
+        if rest:
+            raise AsmError(".data takes no operands", file, line, rest[0].col)
+        return "data"
+    if n == ".entry":
+        if len(rest) != 1 or rest[0].kind != "sym":
+            raise AsmError(".entry expects a single label name",
+                           file, line, rest[0].col if rest else 1)
+        if asm.entry_label is not None:
+            raise AsmError(".entry may only appear once", file, line, rest[0].col)
+        asm.entry_label = rest[0].text
+        asm.entry_file = file
+        asm.entry_line = line
+        return section
+
+    if n in (".byte", ".half", ".word"):
+        groups = split_top_commas(rest)
+        if not groups:
+            raise AsmError(f"{n} requires at least one value",
+                           file, line, rest[0].col if rest else 1)
+        widths = {".byte": 1, ".half": 2, ".word": 4}
+        w = widths[n]
+        out = bytearray()
+        for g in groups:
+            if not g:
+                raise AsmError(f"empty operand in {n}", file, line, 1)
+            if len(g) != 1:
+                raise AsmError(f"{n} operand must be a single literal",
+                               file, line, g[0].col)
+            t = g[0]
+            if t.kind not in ("num", "char"):
+                raise AsmError(f"{n} operand must be a numeric literal",
+                               file, line, t.col)
+            v = parse_int(t.text, file, line, t.col)
+            if w == 1:
+                if not (-128 <= v <= 255):
+                    raise AsmError(f".byte value {v} out of range",
+                                   file, line, t.col)
+                out.append(v & 0xFF)
+            elif w == 2:
+                if not (-(1 << 15) <= v <= 0xFFFF):
+                    raise AsmError(f".half value {v} out of range",
+                                   file, line, t.col)
+                out += struct.pack(">H", v & 0xFFFF)
+            else:
+                if not (-(1 << 31) <= v <= 0xFFFF_FFFF):
+                    raise AsmError(f".word value {v} out of range",
+                                   file, line, t.col)
+                out += struct.pack(">I", v & 0xFFFF_FFFF)
+        emit_data(asm, section, file, line, 1, bytes(out))
+        return section
+
+    if n in (".string", ".asciz"):
+        if len(rest) != 1 or rest[0].kind != "string":
+            raise AsmError(f"{n} expects a string literal",
+                           file, line, rest[0].col if rest else 1)
+        try:
+            data = decode_string(rest[0].text)
+        except ValueError as e:
+            raise AsmError(str(e), file, line, rest[0].col)
+        if n == ".asciz":
+            data = data + b"\x00"
+        emit_data(asm, section, file, line, 1, data)
+        return section
+
+    if n == ".align":
+        if len(rest) != 1 or rest[0].kind != "num":
+            raise AsmError(".align expects a numeric literal",
+                           file, line, rest[0].col if rest else 1)
+        k = parse_int(rest[0].text, file, line, rest[0].col)
+        if not (0 <= k <= 16):
+            raise AsmError(".align: shift count out of range", file, line, rest[0].col)
+        boundary = 1 << k
+        cur = asm.cur_size(section)
+        pad = (-cur) % boundary
+        if pad:
+            emit_data(asm, section, file, line, 1, b"\x00" * pad)
+        return section
+
+    if n == ".skip":
+        if len(rest) != 1 or rest[0].kind != "num":
+            raise AsmError(".skip expects a numeric literal",
+                           file, line, rest[0].col if rest else 1)
+        nbytes = parse_int(rest[0].text, file, line, rest[0].col)
+        if nbytes < 0:
+            raise AsmError(".skip: count must be non-negative",
+                           file, line, rest[0].col)
+        if nbytes:
+            emit_data(asm, section, file, line, 1, b"\x00" * nbytes)
+        return section
+
+    raise AsmError(f"unknown directive {name!r}", file, line, 1)
+
+
+# ---------- Operand-extraction helpers used by encoders ----------
+
+def _need_one_token(g: list[Token], file: str, line: int, what: str) -> Token:
+    if len(g) != 1:
+        raise AsmError(f"expected {what}, got multi-token operand",
+                       file, line, g[0].col if g else 1)
+    return g[0]
+
+
+def parse_imm_operand(g: list[Token], file: str, line: int) -> int:
+    t = _need_one_token(g, file, line, "immediate")
+    if t.kind not in ("num", "char"):
+        raise AsmError(f"expected numeric immediate, got {t.text!r}",
+                       file, line, t.col)
+    return parse_int(t.text, file, line, t.col)
+
+
+def parse_imm_or_call_target(g: list[Token], file: str, line: int) -> int:
+    """Allow `#N` or `N`."""
+    if len(g) == 2 and g[0].kind == "sym" and g[0].text == "#":
+        # Shouldn't happen — '#' is not a sym. We'll handle via a custom token below.
+        raise AsmError("unexpected '#' parse path", file, line, g[0].col)
+    if g and g[0].kind == "punct" and g[0].text == "#":
+        # Also unreachable since we don't tokenize '#'.
+        raise AsmError("unexpected '#' parse path", file, line, g[0].col)
+    return parse_imm_operand(g, file, line)
+
+
+# ---------- Instruction handlers ----------
+
+def handle_instruction(asm: Assembler, section: str, src: SourceLine,
+                       name: str, rest: list[Token]) -> None:
+    file, line, col = src.file, src.line, 1
+    operands = split_top_commas(rest)
+
+    # ----- Pseudo-instructions (CONTRACT.md Section 4.4) -----
+    if name == "nop":
+        if operands:
+            raise AsmError("nop takes no operands", file, line, operands[0][0].col)
+        # sll r0, r0, 0
+        op = encode_r(0, 0, 0, 0, 0, SPECIAL_FUNCT["sll"])
+        emit_const(asm, section, file, line, col, "nop", op)
+        return
+
+    if name == "move":
+        if len(operands) != 2:
+            raise AsmError("move expects 2 operands", file, line, col)
+        rd_t = _need_one_token(operands[0], file, line, "register")
+        rs_t = _need_one_token(operands[1], file, line, "register")
+        rd = parse_gpr(rd_t.text, file, line, rd_t.col)
+        rs = parse_gpr(rs_t.text, file, line, rs_t.col)
+        # addu rd, rs, r0
+        op = encode_r(0, rs, 0, rd, 0, SPECIAL_FUNCT["addu"])
+        emit_const(asm, section, file, line, col, "move", op,
+                   pretty=f"move r{rd}, r{rs}")
+        return
+
+    if name == "b":
+        if len(operands) != 1:
+            raise AsmError("b expects 1 label operand", file, line, col)
+        label_tok = _need_one_token(operands[0], file, line, "label")
+        emit_branch_pseudo(asm, section, src, "b", "beq", 0, 0, label_tok)
+        return
+
+    if name == "li":
+        if len(operands) != 2:
+            raise AsmError("li expects 2 operands", file, line, col)
+        rd_t = _need_one_token(operands[0], file, line, "register")
+        rd = parse_gpr(rd_t.text, file, line, rd_t.col)
+        imm = parse_imm_operand(operands[1], file, line)
+        emit_li(asm, section, file, line, col, rd, imm)
+        return
+
+    if name == "la":
+        if len(operands) != 2:
+            raise AsmError("la expects 2 operands", file, line, col)
+        rd_t = _need_one_token(operands[0], file, line, "register")
+        rd = parse_gpr(rd_t.text, file, line, rd_t.col)
+        lab_t = _need_one_token(operands[1], file, line, "label")
+        if lab_t.kind != "sym":
+            raise AsmError("la: second operand must be a label name",
+                           file, line, lab_t.col)
+        emit_la(asm, section, file, line, col, rd, lab_t.text)
+        return
+
+    # ----- Real instructions -----
+    if name in SPECIAL_FUNCT:
+        encode_special(asm, section, src, name, operands)
+        return
+
+    if name in REGIMM_RT:
+        encode_regimm(asm, section, src, name, operands)
+        return
+
+    if name in MAJOR:
+        op = MAJOR[name]
+        if name in ("j", "jal"):
+            encode_jtype(asm, section, src, name, op, operands)
+            return
+        if name in ("beq", "bne"):
+            encode_branch_2reg(asm, section, src, name, op, operands)
+            return
+        if name in ("blez", "bgtz"):
+            encode_branch_1reg(asm, section, src, name, op, operands)
+            return
+        if name in ("addi", "addiu", "slti", "sltiu"):
+            encode_arith_imm(asm, section, src, name, op, operands, signed=True)
+            return
+        if name in ("andi", "ori", "xori"):
+            encode_arith_imm(asm, section, src, name, op, operands, signed=False)
+            return
+        if name == "lui":
+            encode_lui(asm, section, src, op, operands)
+            return
+        if name in ("lb", "lh", "lw", "lbu", "lhu", "sb", "sh", "sw"):
+            encode_load_store(asm, section, src, name, op, operands)
+            return
+        if name in ("olb", "olh", "olw", "olbu", "olhu", "osb", "osh", "osw"):
+            encode_obj_ls(asm, section, src, name, op, operands)
+            return
+        if name == "send":
+            encode_send_inst(asm, section, src, operands)
+            return
+        if name == "call":
+            encode_call(asm, section, src, operands)
+            return
+
+    if name in OBJECT_FUNCT:
+        encode_object_rr(asm, section, src, name, operands)
+        return
+
+    raise AsmError(f"unknown mnemonic {name!r}", file, line, col)
+
+
+def emit_const(asm: Assembler, section: str, file: str, line: int, col: int,
+               mnemonic: str, word: int, pretty: Optional[str] = None) -> None:
+    inst = emit(asm, section, file, line, col, mnemonic, [], lambda i, a: word)
+    inst.encoded = word
+    if pretty is not None:
+        inst.pretty = pretty
+
+
+# ---- SPECIAL (R-type) ----
+
+def encode_special(asm: Assembler, section: str, src: SourceLine,
+                   name: str, operands) -> None:
+    file, line = src.file, src.line
+    funct = SPECIAL_FUNCT[name]
+
+    if name in ("sll", "srl", "sra"):
+        # rd, rt, shamt
+        if len(operands) != 3:
+            raise AsmError(f"{name} expects 3 operands", file, line, 1)
+        rd = parse_gpr(_need_one_token(operands[0], file, line, "rd").text,
+                       file, line, operands[0][0].col)
+        rt = parse_gpr(_need_one_token(operands[1], file, line, "rt").text,
+                       file, line, operands[1][0].col)
+        sh = parse_imm_operand(operands[2], file, line)
+        if not (0 <= sh <= 31):
+            raise AsmError(f"shift amount {sh} out of range",
+                           file, line, operands[2][0].col)
+        word = encode_r(0, 0, rt, rd, sh, funct)
+        emit_const(asm, section, file, line, 1, name, word)
+        return
+
+    if name in ("sllv", "srlv", "srav"):
+        if len(operands) != 3:
+            raise AsmError(f"{name} expects 3 operands", file, line, 1)
+        rd = parse_gpr(_need_one_token(operands[0], file, line, "rd").text,
+                       file, line, operands[0][0].col)
+        rt = parse_gpr(_need_one_token(operands[1], file, line, "rt").text,
+                       file, line, operands[1][0].col)
+        rs = parse_gpr(_need_one_token(operands[2], file, line, "rs").text,
+                       file, line, operands[2][0].col)
+        word = encode_r(0, rs, rt, rd, 0, funct)
+        emit_const(asm, section, file, line, 1, name, word)
+        return
+
+    if name == "jr":
+        if len(operands) != 1:
+            raise AsmError("jr expects 1 operand", file, line, 1)
+        rs = parse_gpr(_need_one_token(operands[0], file, line, "rs").text,
+                       file, line, operands[0][0].col)
+        word = encode_r(0, rs, 0, 0, 0, funct)
+        emit_const(asm, section, file, line, 1, name, word)
+        return
+
+    if name == "jalr":
+        # JALR rd, rs   or   JALR rs (implies rd=r31)
+        if len(operands) == 1:
+            rs = parse_gpr(_need_one_token(operands[0], file, line, "rs").text,
+                           file, line, operands[0][0].col)
+            rd = 31
+        elif len(operands) == 2:
+            rd = parse_gpr(_need_one_token(operands[0], file, line, "rd").text,
+                           file, line, operands[0][0].col)
+            rs = parse_gpr(_need_one_token(operands[1], file, line, "rs").text,
+                           file, line, operands[1][0].col)
+        else:
+            raise AsmError("jalr expects 1 or 2 operands", file, line, 1)
+        word = encode_r(0, rs, 0, rd, 0, funct)
+        emit_const(asm, section, file, line, 1, name, word)
+        return
+
+    if name in ("mfhi", "mflo"):
+        if len(operands) != 1:
+            raise AsmError(f"{name} expects 1 operand", file, line, 1)
+        rd = parse_gpr(_need_one_token(operands[0], file, line, "rd").text,
+                       file, line, operands[0][0].col)
+        word = encode_r(0, 0, 0, rd, 0, funct)
+        emit_const(asm, section, file, line, 1, name, word)
+        return
+
+    if name in ("mult", "multu", "div", "divu"):
+        # rs, rt
+        if len(operands) != 2:
+            raise AsmError(f"{name} expects 2 operands", file, line, 1)
+        rs = parse_gpr(_need_one_token(operands[0], file, line, "rs").text,
+                       file, line, operands[0][0].col)
+        rt = parse_gpr(_need_one_token(operands[1], file, line, "rt").text,
+                       file, line, operands[1][0].col)
+        word = encode_r(0, rs, rt, 0, 0, funct)
+        emit_const(asm, section, file, line, 1, name, word)
+        return
+
+    # Three-operand register-register ops.
+    if len(operands) != 3:
+        raise AsmError(f"{name} expects 3 operands", file, line, 1)
+    rd = parse_gpr(_need_one_token(operands[0], file, line, "rd").text,
+                   file, line, operands[0][0].col)
+    rs = parse_gpr(_need_one_token(operands[1], file, line, "rs").text,
+                   file, line, operands[1][0].col)
+    rt = parse_gpr(_need_one_token(operands[2], file, line, "rt").text,
+                   file, line, operands[2][0].col)
+    word = encode_r(0, rs, rt, rd, 0, funct)
+    emit_const(asm, section, file, line, 1, name, word)
+
+
+# ---- REGIMM (BLTZ/BGEZ/BLTZAL/BGEZAL) ----
+
+def encode_regimm(asm: Assembler, section: str, src: SourceLine,
+                  name: str, operands) -> None:
+    file, line = src.file, src.line
+    rt_subcode = REGIMM_RT[name]
+    if len(operands) != 2:
+        raise AsmError(f"{name} expects 2 operands (rs, label)", file, line, 1)
+    rs = parse_gpr(_need_one_token(operands[0], file, line, "rs").text,
+                   file, line, operands[0][0].col)
+    label_tok = _need_one_token(operands[1], file, line, "label")
+    if label_tok.kind != "sym":
+        raise AsmError(f"{name}: second operand must be a label",
+                       file, line, label_tok.col)
+
+    inst = emit(asm, section, file, line, 1, name, [],
+                make_branch_encoder(0x01, rs, rt_subcode, label_tok.text, label_tok.col))
+    inst.label_target = label_tok.text
+
+
+def make_branch_encoder(opcode: int, rs: int, rt: int, label: str, col: int):
+    def enc(inst: Inst, asm: Assembler) -> int:
+        target = lookup_label_in_text(asm, label, inst.file, inst.line, col)
+        # Displacement from delay-slot (PC+4 of branch) in words.
+        disp_bytes = target - (inst.offset + 4)
+        if disp_bytes % 4:
+            raise AsmError(f"branch target not 4-byte aligned",
+                           inst.file, inst.line, col)
+        disp_words = disp_bytes // 4
+        if not (-(1 << 15) <= disp_words <= (1 << 15) - 1):
+            raise AsmError(f"branch displacement {disp_words} out of 16-bit signed range",
+                           inst.file, inst.line, col)
+        return encode_i(opcode, rs, rt, disp_words & 0xFFFF)
+    return enc
+
+
+def emit_branch_pseudo(asm: Assembler, section: str, src: SourceLine,
+                       pseudo_name: str, real_name: str, rs: int, rt: int,
+                       label_tok: Token) -> None:
+    file, line = src.file, src.line
+    if label_tok.kind != "sym":
+        raise AsmError(f"{pseudo_name}: operand must be a label",
+                       file, line, label_tok.col)
+    op = MAJOR[real_name]
+    inst = emit(asm, section, file, line, label_tok.col, pseudo_name, [],
+                make_branch_encoder(op, rs, rt, label_tok.text, label_tok.col))
+    inst.label_target = label_tok.text
+
+
+def encode_branch_2reg(asm: Assembler, section: str, src: SourceLine,
+                       name: str, op: int, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 3:
+        raise AsmError(f"{name} expects 3 operands", file, line, 1)
+    rs = parse_gpr(_need_one_token(operands[0], file, line, "rs").text,
+                   file, line, operands[0][0].col)
+    rt = parse_gpr(_need_one_token(operands[1], file, line, "rt").text,
+                   file, line, operands[1][0].col)
+    label_tok = _need_one_token(operands[2], file, line, "label")
+    if label_tok.kind != "sym":
+        raise AsmError(f"{name}: third operand must be a label",
+                       file, line, label_tok.col)
+    inst = emit(asm, section, file, line, 1, name, [],
+                make_branch_encoder(op, rs, rt, label_tok.text, label_tok.col))
+    inst.label_target = label_tok.text
+
+
+def encode_branch_1reg(asm: Assembler, section: str, src: SourceLine,
+                       name: str, op: int, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 2:
+        raise AsmError(f"{name} expects 2 operands", file, line, 1)
+    rs = parse_gpr(_need_one_token(operands[0], file, line, "rs").text,
+                   file, line, operands[0][0].col)
+    label_tok = _need_one_token(operands[1], file, line, "label")
+    if label_tok.kind != "sym":
+        raise AsmError(f"{name}: second operand must be a label",
+                       file, line, label_tok.col)
+    inst = emit(asm, section, file, line, 1, name, [],
+                make_branch_encoder(op, rs, 0, label_tok.text, label_tok.col))
+    inst.label_target = label_tok.text
+
+
+# ---- J-type (J/JAL) ----
+
+def encode_jtype(asm: Assembler, section: str, src: SourceLine,
+                 name: str, op: int, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 1:
+        raise AsmError(f"{name} expects 1 label operand", file, line, 1)
+    label_tok = _need_one_token(operands[0], file, line, "label")
+    if label_tok.kind != "sym":
+        raise AsmError(f"{name}: operand must be a label",
+                       file, line, label_tok.col)
+    inst = emit(asm, section, file, line, label_tok.col, name, [],
+                make_jtype_encoder(op, label_tok.text, label_tok.col))
+    inst.label_target = label_tok.text
+
+
+def make_jtype_encoder(op: int, label: str, col: int):
+    def enc(inst: Inst, asm: Assembler) -> int:
+        # Label address = its byte offset within text + the loaded base 0x10000.
+        # The architectural rule is: the high 4 bits of the resulting target
+        # address come from the high 4 bits of the delay-slot's PC. Within a
+        # single 256MB region (bits 28-31 fixed), the absolute word index is
+        # the 26-bit field. Since text loads at 0x10000, both the delay slot
+        # and the label live in the same 256MB region, so we encode the
+        # absolute word index of the *target* and rely on the upper-4-bits
+        # rule on the simulator side.
+        target = lookup_label_in_text(asm, label, inst.file, inst.line, col)
+        target_addr = 0x00010000 + target  # absolute byte address of target
+        if target_addr & 3:
+            raise AsmError(f"jump target not 4-byte aligned",
+                           inst.file, inst.line, col)
+        ds_addr = 0x00010000 + inst.offset + 4
+        if (target_addr & 0xF000_0000) != (ds_addr & 0xF000_0000):
+            raise AsmError(f"jump target outside 256MB region of delay slot",
+                           inst.file, inst.line, col)
+        word_index = (target_addr >> 2) & 0x03FF_FFFF
+        return encode_j(op, word_index)
+    return enc
+
+
+# ---- I-type arithmetic immediate ----
+
+def encode_arith_imm(asm: Assembler, section: str, src: SourceLine,
+                     name: str, op: int, operands, signed: bool) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 3:
+        raise AsmError(f"{name} expects 3 operands", file, line, 1)
+    rt = parse_gpr(_need_one_token(operands[0], file, line, "rt").text,
+                   file, line, operands[0][0].col)
+    rs = parse_gpr(_need_one_token(operands[1], file, line, "rs").text,
+                   file, line, operands[1][0].col)
+    imm = parse_imm_operand(operands[2], file, line)
+    if signed:
+        # Accept either signed or unsigned 16-bit pattern.
+        imm16 = check_simm_or_uimm(imm, 16, file, line, operands[2][0].col,
+                                   f"{name} immediate")
+    else:
+        # Bitwise ops: zero-extended; require 0..0xFFFF (or signed -32768..-1
+        # which we reinterpret as the same bit pattern).
+        imm16 = check_simm_or_uimm(imm, 16, file, line, operands[2][0].col,
+                                   f"{name} immediate")
+    word = encode_i(op, rs, rt, imm16)
+    emit_const(asm, section, file, line, 1, name, word)
+
+
+# ---- LUI ----
+
+def encode_lui(asm: Assembler, section: str, src: SourceLine,
+               op: int, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 2:
+        raise AsmError("lui expects 2 operands", file, line, 1)
+    rt = parse_gpr(_need_one_token(operands[0], file, line, "rt").text,
+                   file, line, operands[0][0].col)
+    imm = parse_imm_operand(operands[1], file, line)
+    imm16 = check_simm_or_uimm(imm, 16, file, line, operands[1][0].col, "lui immediate")
+    word = encode_i(op, 0, rt, imm16)
+    emit_const(asm, section, file, line, 1, "lui", word)
+
+
+# ---- General loads/stores ----
+
+def encode_load_store(asm: Assembler, section: str, src: SourceLine,
+                      name: str, op: int, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 2:
+        raise AsmError(f"{name} expects `rt, offset(rs)`", file, line, 1)
+    rt = parse_gpr(_need_one_token(operands[0], file, line, "rt").text,
+                   file, line, operands[0][0].col)
+    offset_toks, base_tok = parse_mem_operand(operands[1], file, line)
+    if offset_toks:
+        if len(offset_toks) != 1 or offset_toks[0].kind not in ("num", "char"):
+            raise AsmError(f"{name}: offset must be a single integer literal",
+                           file, line, offset_toks[0].col)
+        off = parse_int(offset_toks[0].text, file, line, offset_toks[0].col)
+    else:
+        off = 0
+    rs = parse_gpr(base_tok.text, file, line, base_tok.col)
+    off16 = check_simm_or_uimm(off, 16, file, line, base_tok.col, f"{name} offset")
+    word = encode_i(op, rs, rt, off16)
+    emit_const(asm, section, file, line, 1, name, word)
+
+
+# ---- Object loads/stores ----
+
+def encode_obj_ls(asm: Assembler, section: str, src: SourceLine,
+                  name: str, op: int, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 2:
+        raise AsmError(f"{name} expects `rt, offset(os)`", file, line, 1)
+    rt = parse_gpr(_need_one_token(operands[0], file, line, "rt").text,
+                   file, line, operands[0][0].col)
+    offset_toks, base_tok = parse_mem_operand(operands[1], file, line)
+    if offset_toks:
+        if len(offset_toks) != 1 or offset_toks[0].kind not in ("num", "char"):
+            raise AsmError(f"{name}: offset must be a single integer literal",
+                           file, line, offset_toks[0].col)
+        off = parse_int(offset_toks[0].text, file, line, offset_toks[0].col)
+    else:
+        off = 0
+    os_ = parse_obj(base_tok.text, file, line, base_tok.col)
+    off16 = check_simm_or_uimm(off, 16, file, line, base_tok.col, f"{name} offset")
+    word = encode_o_ls(op, os_, rt, off16)
+    emit_const(asm, section, file, line, 1, name, word)
+
+
+# ---- O-type register-register (OBJECT funct codes) ----
+
+def encode_object_rr(asm: Assembler, section: str, src: SourceLine,
+                     name: str, operands) -> None:
+    file, line = src.file, src.line
+    funct = OBJECT_FUNCT[name]
+    op = 0x30  # OBJECT major opcode
+
+    def gpr0(g):
+        t = _need_one_token(g, file, line, "register")
+        return parse_gpr(t.text, file, line, t.col)
+
+    def obj0(g):
+        t = _need_one_token(g, file, line, "object register")
+        return parse_obj(t.text, file, line, t.col)
+
+    if name == "omov":
+        if len(operands) != 2:
+            raise AsmError("omov expects 2 operands", file, line, 1)
+        od = obj0(operands[0])
+        os_ = obj0(operands[1])
+        word = encode_o_rr(op, od, os_, 0, 0, funct)
+    elif name == "onull":
+        if len(operands) != 1:
+            raise AsmError("onull expects 1 operand", file, line, 1)
+        od = obj0(operands[0])
+        word = encode_o_rr(op, od, 0, 0, 0, funct)
+    elif name == "oeq":
+        if len(operands) != 3:
+            raise AsmError("oeq expects 3 operands", file, line, 1)
+        rd = gpr0(operands[0])
+        os_ = obj0(operands[1])
+        ot = obj0(operands[2])
+        word = encode_o_rr(op, os_, ot, rd, 0, funct)
+    else:  # oisn, olen, otag, ohome, ocap
+        if len(operands) != 2:
+            raise AsmError(f"{name} expects 2 operands", file, line, 1)
+        rd = gpr0(operands[0])
+        os_ = obj0(operands[1])
+        word = encode_o_rr(op, os_, 0, rd, 0, funct)
+
+    emit_const(asm, section, file, line, 1, name, word)
+
+
+# ---- SEND ----
+
+def encode_send_inst(asm: Assembler, section: str, src: SourceLine, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 1:
+        raise AsmError("send expects 1 object register", file, line, 1)
+    t = _need_one_token(operands[0], file, line, "object register")
+    os_ = parse_obj(t.text, file, line, t.col)
+    word = encode_send(os_)
+    emit_const(asm, section, file, line, 1, "send", word)
+
+
+# ---- CALL ----
+
+def encode_call(asm: Assembler, section: str, src: SourceLine, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 1:
+        raise AsmError("call expects 1 immediate operand", file, line, 1)
+    g = list(operands[0])
+    # Strip optional leading '#' sigil.
+    if g and g[0].kind == "hash":
+        g = g[1:]
+    if len(g) != 1 or g[0].kind not in ("num", "char"):
+        raise AsmError("call: expected an integer primitive number",
+                       file, line, g[0].col if g else 1)
+    imm = parse_int(g[0].text, file, line, g[0].col)
+    if not (0 <= imm < (1 << 26)):
+        raise AsmError(f"call: primitive number {imm} out of range",
+                       file, line, g[0].col)
+    word = encode_j(MAJOR["call"], imm)
+    emit_const(asm, section, file, line, 1, "call", word)
+
+
+# ---- li / la ----
+
+def emit_li(asm: Assembler, section: str, file: str, line: int, col: int,
+            rd: int, imm: int) -> None:
+    """Materialize a 32-bit constant into rd.
+
+    Per CONTRACT.md Section 4.4: if `imm` fits in a sign-extended 16-bit
+    field, emit `addiu rd, r0, imm`. Otherwise, emit `lui` then `ori`,
+    where the upper half is adjusted by +1 if the lower half (when
+    sign-extended) is negative — i.e., the lower half is unsigned, the
+    upper half compensates for the sign extension that ADDIU would do.
+    """
+    if -(1 << 15) <= imm <= (1 << 15) - 1:
+        word = encode_i(MAJOR["addiu"], 0, rd, imm & 0xFFFF)
+        emit_const(asm, section, file, line, col, "li", word,
+                   pretty=f"li r{rd}, {imm}")
+        return
+
+    # Treat as 32-bit unsigned bit pattern.
+    if not (-(1 << 31) <= imm <= 0xFFFF_FFFF):
+        raise AsmError(f"li: immediate {imm} out of 32-bit range",
+                       file, line, col)
+    u = imm & 0xFFFF_FFFF
+    hi = (u >> 16) & 0xFFFF
+    lo = u & 0xFFFF
+    # ORI is zero-extended, so lo is loaded directly. If hi was computed
+    # via the (LUI + ADDIU) pattern instead, we would need the +1 adjust
+    # when lo's sign bit is set. We use LUI+ORI, which has no such issue;
+    # hi and lo are independent.
+    lui_w = encode_i(MAJOR["lui"], 0, rd, hi)
+    ori_w = encode_i(MAJOR["ori"], rd, rd, lo)
+    emit_const(asm, section, file, line, col, "li", lui_w,
+               pretty=f"lui r{rd}, 0x{hi:04X}")
+    emit_const(asm, section, file, line, col, "li", ori_w,
+               pretty=f"ori r{rd}, r{rd}, 0x{lo:04X}")
+
+
+def emit_la(asm: Assembler, section: str, file: str, line: int, col: int,
+            rd: int, label: str) -> None:
+    """Load address of a label into a GPR via deferred LUI/ORI emission.
+
+    We always reserve two instruction words; if the resolved address
+    fits in 16 signed bits, the second word is a NOP-style ori with 0,
+    which keeps the IR layout fixed across passes.
+
+    Actually — to keep the contract clean (`la` == `li imm`), we expand
+    to a fixed two-instruction sequence: `lui rd, hi` followed by
+    `ori rd, rd, lo`. This is one extra instruction in the rare case
+    that the address is small, but it makes pass 1 deterministic.
+    """
+    # Reserve two slots; resolve in pass 2 by referencing the symbol table.
+    # Use a closure-style encoder that rewrites both words.
+    # We track the pair via a shared dict so the second encoder reads what
+    # the first emitted.
+    state = {}
+
+    def enc1(inst: Inst, asm: Assembler) -> int:
+        sec, off = lookup_label(asm, label, inst.file, inst.line, col)
+        addr = section_base(sec) + off
+        state["addr"] = addr & 0xFFFF_FFFF
+        hi = (state["addr"] >> 16) & 0xFFFF
+        return encode_i(MAJOR["lui"], 0, rd, hi)
+
+    def enc2(inst: Inst, asm: Assembler) -> int:
+        if "addr" not in state:
+            # If for any reason enc1 wasn't called first (shouldn't happen),
+            # resolve now.
+            sec, off = lookup_label(asm, label, inst.file, inst.line, col)
+            state["addr"] = (section_base(sec) + off) & 0xFFFF_FFFF
+        lo = state["addr"] & 0xFFFF
+        return encode_i(MAJOR["ori"], rd, rd, lo)
+
+    inst1 = emit(asm, section, file, line, col, "la", [], enc1)
+    inst1.label_target = label
+    emit(asm, section, file, line, col, "la", [], enc2)
+
+
+# ---------------------------------------------------------------------------
+# Pass 2 helpers — label lookup and section base addresses.
+
+# Section base virtual addresses (CONTRACT.md Section 2):
+TEXT_BASE = 0x00010000
+DATA_BASE = 0x00040000
+
+
+def section_base(sec: str) -> int:
+    return TEXT_BASE if sec == "text" else DATA_BASE
+
+
+def lookup_label(asm: Assembler, name: str, file: str, line: int,
+                 col: int) -> tuple[str, int]:
+    if name not in asm.labels:
+        raise AsmError(f"undefined label {name!r}", file, line, col)
+    return asm.labels[name]
+
+
+def lookup_label_in_text(asm: Assembler, name: str, file: str, line: int,
+                         col: int) -> int:
+    sec, off = lookup_label(asm, name, file, line, col)
+    if sec != "text":
+        raise AsmError(f"label {name!r} is in {sec} section, expected text",
+                       file, line, col)
+    return off
+
+
+# ---------------------------------------------------------------------------
+# Pass 2: encode all instructions and produce final byte stream.
+
+def assemble(paths: list[Path]) -> bytes:
+    lines = read_lines(paths)
+    asm = pass1(lines)
+
+    # Resolve entry offset.
+    entry_offset = 0
+    if asm.entry_label is not None:
+        sec, off = lookup_label(asm, asm.entry_label,
+                                asm.entry_file or "?",
+                                asm.entry_line or 0, 1)
+        if sec != "text":
+            raise AsmError(f".entry {asm.entry_label!r} must be in .text section",
+                           asm.entry_file or "?", asm.entry_line or 0, 1)
+        entry_offset = off
+
+    # Encode text section.
+    text_bytes = bytearray()
+    for item in asm.text:
+        if isinstance(item, DataBlob):
+            # We don't allow .byte/.word in .text in this implementation.
+            text_bytes += item.data
+            continue
+        word = item.encoder(item, asm)
+        item.encoded = word
+        text_bytes += struct.pack(">I", word & 0xFFFF_FFFF)
+
+    # Encode data section.
+    data_bytes = bytearray()
+    for item in asm.data:
+        if isinstance(item, DataBlob):
+            data_bytes += item.data
+        else:
+            # Should not happen — .text directives never end up in .data.
+            raise AsmError("instruction emitted in data section",
+                           item.file, item.line, item.col)
+
+    if len(text_bytes) % 4:
+        raise AsmError(f"text size {len(text_bytes)} is not multiple of 4")
+
+    # Build header.
+    hdr = (
+        MAGIC +
+        struct.pack(">I", FORMAT_VERSION) +
+        struct.pack(">I", 0) +                # flags
+        struct.pack(">I", entry_offset) +
+        struct.pack(">I", len(text_bytes)) +
+        struct.pack(">I", len(data_bytes)) +
+        struct.pack(">I", 0)                  # stack_size = 0 -> loader default
+    )
+    assert len(hdr) == HEADER_SIZE
+    return bytes(hdr) + bytes(text_bytes) + bytes(data_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Disassembler
+
+GPR_NAMES = ["zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+             "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+             "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+             "t8", "t9", "t10", "t11", "t12", "sp", "fp", "ra"]
+
+
+def gpr_name(n: int) -> str:
+    return f"r{n}"  # canonical numeric form for round-trip stability
+
+
+def obj_name(n: int) -> str:
+    return f"o{n}"
+
+
+# Reverse maps for decoding.
+SPECIAL_FUNCT_REV = {v: k for k, v in SPECIAL_FUNCT.items()}
+MAJOR_REV = {v: k for k, v in MAJOR.items()}
+REGIMM_RT_REV = {v: k for k, v in REGIMM_RT.items()}
+OBJECT_FUNCT_REV = {v: k for k, v in OBJECT_FUNCT.items()}
+
+
+def disasm_word(word: int, pc: int = 0,
+                targets: Optional[dict] = None) -> str:
+    word &= 0xFFFF_FFFF
+    op = (word >> 26) & 0x3F
+    if op == 0x00:
+        return disasm_special(word)
+    if op == 0x01:
+        return disasm_regimm(word, pc, targets)
+    if op in (0x02, 0x03):
+        return disasm_jtype(word, pc, targets)
+    if op in (0x04, 0x05):
+        return disasm_branch_2reg(word, op, pc, targets)
+    if op in (0x06, 0x07):
+        return disasm_branch_1reg(word, op, pc, targets)
+    if op in (0x08, 0x09, 0x0A, 0x0B):
+        return disasm_arith_imm(word, op, signed=True)
+    if op in (0x0C, 0x0D, 0x0E):
+        return disasm_arith_imm(word, op, signed=False)
+    if op == 0x0F:
+        return disasm_lui(word)
+    if op in (0x20, 0x21, 0x23, 0x24, 0x25, 0x28, 0x29, 0x2B):
+        return disasm_load_store(word, op)
+    if op == 0x30:
+        return disasm_object_rr(word)
+    if op in (0x31, 0x32, 0x33, 0x34, 0x35, 0x38, 0x39, 0x3B):
+        return disasm_obj_ls(word, op)
+    if op == 0x3C:
+        return disasm_send(word)
+    if op == 0x3D:
+        return disasm_call(word)
+    return f".word 0x{word:08x}  ; reserved opcode 0x{op:02x}"
+
+
+def _branch_target_str(pc: int, target_off: int, targets: Optional[dict]) -> str:
+    """Return either a label name or a raw absolute hex address for the target.
+    `target_off` is the byte offset within .text."""
+    if targets is not None and target_off in targets:
+        return targets[target_off]
+    return f"0x{TEXT_BASE + target_off:08x}"
+
+
+def field(word: int, hi: int, lo: int) -> int:
+    width = hi - lo + 1
+    return (word >> lo) & ((1 << width) - 1)
+
+
+def sxt(value: int, width: int) -> int:
+    sign = 1 << (width - 1)
+    return (value ^ sign) - sign
+
+
+def disasm_special(word: int) -> str:
+    rs = field(word, 25, 21)
+    rt = field(word, 20, 16)
+    rd = field(word, 15, 11)
+    sh = field(word, 10, 6)
+    fn = field(word, 5, 0)
+
+    if fn not in SPECIAL_FUNCT_REV:
+        return f".word 0x{word:08x}  ; reserved SPECIAL funct 0x{fn:02x}"
+    name = SPECIAL_FUNCT_REV[fn]
+
+    if name == "sll" and rs == 0 and rt == 0 and rd == 0 and sh == 0:
+        return "nop"
+    if name in ("sll", "srl", "sra"):
+        return f"{name} {gpr_name(rd)}, {gpr_name(rt)}, {sh}"
+    if name in ("sllv", "srlv", "srav"):
+        return f"{name} {gpr_name(rd)}, {gpr_name(rt)}, {gpr_name(rs)}"
+    if name == "jr":
+        return f"jr {gpr_name(rs)}"
+    if name == "jalr":
+        if rd == 31:
+            return f"jalr {gpr_name(rs)}"
+        return f"jalr {gpr_name(rd)}, {gpr_name(rs)}"
+    if name in ("mfhi", "mflo"):
+        return f"{name} {gpr_name(rd)}"
+    if name in ("mult", "multu", "div", "divu"):
+        return f"{name} {gpr_name(rs)}, {gpr_name(rt)}"
+    # Default 3-operand form (add, addu, sub, subu, and, or, xor, nor, slt, sltu)
+    return f"{name} {gpr_name(rd)}, {gpr_name(rs)}, {gpr_name(rt)}"
+
+
+def disasm_regimm(word: int, pc: int, targets: Optional[dict]) -> str:
+    rs = field(word, 25, 21)
+    rt = field(word, 20, 16)
+    imm = sxt(field(word, 15, 0), 16)
+    if rt not in REGIMM_RT_REV:
+        return f".word 0x{word:08x}  ; reserved REGIMM rt 0x{rt:02x}"
+    name = REGIMM_RT_REV[rt]
+    target_off = (pc - TEXT_BASE) + 4 + imm * 4
+    return f"{name} {gpr_name(rs)}, {_branch_target_str(pc, target_off, targets)}"
+
+
+def disasm_jtype(word: int, pc: int, targets: Optional[dict]) -> str:
+    op = (word >> 26) & 0x3F
+    name = MAJOR_REV[op]
+    target_word = field(word, 25, 0)
+    ds = pc + 4
+    target_addr = (ds & 0xF000_0000) | (target_word << 2)
+    target_off = target_addr - TEXT_BASE
+    if targets is not None and target_off in targets:
+        return f"{name} {targets[target_off]}"
+    return f"{name} 0x{target_addr:08x}"
+
+
+def disasm_branch_2reg(word: int, op: int, pc: int,
+                       targets: Optional[dict]) -> str:
+    name = MAJOR_REV[op]
+    rs = field(word, 25, 21)
+    rt = field(word, 20, 16)
+    imm = sxt(field(word, 15, 0), 16)
+    target_off = (pc - TEXT_BASE) + 4 + imm * 4
+    return (f"{name} {gpr_name(rs)}, {gpr_name(rt)}, "
+            f"{_branch_target_str(pc, target_off, targets)}")
+
+
+def disasm_branch_1reg(word: int, op: int, pc: int,
+                       targets: Optional[dict]) -> str:
+    name = MAJOR_REV[op]
+    rs = field(word, 25, 21)
+    imm = sxt(field(word, 15, 0), 16)
+    target_off = (pc - TEXT_BASE) + 4 + imm * 4
+    return (f"{name} {gpr_name(rs)}, "
+            f"{_branch_target_str(pc, target_off, targets)}")
+
+
+def disasm_arith_imm(word: int, op: int, signed: bool) -> str:
+    name = MAJOR_REV[op]
+    rs = field(word, 25, 21)
+    rt = field(word, 20, 16)
+    imm = field(word, 15, 0)
+    if signed:
+        return f"{name} {gpr_name(rt)}, {gpr_name(rs)}, {sxt(imm, 16)}"
+    return f"{name} {gpr_name(rt)}, {gpr_name(rs)}, 0x{imm:04x}"
+
+
+def disasm_lui(word: int) -> str:
+    rt = field(word, 20, 16)
+    imm = field(word, 15, 0)
+    return f"lui {gpr_name(rt)}, 0x{imm:04x}"
+
+
+def disasm_load_store(word: int, op: int) -> str:
+    name = MAJOR_REV[op]
+    rs = field(word, 25, 21)
+    rt = field(word, 20, 16)
+    imm = sxt(field(word, 15, 0), 16)
+    return f"{name} {gpr_name(rt)}, {imm}({gpr_name(rs)})"
+
+
+def disasm_object_rr(word: int) -> str:
+    os_ = field(word, 25, 22)
+    ot = field(word, 21, 18)
+    rd = field(word, 17, 13)
+    rs = field(word, 12, 8)
+    fn = field(word, 7, 4)
+    if fn not in OBJECT_FUNCT_REV:
+        return f".word 0x{word:08x}  ; reserved OBJECT funct 0x{fn:01x}"
+    name = OBJECT_FUNCT_REV[fn]
+    if name == "omov":
+        return f"omov {obj_name(os_)}, {obj_name(ot)}"
+    if name == "onull":
+        return f"onull {obj_name(os_)}"
+    if name == "oeq":
+        return f"oeq {gpr_name(rd)}, {obj_name(os_)}, {obj_name(ot)}"
+    # oisn, olen, otag, ohome, ocap
+    return f"{name} {gpr_name(rd)}, {obj_name(os_)}"
+
+
+def disasm_obj_ls(word: int, op: int) -> str:
+    name = MAJOR_REV[op]
+    os_ = field(word, 25, 22)
+    rt = field(word, 20, 16)  # low 5 bits — high bit (21) is reserved
+    imm = sxt(field(word, 15, 0), 16)
+    return f"{name} {gpr_name(rt)}, {imm}({obj_name(os_)})"
+
+
+def disasm_send(word: int) -> str:
+    os_ = field(word, 25, 22)
+    return f"send {obj_name(os_)}"
+
+
+def disasm_call(word: int) -> str:
+    n = field(word, 25, 0)
+    return f"call #0x{n:x}"
+
+
+# ---------------------------------------------------------------------------
+# .orx file readers for --disasm and --hex.
+
+@dataclass
+class OrxImage:
+    entry_offset: int
+    text: bytes
+    data: bytes
+    flags: int = 0
+    stack_size: int = 0
+
+
+def load_orx(path: Path) -> OrxImage:
+    blob = path.read_bytes()
+    if len(blob) < HEADER_SIZE:
+        raise AsmError(f"{path}: file too short to contain header")
+    if blob[:8] != MAGIC:
+        raise AsmError(f"{path}: bad magic; not an .orx file")
+    version, flags, entry, tsize, dsize, stack = struct.unpack(
+        ">IIIIII", blob[8:HEADER_SIZE])
+    if version != FORMAT_VERSION:
+        raise AsmError(f"{path}: unsupported format version {version}")
+    if HEADER_SIZE + tsize + dsize != len(blob):
+        raise AsmError(f"{path}: file size {len(blob)} does not match header "
+                       f"(expected {HEADER_SIZE + tsize + dsize})")
+    if tsize % 4:
+        raise AsmError(f"{path}: text size {tsize} not a multiple of 4")
+    text = blob[HEADER_SIZE:HEADER_SIZE + tsize]
+    data = blob[HEADER_SIZE + tsize:]
+    return OrxImage(entry_offset=entry, text=text, data=data,
+                    flags=flags, stack_size=stack)
+
+
+def disasm_image(img: OrxImage) -> str:
+    """Disassemble an image, generating synthetic labels (`L_xxxx`) for any
+    text-section byte offset that is the target of a branch or jump. The
+    resulting output reassembles to the same byte-for-byte image."""
+    targets: dict[int, str] = {}
+
+    def remember(off: int) -> str:
+        if off not in targets:
+            targets[off] = f"L_{off:04x}"
+        return targets[off]
+
+    # First pass: scan for branch/jump targets.
+    for off in range(0, len(img.text), 4):
+        word = struct.unpack(">I", img.text[off:off + 4])[0]
+        op = (word >> 26) & 0x3F
+        if op in (0x04, 0x05, 0x06, 0x07):  # BEQ, BNE, BLEZ, BGTZ
+            disp = sxt(field(word, 15, 0), 16)
+            t = off + 4 + disp * 4
+            if 0 <= t < len(img.text):
+                remember(t)
+        elif op == 0x01:  # REGIMM
+            disp = sxt(field(word, 15, 0), 16)
+            t = off + 4 + disp * 4
+            if 0 <= t < len(img.text):
+                remember(t)
+        elif op in (0x02, 0x03):  # J, JAL
+            ds = TEXT_BASE + off + 4
+            tw = field(word, 25, 0)
+            target_addr = (ds & 0xF000_0000) | (tw << 2)
+            t = target_addr - TEXT_BASE
+            if 0 <= t < len(img.text):
+                remember(t)
+
+    # Always label the entry.
+    entry_label = remember(img.entry_offset)
+
+    out: list[str] = []
+    out.append(f"; entry_offset = 0x{img.entry_offset:x}")
+    out.append(f"; text_size    = {len(img.text)} bytes")
+    out.append(f"; data_size    = {len(img.data)} bytes")
+    out.append(f".entry {entry_label}")
+    out.append("")
+    out.append(".text")
+
+    for off in range(0, len(img.text), 4):
+        if off in targets:
+            out.append(f"{targets[off]}:")
+        word = struct.unpack(">I", img.text[off:off + 4])[0]
+        pc = TEXT_BASE + off
+        out.append(f"    {disasm_word(word, pc, targets)}")
+
+    if img.data:
+        out.append("")
+        out.append(".data")
+        for i in range(0, len(img.data), 16):
+            chunk = img.data[i:i + 16]
+            parts = ", ".join(f"0x{b:02x}" for b in chunk)
+            out.append(f"    .byte {parts}")
+    return "\n".join(out) + "\n"
+
+
+def hex_dump(img: OrxImage) -> str:
+    out: list[str] = []
+    out.append("; ----- header -----")
+    raw_hdr = (
+        MAGIC +
+        struct.pack(">I", FORMAT_VERSION) +
+        struct.pack(">I", img.flags) +
+        struct.pack(">I", img.entry_offset) +
+        struct.pack(">I", len(img.text)) +
+        struct.pack(">I", len(img.data)) +
+        struct.pack(">I", img.stack_size)
+    )
+    for off in range(0, HEADER_SIZE, 8):
+        chunk = raw_hdr[off:off + 8]
+        out.append(f"  0x{off:04x}: " + " ".join(f"{b:02x}" for b in chunk))
+    out.append("; ----- text -----")
+    for off in range(0, len(img.text), 4):
+        word = struct.unpack(">I", img.text[off:off + 4])[0]
+        pc = TEXT_BASE + off
+        mnem = disasm_word(word, pc)
+        out.append(f"  text+0x{off:04x} (pc 0x{pc:08x}): "
+                   f"{word:08x}    ; {mnem}")
+    if img.data:
+        out.append("; ----- data -----")
+        for off in range(0, len(img.data), 16):
+            chunk = img.data[off:off + 16]
+            hex_part = " ".join(f"{b:02x}" for b in chunk)
+            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            out.append(f"  data+0x{off:04x}: {hex_part:<47s} |{ascii_part}|")
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Main
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="asmorisc",
+                                description="Object RISC assembler (.s -> .orx)")
+    p.add_argument("inputs", nargs="*", help="input .s files (concatenated)")
+    p.add_argument("-o", "--output", help="output .orx path")
+    p.add_argument("--disasm", metavar="FILE",
+                   help="disassemble an .orx and print to stdout")
+    p.add_argument("--hex", metavar="FILE",
+                   help="hex-dump an .orx with annotated mnemonics")
+    args = p.parse_args(argv)
+
+    if args.disasm:
+        try:
+            img = load_orx(Path(args.disasm))
+        except AsmError as e:
+            print(f"asmorisc: {e}", file=sys.stderr)
+            return 2
+        sys.stdout.write(disasm_image(img))
+        return 0
+
+    if args.hex:
+        try:
+            img = load_orx(Path(args.hex))
+        except AsmError as e:
+            print(f"asmorisc: {e}", file=sys.stderr)
+            return 2
+        sys.stdout.write(hex_dump(img))
+        return 0
+
+    if not args.inputs:
+        p.error("no input files (and neither --disasm nor --hex specified)")
+
+    inputs = [Path(x) for x in args.inputs]
+    for inp in inputs:
+        if not inp.exists():
+            print(f"asmorisc: {inp}: no such file", file=sys.stderr)
+            return 2
+
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        out_path = inputs[0].with_suffix(".orx")
+
+    try:
+        blob = assemble(inputs)
+    except AsmError as e:
+        print(f"asmorisc: error: {e}", file=sys.stderr)
+        return 1
+
+    out_path.write_bytes(blob)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

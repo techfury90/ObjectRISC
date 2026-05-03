@@ -1,0 +1,1221 @@
+#!/usr/bin/env python3
+"""simorisc — Object RISC instruction-set simulator.
+
+Loads an .orx binary per CONTRACT.md Section 1, sets up the initial task
+state per Section 2, and executes Object RISC instructions with the
+architectural semantics of Volume II. Implements the firmware primitives
+TaskExit (0x001), ObjAlloc (0x100), ObjFree (0x101), ObjDerive (0x103),
+InstallHandler (0x200), and ConsoleWrite (0x320). Every other CALL
+primitive returns R2 = ENOSYS.
+
+Multi-CPU mode (`--processors N`) instantiates N CPUs sharing a crossbar.
+The same .orx is loaded onto each CPU; they branch on R7 (PROCID).
+Each CPU also receives a "service" object: O4 = my own (full caps),
+O5..O5+N-2 = the other CPUs' service objects (R+S only). SEND through a
+remote object reference is queued to the home CPU's inbox; that CPU
+dispatches the registered handler when its main task is idle (one task
+per CPU at a time).
+
+The simulator models architectural ISA semantics, not microarchitecture:
+no pipeline, no caches, no real TLB. Architectural delay slots ARE
+honoured (branch decision committed before the delay-slot instruction
+executes). Cross-CPU OL/OS access is dispatched synchronously through
+the home CPU's local descriptor table.
+"""
+
+import argparse
+import struct
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MAGIC = b"ORISC\x00\x00\x00"
+
+# Capability bits (Volume III): R W X S V M C reserved (LSB to MSB).
+CAP_R = 1 << 0
+CAP_W = 1 << 1
+CAP_X = 1 << 2
+CAP_S = 1 << 3
+CAP_V = 1 << 4
+CAP_M = 1 << 5
+CAP_C = 1 << 6
+
+# Trap cause codes (Volume II Section 13).
+CAUSE_BUS_ERROR_I       = 0x02
+CAUSE_BUS_ERROR_D       = 0x03
+CAUSE_ADDR_MISALIGN_I   = 0x04
+CAUSE_ADDR_MISALIGN_D   = 0x05
+CAUSE_TLB_MISS_I        = 0x06
+CAUSE_TLB_MISS_D        = 0x07
+CAUSE_PAGE_PERMISSION   = 0x08
+CAUSE_ARITH_OVERFLOW    = 0x09
+CAUSE_RESERVED_INSTR    = 0x0A
+CAUSE_PRIV_INSTR        = 0x0B
+CAUSE_BREAKPOINT        = 0x0C
+CAUSE_NULL_DEREF        = 0x10
+CAUSE_STALE_REF         = 0x11
+CAUSE_BOUNDS            = 0x12
+CAUSE_CAP_VIOLATION     = 0x13
+CAUSE_SEND_OVERFLOW     = 0x14
+CAUSE_FIRMWARE_CALL     = 0x20
+CAUSE_RESERVED_CALL     = 0x21
+
+CAUSE_NAMES = {
+    CAUSE_BUS_ERROR_I:    "bus-error-i",
+    CAUSE_BUS_ERROR_D:    "bus-error-d",
+    CAUSE_ADDR_MISALIGN_I:"address-misaligned-i",
+    CAUSE_ADDR_MISALIGN_D:"address-misaligned-d",
+    CAUSE_TLB_MISS_I:     "tlb-miss-i",
+    CAUSE_TLB_MISS_D:     "tlb-miss-d",
+    CAUSE_PAGE_PERMISSION:"page-permission",
+    CAUSE_ARITH_OVERFLOW: "arithmetic-overflow",
+    CAUSE_RESERVED_INSTR: "reserved-instruction",
+    CAUSE_PRIV_INSTR:     "privileged-instruction",
+    CAUSE_BREAKPOINT:     "breakpoint",
+    CAUSE_NULL_DEREF:     "null-dereference",
+    CAUSE_STALE_REF:      "stale-reference",
+    CAUSE_BOUNDS:         "bounds-violation",
+    CAUSE_CAP_VIOLATION:  "capability-violation",
+    CAUSE_SEND_OVERFLOW:  "send-buffer-overflow",
+    CAUSE_FIRMWARE_CALL:  "firmware-call",
+    CAUSE_RESERVED_CALL:  "reserved-call",
+}
+
+# Standard firmware error codes (Volume VI Section 2.4).
+ERR_OK       = 0
+ERR_EINVAL   = 1
+ERR_ENOMEM   = 2
+ERR_EPERM    = 3
+ERR_ENOSYS   = 4
+ERR_EBUSY    = 5
+ERR_ENOENT   = 6
+ERR_ETIMEOUT = 7
+ERR_EFAULT   = 8
+ERR_EAGAIN   = 9
+ERR_ESTALE   = 10
+ERR_EREMOTE  = 11
+
+# Type tags reserved by the contract loader.
+TAG_CODE    = 0x4100
+TAG_STACK   = 0x4101
+TAG_DATA    = 0x4102
+TAG_SERVICE = 0x4103
+
+# Service object layout: 64 bytes, present on every CPU in multi-CPU mode.
+SERVICE_OBJ_SIZE = 64
+
+# ---------------------------------------------------------------------------
+# Object descriptor and reference layout
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Descriptor:
+    """An object descriptor in a CPU's local object table.
+
+    We don't model the 32-byte on-the-wire layout from Volume III Section
+    3.2 here; we keep the architecturally observable state in Python form
+    and rely on the generation-counter semantics to make accesses
+    cache-coherent (Volume III Section 4)."""
+    storage: bytearray
+    length: int
+    generation: int
+    type_tag: int
+    max_caps: int
+    flags: int = 0
+    live: bool = True
+    send_handler_ref: int = 0
+    send_handler_off: int = 0
+
+
+def make_ref(generation: int, home: int, index: int, caps: int) -> int:
+    """Pack a 64-bit object reference per Volume III Section 2.1.
+
+       63       48 47    40 39          16 15  8 7 0
+       generation  home pr  local idx     caps  rsv
+    """
+    assert 0 <= generation < (1 << 16)
+    assert 0 <= home < (1 << 8)
+    assert 0 <= index < (1 << 24)
+    assert 0 <= caps < (1 << 8)
+    return ((generation & 0xFFFF) << 48) | \
+           ((home       & 0xFF)   << 40) | \
+           ((index      & 0xFFFFFF) << 16) | \
+           ((caps       & 0xFF)   << 8)
+
+
+def ref_generation(ref: int) -> int:  return (ref >> 48) & 0xFFFF
+def ref_home(ref: int)       -> int:  return (ref >> 40) & 0xFF
+def ref_index(ref: int)      -> int:  return (ref >> 16) & 0xFFFFFF
+def ref_caps(ref: int)       -> int:  return (ref >>  8) & 0xFF
+
+
+# ---------------------------------------------------------------------------
+# Trap exception
+# ---------------------------------------------------------------------------
+
+class Trap(Exception):
+    def __init__(self, cause: int, faulting_pc: int, detail: str = ""):
+        self.cause = cause
+        self.faulting_pc = faulting_pc
+        self.detail = detail
+        super().__init__(f"trap {CAUSE_NAMES.get(cause, hex(cause))} @ "
+                         f"0x{faulting_pc:08x}: {detail}")
+
+
+class TaskExitSignal(Exception):
+    """Raised by primitive_TaskExit; caught by the System scheduler."""
+    def __init__(self, code: int):
+        self.code = code
+
+
+# ---------------------------------------------------------------------------
+# Pending SEND message (host-side representation of SEND_DELIVER)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PendingSend:
+    recipient_ref: int                   # full 64-bit ref of the target object
+    int_payload: List[int]               # 4 ints (R4..R7 of issuer at SEND time)
+    or_payload: List[int]                # 4 OR refs (O1..O4 of issuer at SEND time)
+    src_pid: int                         # which CPU issued this SEND
+
+
+# ---------------------------------------------------------------------------
+# CPU state (per-processor)
+# ---------------------------------------------------------------------------
+
+class CPU:
+    def __init__(self, pid: int = 0, system: Optional['System'] = None):
+        self.pid      = pid
+        self.system   = system
+
+        self.gpr      = [0] * 32          # R0..R31, R0 hardwired zero
+        self.opr      = [0] * 16          # O0..O15, O0 hardwired null
+        self.hi       = 0
+        self.lo       = 0
+        self.pc       = 0
+        self.next_pc  = 0
+        self.cycles   = 0
+
+        # Object table — local to this processor; remote references are
+        # routed through System.lookup_remote_descriptor().
+        self.descriptors: List[Optional[Descriptor]] = [None]  # idx 0 reserved
+        self.next_obj_idx = 1
+        # Reusable freed-slot list (FIFO); generation already incremented.
+        self.free_indices: List[int] = []
+
+        # Page-table substitute: VA range -> (descriptor index, base offset, prot).
+        self.mappings: List[Tuple[int,int,int,int,int]] = []
+
+        # Multi-CPU bookkeeping.
+        self.active = False                  # True when a task is running
+        self.exit_code: Optional[int] = None # set by TaskExit
+        self.inbox: List[PendingSend] = []   # SEND_DELIVERs awaiting dispatch
+        self.boot_state: Optional[Dict] = None  # snapshot used to relaunch handler tasks
+
+        # Trace control.
+        self.trace_enabled = False
+
+    # ---- GPR/OR helpers -----------------------------------------------------
+
+    def set_gpr(self, idx: int, val: int) -> None:
+        if idx == 0:
+            return
+        self.gpr[idx] = val & 0xFFFFFFFF
+
+    def get_gpr(self, idx: int) -> int:
+        return self.gpr[idx] & 0xFFFFFFFF
+
+    def set_opr(self, idx: int, val: int) -> None:
+        if idx == 0:
+            return  # O0 hardwired null
+        self.opr[idx] = val & 0xFFFFFFFFFFFFFFFF
+
+    def get_opr(self, idx: int) -> int:
+        return self.opr[idx] & 0xFFFFFFFFFFFFFFFF
+
+    # ---- object table -------------------------------------------------------
+
+    def alloc_object(self, size: int, type_tag: int, max_caps: int,
+                     init_bytes: Optional[bytes] = None) -> int:
+        """Allocate an object on this CPU; return its reference (caps =
+        max_caps; home = self.pid)."""
+        storage = bytearray(size)
+        if init_bytes is not None:
+            storage[:len(init_bytes)] = init_bytes
+        if self.free_indices:
+            idx = self.free_indices.pop(0)
+            # Carry the bumped generation forward.
+            prior_gen = self.descriptors[idx].generation if self.descriptors[idx] else 1
+            desc = Descriptor(storage=storage, length=size,
+                              generation=prior_gen, type_tag=type_tag,
+                              max_caps=max_caps)
+            self.descriptors[idx] = desc
+        else:
+            desc = Descriptor(storage=storage, length=size,
+                              generation=1, type_tag=type_tag,
+                              max_caps=max_caps)
+            idx = self.next_obj_idx
+            self.next_obj_idx += 1
+            self.descriptors.append(desc)
+        return make_ref(generation=desc.generation, home=self.pid,
+                        index=idx, caps=max_caps)
+
+    def free_object(self, idx: int) -> None:
+        """Bump the generation and mark the slot freed; callers are
+        responsible for capability checks."""
+        d = self.descriptors[idx]
+        if d is None:
+            return
+        d.generation = (d.generation + 1) & 0xFFFF
+        if d.generation == 0:
+            d.generation = 1   # avoid the all-zero-fields-=-null collision
+        d.live = False
+        # Keep slot in self.descriptors so the bumped generation persists;
+        # mark it freed via .live = False, and recycle through free_indices.
+        self.free_indices.append(idx)
+
+    def map_object(self, ref: int, va: int, offset: int, length: int,
+                   prot: int) -> None:
+        """Install a VA->object mapping for general-register loads/stores."""
+        idx = ref_index(ref)
+        self.mappings.append((va, va + length, idx, offset, prot))
+
+    def lookup_va(self, va: int, width: int, want_prot: int,
+                  is_fetch: bool, faulting_pc: int) -> Tuple[Descriptor, int]:
+        """Translate a virtual address to (local descriptor, object_offset)."""
+        if width in (2, 4) and (va & (width - 1)):
+            raise Trap(
+                CAUSE_ADDR_MISALIGN_I if is_fetch else CAUSE_ADDR_MISALIGN_D,
+                faulting_pc,
+                f"VA 0x{va:08x} not aligned to {width}")
+        for (lo, hi, idx, base, prot) in self.mappings:
+            if lo <= va < hi and va + width <= hi:
+                if (prot & want_prot) != want_prot:
+                    raise Trap(CAUSE_PAGE_PERMISSION, faulting_pc,
+                               f"VA 0x{va:08x} prot {prot:#x} lacks {want_prot:#x}")
+                return self.descriptors[idx], base + (va - lo)
+        raise Trap(
+            CAUSE_TLB_MISS_I if is_fetch else CAUSE_TLB_MISS_D,
+            faulting_pc,
+            f"unmapped VA 0x{va:08x}")
+
+    # ---- memory access -------------------------------------------------------
+
+    def fetch_instr(self, pc: int) -> int:
+        desc, off = self.lookup_va(pc, 4, CAP_X, is_fetch=True, faulting_pc=pc)
+        return struct.unpack(">I", bytes(desc.storage[off:off+4]))[0]
+
+    def load_gpr_mem(self, va: int, width: int, signed: bool,
+                     faulting_pc: int) -> int:
+        desc, off = self.lookup_va(va, width, CAP_R, is_fetch=False,
+                                   faulting_pc=faulting_pc)
+        raw = bytes(desc.storage[off:off+width])
+        if   width == 1: val = raw[0]
+        elif width == 2: val = struct.unpack(">H", raw)[0]
+        elif width == 4: val = struct.unpack(">I", raw)[0]
+        else: raise AssertionError("width")
+        if signed:
+            sign = 1 << (width * 8 - 1)
+            if val & sign:
+                val -= (1 << (width * 8))
+            val &= 0xFFFFFFFF
+        return val
+
+    def store_gpr_mem(self, va: int, width: int, val: int,
+                      faulting_pc: int) -> None:
+        desc, off = self.lookup_va(va, width, CAP_W, is_fetch=False,
+                                   faulting_pc=faulting_pc)
+        if   width == 1: desc.storage[off] = val & 0xFF
+        elif width == 2: desc.storage[off:off+2] = struct.pack(">H", val & 0xFFFF)
+        elif width == 4: desc.storage[off:off+4] = struct.pack(">I", val & 0xFFFFFFFF)
+        else: raise AssertionError("width")
+
+    # ---- object register access ---------------------------------------------
+
+    def deref_obj(self, oreg_idx: int, offset: int, width: int,
+                  required_cap: int, faulting_pc: int) -> Tuple[Descriptor, int, int]:
+        """Validate (null/stale/bounds/cap) an OL/OS reference and return
+        (descriptor, byte offset in storage, home_pid). For a remote object,
+        the descriptor is the home CPU's descriptor (returned by reference;
+        callers may read/write its storage). All four checks per Volume II
+        Section 9 happen here precisely."""
+        ref = self.get_opr(oreg_idx)
+        if ref == 0:
+            raise Trap(CAUSE_NULL_DEREF, faulting_pc,
+                       f"null O{oreg_idx} dereference")
+
+        # Caps check uses the issuing reference's caps field; the home's
+        # max_caps is the upper bound but not checked here (it was checked
+        # at allocation/derivation).
+        if (ref_caps(ref) & required_cap) != required_cap:
+            raise Trap(CAUSE_CAP_VIOLATION, faulting_pc,
+                       f"O{oreg_idx} caps {ref_caps(ref):#x} lacks {required_cap:#x}")
+
+        home = ref_home(ref)
+        if self.system is None or home == self.pid:
+            descriptors = self.descriptors
+        else:
+            target = self.system.cpus[home]
+            descriptors = target.descriptors
+
+        idx = ref_index(ref)
+        if idx >= len(descriptors) or descriptors[idx] is None:
+            raise Trap(CAUSE_STALE_REF, faulting_pc,
+                       f"O{oreg_idx} index {idx} out of range on CPU {home}")
+        desc = descriptors[idx]
+        if not desc.live or desc.generation != ref_generation(ref):
+            raise Trap(CAUSE_STALE_REF, faulting_pc,
+                       f"O{oreg_idx} generation {ref_generation(ref)} != "
+                       f"descriptor {desc.generation}")
+
+        if offset < 0 or offset + width > desc.length or width <= 0:
+            raise Trap(CAUSE_BOUNDS, faulting_pc,
+                       f"O{oreg_idx} offset {offset} width {width} "
+                       f"outside [0,{desc.length})")
+        if width in (2, 4) and (offset & (width - 1)):
+            raise Trap(CAUSE_ADDR_MISALIGN_D, faulting_pc,
+                       f"O{oreg_idx} offset {offset} not aligned to {width}")
+        return desc, offset, home
+
+    def inspect_obj(self, oreg_idx: int, faulting_pc: int) -> Tuple[Descriptor, int]:
+        """Look up an object's descriptor for the inspection ops (OLEN, OTAG,
+        OHOME, OCAP). Only checks null + stale, no caps or bounds. Returns
+        (descriptor, home_pid). The OHOME caller wants the home directly
+        (stored already in the ref); other callers just want the descriptor."""
+        ref = self.get_opr(oreg_idx)
+        if ref == 0:
+            raise Trap(CAUSE_NULL_DEREF, faulting_pc, f"O{oreg_idx} null on inspect")
+        home = ref_home(ref)
+        if self.system is None or home == self.pid:
+            descriptors = self.descriptors
+        else:
+            descriptors = self.system.cpus[home].descriptors
+        idx = ref_index(ref)
+        if idx >= len(descriptors) or descriptors[idx] is None:
+            raise Trap(CAUSE_STALE_REF, faulting_pc, f"O{oreg_idx} stale on inspect")
+        desc = descriptors[idx]
+        if not desc.live or desc.generation != ref_generation(ref):
+            raise Trap(CAUSE_STALE_REF, faulting_pc, f"O{oreg_idx} stale on inspect")
+        return desc, home
+
+
+# ---------------------------------------------------------------------------
+# System (the crossbar + N CPUs)
+# ---------------------------------------------------------------------------
+
+class System:
+    def __init__(self, n_cpus: int):
+        self.cpus = [CPU(pid=i, system=self) for i in range(n_cpus)]
+        self.n_cpus = n_cpus
+        self.trace_enabled = False
+
+    # ---- inter-CPU SEND queue ----------------------------------------------
+
+    def queue_send(self, msg: PendingSend) -> None:
+        home = ref_home(msg.recipient_ref)
+        if home >= self.n_cpus:
+            # Dropped: home does not exist.
+            if self.trace_enabled:
+                print(f"  ; SEND dropped: recipient home {home} not configured",
+                      file=sys.stderr)
+            return
+        self.cpus[home].inbox.append(msg)
+        if self.trace_enabled:
+            print(f"  ; CPU{msg.src_pid} -> CPU{home}: SEND queued "
+                  f"(recipient idx={ref_index(msg.recipient_ref)})",
+                  file=sys.stderr)
+
+    # ---- handler dispatch --------------------------------------------------
+
+    def dispatch_handler(self, cpu: CPU) -> bool:
+        """If `cpu` is idle and has a pending SEND, dispatch its handler as a
+        fresh task. Returns True iff a handler was launched."""
+        if cpu.active or not cpu.inbox:
+            return False
+        msg = cpu.inbox.pop(0)
+        idx = ref_index(msg.recipient_ref)
+        if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+            if self.trace_enabled:
+                print(f"  ; CPU{cpu.pid}: SEND_DELIVER for absent obj idx={idx} dropped",
+                      file=sys.stderr)
+            return False
+        desc = cpu.descriptors[idx]
+        if not desc.live or desc.generation != ref_generation(msg.recipient_ref):
+            if self.trace_enabled:
+                print(f"  ; CPU{cpu.pid}: SEND_DELIVER stale (gen mismatch) dropped",
+                      file=sys.stderr)
+            return False
+        if desc.send_handler_ref == 0:
+            if self.trace_enabled:
+                print(f"  ; CPU{cpu.pid}: SEND_DELIVER to obj idx={idx} dropped (no handler)",
+                      file=sys.stderr)
+            return False
+
+        # Restore the boot register snapshot, then overlay the handler-specific
+        # registers per Volume III Section 7.2.
+        snap = cpu.boot_state
+        cpu.gpr = list(snap["gpr"])
+        cpu.opr = list(snap["opr"])
+        cpu.hi  = 0
+        cpu.lo  = 0
+
+        # O1 = fresh full-caps self-reference (firmware constructs).
+        full_self = make_ref(generation=desc.generation, home=cpu.pid,
+                             index=idx, caps=desc.max_caps)
+        cpu.set_opr(1, full_self)
+        # O2..O4 = first three OR payload args from the wire.
+        for i, oref in enumerate(msg.or_payload[:3]):
+            cpu.set_opr(2 + i, oref)
+        # R4..R7 = integer payload from the wire.
+        for i, val in enumerate(msg.int_payload[:4]):
+            cpu.set_gpr(4 + i, val)
+
+        # PC = handler entry within the handler code object's mapped range.
+        handler_idx = ref_index(desc.send_handler_ref)
+        # We require the handler's code object to be the same as the program's
+        # boot code object (mapped at 0x10000). Future revisions can map
+        # additional code objects.
+        cpu.pc = (snap["code_va_base"] + desc.send_handler_off) & 0xFFFFFFFF
+        cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+        cpu.active = True
+
+        if self.trace_enabled:
+            print(f"  ; CPU{cpu.pid}: dispatched handler at PC=0x{cpu.pc:08x} "
+                  f"for obj idx={idx}",
+                  file=sys.stderr)
+        return True
+
+    # ---- scheduler ---------------------------------------------------------
+
+    def run(self, max_cycles: int) -> int:
+        """Round-robin one instruction per active CPU per tick; dispatch
+        handler tasks on idle CPUs with queued SENDs. Returns the exit code
+        of CPU 0 (or of whichever CPU last exited if CPU 0 didn't run)."""
+        ticks = 0
+        while ticks < max_cycles:
+            any_progress = False
+            for cpu in self.cpus:
+                if cpu.active:
+                    try:
+                        step(cpu)
+                    except TaskExitSignal as e:
+                        cpu.active = False
+                        cpu.exit_code = e.code & 0xFF
+                        # Snapshot state at TaskExit so any handlers that
+                        # subsequently dispatch on this CPU inherit the
+                        # environment main configured (e.g., O5..O15
+                        # carrying refs to other objects). Architecturally
+                        # the handler is a fresh task; this snapshot is the
+                        # firmware/loader's contribution to its initial
+                        # register state, atop which the SEND payload is
+                        # overlaid by Volume III Section 7.2.
+                        cpu.boot_state = {
+                            "gpr": list(cpu.gpr),
+                            "opr": list(cpu.opr),
+                            "code_va_base": cpu.boot_state["code_va_base"],
+                        }
+                    except Trap as t:
+                        report_trap(cpu, t)
+                        return 3
+                    any_progress = True
+                else:
+                    if self.dispatch_handler(cpu):
+                        any_progress = True
+            if not any_progress:
+                break
+            ticks += 1
+        else:
+            print(f"simorisc: max cycles exceeded ({max_cycles})", file=sys.stderr)
+            return 2
+
+        # Determine exit code: prefer CPU 0's exit, else first non-None.
+        for cpu in self.cpus:
+            if cpu.exit_code is not None:
+                return cpu.exit_code
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Decoder helpers
+# ---------------------------------------------------------------------------
+
+def sext16(v: int) -> int:
+    v &= 0xFFFF
+    return v - 0x10000 if v & 0x8000 else v
+
+def sext32(v: int) -> int:
+    v &= 0xFFFFFFFF
+    return v - 0x100000000 if v & 0x80000000 else v
+
+def to_u32(v: int) -> int:
+    return v & 0xFFFFFFFF
+
+
+# ---------------------------------------------------------------------------
+# Loader (CONTRACT.md Section 1 + 2)
+# ---------------------------------------------------------------------------
+
+DEFAULT_STACK_SIZE = 0x10000
+
+def load_orx_file(path: str) -> Tuple[bytes, bytes, int, int]:
+    """Parse an .orx file and return (text_bytes, data_bytes, entry_offset,
+    stack_size)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 0x20:
+        sys.exit(f"simorisc: {path}: file too short for header")
+    if data[:8] != MAGIC:
+        sys.exit(f"simorisc: {path}: bad magic (got {data[:8]!r}, want {MAGIC!r})")
+    version, flags, entry, text_size, data_size, stack_size = \
+        struct.unpack(">IIIIII", data[0x08:0x20])
+    if version != 1:
+        sys.exit(f"simorisc: {path}: unsupported format version {version}")
+    if text_size % 4 != 0:
+        sys.exit(f"simorisc: {path}: text_size {text_size} not multiple of 4")
+    expected = 0x20 + text_size + data_size
+    if len(data) != expected:
+        sys.exit(f"simorisc: {path}: file size {len(data)} != header-implied {expected}")
+    if entry >= text_size or entry % 4 != 0:
+        sys.exit(f"simorisc: {path}: bad entry offset {entry:#x} for text size {text_size:#x}")
+    text_bytes = data[0x20:0x20 + text_size]
+    data_bytes = data[0x20 + text_size:0x20 + text_size + data_size]
+    if stack_size == 0:
+        stack_size = DEFAULT_STACK_SIZE
+    return text_bytes, data_bytes, entry, stack_size
+
+
+CODE_VA = 0x00010000
+DATA_VA = 0x00040000
+STACK_TOP = 0x00200000
+
+
+def init_cpu(cpu: CPU, text_bytes: bytes, data_bytes: bytes,
+             entry: int, stack_size: int) -> None:
+    """Allocate code/stack/(data) on `cpu` and prime its initial register state.
+    Service objects (and the cross-CPU O5..O5+N-2 refs) are populated by
+    System.populate_service_objects() after every CPU has been initialized."""
+    text_size = len(text_bytes)
+    data_size = len(data_bytes)
+
+    code_ref  = cpu.alloc_object(text_size, type_tag=TAG_CODE,
+                                 max_caps=CAP_R|CAP_X|CAP_C,
+                                 init_bytes=text_bytes)
+    stack_ref = cpu.alloc_object(stack_size, type_tag=TAG_STACK,
+                                 max_caps=CAP_R|CAP_W|CAP_C)
+    if data_size > 0:
+        data_ref = cpu.alloc_object(data_size, type_tag=TAG_DATA,
+                                    max_caps=CAP_R|CAP_C,
+                                    init_bytes=data_bytes)
+    else:
+        data_ref = 0
+
+    cpu.map_object(code_ref,  va=CODE_VA, offset=0,
+                   length=text_size,  prot=CAP_R|CAP_X)
+    cpu.map_object(stack_ref, va=STACK_TOP - stack_size, offset=0,
+                   length=stack_size, prot=CAP_R|CAP_W)
+    if data_size > 0:
+        cpu.map_object(data_ref, va=DATA_VA, offset=0,
+                       length=data_size, prot=CAP_R)
+
+    cpu.set_opr(1, code_ref)
+    cpu.set_opr(2, stack_ref)
+    cpu.set_opr(3, data_ref)
+    cpu.set_gpr(7, cpu.pid)            # PROCID by contract
+    cpu.set_gpr(29, STACK_TOP - 16)    # SP
+    cpu.set_gpr(30, 0)                 # FP
+    cpu.set_gpr(31, 0)                 # RA
+
+    cpu.pc = CODE_VA + entry
+    cpu.next_pc = cpu.pc + 4
+    cpu.active = True
+
+
+def populate_service_objects(system: System) -> None:
+    """Allocate one service object per CPU (in multi-CPU mode), then hand
+    each CPU references to its own (full caps in O4) and to the others
+    (R+S only, in O5..O5+N-2 in PID-skipping-self order)."""
+    if system.n_cpus < 2:
+        return
+    service_refs = []
+    for cpu in system.cpus:
+        ref = cpu.alloc_object(SERVICE_OBJ_SIZE, type_tag=TAG_SERVICE,
+                               max_caps=CAP_R|CAP_W|CAP_S|CAP_V|CAP_C)
+        service_refs.append(ref)
+
+    for cpu in system.cpus:
+        # O4 = my own service object, full caps.
+        cpu.set_opr(4, service_refs[cpu.pid])
+        # O5..O5+N-2 = other CPUs' services, R+S only.
+        slot = 5
+        for other_pid in range(system.n_cpus):
+            if other_pid == cpu.pid:
+                continue
+            full_ref = service_refs[other_pid]
+            weak = make_ref(generation=ref_generation(full_ref),
+                            home=ref_home(full_ref),
+                            index=ref_index(full_ref),
+                            caps=CAP_R|CAP_S)
+            cpu.set_opr(slot, weak)
+            slot += 1
+
+
+def snapshot_boot_state(cpu: CPU) -> None:
+    """Record the post-init register state so handler dispatch can restore
+    it before overlaying the SEND payload."""
+    cpu.boot_state = {
+        "gpr": list(cpu.gpr),
+        "opr": list(cpu.opr),
+        "code_va_base": CODE_VA,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Firmware primitive dispatch
+# ---------------------------------------------------------------------------
+
+def primitive_TaskExit(cpu: CPU) -> None:
+    code = cpu.get_gpr(4) & 0xFF
+    raise TaskExitSignal(code)
+
+def primitive_ConsoleWrite(cpu: CPU, faulting_pc: int) -> None:
+    o1   = cpu.get_opr(1)
+    off  = cpu.get_gpr(4)
+    n    = cpu.get_gpr(5)
+
+    if o1 == 0:
+        cpu.set_gpr(2, ERR_EFAULT); cpu.set_gpr(3, 0); return
+    home = ref_home(o1)
+    if cpu.system is None or home == cpu.pid:
+        descriptors = cpu.descriptors
+    else:
+        descriptors = cpu.system.cpus[home].descriptors
+    idx = ref_index(o1)
+    if idx >= len(descriptors) or descriptors[idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+    desc = descriptors[idx]
+    if not desc.live or desc.generation != ref_generation(o1):
+        cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+    if (ref_caps(o1) & CAP_R) == 0:
+        cpu.set_gpr(2, ERR_EPERM);  cpu.set_gpr(3, 0); return
+    end = off + n
+    if end < off or end > desc.length:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+    payload = bytes(desc.storage[off:off+n])
+    sys.stdout.buffer.write(payload)
+    sys.stdout.flush()
+    cpu.set_gpr(2, ERR_OK); cpu.set_gpr(3, n)
+
+def primitive_ObjAlloc(cpu: CPU) -> None:
+    length = cpu.get_gpr(4)
+    type_tag = cpu.get_gpr(5) & 0xFFFF
+    init_caps = cpu.get_gpr(6) & 0xFF
+    if length == 0 or length > (1 << 24):
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_opr(1, 0); return
+    try:
+        ref = cpu.alloc_object(length, type_tag=type_tag, max_caps=init_caps)
+    except Exception:
+        cpu.set_gpr(2, ERR_ENOMEM); cpu.set_opr(1, 0); return
+    cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
+
+def primitive_ObjFree(cpu: CPU) -> None:
+    o1 = cpu.get_opr(1)
+    if o1 == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if (ref_caps(o1) & CAP_V) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return
+    home = ref_home(o1)
+    if home != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+    idx = ref_index(o1)
+    if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); return
+    desc = cpu.descriptors[idx]
+    if not desc.live or desc.generation != ref_generation(o1):
+        cpu.set_gpr(2, ERR_ESTALE); return
+    cpu.free_object(idx)
+    cpu.set_gpr(2, ERR_OK)
+
+def primitive_ObjDerive(cpu: CPU) -> None:
+    o1 = cpu.get_opr(1)
+    mask = cpu.get_gpr(4) & 0xFF
+    if o1 == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if (ref_caps(o1) & CAP_C) == 0:
+        cpu.set_gpr(2, ERR_EPERM); cpu.set_opr(1, 0); return
+    new_caps = ref_caps(o1) & mask
+    derived = make_ref(generation=ref_generation(o1),
+                       home=ref_home(o1),
+                       index=ref_index(o1),
+                       caps=new_caps)
+    cpu.set_opr(1, derived)
+    cpu.set_gpr(2, ERR_OK)
+
+def primitive_InstallHandler(cpu: CPU) -> None:
+    target = cpu.get_opr(1)
+    handler = cpu.get_opr(2)
+    handler_off = cpu.get_gpr(4)
+
+    if target == 0 or handler == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if (ref_caps(target) & (CAP_S | CAP_V)) != (CAP_S | CAP_V):
+        cpu.set_gpr(2, ERR_EPERM); return
+    if (ref_caps(handler) & CAP_X) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return
+    if ref_home(target) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+
+    idx = ref_index(target)
+    if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); return
+    desc = cpu.descriptors[idx]
+    if not desc.live or desc.generation != ref_generation(target):
+        cpu.set_gpr(2, ERR_ESTALE); return
+
+    desc.send_handler_ref = handler
+    desc.send_handler_off = handler_off
+    cpu.set_gpr(2, ERR_OK)
+
+def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
+    if prim == 0x001:
+        primitive_TaskExit(cpu)
+    elif prim == 0x100:
+        primitive_ObjAlloc(cpu)
+    elif prim == 0x101:
+        primitive_ObjFree(cpu)
+    elif prim == 0x103:
+        primitive_ObjDerive(cpu)
+    elif prim == 0x200:
+        primitive_InstallHandler(cpu)
+    elif prim == 0x320:
+        primitive_ConsoleWrite(cpu, faulting_pc)
+    else:
+        cpu.set_gpr(2, ERR_ENOSYS)
+        cpu.set_gpr(3, 0)
+
+
+# ---------------------------------------------------------------------------
+# Disassembly (for trace)
+# ---------------------------------------------------------------------------
+
+def fmt_instr(pc: int, word: int, cpu: CPU) -> str:
+    op = (word >> 26) & 0x3F
+    rs = (word >> 21) & 0x1F
+    rt = (word >> 16) & 0x1F
+    rd = (word >> 11) & 0x1F
+    sh = (word >>  6) & 0x1F
+    fn = word & 0x3F
+    imm = word & 0xFFFF
+    simm = sext16(imm)
+    target = word & 0x03FFFFFF
+
+    if op == 0x00:
+        m = {
+            0x00:"sll", 0x02:"srl", 0x03:"sra",
+            0x04:"sllv",0x06:"srlv",0x07:"srav",
+            0x08:"jr",  0x09:"jalr",
+            0x10:"mfhi",0x12:"mflo",
+            0x18:"mult",0x19:"multu",0x1A:"div",0x1B:"divu",
+            0x20:"add", 0x21:"addu",0x22:"sub", 0x23:"subu",
+            0x24:"and", 0x25:"or",  0x26:"xor", 0x27:"nor",
+            0x2A:"slt", 0x2B:"sltu",
+        }.get(fn, f"special?fn={fn:#x}")
+        if fn in (0x00,0x02,0x03):       return f"{m} r{rd}, r{rt}, {sh}"
+        if fn in (0x04,0x06,0x07):       return f"{m} r{rd}, r{rt}, r{rs}"
+        if fn == 0x08:                   return f"{m} r{rs}"
+        if fn == 0x09:                   return f"{m} r{rd}, r{rs}"
+        if fn in (0x10,0x12):            return f"{m} r{rd}"
+        if fn in (0x18,0x19,0x1A,0x1B):  return f"{m} r{rs}, r{rt}"
+        return f"{m} r{rd}, r{rs}, r{rt}"
+    if op == 0x01:
+        m = {0x00:"bltz",0x01:"bgez",0x10:"bltzal",0x11:"bgezal"}.get(rt, f"regimm?{rt:#x}")
+        return f"{m} r{rs}, 0x{(pc + 4 + simm*4) & 0xFFFFFFFF:08x}"
+    if op == 0x02:                       return f"j 0x{(((pc+4) & 0xF0000000) | (target<<2)):08x}"
+    if op == 0x03:                       return f"jal 0x{(((pc+4) & 0xF0000000) | (target<<2)):08x}"
+    if op == 0x04:                       return f"beq r{rs}, r{rt}, 0x{(pc+4+simm*4)&0xFFFFFFFF:08x}"
+    if op == 0x05:                       return f"bne r{rs}, r{rt}, 0x{(pc+4+simm*4)&0xFFFFFFFF:08x}"
+    if op == 0x06:                       return f"blez r{rs}, 0x{(pc+4+simm*4)&0xFFFFFFFF:08x}"
+    if op == 0x07:                       return f"bgtz r{rs}, 0x{(pc+4+simm*4)&0xFFFFFFFF:08x}"
+    if op == 0x08:                       return f"addi r{rt}, r{rs}, {simm}"
+    if op == 0x09:                       return f"addiu r{rt}, r{rs}, {simm}"
+    if op == 0x0A:                       return f"slti r{rt}, r{rs}, {simm}"
+    if op == 0x0B:                       return f"sltiu r{rt}, r{rs}, {simm}"
+    if op == 0x0C:                       return f"andi r{rt}, r{rs}, 0x{imm:04x}"
+    if op == 0x0D:                       return f"ori r{rt}, r{rs}, 0x{imm:04x}"
+    if op == 0x0E:                       return f"xori r{rt}, r{rs}, 0x{imm:04x}"
+    if op == 0x0F:                       return f"lui r{rt}, 0x{imm:04x}"
+    if op == 0x20:                       return f"lb r{rt}, {simm}(r{rs})"
+    if op == 0x21:                       return f"lh r{rt}, {simm}(r{rs})"
+    if op == 0x23:                       return f"lw r{rt}, {simm}(r{rs})"
+    if op == 0x24:                       return f"lbu r{rt}, {simm}(r{rs})"
+    if op == 0x25:                       return f"lhu r{rt}, {simm}(r{rs})"
+    if op == 0x28:                       return f"sb r{rt}, {simm}(r{rs})"
+    if op == 0x29:                       return f"sh r{rt}, {simm}(r{rs})"
+    if op == 0x2B:                       return f"sw r{rt}, {simm}(r{rs})"
+    if op == 0x30:
+        os_  = (word >> 22) & 0xF
+        ot   = (word >> 18) & 0xF
+        ord_ = (word >> 13) & 0x1F
+        ofn  = (word >>  4) & 0xF
+        m = {0x0:"omov",0x1:"onull",0x2:"oeq",0x3:"oisn",
+             0x4:"olen",0x5:"otag",0x6:"ohome",0x7:"ocap"}.get(ofn, f"obj?fn={ofn:#x}")
+        if ofn == 0x0: return f"omov o{os_}, o{ot}"
+        if ofn == 0x1: return f"onull o{os_}"
+        if ofn == 0x2: return f"oeq r{ord_}, o{os_}, o{ot}"
+        return f"{m} r{ord_}, o{os_}"
+    if op in (0x31,0x32,0x33,0x34,0x35,0x38,0x39,0x3B):
+        os_ = (word >> 22) & 0xF
+        rt_ = (word >> 16) & 0x3F
+        off = sext16(word & 0xFFFF)
+        m = {0x31:"olb",0x32:"olh",0x33:"olw",0x34:"olbu",
+             0x35:"olhu",0x38:"osb",0x39:"osh",0x3B:"osw"}[op]
+        return f"{m} r{rt_ & 0x1F}, {off}(o{os_})"
+    if op == 0x3C:
+        os_ = (word >> 22) & 0xF
+        return f"send o{os_}"
+    if op == 0x3D:
+        return f"call #{target:#x}"
+    return f"???op={op:#x}"
+
+
+def emit_trace(cpu: CPU, pc: int, word: int,
+               pre_gpr: List[int], pre_opr: List[int],
+               pre_hi: int, pre_lo: int) -> None:
+    if not cpu.trace_enabled:
+        return
+    diffs: List[str] = []
+    for i in range(32):
+        if cpu.gpr[i] != pre_gpr[i]:
+            diffs.append(f"r{i} = 0x{cpu.gpr[i]:08x}")
+    for i in range(16):
+        if cpu.opr[i] != pre_opr[i]:
+            diffs.append(f"o{i} = 0x{cpu.opr[i]:016x}")
+    if cpu.hi != pre_hi:
+        diffs.append(f"hi = 0x{cpu.hi:08x}")
+    if cpu.lo != pre_lo:
+        diffs.append(f"lo = 0x{cpu.lo:08x}")
+    decoded = fmt_instr(pc, word, cpu)
+    prefix = f"CPU{cpu.pid} " if cpu.system and cpu.system.n_cpus > 1 else ""
+    line = f"{prefix}0x{pc:08x}  {decoded:<32s}"
+    if diffs:
+        line += "  ; " + ", ".join(diffs)
+    print(line, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Instruction step
+# ---------------------------------------------------------------------------
+
+def step(cpu: CPU) -> None:
+    pc = cpu.pc
+    if pc == 0:
+        raise Trap(CAUSE_BUS_ERROR_I, pc, "main returned without TaskExit")
+    word = cpu.fetch_instr(pc)
+    op = (word >> 26) & 0x3F
+
+    pre_gpr = cpu.gpr.copy()
+    pre_opr = cpu.opr.copy()
+    pre_hi, pre_lo = cpu.hi, cpu.lo
+
+    branch_target: Optional[int] = None
+    def take_branch(target: int) -> None:
+        nonlocal branch_target
+        branch_target = target & 0xFFFFFFFF
+
+    rs = (word >> 21) & 0x1F
+    rt = (word >> 16) & 0x1F
+    rd = (word >> 11) & 0x1F
+    sh = (word >>  6) & 0x1F
+    fn = word & 0x3F
+    imm = word & 0xFFFF
+    simm = sext16(imm)
+    target26 = word & 0x03FFFFFF
+
+    def gpr(i): return cpu.get_gpr(i)
+    def sgpr(i): return sext32(cpu.get_gpr(i))
+
+    if op == 0x00:  # SPECIAL
+        if   fn == 0x00:
+            cpu.set_gpr(rd, to_u32(gpr(rt) << sh))
+        elif fn == 0x02:
+            cpu.set_gpr(rd, to_u32(gpr(rt) >> sh))
+        elif fn == 0x03:
+            cpu.set_gpr(rd, to_u32(sgpr(rt) >> sh))
+        elif fn == 0x04:
+            cpu.set_gpr(rd, to_u32(gpr(rt) << (gpr(rs) & 0x1F)))
+        elif fn == 0x06:
+            cpu.set_gpr(rd, to_u32(gpr(rt) >> (gpr(rs) & 0x1F)))
+        elif fn == 0x07:
+            cpu.set_gpr(rd, to_u32(sgpr(rt) >> (gpr(rs) & 0x1F)))
+        elif fn == 0x08:
+            take_branch(gpr(rs))
+        elif fn == 0x09:
+            cpu.set_gpr(rd if rd else 31, to_u32(pc + 8))
+            take_branch(gpr(rs))
+        elif fn == 0x10:
+            cpu.set_gpr(rd, cpu.hi)
+        elif fn == 0x12:
+            cpu.set_gpr(rd, cpu.lo)
+        elif fn == 0x18:
+            prod = sgpr(rs) * sgpr(rt)
+            cpu.lo = to_u32(prod); cpu.hi = to_u32(prod >> 32)
+        elif fn == 0x19:
+            prod = gpr(rs) * gpr(rt)
+            cpu.lo = to_u32(prod); cpu.hi = to_u32(prod >> 32)
+        elif fn == 0x1A:
+            a, b = sgpr(rs), sgpr(rt)
+            if b == 0:
+                cpu.lo, cpu.hi = 0, to_u32(a)
+            else:
+                q = abs(a) // abs(b)
+                if (a < 0) ^ (b < 0):
+                    q = -q
+                r = a - q * b
+                cpu.lo, cpu.hi = to_u32(q), to_u32(r)
+        elif fn == 0x1B:
+            a, b = gpr(rs), gpr(rt)
+            if b == 0:
+                cpu.lo, cpu.hi = 0, a
+            else:
+                cpu.lo, cpu.hi = a // b, a % b
+        elif fn == 0x20:
+            a, b = sgpr(rs), sgpr(rt); r = a + b
+            if r < -0x80000000 or r > 0x7FFFFFFF:
+                raise Trap(CAUSE_ARITH_OVERFLOW, pc, "ADD overflow")
+            cpu.set_gpr(rd, to_u32(r))
+        elif fn == 0x21:
+            cpu.set_gpr(rd, to_u32(gpr(rs) + gpr(rt)))
+        elif fn == 0x22:
+            a, b = sgpr(rs), sgpr(rt); r = a - b
+            if r < -0x80000000 or r > 0x7FFFFFFF:
+                raise Trap(CAUSE_ARITH_OVERFLOW, pc, "SUB overflow")
+            cpu.set_gpr(rd, to_u32(r))
+        elif fn == 0x23: cpu.set_gpr(rd, to_u32(gpr(rs) - gpr(rt)))
+        elif fn == 0x24: cpu.set_gpr(rd, gpr(rs) & gpr(rt))
+        elif fn == 0x25: cpu.set_gpr(rd, gpr(rs) | gpr(rt))
+        elif fn == 0x26: cpu.set_gpr(rd, gpr(rs) ^ gpr(rt))
+        elif fn == 0x27: cpu.set_gpr(rd, to_u32(~(gpr(rs) | gpr(rt))))
+        elif fn == 0x2A: cpu.set_gpr(rd, 1 if sgpr(rs) < sgpr(rt) else 0)
+        elif fn == 0x2B: cpu.set_gpr(rd, 1 if gpr(rs)  < gpr(rt)  else 0)
+        else:
+            raise Trap(CAUSE_RESERVED_INSTR, pc, f"SPECIAL funct {fn:#x}")
+    elif op == 0x01:
+        cond_target = to_u32(pc + 4 + (simm * 4))
+        if   rt == 0x00: cond = sgpr(rs) <  0
+        elif rt == 0x01: cond = sgpr(rs) >= 0
+        elif rt == 0x10:
+            cpu.set_gpr(31, to_u32(pc + 8)); cond = sgpr(rs) < 0
+        elif rt == 0x11:
+            cpu.set_gpr(31, to_u32(pc + 8)); cond = sgpr(rs) >= 0
+        else:
+            raise Trap(CAUSE_RESERVED_INSTR, pc, f"REGIMM rt {rt:#x}")
+        if cond: take_branch(cond_target)
+    elif op == 0x02:
+        ds = pc + 4
+        take_branch((ds & 0xF0000000) | (target26 << 2))
+    elif op == 0x03:
+        cpu.set_gpr(31, to_u32(pc + 8))
+        ds = pc + 4
+        take_branch((ds & 0xF0000000) | (target26 << 2))
+    elif op == 0x04:
+        if gpr(rs) == gpr(rt): take_branch(to_u32(pc + 4 + simm*4))
+    elif op == 0x05:
+        if gpr(rs) != gpr(rt): take_branch(to_u32(pc + 4 + simm*4))
+    elif op == 0x06:
+        if sgpr(rs) <= 0:      take_branch(to_u32(pc + 4 + simm*4))
+    elif op == 0x07:
+        if sgpr(rs) > 0:       take_branch(to_u32(pc + 4 + simm*4))
+    elif op == 0x08:
+        a = sgpr(rs); b = simm; r = a + b
+        if r < -0x80000000 or r > 0x7FFFFFFF:
+            raise Trap(CAUSE_ARITH_OVERFLOW, pc, "ADDI overflow")
+        cpu.set_gpr(rt, to_u32(r))
+    elif op == 0x09: cpu.set_gpr(rt, to_u32(gpr(rs) + simm))
+    elif op == 0x0A: cpu.set_gpr(rt, 1 if sgpr(rs) < simm else 0)
+    elif op == 0x0B: cpu.set_gpr(rt, 1 if gpr(rs) < (simm & 0xFFFFFFFF) else 0)
+    elif op == 0x0C: cpu.set_gpr(rt, gpr(rs) & imm)
+    elif op == 0x0D: cpu.set_gpr(rt, gpr(rs) | imm)
+    elif op == 0x0E: cpu.set_gpr(rt, gpr(rs) ^ imm)
+    elif op == 0x0F: cpu.set_gpr(rt, to_u32(imm << 16))
+    elif op in (0x20,0x21,0x23,0x24,0x25):
+        ea = to_u32(gpr(rs) + simm)
+        if   op == 0x20: cpu.set_gpr(rt, cpu.load_gpr_mem(ea, 1, True,  pc))
+        elif op == 0x21: cpu.set_gpr(rt, cpu.load_gpr_mem(ea, 2, True,  pc))
+        elif op == 0x23: cpu.set_gpr(rt, cpu.load_gpr_mem(ea, 4, False, pc))
+        elif op == 0x24: cpu.set_gpr(rt, cpu.load_gpr_mem(ea, 1, False, pc))
+        elif op == 0x25: cpu.set_gpr(rt, cpu.load_gpr_mem(ea, 2, False, pc))
+    elif op in (0x28,0x29,0x2B):
+        ea = to_u32(gpr(rs) + simm)
+        if   op == 0x28: cpu.store_gpr_mem(ea, 1, gpr(rt), pc)
+        elif op == 0x29: cpu.store_gpr_mem(ea, 2, gpr(rt), pc)
+        elif op == 0x2B: cpu.store_gpr_mem(ea, 4, gpr(rt), pc)
+    elif op == 0x30:  # OBJECT R-R
+        os_  = (word >> 22) & 0xF
+        ot   = (word >> 18) & 0xF
+        ord_ = (word >> 13) & 0x1F
+        ofn  = (word >>  4) & 0xF
+        if ofn == 0x0:
+            cpu.set_opr(os_, cpu.get_opr(ot))
+        elif ofn == 0x1:
+            cpu.set_opr(os_, 0)
+        elif ofn == 0x2:
+            a = cpu.get_opr(os_); b = cpu.get_opr(ot)
+            mask = 0xFFFFFFFFFFFF0000
+            cpu.set_gpr(ord_, 1 if (a & mask) == (b & mask) else 0)
+        elif ofn == 0x3:
+            cpu.set_gpr(ord_, 1 if cpu.get_opr(os_) == 0 else 0)
+        elif ofn in (0x4,0x5,0x6,0x7):
+            desc, home = cpu.inspect_obj(os_, pc)
+            if   ofn == 0x4: cpu.set_gpr(ord_, desc.length & 0xFFFFFFFF)
+            elif ofn == 0x5: cpu.set_gpr(ord_, desc.type_tag & 0xFFFF)
+            elif ofn == 0x6: cpu.set_gpr(ord_, home)
+            elif ofn == 0x7: cpu.set_gpr(ord_, ref_caps(cpu.get_opr(os_)))
+        else:
+            raise Trap(CAUSE_RESERVED_INSTR, pc, f"OBJECT funct {ofn:#x}")
+    elif op in (0x31,0x32,0x33,0x34,0x35,0x38,0x39,0x3B):
+        os_ = (word >> 22) & 0xF
+        rt_full = (word >> 16) & 0x3F
+        if rt_full & 0x20:
+            raise Trap(CAUSE_RESERVED_INSTR, pc,
+                       "O-load/store rt' high bit reserved must be zero")
+        rt5 = rt_full & 0x1F
+        offset = sext16(word & 0xFFFF)
+        if   op == 0x31:
+            desc, off, _ = cpu.deref_obj(os_, offset, 1, CAP_R, pc)
+            v = desc.storage[off]
+            cpu.set_gpr(rt5, v - 0x100 if v & 0x80 else v)
+        elif op == 0x32:
+            desc, off, _ = cpu.deref_obj(os_, offset, 2, CAP_R, pc)
+            v = struct.unpack(">H", bytes(desc.storage[off:off+2]))[0]
+            cpu.set_gpr(rt5, v - 0x10000 if v & 0x8000 else v)
+        elif op == 0x33:
+            desc, off, _ = cpu.deref_obj(os_, offset, 4, CAP_R, pc)
+            cpu.set_gpr(rt5, struct.unpack(">I", bytes(desc.storage[off:off+4]))[0])
+        elif op == 0x34:
+            desc, off, _ = cpu.deref_obj(os_, offset, 1, CAP_R, pc)
+            cpu.set_gpr(rt5, desc.storage[off])
+        elif op == 0x35:
+            desc, off, _ = cpu.deref_obj(os_, offset, 2, CAP_R, pc)
+            cpu.set_gpr(rt5, struct.unpack(">H", bytes(desc.storage[off:off+2]))[0])
+        elif op == 0x38:
+            desc, off, _ = cpu.deref_obj(os_, offset, 1, CAP_W, pc)
+            desc.storage[off] = cpu.get_gpr(rt5) & 0xFF
+        elif op == 0x39:
+            desc, off, _ = cpu.deref_obj(os_, offset, 2, CAP_W, pc)
+            desc.storage[off:off+2] = struct.pack(">H", cpu.get_gpr(rt5) & 0xFFFF)
+        elif op == 0x3B:
+            desc, off, _ = cpu.deref_obj(os_, offset, 4, CAP_W, pc)
+            desc.storage[off:off+4] = struct.pack(">I", cpu.get_gpr(rt5))
+    elif op == 0x3C:  # SEND
+        os_ = (word >> 22) & 0xF
+        ref = cpu.get_opr(os_)
+        if ref == 0:
+            raise Trap(CAUSE_NULL_DEREF, pc, f"SEND on null O{os_}")
+        if (ref_caps(ref) & CAP_S) == 0:
+            raise Trap(CAUSE_CAP_VIOLATION, pc, f"SEND lacks S on O{os_}")
+        # Validate via the home CPU's descriptor table.
+        home = ref_home(ref)
+        if cpu.system is None:
+            descriptors = cpu.descriptors
+        elif home == cpu.pid:
+            descriptors = cpu.descriptors
+        else:
+            descriptors = cpu.system.cpus[home].descriptors
+        idx = ref_index(ref)
+        if idx >= len(descriptors) or descriptors[idx] is None:
+            raise Trap(CAUSE_STALE_REF, pc, f"SEND stale O{os_}")
+        desc = descriptors[idx]
+        if not desc.live or desc.generation != ref_generation(ref):
+            raise Trap(CAUSE_STALE_REF, pc, f"SEND stale O{os_}")
+        # Build payload: int = R4..R7, OR = O1..O4 (per Vol II Section 10).
+        msg = PendingSend(
+            recipient_ref=ref,
+            int_payload=[cpu.get_gpr(4 + i) for i in range(4)],
+            or_payload =[cpu.get_opr(1 + i) for i in range(4)],
+            src_pid=cpu.pid,
+        )
+        if cpu.system is not None:
+            cpu.system.queue_send(msg)
+        else:
+            # No system context: drop, but at least record in trace.
+            pass
+    elif op == 0x3D:  # CALL — no delay slot.
+        prim = target26
+        dispatch_call(cpu, prim, pc)
+        cpu.pc = to_u32(pc + 4)
+        cpu.next_pc = to_u32(cpu.pc + 4)
+        cpu.cycles += 1
+        emit_trace(cpu, pc, word, pre_gpr, pre_opr, pre_hi, pre_lo)
+        return
+    else:
+        raise Trap(CAUSE_RESERVED_INSTR, pc, f"opcode {op:#x}")
+
+    if branch_target is None:
+        cpu.pc = cpu.next_pc
+        cpu.next_pc = to_u32(cpu.pc + 4)
+    else:
+        cpu.pc = cpu.next_pc
+        cpu.next_pc = branch_target
+
+    cpu.cycles += 1
+    emit_trace(cpu, pc, word, pre_gpr, pre_opr, pre_hi, pre_lo)
+
+
+# ---------------------------------------------------------------------------
+# Trap reporter
+# ---------------------------------------------------------------------------
+
+def report_trap(cpu: CPU, t: Trap) -> None:
+    prefix = f"CPU{cpu.pid} " if (cpu.system and cpu.system.n_cpus > 1) else ""
+    print(f"simorisc: {prefix}trap {CAUSE_NAMES.get(t.cause, hex(t.cause))} "
+          f"(cause 0x{t.cause:02x}) at PC=0x{t.faulting_pc:08x}: {t.detail}",
+          file=sys.stderr)
+    print(f"  PC=0x{cpu.pc:08x}  next_PC=0x{cpu.next_pc:08x}  "
+          f"cycles={cpu.cycles}", file=sys.stderr)
+    for i in range(0, 32, 4):
+        row = "  " + "  ".join(f"r{j:>2}=0x{cpu.gpr[j]:08x}"
+                               for j in range(i, i+4))
+        print(row, file=sys.stderr)
+    for i in (0,1,2,3,4):
+        print(f"  o{i}=0x{cpu.opr[i]:016x}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(prog="simorisc",
+        description="Object RISC instruction-set simulator")
+    ap.add_argument("orx", help="path to .orx binary")
+    ap.add_argument("--processors", type=int, default=1,
+                    help="number of Object RISC processors (default 1)")
+    ap.add_argument("--trace", action="store_true",
+                    help="print each retired instruction with register effects")
+    ap.add_argument("--max-cycles", type=int, default=10_000_000,
+                    help="cycle bound (default 10000000)")
+    args = ap.parse_args(argv)
+
+    if args.processors < 1 or args.processors > 16:
+        sys.exit(f"simorisc: --processors must be in [1, 16]")
+
+    text_bytes, data_bytes, entry, stack_size = load_orx_file(args.orx)
+
+    system = System(args.processors)
+    system.trace_enabled = args.trace
+    for cpu in system.cpus:
+        cpu.trace_enabled = args.trace
+        init_cpu(cpu, text_bytes, data_bytes, entry, stack_size)
+    populate_service_objects(system)
+    for cpu in system.cpus:
+        snapshot_boot_state(cpu)
+
+    return system.run(args.max_cycles)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

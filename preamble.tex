@@ -1,0 +1,26 @@
+% Custom preamble for the Object RISC reference PDF.
+
+% Suppress the automatic "Chapter N" header above each chapter — the
+% chapter heading itself ("Volume I — Overview") is self-describing.
+% This achieves the same effect as titlesec without needing the package.
+\makeatletter
+\renewcommand{\@makechapterhead}[1]{%
+  \vspace*{40\p@}%
+  {\parindent \z@ \centering \normalfont
+    \interlinepenalty\@M
+    \Huge\bfseries #1\par\nobreak
+    \vskip 30\p@
+  }}
+\renewcommand{\@makeschapterhead}[1]{%
+  \vspace*{40\p@}%
+  {\parindent \z@ \centering \normalfont
+    \interlinepenalty\@M
+    \Huge\bfseries #1\par\nobreak
+    \vskip 30\p@
+  }}
+\makeatother
+
+% Discourage page breaks that leave widows or orphans.
+\widowpenalty=10000
+\clubpenalty=10000
+\raggedbottom
