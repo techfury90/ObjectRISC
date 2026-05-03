@@ -97,20 +97,35 @@ wire-format crossbar in its own process:
 examples/run_hello_terminal.sh
 ```
 
-Parallel π(N) across four CPUs, results streamed live to the
-terminal. The coordinator partitions [2..2000] into quarters,
-dispatches work via SEND with a derived reply cap, and prints each
-worker's count and elapsed cycles as the reply arrives:
+Parallel π(N) across K+1 CPUs, results streamed live to the
+terminal. The coordinator partitions [2..N] into K+1 equal ranges,
+dispatches work to the workers via SEND with a derived reply cap,
+computes its own range, and prints each worker's count and elapsed
+cycles as the reply arrives:
 
 ```sh
-examples/run_parallel_primes.sh
-# Parallel pi(2000) across 4 CPUs:
-# CPU 0: 95 primes in 14759 cycles
-# CPU 1: 73 primes in 21024 cycles
-# CPU 2: 71 primes in 24978 cycles
-# CPU 3: 64 primes in 27567 cycles
-# Total: pi(2000) = 303
+examples/run_parallel_primes                  # defaults: N=2000, w=3
+examples/run_parallel_primes -N 5000 -w 5
+examples/run_parallel_primes -N 10000 -w 8
+
+# Parallel pi(10000) across 9 CPUs:
+# CPU 0: 186 primes in 41270 cycles
+# CPU 1: 145 primes in 59893 cycles
+# CPU 2: 139 primes in 71274 cycles
+# CPU 3: 133 primes in 79765 cycles
+# CPU 4: 129 primes in 86472 cycles
+# CPU 5: 127 primes in 93499 cycles
+# CPU 6: 126 primes in 99069 cycles
+# CPU 7: 122 primes in 103186 cycles
+# CPU 8: 122 primes in 108465 cycles
+# Total: pi(10000) = 1229
 ```
+
+`w` is capped at 10 (the program's worker-dispatch jump table has ten
+entries — one per OR slot O6..O15 holding worker service refs at
+boot). At larger `w` the result lines visibly arrive out of order
+because the OS schedules each CPU process independently and they
+finish at different rates.
 
 ## Status
 

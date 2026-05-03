@@ -1,43 +1,44 @@
-; parallel_primes.s — count π(N) across four CPUs, stream to a terminal.
+; parallel_primes.s — parameterized parallel π(N) demo, streamed to a terminal.
 ;
-; A multi-process Object RISC demo. Loaded onto four CPUs (PID 0..3) plus
-; one terminal device at PID 16. Branches on R7 (PROCID):
-;   PID 0  — coordinator + worker for [2..LIM/4]
-;   PID k  — worker for the k'th quarter  (k = 1, 2, 3)
+; Loaded onto K+1 CPUs (PID 0..K) plus one terminal device at PID 16.
+; CPU 0 is the coordinator and also computes its own quarter-share;
+; CPUs 1..K are workers. The coordinator partitions [2..N] into K+1
+; equal ranges, dispatches K of them via SEND with a derived reply
+; cap, computes its own range, polls K replies, and prints the total.
 ;
-; Each worker installs a handler on its own service object and TaskExits
-; so the handler runs on incoming SEND. The coordinator allocates a
-; reply object with a depth-3 receive queue, derives a send-only cap on
-; it, and SENDs each work request with that cap as a payload OR. Workers
-; SEND back (worker_id, count, elapsed) through the cap.
+; Both N (upper bound) and K (number of workers) live as .word
+; constants in the data section, patched per-run by the launcher
+; script `examples/run_parallel_primes`. To support varying K without
+; the OR-slot conflicts that would otherwise be inevitable (worker
+; service refs land in O6..O(5+K), but the coord wants O9..O15 for
+; its own state), the coord saves all of O6..O15 into an OBJSTORE
+; backing object up front and then loads them back on demand via a
+; jump table of OREFLD instructions — each table entry picks one of
+; ten possible offsets into the OBJSTORE buffer.
 ;
-; Range bounds:
-;   coord:    [2 .. 500]
-;   worker 1: [501 .. 1000]
-;   worker 2: [1001 .. 1500]
-;   worker 3: [1501 .. 2000]
+; The dispatch table is an architectural showcase as well as a fix:
+; OBJSTORE storage and OREFLD/OREFST are exactly the mechanism
+; Volume III §5.4 added for situations like this — saving and
+; restoring object references without violating the capability
+; invariant.
 ;
-; Run with:
-;   python3 tools/oriscrun \
-;       --terminal pid=16 \
-;       --cpu pid=0:program=examples/parallel_primes.orx,service=16=1@9,service=1=4@9,service=2=4@9,service=3=4@9 \
-;       --cpu pid=1:program=examples/parallel_primes.orx,serve \
-;       --cpu pid=2:program=examples/parallel_primes.orx,serve \
-;       --cpu pid=3:program=examples/parallel_primes.orx,serve
-;
-; Worker service objects sit at local index 4 (after code, stack, data
-; allocated by init_cpu); the terminal's console hardcodes index 1.
+; Run via:
+;   examples/run_parallel_primes -N 2000 -w 3
 ;
 ; Conventions throughout (callee-preserved across helper jal's):
-;   o9   = code object reference (saved at entry, preserved)
-;   o11  = terminal service ref            (coord only; from --service slot)
-;   o12  = own service ref (with queue)    (coord only; for terminal acks)
-;   o13  = reply object ref (with queue)   (coord only; for worker replies)
-;   o14  = send-only cap on o13            (coord only; given to workers)
-;   o15  = send-only cap on o12            (coord only; given to terminal)
-;   o5   = output buffer object ref        (coord only; we MapObject it)
-;   r24  = output buffer base VA           (coord only; for SB writes)
-;   r25  = running total of primes counted (coord only)
+;   o5   = output buffer object ref       (coord only; we MapObject it)
+;   o6   = OBJSTORE buffer of saved refs  (coord only; slots 0..9 = orig o6..o15)
+;   o7   = terminal service ref           (coord only)
+;   o8   = own service ref (queued)       (coord only; for terminal acks)
+;   o9   = code object ref                (workers only)
+;   o10  = reply object ref (queued)      (coord only; for worker replies)
+;   o11  = reply send-cap                 (coord only; given to workers)
+;   o12  = ack send-cap                   (coord only; given to terminal)
+;   r24  = output buffer base VA          (coord only; for SB writes)
+;   r25  = N (upper bound)                (coord only; loaded from .data)
+;   r26  = K (worker count)               (coord only; loaded from .data)
+;   r27  = range_size = N / (K+1)         (coord only)
+;   r28  = running total of primes        (coord only)
 
 .entry main
 
@@ -47,7 +48,6 @@
 ; main — branch on PROCID
 ;========================================================================
 main:
-    omov  o9, o1                  ; o9 = code object (used by workers)
     beq   r7, r0, coordinator
     nop
     j     worker
@@ -57,8 +57,29 @@ main:
 ; coordinator (PID 0)
 ;========================================================================
 coordinator:
-    omov  o11, o5                 ; preserve terminal service
-    omov  o12, o4                 ; preserve own service
+    ; ------- save o6..o15 to OBJSTORE before clobbering ----------------
+    addiu r4, r0, 80              ; 10 slots × 8 bytes
+    addiu r5, r0, 0x4202
+    addiu r6, r0, 0x03            ; R+W (we do not need to share)
+    call  #0x106                  ; ObjAllocStore
+    bne   r2, r0, fatal
+    nop
+    ; o1 = OBJSTORE buf. Save originals before we overwrite anything.
+    orefst o6, 0(o1)
+    orefst o7, 8(o1)
+    orefst o8, 16(o1)
+    orefst o9, 24(o1)
+    orefst o10, 32(o1)
+    orefst o11, 40(o1)
+    orefst o12, 48(o1)
+    orefst o13, 56(o1)
+    orefst o14, 64(o1)
+    orefst o15, 72(o1)
+    omov  o6, o1                  ; from now on, o6 = OBJSTORE buf
+
+    ; ------- recover terminal (orig o5) and own service (orig o4) ------
+    omov  o7, o5                  ; preserve terminal service
+    omov  o8, o4                  ; preserve own service
 
     ; ------- allocate output buffer (256 B, R+W) and map it ------------
     addiu r4, r0, 256
@@ -70,7 +91,7 @@ coordinator:
     omov  o5, o1                  ; o5 = output buffer object
 
     omov  o1, o5
-    addu  r4, r0, r0              ; va_hint = 0 (firmware picks)
+    addu  r4, r0, r0              ; va_hint = 0
     addu  r5, r0, r0              ; offset = 0
     addiu r6, r0, 0x03            ; prot = R+W
     addiu r7, r0, 256
@@ -80,17 +101,17 @@ coordinator:
     addu  r24, r3, r0             ; r24 = buffer VA
 
     ; ------- own-service receive queue + ack send-cap (for terminal) ---
-    omov  o1, o12
+    omov  o1, o8
     addiu r4, r0, 1
     call  #0x203                  ; ReceiveQueueAttach
     bne   r2, r0, fatal
     nop
-    omov  o1, o12
+    omov  o1, o8
     addiu r4, r0, 0x08            ; mask = S
     call  #0x103                  ; ObjDerive
     bne   r2, r0, fatal
     nop
-    omov  o15, o1                 ; ack send-cap
+    omov  o12, o1                 ; ack send-cap
 
     ; ------- reply object + queue + send-cap (for workers) -------------
     addiu r4, r0, 4
@@ -99,64 +120,88 @@ coordinator:
     call  #0x100
     bne   r2, r0, fatal
     nop
-    omov  o13, o1
+    omov  o10, o1                 ; reply object
 
-    omov  o1, o13
-    addiu r4, r0, 3               ; depth = 3
+    ; Attach a queue deep enough for K replies. K is at most 10.
+    omov  o1, o10
+    addiu r4, r0, 10
     call  #0x203
     bne   r2, r0, fatal
     nop
 
-    omov  o1, o13
+    omov  o1, o10
     addiu r4, r0, 0x08            ; mask = S
     call  #0x103
     bne   r2, r0, fatal
     nop
-    omov  o14, o1                 ; reply send-cap for workers
+    omov  o11, o1                 ; reply send-cap for workers
 
-    ; ------- print header ---------------------------------------------
-    la    r4, str_header
-    addiu r5, r0, 33              ; "Parallel pi(2000) across 4 CPUs:\n"
-    jal   print_lit
+    ; ------- load N and K from .data, compute range_size ---------------
+    la    r1, config_N
+    lw    r25, 0(r1)              ; r25 = N
+    la    r1, config_K
+    lw    r26, 0(r1)              ; r26 = K (number of workers)
+
+    ; range_size = N / (K + 1)
+    addiu r1, r26, 1              ; K + 1
+    divu  r25, r1
+    mflo  r27                     ; r27 = range_size
+
+    ; ------- print header: "Parallel pi(<N>) across <K+1> CPUs:\n" -----
+    addiu r1, r26, 1              ; K + 1 = total CPU count
+    addu  r4, r25, r0
+    addu  r5, r1, r0
+    jal   print_header
     nop
 
-    ; ------- dispatch work to PID 1, 2, 3 ------------------------------
-    omov  o1, o6                  ; PID 1 service
-    omov  o2, o14                 ; payload OR1 = reply send-cap
+    ; ------- dispatch work to workers 1..K -----------------------------
+    addiu r19, r0, 1              ; w = 1
+dispatch_loop:
+    sltu  r1, r26, r19            ; (K < w)?
+    bne   r1, r0, dispatch_done
+    nop
+
+    ; lo = w * range_size + 1
+    multu r19, r27
+    mflo  r20
+    addiu r20, r20, 1             ; r20 = lo
+
+    ; hi = (w+1) * range_size  (clamp last worker to N)
+    addiu r1, r19, 1
+    multu r1, r27
+    mflo  r21                     ; r21 = (w+1) * range_size
+    sltu  r1, r19, r26            ; (w < K)?  i.e. not the last worker
+    bne   r1, r0, send_to_worker
+    nop
+    addu  r21, r25, r0             ; last worker's hi clamps to N
+
+send_to_worker:
+    ; jal dispatch_to_worker(r4=w) → o1 = worker w's service ref
+    addu  r4, r19, r0
+    jal   dispatch_to_worker
+    nop
+    ; o1 now holds worker w's service ref. Build SEND.
+    omov  o2, o11                 ; payload OR1 = reply send-cap
     onull o3
     onull o4
-    addiu r4, r0, 1               ; worker id
-    addiu r5, r0, 501             ; lo
-    addiu r6, r0, 1000            ; hi
+    addu  r4, r19, r0             ; worker id
+    addu  r5, r20, r0             ; lo
+    addu  r6, r21, r0             ; hi
     addiu r7, r0, 0
     send  o1
 
-    omov  o1, o7                  ; PID 2 service
-    omov  o2, o14
-    onull o3
-    onull o4
-    addiu r4, r0, 2
-    addiu r5, r0, 1001
-    addiu r6, r0, 1500
-    addiu r7, r0, 0
-    send  o1
+    addiu r19, r19, 1
+    j     dispatch_loop
+    nop
 
-    omov  o1, o8                  ; PID 3 service
-    omov  o2, o14
-    onull o3
-    onull o4
-    addiu r4, r0, 3
-    addiu r5, r0, 1501
-    addiu r6, r0, 2000
-    addiu r7, r0, 0
-    send  o1
+dispatch_done:
 
-    ; ------- coordinator does its own range [2..500] -------------------
+    ; ------- coord does its own range [2 .. range_size] ----------------
     call  #0x301                  ; ReadCycles
     addu  r16, r3, r0             ; start
 
     addiu r4, r0, 2
-    addiu r5, r0, 500
+    addu  r5, r27, r0             ; hi = range_size
     jal   count_primes
     nop
     addu  r17, r2, r0             ; count
@@ -164,7 +209,7 @@ coordinator:
     call  #0x301
     subu  r18, r3, r16            ; elapsed
 
-    addu  r25, r17, r0            ; total = our count
+    addu  r28, r17, r0            ; total = our count
 
     addu  r4, r0, r0              ; cpu id = 0
     addu  r5, r17, r0
@@ -172,10 +217,10 @@ coordinator:
     jal   print_result
     nop
 
-    ; ------- poll reply queue three times ------------------------------
-    addiu r19, r0, 3
+    ; ------- poll reply queue K times ----------------------------------
+    addu  r19, r26, r0            ; r19 = K (replies remaining)
 poll_loop:
-    omov  o1, o13
+    omov  o1, o10
     addiu r4, r0, -1              ; infinite timeout
     call  #0x204                  ; ReceiveQueuePoll
     bne   r2, r0, fatal
@@ -184,7 +229,7 @@ poll_loop:
     addu  r20, r3, r0
     addu  r21, r4, r0
     addu  r22, r5, r0
-    addu  r25, r25, r21
+    addu  r28, r28, r21
 
     addu  r4, r20, r0
     addu  r5, r21, r0
@@ -196,8 +241,9 @@ poll_loop:
     bne   r19, r0, poll_loop
     nop
 
-    ; ------- print total -----------------------------------------------
+    ; ------- print total: "Total: pi(<N>) = <total>\n" -----------------
     addu  r4, r25, r0
+    addu  r5, r28, r0
     jal   print_total
     nop
 
@@ -206,14 +252,15 @@ poll_loop:
     nop
 
 ;========================================================================
-; worker (PID 1, 2, 3) — install handler then TaskExit
+; worker (PID 1..K) — install handler then TaskExit
 ;========================================================================
 worker:
+    omov  o9, o1                  ; o9 = code object
     omov  o1, o4                  ; target = own service
-    omov  o2, o9                  ; code object
+    omov  o2, o9
     la    r5, prime_handler
     lui   r6, 0x0001              ; 0x10000 = code base
-    subu  r4, r5, r6              ; offset within code object
+    subu  r4, r5, r6
     call  #0x200                  ; InstallHandler
     bne   r2, r0, fatal
     nop
@@ -225,10 +272,8 @@ worker:
 ;========================================================================
 ; prime_handler — invoked by firmware on incoming SEND
 ;
-; Entry: O1 = self (recipient with full caps),
-;        O2 = sender's O1 = recipient (= self with sender's caps; ignored),
-;        O3 = sender's O2 = reply send-cap,
-;        O4 = sender's O3 = null (unused).
+; Entry: O3 = sender's O2 = reply send-cap (sender's O1 → our O2 is
+;        the recipient ref, which we ignore).
 ;        R4 = worker_id, R5 = lo, R6 = hi.
 ;========================================================================
 prime_handler:
@@ -241,7 +286,7 @@ prime_handler:
     sw    r20, 8(sp)              ; count
     sw    r21, 4(sp)              ; elapsed
 
-    omov  o9, o3                  ; preserve reply cap (sender's O2 → our O3)
+    omov  o9, o3                  ; preserve reply cap
     addu  r16, r4, r0
     addu  r17, r5, r0
     addu  r18, r6, r0
@@ -273,34 +318,79 @@ prime_handler:
     nop
 
 ;========================================================================
-; count_primes(r4 = lo, r5 = hi) -> r2 = count
+; dispatch_to_worker(r4 = w in 1..10) → o1 = worker w's service ref
 ;
-; Counts primes p with lo <= p <= hi by trial division.
+; Loads the original o(5+w) value (which we OREFST'd into the OBJSTORE
+; buffer in o6 at startup) into o1. The jump table indexes by w-1 with
+; one (jr r31; orefld o1, OFFSET(o6)) entry per worker. The OREFLD
+; runs in the jr's delay slot — the load completes before control
+; returns to the caller.
+;========================================================================
+dispatch_to_worker:
+    addiu r1, r4, -1              ; r1 = w - 1
+    sll   r1, r1, 3               ; r1 = (w-1) * 8
+    la    r2, dispatch_table
+    addu  r1, r1, r2
+    jr    r1
+    nop
+
+dispatch_table:
+    ; w = 1 — original o6
+    jr    r31
+    orefld o1, 0(o6)
+    ; w = 2 — original o7
+    jr    r31
+    orefld o1, 8(o6)
+    ; w = 3 — original o8
+    jr    r31
+    orefld o1, 16(o6)
+    ; w = 4 — original o9
+    jr    r31
+    orefld o1, 24(o6)
+    ; w = 5 — original o10
+    jr    r31
+    orefld o1, 32(o6)
+    ; w = 6 — original o11
+    jr    r31
+    orefld o1, 40(o6)
+    ; w = 7 — original o12
+    jr    r31
+    orefld o1, 48(o6)
+    ; w = 8 — original o13
+    jr    r31
+    orefld o1, 56(o6)
+    ; w = 9 — original o14
+    jr    r31
+    orefld o1, 64(o6)
+    ; w = 10 — original o15
+    jr    r31
+    orefld o1, 72(o6)
+
+;========================================================================
+; count_primes(r4 = lo, r5 = hi) -> r2 = count
 ;========================================================================
 count_primes:
     addiu sp, sp, -16
     sw    r31, 12(sp)
-    sw    r16, 8(sp)              ; current candidate
-    sw    r17, 4(sp)              ; hi
-    sw    r18, 0(sp)              ; running count
+    sw    r16, 8(sp)
+    sw    r17, 4(sp)
+    sw    r18, 0(sp)
 
     addu  r16, r4, r0
     addu  r17, r5, r0
     addu  r18, r0, r0
 
-    ; Count 2 separately if [lo..hi] contains 2.
     addiu r1, r0, 2
-    sltu  r2, r17, r1             ; r2 = (hi < 2)?
+    sltu  r2, r17, r1
     bne   r2, r0, cp_no_two
     nop
-    sltu  r2, r1, r16             ; r2 = (2 < lo)?  i.e. lo > 2
+    sltu  r2, r1, r16
     bne   r2, r0, cp_no_two
     nop
-    addiu r18, r18, 1             ; counted 2
+    addiu r18, r18, 1
 cp_no_two:
-    ; Advance r16 to first odd >= max(r16, 3).
     addiu r1, r0, 3
-    sltu  r2, r16, r1             ; r2 = (r16 < 3)?
+    sltu  r2, r16, r1
     beq   r2, r0, cp_align_odd
     nop
     addiu r16, r0, 3
@@ -311,7 +401,7 @@ cp_align_odd:
     addiu r16, r16, 1
 
 cp_loop:
-    sltu  r1, r17, r16            ; (hi < n)?
+    sltu  r1, r17, r16
     bne   r1, r0, cp_done
     nop
 
@@ -337,20 +427,19 @@ cp_done:
 
 ;========================================================================
 ; is_prime(r4 = n) -> r2 = (1 if prime else 0)
-;
-; Assumes n is odd and n >= 3. Trial-divides by odd d while d*d <= n.
+; Assumes n is odd and n >= 3.
 ;========================================================================
 is_prime:
     addiu r5, r0, 3
 ip_loop:
     multu r5, r5
-    mflo  r6                      ; d*d
-    sltu  r1, r4, r6              ; (n < d*d)?
+    mflo  r6
+    sltu  r1, r4, r6
     bne   r1, r0, ip_prime
     nop
 
     divu  r4, r5
-    mfhi  r6                      ; remainder
+    mfhi  r6
     beq   r6, r0, ip_not_prime
     nop
 
@@ -369,53 +458,9 @@ ip_not_prime:
     nop
 
 ;========================================================================
-; print_lit(r4 = src VA, r5 = length)
-;   SENDs the bytes at [src..src+length) on the data section directly
-;   to the terminal — used for fully-static strings (header).
-;
-;   o3 still carries the data section ref at boot; we use it as the
-;   SEND source. The terminal's OBJ_READ_REQ resolves through the
-;   home CPU's descriptor table.
-;========================================================================
-print_lit:
-    addiu sp, sp, -16
-    sw    r31, 12(sp)
-    sw    r16, 8(sp)              ; offset within data
-    sw    r17, 4(sp)              ; length
-
-    ; Convert VA to offset within data section: offset = src - 0x40000.
-    lui   r1, 0x0004
-    subu  r16, r4, r1
-    addu  r17, r5, r0
-
-    omov  o1, o11                 ; terminal
-    omov  o2, o3                  ; payload OR1 = data section ref
-    omov  o3, o15                 ; payload OR2 = ack send-cap
-    onull o4
-    addu  r4, r16, r0             ; offset
-    addu  r5, r17, r0             ; length
-    addiu r6, r0, 0
-    addiu r7, r0, 0
-    send  o1
-
-    ; Wait for the terminal's ack via our own service queue.
-    omov  o1, o12
-    addiu r4, r0, -1
-    call  #0x204
-    bne   r2, r0, fatal
-    nop
-
-    lw    r17, 4(sp)
-    lw    r16, 8(sp)
-    lw    r31, 12(sp)
-    jr    r31
-    addiu sp, sp, 16
-
-;========================================================================
 ; print_buf(r4 = length)
 ;   SENDs the first `length` bytes of the output buffer (o5) to the
-;   terminal and waits for the ack. Caller has already populated the
-;   buffer at offsets [0..length).
+;   terminal and waits for the ack.
 ;========================================================================
 print_buf:
     addiu sp, sp, -8
@@ -423,17 +468,17 @@ print_buf:
     sw    r16, 0(sp)
     addu  r16, r4, r0
 
-    omov  o1, o11
+    omov  o1, o7                  ; terminal
     omov  o2, o5                  ; payload[0] = output buffer
-    omov  o3, o15                 ; payload[1] = ack send-cap
+    omov  o3, o12                 ; payload[1] = ack send-cap
     onull o4
-    addiu r4, r0, 0               ; offset in source
-    addu  r5, r16, r0             ; length
+    addiu r4, r0, 0
+    addu  r5, r16, r0
     addiu r6, r0, 0
     addiu r7, r0, 0
     send  o1
 
-    omov  o1, o12
+    omov  o1, o8
     addiu r4, r0, -1
     call  #0x204
     bne   r2, r0, fatal
@@ -445,24 +490,92 @@ print_buf:
     addiu sp, sp, 8
 
 ;========================================================================
+; print_header(r4 = N, r5 = total CPU count)
+;   Streams "Parallel pi(<N>) across <count> CPUs:\n" into the buffer
+;   piece by piece, then prints it.
+;========================================================================
+print_header:
+    addiu sp, sp, -16
+    sw    r31, 12(sp)
+    sw    r16, 8(sp)              ; N
+    sw    r17, 4(sp)              ; CPU count
+    sw    r18, 0(sp)              ; cursor
+
+    addu  r16, r4, r0
+    addu  r17, r5, r0
+    addu  r18, r0, r0
+
+    ; "Parallel pi("
+    la    r4, str_parallel
+    addu  r5, r24, r0
+    addu  r5, r5, r18
+    addiu r6, r0, 12
+    jal   emit_lit
+    nop
+    addu  r18, r18, r2
+
+    ; <N>
+    addu  r4, r16, r0
+    addu  r5, r24, r0
+    addu  r5, r5, r18
+    jal   itoa
+    nop
+    addu  r18, r18, r2
+
+    ; ") across "
+    la    r4, str_across
+    addu  r5, r24, r0
+    addu  r5, r5, r18
+    addiu r6, r0, 9
+    jal   emit_lit
+    nop
+    addu  r18, r18, r2
+
+    ; <CPU count>
+    addu  r4, r17, r0
+    addu  r5, r24, r0
+    addu  r5, r5, r18
+    jal   itoa
+    nop
+    addu  r18, r18, r2
+
+    ; " CPUs:\n"
+    la    r4, str_cpus_nl
+    addu  r5, r24, r0
+    addu  r5, r5, r18
+    addiu r6, r0, 7
+    jal   emit_lit
+    nop
+    addu  r18, r18, r2
+
+    addu  r4, r18, r0
+    jal   print_buf
+    nop
+
+    lw    r18, 0(sp)
+    lw    r17, 4(sp)
+    lw    r16, 8(sp)
+    lw    r31, 12(sp)
+    jr    r31
+    addiu sp, sp, 16
+
+;========================================================================
 ; print_result(r4 = cpu_id, r5 = count, r6 = elapsed)
-;   Formats "CPU <id>: <count> primes in <elapsed> cycles\n" into the
-;   output buffer and prints it.
+;   "CPU <id>: <count> primes in <elapsed> cycles\n"
 ;========================================================================
 print_result:
     addiu sp, sp, -32
     sw    r31, 28(sp)
-    sw    r16, 24(sp)             ; cpu id
-    sw    r17, 20(sp)             ; count
-    sw    r18, 16(sp)             ; elapsed
-    sw    r19, 12(sp)             ; cursor offset
+    sw    r16, 24(sp)
+    sw    r17, 20(sp)
+    sw    r18, 16(sp)
+    sw    r19, 12(sp)             ; cursor
 
     addu  r16, r4, r0
     addu  r17, r5, r0
     addu  r18, r6, r0
-    addu  r19, r0, r0             ; cursor = 0
+    addu  r19, r0, r0
 
-    ; "CPU "
     la    r4, str_cpu
     addu  r5, r24, r0
     addu  r5, r5, r19
@@ -471,7 +584,6 @@ print_result:
     nop
     addu  r19, r19, r2
 
-    ; <cpu id>
     addu  r4, r16, r0
     addu  r5, r24, r0
     addu  r5, r5, r19
@@ -479,7 +591,6 @@ print_result:
     nop
     addu  r19, r19, r2
 
-    ; ": "
     la    r4, str_colon
     addu  r5, r24, r0
     addu  r5, r5, r19
@@ -488,7 +599,6 @@ print_result:
     nop
     addu  r19, r19, r2
 
-    ; <count>
     addu  r4, r17, r0
     addu  r5, r24, r0
     addu  r5, r5, r19
@@ -496,7 +606,6 @@ print_result:
     nop
     addu  r19, r19, r2
 
-    ; " primes in "
     la    r4, str_primesin
     addu  r5, r24, r0
     addu  r5, r5, r19
@@ -505,7 +614,6 @@ print_result:
     nop
     addu  r19, r19, r2
 
-    ; <elapsed>
     addu  r4, r18, r0
     addu  r5, r24, r0
     addu  r5, r5, r19
@@ -513,7 +621,6 @@ print_result:
     nop
     addu  r19, r19, r2
 
-    ; " cycles\n"
     la    r4, str_cyclesnl
     addu  r5, r24, r0
     addu  r5, r5, r19
@@ -535,45 +642,63 @@ print_result:
     addiu sp, sp, 32
 
 ;========================================================================
-; print_total(r4 = total)
-;   Formats "\nTotal: pi(2000) = <total>\n" and prints it.
+; print_total(r4 = N, r5 = total)
+;   "Total: pi(<N>) = <total>\n"
 ;========================================================================
 print_total:
     addiu sp, sp, -16
     sw    r31, 12(sp)
-    sw    r16, 8(sp)
-    sw    r17, 4(sp)              ; cursor
+    sw    r16, 8(sp)              ; N
+    sw    r17, 4(sp)              ; total
+    sw    r18, 0(sp)              ; cursor
 
     addu  r16, r4, r0
-    addu  r17, r0, r0
+    addu  r17, r5, r0
+    addu  r18, r0, r0
 
-    la    r4, str_totalpref
+    la    r4, str_total_pre
     addu  r5, r24, r0
-    addu  r5, r5, r17
-    addiu r6, r0, 18
+    addu  r5, r5, r18
+    addiu r6, r0, 10
     jal   emit_lit
     nop
-    addu  r17, r17, r2
+    addu  r18, r18, r2
 
     addu  r4, r16, r0
     addu  r5, r24, r0
-    addu  r5, r5, r17
+    addu  r5, r5, r18
     jal   itoa
     nop
-    addu  r17, r17, r2
+    addu  r18, r18, r2
+
+    la    r4, str_eq
+    addu  r5, r24, r0
+    addu  r5, r5, r18
+    addiu r6, r0, 4
+    jal   emit_lit
+    nop
+    addu  r18, r18, r2
+
+    addu  r4, r17, r0
+    addu  r5, r24, r0
+    addu  r5, r5, r18
+    jal   itoa
+    nop
+    addu  r18, r18, r2
 
     la    r4, str_nl
     addu  r5, r24, r0
-    addu  r5, r5, r17
+    addu  r5, r5, r18
     addiu r6, r0, 1
     jal   emit_lit
     nop
-    addu  r17, r17, r2
+    addu  r18, r18, r2
 
-    addu  r4, r17, r0
+    addu  r4, r18, r0
     jal   print_buf
     nop
 
+    lw    r18, 0(sp)
     lw    r17, 4(sp)
     lw    r16, 8(sp)
     lw    r31, 12(sp)
@@ -582,12 +707,9 @@ print_total:
 
 ;========================================================================
 ; emit_lit(r4 = src VA, r5 = dst VA, r6 = length) -> r2 = length
-;   Copies `length` bytes from [src..src+length) into [dst..dst+length).
-;   Used to splice fixed strings out of the data section into the
-;   output buffer at a caller-chosen offset.
 ;========================================================================
 emit_lit:
-    addu  r2, r6, r0              ; return length
+    addu  r2, r6, r0
 el_loop:
     beq   r6, r0, el_done
     nop
@@ -596,7 +718,7 @@ el_loop:
     addiu r4, r4, 1
     addiu r5, r5, 1
     j     el_loop
-    addiu r6, r6, -1              ; (delay slot) decrement remaining
+    addiu r6, r6, -1
 
 el_done:
     jr    r31
@@ -608,17 +730,16 @@ el_done:
 itoa:
     addiu sp, sp, -32
     sw    r31, 28(sp)
-    sw    r16, 24(sp)             ; remaining value
-    sw    r17, 20(sp)             ; dst va
-    sw    r18, 16(sp)             ; digit count
-    ; sp+0..sp+15 holds digits in reverse order
+    sw    r16, 24(sp)
+    sw    r17, 20(sp)
+    sw    r18, 16(sp)
+    ; sp+0..sp+15 = reverse-order digits
 
     addu  r16, r4, r0
     addu  r17, r5, r0
 
     bne   r16, r0, it_loop
     nop
-    ; Special case 0
     addiu r1, r0, 0x30
     sb    r1, 0(r17)
     addiu r2, r0, 1
@@ -633,7 +754,7 @@ it_loop_body:
     addiu r1, r0, 10
     divu  r16, r1
     mflo  r16
-    mfhi  r2                      ; digit
+    mfhi  r2
     addiu r2, r2, 0x30
     addu  r3, sp, r18
     sb    r2, 0(r3)
@@ -642,7 +763,7 @@ it_loop_body:
     nop
 
 it_emit:
-    addu  r2, r18, r0             ; bytes to return
+    addu  r2, r18, r0
 it_emit_loop:
     beq   r18, r0, it_done
     nop
@@ -663,7 +784,7 @@ it_done:
     addiu sp, sp, 32
 
 ;========================================================================
-; fatal — write 99 to exit code and TaskExit
+; fatal — exit with code 99
 ;========================================================================
 fatal:
     addiu r4, r0, 99
@@ -671,50 +792,32 @@ fatal:
     nop
 
 ;========================================================================
-; .data — static strings
+; .data — runtime config and string fragments
 ;========================================================================
 .data
-str_header:
-    .string "Parallel pi(2000) across 4 CPUs:\n"
-str_header_end:
 
-str_cpu:
+; --- Config: patched by the launcher script -----------------------------
+config_N:    .word 2000           ; upper bound for prime counting
+config_K:    .word 3              ; number of worker CPUs
+
+; --- String fragments (each emitted via emit_lit at known length) -------
+str_parallel:                     ; "Parallel pi(" — 12 bytes
+    .string "Parallel pi("
+str_across:                       ; ") across " — 9 bytes
+    .string ") across "
+str_cpus_nl:                      ; " CPUs:\n" — 7 bytes
+    .string " CPUs:\n"
+str_cpu:                          ; "CPU " — 4 bytes
     .string "CPU "
-str_cpu_end:
-
-str_colon:
+str_colon:                        ; ": " — 2 bytes
     .string ": "
-str_colon_end:
-
-str_primesin:
+str_primesin:                     ; " primes in " — 11 bytes
     .string " primes in "
-str_primesin_end:
-
-str_cyclesnl:
+str_cyclesnl:                     ; " cycles\n" — 8 bytes
     .string " cycles\n"
-str_cyclesnl_end:
-
-str_totalpref:
-    .string "Total: pi(2000) = "
-str_totalpref_end:
-
-str_nl:
+str_total_pre:                    ; "Total: pi(" — 10 bytes
+    .string "Total: pi("
+str_eq:                           ; ") = " — 4 bytes
+    .string ") = "
+str_nl:                           ; "\n" — 1 byte
     .string "\n"
-str_nl_end:
-
-;========================================================================
-; Length constants — labels are absolute VAs, so subtract pairs to get
-; lengths. The assembler treats `.set name, expr` as a symbol = expr,
-; but our assembler doesn't; instead we hand-compute by counting bytes.
-; (See the matching addiu r5, r0, str_*_len in code above.)
-;========================================================================
-
-; Hand-counted from above:
-;   "Parallel pi(2000) across 4 CPUs:\n"  = 33
-;   "CPU "                                 = 4
-;   ": "                                   = 2
-;   " primes in "                          = 11
-;   " cycles\n"                            = 8
-;   "Total: pi(2000) = "                   = 18
-;   "\n"                                   = 1
-
