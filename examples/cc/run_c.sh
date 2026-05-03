@@ -46,12 +46,14 @@ trap "rm -rf $TMP" EXIT
 # flag or we ship a linker. (macOS sed doesn't support \b, so we
 # anchor by ensuring nothing else in pcc's output starts with L
 # followed by a digit — true for all our use cases.)
-"$CPP"  "$src" > "$TMP/program.i"
+#
+# `-I tools/cc/arch/orisc` makes orisc.h available as #include.
+"$CPP"  -I tools/cc/arch/orisc "$src" > "$TMP/program.i"
 "$CCOM" < "$TMP/program.i" | sed 's/L\([0-9][0-9]*\)/LP\1/g' > "$TMP/program.s"
 
 # Compile the shared library helpers (print_str, print_int, ...) so
 # every demo can use them without re-implementing.
-"$CPP"  examples/cc/lib.c > "$TMP/lib.i"
+"$CPP"  -I tools/cc/arch/orisc examples/cc/lib.c > "$TMP/lib.i"
 "$CCOM" < "$TMP/lib.i" | sed 's/L\([0-9][0-9]*\)/LL\1/g' > "$TMP/lib.s"
 
 python3 tools/asm/asmorisc \

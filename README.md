@@ -110,6 +110,8 @@ examples/cc/run_c.sh examples/cc/primes.c    # primes < 50
 examples/cc/run_c.sh examples/cc/fizzbuzz.c  # 1..20 fizzbuzz
 examples/cc/run_c.sh examples/cc/pascal.c    # Pascal's triangle
 examples/cc/run_c.sh examples/cc/hello_or.c  # __or in C
+examples/cc/run_c.sh examples/cc/print_or.c  # __or + inline asm
+examples/cc/run_c.sh examples/cc/inspect.c   # OEQ/OISN/OLEN/OTAG/OHOME/OCAP
 ```
 
 The `hello_or.c` and `print_or.c` variants use the `__or`
