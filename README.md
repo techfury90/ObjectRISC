@@ -110,5 +110,4 @@ silicon. The reference implementation lives in Python.
 
 ## License
 
-No license declared yet. Defaulting to "all rights reserved" until
-one is added.
+MIT — see [`LICENSE`](LICENSE).
