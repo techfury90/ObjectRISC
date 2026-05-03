@@ -8,6 +8,40 @@ Done
   longlong, 16 ORs as CLASSC), RSTATUS / ROVERLAP / GCLASS,
   TARGET_BUILTINS stub for varargs.
 
+- order.c. notoff (16-bit signed offset legality), offstar (base+
+  small-immediate addressing), livecall (R2..R7 + O1..O4), and the
+  trivial setbin/setasg/setuni/setorder/acceptable hooks.
+
+- code.c first cut. setseg (text/data only — Object RISC has no
+  rodata/PIC/TLS yet), defloc (emits `name:` and `.entry main`),
+  defalign (lowers to asmorisc `.align K`), bfcode (R4..R7 integer
+  args lowered to temps; structs/longlong/FP error out for now),
+  efcode/funcode/moveargs in their basic shape, varargs builtin
+  forwards.
+
+- local2.c first cut. rnames[] in our syntax (r0..r31, sp/fp/ra,
+  pair names with `!` padding, o0..o15). prologue/epilogue per
+  Vol VII §2.3 (no FP unless forced; SP-relative everything).
+  rmove dispatches between addu/omov by class. gclass handles
+  CLASSA/CLASSB; CLASSC awaits __or qualifier. Operand-printing
+  helpers (adrput/conput/adrcon) implemented for register/
+  literal/OREG forms; FLD and a handful of other paths still
+  comperr.
+
+- local.c stub. Function shapes for clocal (currently passthrough),
+  ninval, exname, ctype, defzero (lowered to data label + .skip),
+  and the four orisc_builtin_va_* forwards. Most are stubs with
+  `cerror` until exercised.
+
+- table.c stub. Empty pattern table — only the structural entries
+  (initial empty, the DF rewrites, the FREE sentinel, tablesize).
+  Compiler will reach codegen and refuse to match anything until
+  real patterns land.
+
+This brings the orisc backend to "files are in the right shape and
+will link if pcc were built for it." Codegen does NOT work yet —
+table.c is empty, and many local2.c hooks are comperr-stubs.
+
 Remaining (in rough order)
 ==========================
 
