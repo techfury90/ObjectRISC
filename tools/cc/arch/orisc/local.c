@@ -39,17 +39,67 @@ clocal(NODE *p)
 	 * checking but before code generation. Standard ports use it
 	 * to lower target-specific constructs (e.g., extending small
 	 * integers, materializing label addresses, calling-convention
-	 * fixups). For Object RISC we'll need clocal hooks to:
+	 * fixups).
+	 *
+	 * For Object RISC we'll need clocal hooks to:
 	 *   - identify __or-qualified pointer ops and rewrite them
 	 *     into OREFLD/OREFST trees;
 	 *   - lower __builtin_orisc_* calls into target-specific tree
 	 *     forms that table.c can match;
 	 *   - handle integer extension since our loads sign- or
 	 *     zero-extend based on the load mnemonic (LB vs LBU etc.).
-	 *
-	 * For now, return the node unchanged — works for trivial
-	 * programs that don't exercise any of the above.
 	 */
+	struct symtab *q;
+	NODE *r;
+
+	switch (p->n_op) {
+	case NAME:
+		/*
+		 * Auto and param references arrive as NAMEs of named
+		 * symbols; lower them to FP-relative struct refs so
+		 * the matcher can fold them into OREG addressing for
+		 * load/store. Static globals at the top level keep
+		 * their NAME form (the assembler resolves the symbol
+		 * to an absolute address). Register variables become
+		 * REG nodes directly.
+		 */
+		if ((q = p->n_sp) == NULL)
+			return p;
+		switch (q->sclass) {
+		case PARAM:
+		case AUTO:
+			r = block(REG, NIL, NIL, PTR+STRTY, 0, 0);
+			slval(r, 0);
+			r->n_rval = FP;
+			p = stref(block(STREF, r, p, 0, 0, 0));
+			break;
+		case STATIC:
+			if (q->slevel == 0)
+				break;
+			slval(p, 0);
+			p->n_sp = q;
+			break;
+		case REGISTER:
+			p->n_op = REG;
+			slval(p, 0);
+			p->n_rval = q->soffset;
+			break;
+		}
+		break;
+
+	case FORCE:
+		/*
+		 * Lower `return X;` into the form `R2 = X` so the
+		 * return value lands in V0/R2 (RETREG) per Vol VII §2.1.
+		 * Without this, pcc allocates the return temp to whatever
+		 * it pleases and the caller can't find the value.
+		 */
+		p->n_op = ASSIGN;
+		p->n_right = p->n_left;
+		p->n_left = block(REG, NIL, NIL, p->n_type, 0, 0);
+		p->n_left->n_rval = RETREG(p->n_type);
+		break;
+	}
 	return p;
 }
 

@@ -88,11 +88,9 @@ prologue(struct interpass_prolog *ipp)
 	ftype = ipp->ipp_type;
 
 	/* Asmorisc has no .globl; visibility is implicit. The .entry
-	 * directive (CONTRACT.md §4.2) names the program's entry
-	 * point — emit it for `main` so the loader knows where to
-	 * start. */
-	if (strcmp(ipp->ipp_name, "main") == 0)
-		printf("\t.entry main\n");
+	 * directive (CONTRACT.md §4.2) is emitted by the startup
+	 * file (crt0.s) which calls main and TaskExits with its
+	 * return value, not by the C compiler itself. */
 
 	printf("%s:\n", ipp->ipp_name);
 
@@ -164,6 +162,18 @@ hopcode(int f, int o)
 	case AND:	str = "and";	break;
 	case OR:	str = "or";	break;
 	case ER:	str = "xor";	break;
+	/* Comparison ops emit branches against zero (used by the
+	 * OPLOG SZERO pattern in table.c). asmorisc provides beqz
+	 * and bnez pseudos; the rest map directly to bltz/bgez/
+	 * blez/bgtz which take a single GPR operand. Unsigned
+	 * variants reuse the same mnemonics since the comparison
+	 * is against zero. */
+	case EQ:	str = "beqz";	break;
+	case NE:	str = "bnez";	break;
+	case ULE: case LE:	str = "blez";	break;
+	case ULT: case LT:	str = "bltz";	break;
+	case UGE: case GE:	str = "bgez";	break;
+	case UGT: case GT:	str = "bgtz";	break;
 	default:
 		comperr("hopcode: %d", o);
 		str = 0;
@@ -248,10 +258,30 @@ shiftop(NODE *p)
 	return 0;
 }
 
+/*
+ * zzzcode template hook — called by table.c patterns containing
+ * `Zx` to emit code that's awkward to express as a static template.
+ * We implement only the cases the current pattern table actually
+ * uses; new ones get added as the table grows.
+ */
 void
 zzzcode(NODE *p, int c)
 {
-	comperr("zzzcode '%c' not implemented for orisc", c);
+	int sz;
+
+	switch (c) {
+	case 'C':
+		/* Restore SP after a call — undoes the 16-byte spill
+		 * area we reserved before the jal. Per MIPS pcc the
+		 * actual amount is max(16, n_qual) so callers passing
+		 * more than 4 stack args bump SP back by the larger
+		 * amount. */
+		sz = p->n_qual > 16 ? p->n_qual : 16;
+		printf("\taddiu sp, sp, %d\n", sz);
+		break;
+	default:
+		comperr("zzzcode '%c' not implemented for orisc", c);
+	}
 }
 
 int
