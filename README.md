@@ -53,7 +53,10 @@ Pagella, 79 pp).
 
 ### Toolchain
 
-Pure Python 3.10+, standard library only. No build step.
+The asm / sim / devices / launcher tools are pure Python 3.10+,
+standard library only — no build step. The C compiler is a
+vendored pcc and needs `./configure && make` once (see
+[`tools/cc/arch/orisc/README.md`](tools/cc/arch/orisc/README.md)).
 
 | Tool                                         | Purpose                                              |
 |----------------------------------------------|------------------------------------------------------|
@@ -62,7 +65,7 @@ Pure Python 3.10+, standard library only. No build step.
 | [`tools/sim/oriscbar`](tools/sim)            | Standalone wire-level crossbar daemon                |
 | [`tools/devices/oriscterm`](tools/devices)   | Tk-based terminal device that connects to `oriscbar` |
 | [`tools/oriscrun`](tools/oriscrun)           | Launcher: spawns crossbar + devices + CPU processes  |
-| [`tools/cc`](tools/cc)                       | Vendored pcc with an Object RISC backend in progress (`arch/orisc/`) |
+| [`tools/cc`](tools/cc/arch/orisc)            | Vendored pcc with an Object RISC backend (`arch/orisc/`) |
 
 ### Validation
 
@@ -133,7 +136,9 @@ that take `__or` parameters can use them inside the body
 without explicit register binding (`print_via_or_arg.c`,
 `or_callee_inspect.c`). OL/OS-via-OR as native pcc patterns
 (rather than via inline asm) and `__or` returns in O1 are
-still pending.
+still pending — see
+[`tools/cc/arch/orisc/README.md`](tools/cc/arch/orisc/README.md)
+for the backend's status and TODO.
 
 The demos collectively exercise: recursion, loops with
 conditionals, if/else-if chains, stack-allocated arrays of int and

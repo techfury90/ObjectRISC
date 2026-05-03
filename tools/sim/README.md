@@ -6,6 +6,13 @@ up the initial task state, and executes Object RISC instructions with
 the architectural semantics of Volume II. Supports both single-CPU and
 multi-CPU configurations connected by a wire-level crossbar.
 
+When run multi-process, an external [`oriscbar`](oriscbar) is the
+crossbar daemon and `simorisc --bar <socket>` is one CPU client of
+it. Devices (such as the Tk-based [`oriscterm`](../devices)) speak
+the same wire protocol — see
+[`tools/devices/README.md`](../devices/README.md) for the full
+attachment lifecycle, framing, and SEND-payload conventions.
+
 ## Usage
 
     tools/sim/simorisc <program.orx>

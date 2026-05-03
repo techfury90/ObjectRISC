@@ -653,12 +653,172 @@ The integration contract was re-checked against the revised volumes
 and the simulator's source for consistency. Both PDF builds (Computer
 Modern, Palatino) were regenerated.
 
+## Phase 12 — A C compiler
+
+Up to Phase 11, every Object RISC program was hand-written
+assembly. The architecture had survived hello-world, parallel π,
+the wire-format crossbar, and a graphical terminal — but each of
+those was someone (or some agent) writing the instructions
+directly. The next question was whether a real C compiler could
+target the architecture, and what it would discover when it tried.
+
+### The macro assembler
+
+A small precondition: pcc emits assembly that uses `.set`
+directives and label arithmetic in expression contexts (e.g.
+`addiu sp, sp, F-4` where `F` is a frame-size symbol). The
+original asmorisc accepted only literal integer immediates, so
+the first work was a small expression evaluator: `.set NAME, EXPR`
+defines a symbol; immediates and offsets in instruction operands
+accept the same expression grammar (`+`, `-`, parens, label
+references). The change touched ~150 lines of asmorisc and one
+test category in the validation suite.
+
+### Vendoring pcc
+
+The plausible candidates for a 1986-era compiler were the BSD
+*Portable C Compiler* (pcc) family. After tracing the lineage
+back through Anders Magnusson's modern revival
+(`pcc.ludd.ltu.se`), we vendored the
+[`pmer/pcc`](https://github.com/pmer/pcc) snapshot into
+`tools/cc/`. pcc is BSD-licensed, written in C90, builds with
+`./configure && make`, and — crucially — has a clean separation
+between the language front end (`cc/ccom`) and the per-target
+backend (`arch/$TARGET/`). Adding orisc was a matter of writing
+six files: `macdefs.h`, `code.c`, `local.c`, `local2.c`,
+`order.c`, and `table.c`, plus a `crt0.s` and a small
+`console_io.s` bridge.
+
+### The backend, contract-first
+
+The first cut compiled `int main(void) { return 7; }` to nothing
+useful; the second cut compiled it to a function that stored 7
+to a local but never moved it to R2. Everything from there was
+a series of small discoveries about what pcc expected from a
+backend:
+
+- **FORCE lowering.** pcc's `clocal` hook receives a `FORCE` node
+  for every `return`; the backend's job is to lower it to the
+  ABI's return-register ASSIGN. Plain integer returns went to
+  `R2` (the architectural retval) via a one-line addition.
+- **AUTO/PARAM rewriting.** `NAME` nodes referencing locals
+  arrive without addressing information; `clocal` rewrites them
+  to `STREF(FP, name)` so `local2.c` can emit FP-relative
+  loads/stores. Without this, every local lookup tried to
+  resolve as a global symbol.
+- **Comparison operators.** pcc's `hopcode` table didn't have
+  the comparison operators; we added EQ/NE/LE/LT/GE/GT and their
+  unsigned cousins, each emitting `beqz`/`bnez`/`blez`/`bltz`/
+  `bgez`/`bgtz` against zero (with the comparison materialized
+  into a register first by other patterns).
+- **The post-call SP restore.** pcc's `zzzcode` hook is the
+  catch-all for backend-specific assembly emission keyed by a
+  letter; `'C'` was the slot we used for the post-CALL `addiu
+  sp, sp, N` that releases the outgoing-arg spill area.
+
+By the end of the first round the pipeline survived hello, a
+factorial table, primes under 50, FizzBuzz, Pascal's triangle,
+and an `inspect` demo that read OLEN/OTAG/OHOME/OCAP through
+extended inline asm. Output assembly is correct but verbose;
+the dead-store / spurious-save pattern visible in the early
+output was tamed by withdrawing the callee-preserved GPRs
+(R16..R23) from pcc's allocation pool, which costs theoretical
+register pressure relief but eliminated 16 dead instructions
+per function. (When we have programs that genuinely need a
+wider pool, the optimizer pass will need a real elide-dead-saves
+upgrade; nothing in the demo set hits the limit.)
+
+### Char-init coalescing for `.ascii`
+
+A `const char hello[] = "Hello, world!\n"` declaration emitted
+one `.byte N` directive per character — fifteen lines for one
+string. A small change in `local.c::ninval` accumulates
+consecutive ICON-typed char inits and emits them as a single
+`.ascii "..."` directive at section / symbol boundaries.
+~15× reduction in object-file size for any C program with
+string literals in static storage.
+
+### The `__or` qualifier
+
+The hard part. C has no native concept of a separate register
+file for capability-bearing pointers; everything to do with the
+OR file (CLASSC in pcc's allocator) had to be coaxed in through
+a new type qualifier. Three subphases over multiple commits.
+
+**Phase 1 — Parse-only foundation.** Added `OREF = 0x80` to the
+qualifier-bit set in `mip/manifest.h` (alongside CON and VOL),
+registered `__or` as a `C_QUALIFIER` keyword in `cc/ccom/scan.l`,
+and extended `arch/orisc/macdefs.h`'s `PCLASS` macro to route
+OREF-qualified nodes — and, separately, raw REG nodes whose
+physical reg number falls in the OR-file range (48..63) — to
+CLASSC. This last part is the bridge that makes the explicit
+`register __or T *p __asm__("oN")` syntax work: pcc's
+`__asm__` binding lands the value in CLASSC without flowing
+the qualifier, and `PCLASS` recognizes the register number
+even when n_qual is missing.
+
+**Phase 2a — Explicit-binding ops.** Three new patterns in
+`table.c` covered the common ASSIGN cases: SCREG↔SCREG → `omov`;
+OPLTYPE INCREG SZERO → `onull`; OPLTYPE INCREG SCREG → `omov`.
+Combined with extended inline asm
+(`asm("olw %0, 0(%1)" : "=r"(out) : "r"(or_var))`), this is
+enough to write a hello-world that calls firmware ConsoleWrite
+directly from C: the OR moves are real C statements, only the
+firmware-call sequence remains inline asm.
+
+**Phase 2b — Caller-side calling convention.** `moveargs` in
+`code.c` now routes `__or`-qualified call arguments to O1..O4
+per Vol VII §2.1 and `cerror`s on overflow (spilling an OR
+to byte memory would violate the capability invariant). With
+the syntax `void *__or` (qualifier *after* the `*`, so it
+qualifies the pointer rather than the pointee), C calls like
+`orisc_console_write(o3_data, 0, 14)` lower to clean
+`omov o1, o3; ...; jal orisc_console_write`. The
+`print_clean.c` demo is the canonical example.
+
+**Phase 2c — Callee-side parameters.** The natural way for pcc
+to receive a parameter is to lift it through a `tempnode`,
+which inherits CLASSA from `gclass(n_type)` and so can't
+coalesce with the CLASSC source — `Coalesce: src class 3, dst
+class 1`. The fix is to bypass the tempnode entirely: in
+`bfcode`, set `sp->sclass = REGISTER; sp->sflags |= SINREG;
+sp->soffset = O[opr]` for each OREF-qualified parameter,
+mirroring exactly what the explicit `__asm__("oN")` syntax does.
+Body NAME references then resolve straight to the OR file.
+The cross-build wrinkle: `SINREG` is in `cc/ccom/pass1.h` but
+not `cc/cxxcom/pass1.h`; an alias `#define SINREG SLOCAL1` to
+the latter (where bit 010000 was unused) lets `code.c` build
+under both. cxxcom never reads SINREG, so the alias is a
+harmless no-op. The `print_via_or_arg.c` and `or_callee_inspect.c`
+demos exercise the path.
+
+What remains: `__or` returns in O1 (same root cause as the
+tempnode-class blindness — `cftnod` is allocated CLASSA before
+FORCE runs), OL/OS as native pcc patterns instead of via inline
+asm, and the capability-invariant type checks (forbid casts
+between `__or` and integer pointers, forbid address-of of `__or`
+lvalues). All documented in `tools/cc/arch/orisc/TODO`.
+
+### Status
+
+Eleven C demos build and run end-to-end through the pipeline
+(`run_c.sh` in `examples/cc/`): hello world, factorial table,
+primes, FizzBuzz, Pascal's triangle, `__or` direct binding,
+`__or` + inline asm, `__or` introspection, the caller-side
+`__or` calling convention, an `__or` arg forwarded through a
+pure-C function, and an `__or` arg used inside the body for
+OISN/OLEN inspection. The architecture genuinely round-trips
+ordinary C through a 1986-era compiler stack — and the
+non-trivial bits (the OR file, the caller/callee `__or`
+convention) round-trip too.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
   reflect everything learned in implementation.
-- An assembler and a simulator (~3,000 lines of Python, stdlib only)
-  with single-CPU, in-process multi-CPU, and multi-process modes.
+- An assembler (with `.set` and label arithmetic) and a simulator
+  (~3,000 lines of Python, stdlib only) with single-CPU,
+  in-process multi-CPU, and multi-process modes.
 - A validation suite spanning thirteen categories (integer, logical,
   memory, control, oreg, omem, firmware, traps, call, golden,
   multi-CPU including link boot, loadable modules, receive queues),
@@ -667,6 +827,10 @@ Modern, Palatino) were regenerated.
   runtime (`simorisc --bar`), and graphical terminal device
   (`oriscterm`) demonstrating the architecture's communication model
   as a small distributed system.
+- A vendored pcc with an Object RISC backend that compiles real C
+  programs end-to-end, including a working `__or` storage-class
+  qualifier on parameters and register-bound variables (caller and
+  callee sides of the calling convention both wired).
 
 The two open consequences from the initial commit are both closed:
 
