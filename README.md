@@ -62,6 +62,7 @@ Pure Python 3.10+, standard library only. No build step.
 | [`tools/sim/oriscbar`](tools/sim)            | Standalone wire-level crossbar daemon                |
 | [`tools/devices/oriscterm`](tools/devices)   | Tk-based terminal device that connects to `oriscbar` |
 | [`tools/oriscrun`](tools/oriscrun)           | Launcher: spawns crossbar + devices + CPU processes  |
+| [`tools/cc`](tools/cc)                       | Vendored pcc with an Object RISC backend in progress (`arch/orisc/`) |
 
 ### Validation
 

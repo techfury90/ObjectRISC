@@ -1,0 +1,123 @@
+Object RISC backend for pcc — work list
+
+Done
+====
+
+- macdefs.h first cut. Type sizes, big-endian, register file
+  declarations (32 GPRs as CLASSA, GPR pairs as CLASSB for 64-bit
+  longlong, 16 ORs as CLASSC), RSTATUS / ROVERLAP / GCLASS,
+  TARGET_BUILTINS stub for varargs.
+
+Remaining (in rough order)
+==========================
+
+1. code.c — function prologue/epilogue.
+
+   The architectural calling convention is in Volume VII §2.3:
+     prologue: addiu sp, sp, -F; sw r31, F-4(sp); sw r17, F-8(sp); ...
+     epilogue: lw r17, F-8(sp); lw r31, F-4(sp); jr r31; addiu sp, sp, F
+                                                       ^^ in branch slot
+   Argument lowering: integer args in R4..R7, OR args in O1..O4,
+   spill area at top of caller's frame for arg #5+.
+
+   The MIPS port's code.c (top-level) is the closest template. Adapt
+   for our slimmer arg set (4 integer / 4 OR vs MIPS O32 4 integer /
+   no OR).
+
+2. local.c — frontend ABI hooks.
+
+   Lowering pass for: struct/union argument passing, struct return
+   (Volume VII §2.6 — ≤8B in R2:R3, 9..64B via implicit zeroth arg,
+   >64B via heap-allocated object), varargs setup, and the OR-aware
+   bits — `__or` qualifier handling, OR-typed return values in O1.
+
+3. local2.c — backend hooks.
+
+   Register-class encoding helpers, special-case peephole patterns,
+   and the ZERO-register optimization (any source-position int 0 can
+   be `R0` for free).
+
+4. table.c — instruction selection.
+
+   The bulk of the work. Hundreds of patterns covering int arithmetic,
+   logicals, shifts, branches, loads/stores. Source: the MIPS port's
+   table.c — same shapes for everything in the integer core. Renamed
+   instructions (addu instead of addu — actually identical), no lwl/
+   lwr (we have no unaligned-load helpers), no FP patterns yet.
+
+   New patterns for Object RISC primitives:
+     - OMOV/ONULL/OEQ/OISN/OLEN/OTAG/OHOME/OCAP — direct OR ops
+     - OL{B,BU,H,HU,W} / OS{B,H,W} — typed object loads/stores
+     - OREFLD / OREFST — for `__or` lvalues
+     - OFENCE — barrier intrinsic (no operand)
+     - SEND — recipient OR + R4..R7 int / O2..O4 OR payload from regs
+     - CALL — primitive number as immediate (for __builtin_orisc_call)
+
+5. order.c — operand ordering hints.
+
+   Mostly trivial. Tells the allocator preferred operand orders for
+   commutative ops, etc.
+
+6. Build wiring.
+
+   - configure.ac: add `orisc-*-*)` arms in the target switch.
+   - Makefile.in: nothing to change if we follow standard layout.
+   - os/: probably need a new `os/orisc/` (or use `os/none/`) for
+     our bare-metal target environment.
+
+7. Codegen → asmorisc bridge.
+
+   pcc emits text assembly. We need to make it emit *our* assembly
+   syntax (matching CONTRACT.md §4) so asmorisc consumes it directly.
+   Most mnemonics carry over verbatim from MIPS — the work is
+   adapting `prtype()` / `prnode()` in local2.c to use our register
+   names (r0..r31, o0..o15) and to emit our directive set
+   (.text/.data/.entry/.set/.byte/.half/.word/.string/.asciz/.align/
+   .skip).
+
+8. Builtins for Object RISC primitives.
+
+   Function declarations + lowering:
+     __builtin_orisc_send(O1_recipient, ...)
+     __builtin_orisc_oref_load(O_obj, int_offset) -> __or void*
+     __builtin_orisc_oref_store(O_obj, int_offset, __or void *)
+     __builtin_orisc_ofence(void)
+     __builtin_orisc_call(int_prim, ...)              -- raw CALL
+     __builtin_orisc_olen(O_obj) -> int
+     __builtin_orisc_otag(O_obj) -> int
+     __builtin_orisc_ohome(O_obj) -> int
+     __builtin_orisc_ocap(O_obj) -> int
+     __builtin_orisc_oeq(O_a, O_b) -> int
+     __builtin_orisc_oisn(O) -> int
+     __builtin_orisc_omov(O_dst, O_src)               -- usually implicit
+     __builtin_orisc_onull(O_dst)                     -- usually implicit
+
+9. `__or` storage-class qualifier.
+
+   Frontend extension: `__or T *p` declares an object reference. The
+   front end allocates these from the OR file (CLASSC) instead of the
+   GPR file. Casts between integer pointers and `__or` pointers are
+   forbidden statically (the capability invariant); this needs a hook
+   in the type-compatibility checker.
+
+   Open question: should we add a separate base type, like `__or_t`,
+   instead of overloading pointer qualifier semantics? The qualifier
+   route is more C-ish; the new-type route is more honest about
+   what's actually different. For a first cut, qualifier — and we
+   can revisit when we have the whole pipeline working.
+
+10. Test harness.
+
+    Compile-and-run loop: write small C programs, build with our pcc
+    + asmorisc, run on simorisc, check output. Mirror the structure
+    of tools/sim/tests/validation/ but in C. Some cases that should
+    work end-to-end before we declare done:
+      - hello world with __builtin_orisc_call(0x320, ...)
+      - a struct return
+      - varargs printf-style
+      - a loop computing a checksum
+      - SEND to a service
+      - OBJSTORE alloc + OREFLD/OREFST
+
+Realistic timeline: weeks, not days. The macdefs.h above is maybe
+2% of the total work.
