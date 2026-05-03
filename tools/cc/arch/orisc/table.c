@@ -135,15 +135,15 @@ struct optab table[] = {
 	SAREG,	TSWORD|TSHORT|TCHAR,
 	SBREG,	TLONGLONG,
 		NBREG,	RESC1,
-		"	addu A1, AL, r0	# int -> longlong (low half)\n"
-		"	sra U1, AL, 31	# (sign-extend to high half)\n", },
+		"	addu A1, AL, r0	; int -> longlong (low half)\n"
+		"	sra U1, AL, 31	; (sign-extend to high half)\n", },
 
 /* int -> ulonglong: low half = source, high half = 0 */
 { SCONV,	INBREG,
 	SAREG,	TSWORD|TSHORT|TCHAR,
 	SBREG,	TULONGLONG,
 		NBREG,	RESC1,
-		"	addu A1, AL, r0	# int -> ulonglong (low half)\n"
+		"	addu A1, AL, r0	; int -> ulonglong (low half)\n"
 		"	addu U1, r0, r0\n", },
 
 { SCONV,	INBREG,
@@ -158,7 +158,7 @@ struct optab table[] = {
 	SBREG,	TLONGLONG|TULONGLONG,
 	SAREG,	TWORD,
 		NAREG,	RESC1,
-		"	addu A1, AL, r0	# (u)ll -> int\n", },
+		"	addu A1, AL, r0	; (u)ll -> int\n", },
 
 { SCONV,	INAREG,
 	SBREG,	TLONGLONG|TULONGLONG,
@@ -314,7 +314,7 @@ struct optab table[] = {
 	SAREG,	TWORD|TPOINT|TSHORT|TUSHORT|TCHAR|TUCHAR,
 	SANY,	TANY,
 		NAREG|NASL,	RESC1,
-		"	subu A1, r0, AL	# negate\n", },
+		"	subu A1, r0, AL	; negate\n", },
 
 /*
  * Generic OPSIMP — for AND / OR / ER (xor). pcc fills in `O` from
@@ -380,7 +380,7 @@ struct optab table[] = {
 	SAREG,	TWORD|TSHORT|TUSHORT|TCHAR|TUCHAR,
 	SANY,	TANY,
 		NAREG|NASL,	RESC1,
-		"	nor A1, r0, AL	# complement\n", },
+		"	nor A1, r0, AL	; complement\n", },
 
 /*
  * Assignments. Memory destinations get sw / sh / sb; register

@@ -104,27 +104,26 @@ of your choice — `/tmp/pcc-build` is the default), then run any
 `.c` through the pipeline:
 
 ```sh
-examples/cc/run_c.sh examples/cc/hello.c
-# Hello, world!
-
-examples/cc/run_c.sh examples/cc/factab.c
-# 1! = 1
-# 2! = 2
-# 3! = 6
-# 4! = 24
-# 5! = 120
-# 6! = 720
-# 7! = 5040
+examples/cc/run_c.sh examples/cc/hello.c     # Hello, world!
+examples/cc/run_c.sh examples/cc/factab.c    # 1!..7! table
+examples/cc/run_c.sh examples/cc/primes.c    # primes < 50
+examples/cc/run_c.sh examples/cc/fizzbuzz.c  # 1..20 fizzbuzz
+examples/cc/run_c.sh examples/cc/pascal.c    # Pascal's triangle
 ```
 
-`factab.c` exercises a fair slice of C: recursion, loops,
-conditionals, stack-allocated arrays, pointer arithmetic, string
-literals, integer division and modulo. Each program links against
-`crt0.s` (provides `.entry _start`, calls main, TaskExits with
-main's R2 as the exit code) and `console_io.s` (a small bridge to
-firmware ConsoleWrite — temporary until the C compiler grows the
-`__or` qualifier and OR-file patterns). Both live in
-`tools/cc/arch/orisc/`.
+The demos collectively exercise: recursion, loops with
+conditionals, if/else-if chains, stack-allocated arrays of int and
+char, computed array indexing, pointer arithmetic, string literals,
+integer arithmetic (add/sub/mul/div/mod/and/or/xor), bitwise
+operations, multi-file compilation (each program links against
+`examples/cc/lib.c` for shared `print_str`/`print_int`), and
+external calls.
+
+Each program links against `crt0.s` (provides `.entry _start`,
+calls main, TaskExits with main's R2 as the exit code) and
+`console_io.s` (a small bridge to firmware ConsoleWrite —
+temporary until the C compiler grows the `__or` qualifier and
+OR-file patterns). Both live in `tools/cc/arch/orisc/`.
 
 Parallel π(N) across K+1 CPUs, results streamed live to the
 terminal. The coordinator partitions [2..N] into K+1 equal ranges,

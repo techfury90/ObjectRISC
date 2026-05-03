@@ -38,12 +38,26 @@ fi
 TMP=$(mktemp -d)
 trap "rm -rf $TMP" EXIT
 
+# Compile the user's program. Local-label numbering (L1, L2, ...) is
+# per-compilation-unit but the assembler sees one big symbol table,
+# so without a real linker we'd get duplicate-label errors when
+# linking multiple .c files. sed-rename `L\d+` per-unit as a stand-in
+# for proper local-symbol scoping until pcc grows a label-prefix
+# flag or we ship a linker. (macOS sed doesn't support \b, so we
+# anchor by ensuring nothing else in pcc's output starts with L
+# followed by a digit — true for all our use cases.)
 "$CPP"  "$src" > "$TMP/program.i"
-"$CCOM" < "$TMP/program.i" > "$TMP/program.s"
+"$CCOM" < "$TMP/program.i" | sed 's/L\([0-9][0-9]*\)/LP\1/g' > "$TMP/program.s"
+
+# Compile the shared library helpers (print_str, print_int, ...) so
+# every demo can use them without re-implementing.
+"$CPP"  examples/cc/lib.c > "$TMP/lib.i"
+"$CCOM" < "$TMP/lib.i" | sed 's/L\([0-9][0-9]*\)/LL\1/g' > "$TMP/lib.s"
 
 python3 tools/asm/asmorisc \
     tools/cc/arch/orisc/crt0.s \
     tools/cc/arch/orisc/console_io.s \
+    "$TMP/lib.s" \
     "$TMP/program.s" \
     -o "$TMP/program.orx"
 
