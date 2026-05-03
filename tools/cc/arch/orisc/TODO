@@ -123,6 +123,41 @@ Done
   console_io.s — the OR moves are pure C, the OL and the
   firmware-CALL sequence are inline asm.
 
+- `__or` Phase 2b — caller-side calling convention works.
+  moveargs in code.c routes `__or`-qualified call arguments to
+  O1..O4 (with overflow → cerror, since byte-spill of an OR
+  violates the capability invariant). Combined with the syntax
+  `void *__or` (qualifier AFTER the *, so it qualifies the
+  pointer rather than what's pointed-to), C function calls with
+  `__or` arguments emit clean code:
+
+      orisc_console_write(o3_data, 0, 14);
+
+  …compiles to:
+
+      li    r5, 14
+      move  r4, r0
+      omov  o1, o3
+      jal   orisc_console_write
+
+  The `orisc_console_write` callee (in console_io.s) is a
+  4-instruction passthrough: `call #0x320; nop; jr r31; nop`.
+
+  See examples/cc/print_clean.c for the full demo.
+
+  Open issue: callee-side. Function bodies that take `__or`
+  parameters fail with "Coalesce: src class 3, dst class 1"
+  inside the body, because the bfcode helper uses tempnode()
+  to lift the arg into a local, and tempnode picks CLASSA
+  regardless of the param's qualifier (it consults
+  gclass(n_type), which can't see qualifiers). Same root cause
+  as the FORCE issue documented above. Workaround for now:
+  receiving `__or` args is delegated to hand-written .s
+  callees; pure-C functions can take ordinary pointer args
+  whose values happen to live in OR slots in the caller, but
+  cannot natively manipulate the OR ref through C statements
+  inside the body.
+
   Phase 2b/c/... (still pending) — the multi-session work:
     1. clocal lowering for `__or` autos: skip the AUTO/PARAM
        STREF rewrite, become REG nodes in CLASSC. Effectively

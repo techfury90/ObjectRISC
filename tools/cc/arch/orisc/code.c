@@ -140,18 +140,21 @@ bfcode(struct symtab **sp, int cnt)
 	}
 
 	gpr = R4;
-	/* opr (= O1) starts here once __or qualifier lands. */
+	/*
+	 * `__or` parameters — caller-side convention works (moveargs
+	 * lowers to ASSIGN(O1, val)) but the receive side is harder:
+	 * tempnode creates CLASSA temps regardless of qualifier, so
+	 * the in-function variable can't be promoted to CLASSC
+	 * automatically. Functions taking `__or` args currently fail
+	 * with "Coalesce: src class 3, dst class 1" inside the body.
+	 * Workaround for now: declare the param type as a regular
+	 * pointer (no `__or`) and rely on the caller having put the
+	 * value in the right OR slot — caller is responsible for the
+	 * OR-side ABI. Real fix needs tempnode to take a qualifier.
+	 */
 
 	for (i = 0; i < cnt; i++) {
 		sym = sp[i];
-
-		if (ISPTR(sym->stype) || ISSOU(sym->stype)) {
-			/*
-			 * TODO: distinguish `__or` pointers (go to OR file)
-			 * from ordinary pointers (go to GPR file). For now
-			 * everything is a GPR.
-			 */
-		}
 
 		switch (sym->stype) {
 		case STRTY+FTN:
@@ -234,21 +237,31 @@ moveargs(NODE *p, int *gpr, int *opr, int *stacksize)
 	}
 
 	/*
-	 * For now, route everything to the GPR file. Once the `__or`
-	 * qualifier lands and we can identify reference-typed values,
-	 * those will route to *opr instead. (void) the unused opr to
-	 * silence the warning until then.
+	 * `__or`-qualified arguments route to the OR file (O1..O4)
+	 * per Vol VII §2.1; everything else uses the integer arg
+	 * regs (R4..R7) and spills to the outgoing-arg area beyond
+	 * that.
 	 */
-	(void)opr;
-	if (*gpr <= R7) {
+	if (ISOREF(r->n_qual) && *opr <= O4) {
+		q = block(REG, NIL, NIL, r->n_type, r->n_df, r->n_ap);
+		q->n_qual = OREF;
+		q->n_rval = (*opr)++;
+		r = buildtree(ASSIGN, q, r);
+	} else if (!ISOREF(r->n_qual) && *gpr <= R7) {
 		q = block(REG, NIL, NIL, r->n_type, r->n_df, r->n_ap);
 		q->n_rval = (*gpr)++;
 		r = buildtree(ASSIGN, q, r);
 	} else {
 		/* Stack overflow arg — bump stacksize, remember offset.
 		 * tsize returns bits; convert to bytes. SETOFF aligns
-		 * up to a multiple of the type's natural width. */
-		int sz = tsize(r->n_type, r->n_df, r->n_ap) / SZCHAR;
+		 * up to a multiple of the type's natural width. OR args
+		 * past O4 currently fall here, but spilling an OR to
+		 * byte memory violates the capability invariant; cerror
+		 * if we hit that case. */
+		int sz;
+		if (ISOREF(r->n_qual))
+			cerror("more than four __or arguments — needs OBJSTORE spill");
+		sz = tsize(r->n_type, r->n_df, r->n_ap) / SZCHAR;
 		r = block(FUNARG, r, NIL, r->n_type, r->n_df, r->n_ap);
 		SETOFF(*stacksize, sz);
 		r->n_rval = *stacksize;

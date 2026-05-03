@@ -52,3 +52,26 @@ cw_call:
 
     jr    r31                     ; r2 holds status from ConsoleWrite
     nop                           ; (jr delay slot)
+
+
+;========================================================================
+; OR-aware ConsoleWrite wrapper. Lets C code with proper `__or` arg
+; types call ConsoleWrite directly:
+;
+;     extern int orisc_console_write(void *__or src,
+;                                    int offset, int count);
+;
+; pcc's caller-side `__or` calling convention puts the source ref
+; in O1 and the int args in R4/R5 — exactly the firmware ABI. So
+; this wrapper is just a passthrough: invoke #0x320 and return.
+;
+; Use this instead of `console_write` when you have an `__or`-typed
+; reference (avoids the VA-range heuristic) and want direct firmware
+; access from C without inline asm.
+;========================================================================
+
+orisc_console_write:
+    call  #0x320                  ; ConsoleWrite
+    nop
+    jr    r31
+    nop

@@ -112,6 +112,7 @@ examples/cc/run_c.sh examples/cc/pascal.c    # Pascal's triangle
 examples/cc/run_c.sh examples/cc/hello_or.c  # __or in C
 examples/cc/run_c.sh examples/cc/print_or.c  # __or + inline asm
 examples/cc/run_c.sh examples/cc/inspect.c   # OEQ/OISN/OLEN/OTAG/OHOME/OCAP
+examples/cc/run_c.sh examples/cc/print_clean.c # __or via calling convention
 ```
 
 The `hello_or.c` and `print_or.c` variants use the `__or`
