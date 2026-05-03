@@ -33,10 +33,16 @@ Done
   and the four orisc_builtin_va_* forwards. Most are stubs with
   `cerror` until exercised.
 
-- table.c stub. Empty pattern table — only the structural entries
-  (initial empty, the DF rewrites, the FREE sentinel, tablesize).
-  Compiler will reach codegen and refuse to match anything until
-  real patterns land.
+- table.c first cut (~600 lines, 60+ patterns). Integer ISA
+  coverage: SCONV/PCONV, ASSIGN (reg/mem variants for byte/half/
+  word/longlong), PLUS/MINUS/AND/OR/ER/UMINUS/COMPL, MUL/DIV/MOD
+  via mult{,u}/div{,u}+mflo/mfhi, LS/RS shifts (immediate and
+  variable), EQ/NE/OPLOG comparisons, GOTO, CALL/UCALL (direct and
+  indirect), FUNARG spill, UMUL deref. Plus the standard DF
+  catch-all rewrites and FREE sentinel. Skipped for now: floating
+  point, bit fields, struct copies, longlong arithmetic beyond
+  basic move/load, and all Object RISC novel ops (OMOV/OEQ/OL*/
+  OS*/OREFLD/OREFST/OFENCE/SEND).
 
 This brings the orisc backend to "files are in the right shape and
 will link if pcc were built for it." Codegen does NOT work yet —
