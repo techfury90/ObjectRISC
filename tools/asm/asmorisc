@@ -332,8 +332,14 @@ def decode_string(tok: str) -> bytes:
             # path when the first digit is followed by at least one
             # more octal digit — otherwise \0 stays the single-NUL
             # alias. pcc emits \012 etc. for non-printable chars.
-            if nxt in "01234567" and i + 2 < len(tok) - 1 \
-                    and tok[i + 2] in "01234567":
+            if nxt in "01234567":
+                # C-standard octal escape: 1-3 digits, terminated
+                # by a non-octal char. pcc emits short forms like
+                # `\1` and `\10`; we also need to handle `\012`.
+                # The single-digit `\0` is a special case in
+                # _ESCAPES below for "embedded NUL"; we handle the
+                # "0 followed by another octal digit" path here too
+                # to stay consistent (e.g., \012 → 0o12).
                 end = i + 2
                 while end < len(tok) - 1 and end - (i + 1) < 3 \
                         and tok[end] in "01234567":

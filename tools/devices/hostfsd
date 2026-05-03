@@ -115,6 +115,7 @@ OP_CLOSE      = 1
 OP_READ       = 2
 OP_WRITE      = 3
 OP_SUBSCRIBE  = 4
+OP_OPENDIR    = 5
 
 # ---- Error codes (negative R3 in responses) ------------------------------
 
@@ -233,9 +234,14 @@ class Session:
 @dataclass
 class OpenFile:
     fd: int
-    host_fd: int
     flags: int
-    path: str           # for diagnostics
+    path: str                          # for diagnostics
+    host_fd: int = -1                  # set for regular files
+    buffer: Optional[bytes] = None     # set for directory listings
+    buffer_pos: int = 0                # next byte to return on read
+
+    def is_dir(self) -> bool:
+        return self.buffer is not None
 
 
 @dataclass
@@ -413,6 +419,8 @@ class HostFSD:
             return
         if op == OP_OPEN:
             self._do_open(sess, int_payload, or_payload)
+        elif op == OP_OPENDIR:
+            self._do_open(sess, int_payload, or_payload, opendir=True)
         elif op == OP_CLOSE:
             self._do_close(sess, int_payload)
         elif op == OP_READ:
@@ -450,7 +458,8 @@ class HostFSD:
 
     # ---- OPEN -------------------------------------------------------------
 
-    def _do_open(self, sess: Session, int_payload, or_payload) -> None:
+    def _do_open(self, sess: Session, int_payload, or_payload,
+                 opendir: bool = False) -> None:
         path_ref = or_payload[1]
         path_off = int_payload[1]
         path_len = int_payload[2]
@@ -462,16 +471,18 @@ class HostFSD:
         if len(sess.open_files) >= MAX_FDS_PER_CPU:
             return self._reply(sess, E_NOMEM, 0)
         # Issue OBJ_READ_REQ to fetch the path bytes from the CPU.
+        # The pending-request's op field carries OP_OPENDIR for the
+        # directory case so the response handler picks the right path.
         trans = self._next_trans()
         self.pending[trans] = PendingRequest(
-            op=OP_OPEN, session=sess, flags=flags,
+            op=(OP_OPENDIR if opendir else OP_OPEN),
+            session=sess, flags=flags,
             bytes_remaining=path_len)
         req = build_obj_read_req(self.my_pid, ref_home(path_ref), trans,
                                  path_ref, path_off, path_len)
         self.send_packet(req)
 
     def _open_file(self, sess: Session, path_bytes: bytes, flags: int) -> None:
-        # Decode path; resolve against jail if any.
         try:
             path_str = path_bytes.decode('utf-8')
         except UnicodeDecodeError:
@@ -479,7 +490,6 @@ class HostFSD:
         path_obj = self._resolve_path(path_str)
         if path_obj is None:
             return self._reply(sess, E_ACCES, 0)
-        # Build os.open() flags.
         rw_bits = flags & 3
         if rw_bits == 0:        os_flags = os.O_RDONLY
         elif rw_bits == 1:      os_flags = os.O_WRONLY
@@ -500,7 +510,6 @@ class HostFSD:
             length = os.fstat(host_fd).st_size
         except OSError:
             length = 0
-        # Allocate a session-local fd.
         fd = sess.next_fd
         sess.next_fd += 1
         sess.open_files[fd] = OpenFile(
@@ -508,6 +517,46 @@ class HostFSD:
         self._log(f"open fd={fd} → {path_str!r} (flags=0x{flags:x}, "
                   f"size={length})")
         self._reply(sess, fd, length)
+
+    def _open_dir(self, sess: Session, path_bytes: bytes) -> None:
+        try:
+            path_str = path_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            return self._reply(sess, E_INVAL, 0)
+        path_obj = self._resolve_path(path_str)
+        if path_obj is None:
+            return self._reply(sess, E_ACCES, 0)
+        try:
+            names = sorted(os.listdir(str(path_obj)))
+        except FileNotFoundError:
+            return self._reply(sess, E_NOENT, 0)
+        except NotADirectoryError:
+            return self._reply(sess, E_INVAL, 0)
+        except PermissionError:
+            return self._reply(sess, E_ACCES, 0)
+        except OSError as e:
+            self._log(f"listdir({path_str!r}) failed: {e}")
+            return self._reply(sess, E_IO, 0)
+        # Format: one name per line, trailing newline. Append a trailing
+        # '/' to entries that are subdirectories (cheap visual hint, and
+        # avoids needing a separate stat op for now).
+        lines = []
+        for name in names:
+            try:
+                if (path_obj / name).is_dir():
+                    lines.append(name + "/")
+                else:
+                    lines.append(name)
+            except OSError:
+                lines.append(name)
+        listing = ("\n".join(lines) + "\n").encode("utf-8")
+        fd = sess.next_fd
+        sess.next_fd += 1
+        sess.open_files[fd] = OpenFile(
+            fd=fd, flags=0, path=path_str, buffer=listing)
+        self._log(f"opendir fd={fd} → {path_str!r} ({len(names)} entries, "
+                  f"{len(listing)} bytes)")
+        self._reply(sess, fd, len(listing))
 
     def _resolve_path(self, path_str: str) -> Optional[Path]:
         if self.root is None:
@@ -529,12 +578,13 @@ class HostFSD:
         of = sess.open_files.pop(fd, None)
         if of is None:
             return self._reply(sess, E_BADF, 0)
-        try:
-            os.close(of.host_fd)
-            status = 0
-        except OSError as e:
-            self._log(f"close(fd={fd}) failed: {e}")
-            status = E_IO
+        status = 0
+        if not of.is_dir():
+            try:
+                os.close(of.host_fd)
+            except OSError as e:
+                self._log(f"close(fd={fd}) failed: {e}")
+                status = E_IO
         self._log(f"close fd={fd} → {of.path!r} (status={status})")
         self._reply(sess, status, 0)
 
@@ -552,15 +602,21 @@ class HostFSD:
             return self._reply(sess, E_INVAL, 0)
         if (ref_caps(dst_ref) & CAP_W) == 0:
             return self._reply(sess, E_ACCES, 0)
-        try:
-            data = os.read(of.host_fd, count)
-        except OSError as e:
-            self._log(f"read(fd={fd}, count={count}) failed: {e}")
-            return self._reply(sess, E_IO, 0)
+        # Pull `count` bytes from either a host file or a directory-
+        # listing buffer (set by OP_OPENDIR).
+        if of.is_dir():
+            data = of.buffer[of.buffer_pos:of.buffer_pos + count]
+            of.buffer_pos += len(data)
+        else:
+            try:
+                data = os.read(of.host_fd, count)
+            except OSError as e:
+                self._log(f"read(fd={fd}, count={count}) failed: {e}")
+                return self._reply(sess, E_IO, 0)
+        self._log(f"read fd={fd} count={count} → {len(data)} bytes "
+                  f"(dst_off={dst_off}, dst caps=0x{ref_caps(dst_ref):x})")
         if len(data) == 0:
-            # EOF; no need to OBJ_WRITE, just respond.
-            return self._reply(sess, 0, 0)
-        # Issue OBJ_WRITE_REQ to land bytes in the CPU's buffer.
+            return self._reply(sess, 0, 0)    # EOF
         trans = self._next_trans()
         self.pending[trans] = PendingRequest(
             op=OP_READ, session=sess, fd=fd,
@@ -607,6 +663,8 @@ class HostFSD:
         data = raw[:pr.bytes_remaining]
         if pr.op == OP_OPEN:
             self._open_file(pr.session, data, pr.flags)
+        elif pr.op == OP_OPENDIR:
+            self._open_dir(pr.session, data)
         elif pr.op == OP_WRITE:
             of = pr.session.open_files.get(pr.fd)
             if of is None:

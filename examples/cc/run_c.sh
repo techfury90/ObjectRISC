@@ -30,10 +30,10 @@ if [ ! -x "$CPP" ] || [ ! -x "$CCOM" ]; then
 error: pcc binaries not found in $PCC_BUILD
        (looked for: $CPP and $CCOM)
 
-Build pcc for orisc once:
-    mkdir -p $PCC_BUILD && cd $PCC_BUILD
-    $PWD/tools/cc/configure --target=orisc-unknown-none
-    make
+Bootstrap the C compiler with:
+    tools/cc/build.sh
+
+Then re-run this script.
 EOF
     exit 1
 fi

@@ -57,14 +57,22 @@ What's still missing or stubbed (most documented further in the
 
 ## Build
 
-From a build directory of your choice (`/tmp/pcc-build` is the
-convention used by `examples/cc/run_c.sh`):
+The simplest path — one-shot bootstrap script:
+
+    tools/cc/build.sh
+
+Builds into `/tmp/pcc-build` by default; override with
+`PCC_BUILD=/path/to/build tools/cc/build.sh`. Re-run the script
+when you change anything under `arch/orisc/` — incremental
+rebuilds are fast.
+
+Doing it manually:
 
     mkdir -p /tmp/pcc-build && cd /tmp/pcc-build
     "$OBJECTRISC_ROOT"/tools/cc/configure --target=orisc-unknown-none
     make
 
-(`$OBJECTRISC_ROOT` here is wherever you cloned the repo;
+(`$OBJECTRISC_ROOT` is wherever you cloned the repo;
 `configure` needs an absolute path because it's an out-of-tree
 build.)
 

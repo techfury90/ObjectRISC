@@ -1424,6 +1424,117 @@ to its directory, asserts on the cpu's stdout (`FD=0`,
   Now that we have three real devices to learn from, the
   abstraction lines should be visible.
 
+## Phase 19 — A shell (and a terminal library)
+
+The C demos for keyboard / mouse / paint were getting unwieldy —
+each one open-coded the same SEND patterns, OR-hygiene saves,
+queue polls. Time to extract a real terminal library, then build
+the first shell on top of it.
+
+### `tools/cc/lib/term.c`
+
+Wraps the wire protocols for oriscterm's console (idx 1) and
+keyboard (idx 2) services. The interesting functions:
+
+- `term_init()` — parks boot O2/O3/O4 into O11/O14/O15, attaches
+  a receive queue to the self-service, subscribes to keyboard.
+  Must be called once at program start.
+- `term_print(s)` / `term_print_char(c)` / `term_print_int(n)` /
+  `term_print_hex(n)` — write to the terminal console (NOT host
+  stdout — for that keep using the print_* family from io.c).
+- `term_getkey(*out_mods)` — block until next keystroke.
+
+Programs follow the standard OR-hygiene contract: park boot
+ORs once at term_init, every helper restores them on the way
+out. Single-byte output uses a 256-byte static lookup table in
+`.data` — `term_print_char(c)` sends offset `c` from that
+table — because stack-buffer chars get clobbered by subsequent
+calls before oriscterm's async OBJ_READ_REQ comes back.
+
+### Bug uncovered: pcc treats `register __or` as callee-save
+
+Building term_init exposed a real backend issue. With
+
+    register void *__or o11_save __asm__("o11");
+    o11_save = boot_stack;
+
+pcc emits a callee-save dance: prologue stashes the OLD value
+of O11 into O10, body sets O11 = boot stack, epilogue restores
+O11 from O10. This corrupted the hostfsd ref the runner had
+placed in O10.
+
+Workaround in this commit: avoid `register __or __asm__("oN")`
+declarations for the save slots; use raw `asm volatile("omov
+o11, o2")` instead. pcc doesn't track the assignment and won't
+emit save/restore. Documented in term.c at the relevant spot.
+Real fix is in the orisc backend's RSTATUS / regs.c — those
+slots should be marked caller-save. Left for a follow-up.
+
+### `tools/devices/hostfsd` gains `OP_OPENDIR`
+
+The shell needs `ls` — added `OP_OPENDIR` (5) to hostfsd. Same
+shape as `OP_OPEN` but the resulting fd reads back a `name\n`
+listing of the directory's entries (subdirs end with `/`).
+Implemented by extending OpenFile with an optional `buffer`
+field; `OP_READ`'s handler picks the buffer path when
+`is_dir()`. `hf_opendir(path)` added to the libc wrapper.
+
+### `tools/oriscrun --hostfsd`
+
+Mirrors `--terminal` for the hostfsd device. `--hostfsd
+"pid=N,root=PATH"` spawns it inline with the rest of the
+oriscrun-launched system, including the wait-for-READY
+synchronization. Removes the boilerplate of spawning hostfsd
+manually before oriscrun.
+
+### `examples/cc/shell.c`
+
+The MVP shell. Built-ins: `help`, `cat <path>`, `ls [<path>]`,
+`exit`. Read-line loop with backspace (no visual undo for
+v1 — text widget is append-only). Prompt is `orisc> `.
+
+The cute touch the user requested: the build banner shows the
+current real-world date minus 40 years. `run_shell.sh` computes
+it via `date -v -40y +"%b %e %Y %-l:%M %p"` and passes it to
+cpp via `-DBUILD_BANNER`. So a fresh build today (2026-05-03)
+announces itself as `Object RISC Shell (May 3 1986 6:34 PM)`.
+
+### Headless test
+
+`tools/devices/tests/test_shell.sh` builds shell.orx, launches
+oriscbar + real hostfsd (jailed to a fixture dir) + the
+already-extended `fake_terminal.py` (which now also handles
+console-write SENDs by issuing OBJ_READ_REQ and rendering the
+bytes), and asserts the shell handled `ls` correctly.
+
+`fake_terminal.py` got a buffered render mode — single-byte
+console writes were getting block-buffered when redirected to
+a file, so we accumulate everything and dump it as a `console
+render` block at exit.
+
+### What's not yet done
+
+- **Migrate existing demos onto term lib.** kbd_echo / paint /
+  mouse_paint still open-code their inline asm. Worth a pass
+  to validate the lib API; deferred to keep this commit
+  bounded.
+- **Backspace visual undo.** Needs grid-service overwrites or
+  cursor positioning; defer until we have a use case.
+- **Shell command history / line editing / piping.** Out of
+  scope for the MVP.
+- **Race in the test's exit path.** The shell's "bye!\n" SEND
+  goes out, but its OBJ_READ_RESP races with TaskExit and
+  fake_terminal sometimes doesn't render it before tearing
+  down. Documented in the test; the SEND is visible in the
+  wire log so we know the shell logic is correct.
+- **Static C functions still leak into the global symbol
+  table** (asmorisc default-globals everything not L\d+).
+  Same flag as Phase 18.
+- **A shared Python device library.** Three Python devices in
+  tree (oriscterm, linkbootd, hostfsd) plus fake_terminal.py
+  all duplicate the wire helpers. Still queued for a
+  refactor commit.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

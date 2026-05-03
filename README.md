@@ -85,7 +85,20 @@ python3 tools/sim/tests/validation/runner.py
 
 ## Quick taste
 
-Hello world:
+Most of the toolchain is pure Python — no build step. The C
+compiler is the exception: a vendored pcc that needs `./configure
+&& make` once. Bootstrap script handles it:
+
+```sh
+tools/cc/build.sh        # produces /tmp/pcc-build/cc/{cpp,ccom}/orisc-*
+```
+
+After that, `examples/cc/run_c.sh` and the `tools/devices/tests/`
+scripts find the binaries automatically. Override the location
+with `PCC_BUILD=/path/to/build tools/cc/build.sh` if `/tmp` isn't
+where you want it.
+
+Hello world (assembly, doesn't need pcc):
 
 ```sh
 tools/asm/asmorisc tools/asm/examples/hello.s -o /tmp/hello.orx

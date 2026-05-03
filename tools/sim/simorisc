@@ -2132,8 +2132,9 @@ def report_trap(cpu: CPU, t: Trap) -> None:
         row = "  " + "  ".join(f"r{j:>2}=0x{cpu.gpr[j]:08x}"
                                for j in range(i, i+4))
         print(row, file=sys.stderr)
-    for i in (0,1,2,3,4):
-        print(f"  o{i}=0x{cpu.opr[i]:016x}", file=sys.stderr)
+    for i in range(0, 16, 2):
+        print(f"  o{i:>2}=0x{cpu.opr[i]:016x}  "
+              f"o{i+1:>2}=0x{cpu.opr[i+1]:016x}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

@@ -32,8 +32,11 @@ for a pointer subscribe).
 import argparse, errno, selectors, socket, struct, sys, time
 
 HELLO_MAGIC = 0xC0FFEEAA
-PKT_SEND_DELIVER = 0x20
+PKT_OBJ_READ_REQ  = 0x10
+PKT_OBJ_READ_RESP = 0x11
+PKT_SEND_DELIVER  = 0x20
 
+CONSOLE_INDEX  = 1
 KEYBOARD_INDEX = 2
 POINTER_INDEX  = 6
 
@@ -71,6 +74,12 @@ def build_send_deliver(src_pid, dst_pid, trans, recipient_ref,
     return pack_packet(src_pid, dst_pid, PKT_SEND_DELIVER, 0, trans, pl)
 
 
+def build_obj_read_req(src_pid, dst_pid, trans, ref, offset, width):
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF,
+               offset & 0xFFFFFFFF, width & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_REQ, 0, trans, payload)
+
+
 def ref_home(r): return (r >> 40) & 0xFF
 def ref_index(r): return (r >> 16) & 0xFFFFFF
 
@@ -84,6 +93,12 @@ class FakeTerminal:
         self.ptr_sub = None
         self.ptr_state = 0
         self.trans = 0
+        # Outstanding console-write reads: trans_id → expected length.
+        # On OBJ_READ_RESP we decode and append to console_render
+        # (kept as a buffer so we can dump it cleanly at exit; per-byte
+        # writes to a redirected stdout get block-buffered and lost).
+        self.console_reads: dict = {}
+        self.console_render = bytearray()
 
     def drain_pending_subs(self, timeout):
         """Pull bytes off the socket until both `timeout` seconds have
@@ -105,7 +120,12 @@ class FakeTerminal:
                 self._handle(unpack_packet(pkt_bytes))
 
     def _handle(self, pkt):
+        if pkt["type"] == PKT_OBJ_READ_RESP:
+            self._handle_read_resp(pkt)
+            return
         if pkt["type"] != PKT_SEND_DELIVER:
+            print(f"fake_terminal: ignoring pkt type 0x{pkt['type']:02x}",
+                  file=sys.stderr, flush=True)
             return
         if len(pkt["payload"]) != 14:
             return
@@ -113,12 +133,40 @@ class FakeTerminal:
         recipient_ref = p[0] | (p[1] << 32)
         sub_ref = p[8] | (p[9] << 32)
         idx = ref_index(recipient_ref)
+        print(f"fake_terminal: SEND to idx={idx} recipient=0x{recipient_ref:016x} "
+              f"sub=0x{sub_ref:016x} R4={p[2]} R5={p[3]}",
+              file=sys.stderr, flush=True)
         if idx == KEYBOARD_INDEX and sub_ref:
             self.kbd_sub = sub_ref
             print(f"fake_terminal: kbd subscribe 0x{sub_ref:016x}", flush=True)
         elif idx == POINTER_INDEX and sub_ref:
             self.ptr_sub = sub_ref
             print(f"fake_terminal: ptr subscribe 0x{sub_ref:016x}", flush=True)
+        elif idx == CONSOLE_INDEX:
+            # CPU sent us a console-write request — same shape as
+            # oriscterm's idx-1 service: O2 = source ref, R4 = offset,
+            # R5 = byte count. The OR payload starts at word 6; OR
+            # slot 1 (sender's O2) is words [8..10].
+            source_ref = p[8] | (p[9] << 32)
+            offset = p[2]
+            length = p[3]
+            if source_ref and length:
+                trans = self._next_trans()
+                self.console_reads[trans] = length
+                pkt_out = build_obj_read_req(
+                    self.pid, ref_home(source_ref), trans,
+                    source_ref, offset, length)
+                self.sock.sendall(struct.pack(">I", len(pkt_out)) + pkt_out)
+
+    def _handle_read_resp(self, pkt):
+        n = self.console_reads.pop(pkt["trans"], None)
+        if n is None:
+            return
+        if pkt["flags"] & 0x3F:
+            return    # fault; ignore
+        words = pkt["payload"]
+        raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in words)
+        self.console_render.extend(raw[:n])
 
     def wait_for(self, want_kbd, want_ptr, timeout=10.0):
         deadline = time.time() + timeout
@@ -237,7 +285,9 @@ def main():
                  f"ptr={'ok' if term.ptr_sub else 'pending'})")
 
     for ev in events:
-        time.sleep(args.delay)
+        # Keep the socket drained between events so console writes
+        # arrive in order with the keystrokes that triggered them.
+        term.drain_pending_subs(args.delay)
         if ev[0] == "key":
             term.send_key(ev[1], ev[2])
         elif ev[0] == "motion":
@@ -247,7 +297,14 @@ def main():
         elif ev[0] == "up":
             term.send_up(ev[1], ev[2], ev[3])
 
-    time.sleep(args.linger)
+    # Final drain — give the CPU a chance to flush its last outputs.
+    term.drain_pending_subs(args.linger)
+    # Dump everything the CPU asked us to render. Single block at the
+    # end of the run so test scripts can grep cleanly without the
+    # event-log lines interleaved.
+    sys.stdout.write("--- console render ---\n")
+    sys.stdout.write(term.console_render.decode("utf-8", errors="replace"))
+    sys.stdout.flush()
     return 0
 
 

@@ -15,6 +15,34 @@ in only the parts a given program actually calls.
 | `void print_int(int n)` | write `n` formatted as a signed decimal integer |
 | `void print_hex(unsigned int n)` | write `n` formatted as `0xHHHHHHHH` (8 hex digits) |
 
+### `term.c` — oriscterm interaction (console + keyboard)
+
+| Function | Effect |
+|----------|--------|
+| `void term_init(void)` | save boot O2/O3/O4 → O11/O14/O15, attach a queue, subscribe to keyboard. Call once. |
+| `void term_print(const char *s)` | write a string to the terminal console |
+| `void term_print_char(char c)` | write a single byte (uses a static lookup table; safe across rapid calls) |
+| `void term_print_int(int n)` | write a signed decimal integer |
+| `void term_print_hex(unsigned int n)` | write `0xHHHHHHHH` |
+| `int  term_getkey(int *out_mods)` | block until next keystroke; return codepoint, write modifier mask via out_mods |
+
+Programs MUST follow the OR-hygiene boot ABI:
+
+    O5  = oriscterm console  (--service order)
+    O6  = oriscterm keyboard (--service order)
+    O11 = boot stack ref     (parked by term_init)
+    O14 = boot self-svc      (parked by term_init)
+    O15 = boot data ref      (parked by term_init)
+
+Special-key codepoints (`TK_BACKSPACE`, `TK_RETURN`, etc.) and
+modifier mask bits (`TK_MOD_SHIFT`, etc.) are in `liborisc.h`.
+
+### `host_io.c` — host filesystem (hostfsd) wrapper
+
+Documented in [`tools/devices/README.md`](../../devices/README.md)
+under "hostfsd". Adds `hf_init / hf_open / hf_opendir / hf_close /
+hf_read / hf_write` to the libc.
+
 ### `string.c` — string and memory primitives
 
 | Function | Effect |

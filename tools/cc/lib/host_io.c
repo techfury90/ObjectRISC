@@ -34,6 +34,7 @@
 #define OP_READ       2
 #define OP_WRITE      3
 #define OP_SUBSCRIBE  4
+#define OP_OPENDIR    5
 
 /* Section base VAs from CONTRACT.md §2. */
 #define DATA_VA  0x00040000
@@ -96,17 +97,14 @@ hf_wait(int *out_secondary)
 int
 hf_init(void)
 {
-	register void *__or o4_self __asm__("o4");
-	register void *__or o9_subref __asm__("o9");
 	int status;
 
 	/* Attach a queue on our self-service so hostfsd's responses land
-	 * in something we can poll. Depth 16 is plenty for the
-	 * synchronous one-op-at-a-time shape. */
+	 * in something we can poll. */
 	asm volatile(
 		"omov  o1, o4\n"
 		"addiu r4, r0, 16\n"
-		"call  #0x203\n"             /* ReceiveQueueAttach */
+		"call  #0x203\n"
 		"nop\n"
 		"addu  %0, r2, r0"
 		: "=r"(status)
@@ -118,22 +116,20 @@ hf_init(void)
 		return -1;
 	}
 
-	/* Derive an R|S self-ref to hand hostfsd as our reply target. */
+	/* Derive an R|S self-ref into O9 (no `register __or __asm__`
+	 * declarations — see term.c::term_init for why). */
 	asm volatile(
 		"omov  o1, o4\n"
-		"addiu r4, r0, 9\n"          /* R|S = 0x09 */
-		"call  #0x103\n"             /* ObjDerive */
+		"addiu r4, r0, 9\n"
+		"call  #0x103\n"
 		"nop\n"
-		"omov  %0, o1"
-		: "=r"(o9_subref)
-		:
-		: "r1", "r2", "r4"
+		"omov  o9, o1"
 	);
 
-	/* Send OP_SUBSCRIBE. */
+	/* Send OP_SUBSCRIBE to hostfsd (in O10). */
 	asm volatile(
-		"omov  o1, o10\n"            /* hostfsd service */
-		"omov  o2, o9\n"             /* subscriber ref */
+		"omov  o1, o10\n"
+		"omov  o2, o9\n"
 		"onull o3\n"
 		"addiu r4, r0, 4\n"          /* OP_SUBSCRIBE */
 		"addiu r5, r0, 0\n"
@@ -145,7 +141,6 @@ hf_init(void)
 		: "r1", "r4", "r5", "r6", "r7"
 	);
 	hf_restore_or();
-	(void)o4_self;
 	return 0;
 }
 
@@ -197,6 +192,55 @@ hf_open(const char *path, int flags)
 	{
 		int discard;
 		fd = hf_wait(&discard);   /* secondary = file size; ignored for now */
+	}
+	return fd;
+}
+
+/* --- hf_opendir — open a directory; subsequent hf_read returns
+ *     a "name1\nname2\n..." listing of the entries (subdirs end "/"). */
+
+int
+hf_opendir(const char *path)
+{
+	int path_off, path_len, fd;
+	const char *p;
+	for (p = path, path_len = 0; *p; p++, path_len++) ;
+	if ((unsigned int)path >= STACK_BOTTOM
+	    && (unsigned int)path < STACK_TOP) {
+		path_off = (int)((unsigned int)path - STACK_BOTTOM);
+		asm volatile(
+			"omov  o1, o10\n"
+			"omov  o2, o11\n"
+			"onull o3\n"
+			"addiu r4, r0, 5\n"          /* OP_OPENDIR */
+			"addu  r5, %0, r0\n"
+			"addu  r6, %1, r0\n"
+			"addiu r7, r0, 0\n"
+			"send  o1"
+			:
+			: "r"(path_off), "r"(path_len)
+			: "r1", "r4", "r5", "r6", "r7"
+		);
+	} else {
+		path_off = (int)((unsigned int)path - DATA_VA);
+		asm volatile(
+			"omov  o1, o10\n"
+			"omov  o2, o15\n"
+			"onull o3\n"
+			"addiu r4, r0, 5\n"
+			"addu  r5, %0, r0\n"
+			"addu  r6, %1, r0\n"
+			"addiu r7, r0, 0\n"
+			"send  o1"
+			:
+			: "r"(path_off), "r"(path_len)
+			: "r1", "r4", "r5", "r6", "r7"
+		);
+	}
+	hf_restore_or();
+	{
+		int discard;
+		fd = hf_wait(&discard);
 	}
 	return fd;
 }

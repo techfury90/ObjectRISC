@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ORISCBAR  = ROOT / "tools" / "sim"     / "oriscbar"
 SIMORISC  = ROOT / "tools" / "sim"     / "simorisc"
 ORISCTERM = ROOT / "tools" / "devices" / "oriscterm"
+HOSTFSD   = ROOT / "tools" / "devices" / "hostfsd"
 
 
 def parse_cpu_spec(spec: str) -> dict:
@@ -72,6 +73,24 @@ def parse_terminal_spec(spec: str) -> dict:
         raise SystemExit(f"oriscrun: --terminal spec must start with pid=, "
                          f"got {spec!r}")
     return {"pid": int(spec[len("pid="):])}
+
+
+def parse_hostfsd_spec(spec: str) -> dict:
+    """Parse 'pid=N[,root=PATH]' into a dict."""
+    out = {"pid": None, "root": None}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("pid="):
+            out["pid"] = int(part[len("pid="):])
+        elif part.startswith("root="):
+            out["root"] = part[len("root="):]
+        else:
+            raise SystemExit(f"oriscrun: unknown --hostfsd field {part!r}")
+    if out["pid"] is None:
+        raise SystemExit(f"oriscrun: --hostfsd spec missing pid=N: {spec!r}")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +129,10 @@ def main(argv) -> int:
     ap.add_argument("--terminal", action="append", default=[],
                     metavar="pid=N",
                     help="spawn an oriscterm at the given pid")
+    ap.add_argument("--hostfsd", action="append", default=[],
+                    metavar="pid=N[,root=PATH]",
+                    help="spawn a hostfsd at the given pid; "
+                         "optional root=PATH jails the service")
     ap.add_argument("--cpu", action="append", default=[], required=True,
                     metavar="SPEC",
                     help="spawn a simorisc CPU; SPEC is "
@@ -129,6 +152,7 @@ def main(argv) -> int:
 
     cpu_specs = [parse_cpu_spec(s) for s in args.cpu]
     term_specs = [parse_terminal_spec(s) for s in args.terminal]
+    hf_specs   = [parse_hostfsd_spec(s) for s in args.hostfsd]
     if not any(c["pid"] == args.leader for c in cpu_specs):
         sys.exit(f"oriscrun: --leader pid {args.leader} has no matching --cpu")
 
@@ -208,6 +232,32 @@ def main(argv) -> int:
         sys.stdout.write(f"[term{tspec['pid']}] "
                          f"{line.decode('utf-8', errors='replace')}")
         _attach_forwarders(f"term{tspec['pid']}", term)
+
+    for hspec in hf_specs:
+        cmd = [sys.executable, str(HOSTFSD),
+               "--socket", sock_path, "--pid", str(hspec["pid"]),
+               "-v"]
+        if hspec["root"] is not None:
+            cmd.extend(["--root", hspec["root"]])
+        hf = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        procs.append((f"hf{hspec['pid']}", hf))
+        deadline = time.time() + 5.0
+        line = b''
+        while time.time() < deadline:
+            rd, _, _ = select.select([hf.stdout], [], [], 0.1)
+            if hf.stdout in rd:
+                line = hf.stdout.readline()
+                if b"READY" in line:
+                    break
+        if b"READY" not in line:
+            sys.stderr.write(f"oriscrun: hostfsd pid={hspec['pid']} "
+                             f"failed to start\n")
+            return cleanup_and_exit(1)
+        sys.stdout.write(f"[hf{hspec['pid']}] "
+                         f"{line.decode('utf-8', errors='replace')}")
+        _attach_forwarders(f"hf{hspec['pid']}", hf)
 
     # ---- 3. Spawn CPUs ----------------------------------------------------
     leader_proc = None
