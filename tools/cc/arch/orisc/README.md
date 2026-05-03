@@ -70,9 +70,9 @@ build.)
 The output binaries are `cc/cpp/orisc-unknown-none-cpp` and
 `cc/ccom/orisc-unknown-none-ccom`. The compiler is invoked through
 the wrapper [`examples/cc/run_c.sh`](../../../../examples/cc/run_c.sh),
-which drives the full pipeline (cpp → ccom → asmorisc → simorisc)
-and links each program against
-[`crt0.s`](crt0.s), [`console_io.s`](console_io.s), and
+which drives the full pipeline (cpp → ccom → `asmorisc -r` per
+translation unit → `orld` → simorisc) and links each program
+against [`crt0.s`](crt0.s), [`console_io.s`](console_io.s), and
 [`examples/cc/lib.c`](../../../../examples/cc/lib.c).
 
 ## Try it

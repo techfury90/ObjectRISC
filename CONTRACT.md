@@ -37,6 +37,77 @@ The assembler produces this format. The simulator consumes it. A
 loader that finds a magic mismatch, an unsupported version, or a
 file-size discrepancy must reject the file.
 
+## 1.1 The `.oro` Object File Format
+
+The intermediate format consumed by the linker. An `.oro` file
+holds the assembled output of one source file together with the
+symbol and relocation metadata needed to combine it with other
+`.oro` files into a single `.orx`. The simulator never sees this
+format; it's strictly a contract between the assembler
+(`asmorisc -r`) and the linker (`orld`). Big-endian throughout.
+
+| Offset | Size | Field                                                                |
+|--------|------|----------------------------------------------------------------------|
+| `0x00` | 8    | Magic: ASCII bytes `ORISCOBJ` (`0x4F 0x52 0x49 0x53 0x43 0x4F 0x42 0x4A`) |
+| `0x08` | 4    | Format version, currently `1`                                        |
+| `0x0C` | 4    | Flags, currently `0`                                                 |
+| `0x10` | 4    | Text section size, in bytes (multiple of 4)                          |
+| `0x14` | 4    | Data section size, in bytes (no alignment requirement)               |
+| `0x18` | 4    | Symbol-table entry count (each entry is 16 bytes)                    |
+| `0x1C` | 4    | Relocation-table entry count (each entry is 12 bytes)                |
+| `0x20` | T    | Text section bytes — instruction words for resolved sites; zero-padding at relocation sites |
+| `0x20+T` | D  | Data section bytes                                                   |
+| `0x20+T+D` | 16·N | Symbol table — N entries of 16 bytes each (layout below)         |
+| `0x20+T+D+16N` | 12·R | Relocation table — R entries of 12 bytes each (layout below) |
+| `0x20+T+D+16N+12R` | rest | String table — concatenated NUL-terminated symbol names    |
+
+### Symbol entry (16 bytes)
+
+| Offset | Size | Field                                                              |
+|--------|------|--------------------------------------------------------------------|
+| `0x00` | 4    | Name offset within the string table                                |
+| `0x04` | 4    | Value (offset within the symbol's section, or zero for undefined)  |
+| `0x08` | 1    | Section: `0` undefined, `1` text, `2` data, `3` absolute           |
+| `0x09` | 1    | Binding: `0` local, `1` global                                     |
+| `0x0A` | 1    | Type: `0` none, `1` function, `2` data                             |
+| `0x0B` | 5    | Reserved (zero)                                                    |
+
+A symbol entry with `section = 0` is an undefined reference — the
+file expects another `.oro` to provide a definition at link time.
+Local symbols are kept in the table only so relocations within the
+same file can name them; the linker discards them after applying
+the relocations.
+
+### Relocation entry (12 bytes)
+
+| Offset | Size | Field                                                              |
+|--------|------|--------------------------------------------------------------------|
+| `0x00` | 4    | Offset within the target section                                   |
+| `0x04` | 1    | Target section: `1` text, `2` data                                 |
+| `0x05` | 1    | Relocation type (see below)                                        |
+| `0x06` | 2    | Reserved (zero)                                                    |
+| `0x08` | 4    | Symbol-table index (zero-based)                                    |
+
+### Relocation types
+
+| Code   | Name              | Effect                                                                            |
+|--------|-------------------|-----------------------------------------------------------------------------------|
+| `0x00` | `R_ORISC_NONE`    | No-op (reserved)                                                                  |
+| `0x01` | `R_ORISC_ABS32`   | Patch the full 32-bit word at the offset with the symbol's absolute virtual address |
+| `0x02` | `R_ORISC_HI16`    | Patch the low 16 bits of the instruction word with the upper 16 bits of the symbol's VA (for `lui`) |
+| `0x03` | `R_ORISC_LO16`    | Patch the low 16 bits of the instruction word with the lower 16 bits of the symbol's VA (for `ori`/`addiu`) |
+| `0x04` | `R_ORISC_BRANCH16`| Patch the low 16 bits of the instruction word with the signed (target_VA − (instr_VA + 4)) >> 2; assembled with this reloc only when the target is undefined in this file |
+| `0x05` | `R_ORISC_J26`     | Patch the low 26 bits of the instruction word with `(target_VA >> 2) & 0x03FFFFFF` (for `j`/`jal`) |
+
+`HI16` and `LO16` use the simple high/low split — the upper 16
+bits are `(addr >> 16) & 0xFFFF`, no sign-extension adjustment.
+This is correct for `lui` followed by `ori` (which zero-extends);
+do not use the LO16 reloc with `addiu` unless the address is
+known to fit in the low 16 bits unsigned.
+
+`BRANCH16` and `J26` patches expect the existing low bits to be
+zero (the assembler has emitted a placeholder).
+
 ## 2. The Initial Task State
 
 When the simulator loads an `.orx`, it sets up the initial task as if

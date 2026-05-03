@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""orld — Object RISC linker.
+
+Combines one or more `.oro` object files (produced by `asmorisc -r`) into
+a single `.orx` executable. Concatenates text and data sections, resolves
+cross-file global symbols, applies the relocation records from each input,
+and writes a final `.orx` with the right entry offset.
+
+Usage:
+    tools/ld/orld -o program.orx crt0.oro lib.oro program.oro
+    tools/ld/orld --entry main -o program.orx lib.oro program.oro
+
+Default entry symbol is `_start`. The linker errors out if the entry symbol
+isn't defined in any input, if a global symbol is multiply defined, or if
+a relocation references a symbol no input provides.
+
+See CONTRACT.md §1 (.orx format) and §1.1 (.oro format).
+"""
+
+import argparse
+import struct
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# .orx output container — must agree with simorisc.
+ORX_MAGIC          = b"ORISC\x00\x00\x00"
+ORX_FORMAT_VERSION = 1
+ORX_HEADER_SIZE    = 0x20
+
+# .oro input container — must agree with asmorisc.
+ORO_MAGIC          = b"ORISCOBJ"
+ORO_FORMAT_VERSION = 1
+ORO_HEADER_SIZE    = 0x20
+ORO_SYMBOL_SIZE    = 16
+ORO_RELOC_SIZE     = 12
+
+ORO_SEC_UNDEF = 0
+ORO_SEC_TEXT  = 1
+ORO_SEC_DATA  = 2
+ORO_SEC_ABS   = 3
+
+ORO_BIND_LOCAL  = 0
+ORO_BIND_GLOBAL = 1
+
+R_ORISC_NONE     = 0
+R_ORISC_ABS32    = 1
+R_ORISC_HI16     = 2
+R_ORISC_LO16     = 3
+R_ORISC_BRANCH16 = 4
+R_ORISC_J26      = 5
+
+# Section base virtual addresses (CONTRACT.md §2).
+TEXT_VA = 0x00010000
+DATA_VA = 0x00040000
+
+
+# ---------------------------------------------------------------------------
+# Parsed .oro
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Symbol:
+    name: str
+    value: int          # offset within section (or 0 for undefined)
+    section: int        # ORO_SEC_*
+    binding: int        # ORO_BIND_*
+
+
+@dataclass
+class Reloc:
+    offset: int
+    section: int        # 1=text, 2=data
+    rtype: int
+    sym_index: int
+
+
+@dataclass(eq=False)
+class ObjectFile:
+    """eq=False keeps the default identity-based hashing so ObjectFile
+    can be used as a dict key (text_offsets / data_offsets)."""
+    path: Path
+    text: bytearray
+    data: bytearray
+    symbols: List[Symbol]
+    relocs: List[Reloc]
+
+
+def load_oro(path: Path) -> ObjectFile:
+    blob = path.read_bytes()
+    if len(blob) < ORO_HEADER_SIZE:
+        raise SystemExit(f"orld: {path}: too short for .oro header")
+    if blob[:8] != ORO_MAGIC:
+        raise SystemExit(f"orld: {path}: not a .oro file "
+                         f"(magic {blob[:8]!r} != {ORO_MAGIC!r})")
+    version, flags, text_size, data_size, sym_count, rel_count = \
+        struct.unpack(">IIIIII", blob[8:0x20])
+    if version != ORO_FORMAT_VERSION:
+        raise SystemExit(f"orld: {path}: unsupported .oro version {version}")
+    if text_size % 4:
+        raise SystemExit(f"orld: {path}: text size {text_size} not multiple of 4")
+
+    cursor = ORO_HEADER_SIZE
+    text = bytearray(blob[cursor:cursor + text_size]); cursor += text_size
+    data = bytearray(blob[cursor:cursor + data_size]); cursor += data_size
+    sym_bytes_len = sym_count * ORO_SYMBOL_SIZE
+    sym_bytes = blob[cursor:cursor + sym_bytes_len]; cursor += sym_bytes_len
+    rel_bytes_len = rel_count * ORO_RELOC_SIZE
+    rel_bytes = blob[cursor:cursor + rel_bytes_len]; cursor += rel_bytes_len
+    str_bytes = blob[cursor:]
+
+    # Symbols.
+    symbols: List[Symbol] = []
+    for i in range(sym_count):
+        off = i * ORO_SYMBOL_SIZE
+        name_off, value, section, binding, type_ = struct.unpack_from(
+            ">IIBBB", sym_bytes, off)
+        # Read NUL-terminated name from string table.
+        end = str_bytes.index(b'\x00', name_off)
+        name = str_bytes[name_off:end].decode('utf-8')
+        symbols.append(Symbol(name=name, value=value,
+                              section=section, binding=binding))
+
+    # Relocations.
+    relocs: List[Reloc] = []
+    for i in range(rel_count):
+        off = i * ORO_RELOC_SIZE
+        roff, sec, rtype, sym_idx = struct.unpack_from(
+            ">IBB2xI", rel_bytes, off)
+        relocs.append(Reloc(offset=roff, section=sec,
+                            rtype=rtype, sym_index=sym_idx))
+
+    return ObjectFile(path=path, text=text, data=data,
+                      symbols=symbols, relocs=relocs)
+
+
+# ---------------------------------------------------------------------------
+# Linking
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GlobalSymbol:
+    """A global symbol resolved across all inputs to its final VA."""
+    name: str
+    value: int          # final absolute VA
+    obj: ObjectFile     # provenance (for error messages and `--map`)
+
+
+def link(objs: List[ObjectFile], entry_name: str
+         ) -> Tuple[bytes, bytes, int]:
+    """Lay out, resolve, and patch. Returns (text_bytes, data_bytes,
+    entry_offset_in_text)."""
+
+    # Step 1 — section layout. Each .oro contributes its text and data to
+    # the unified output at a per-file base offset.
+    text_offsets: Dict[ObjectFile, int] = {}
+    data_offsets: Dict[ObjectFile, int] = {}
+    text_cursor = 0
+    data_cursor = 0
+    for obj in objs:
+        text_offsets[obj] = text_cursor
+        text_cursor += len(obj.text)
+        data_offsets[obj] = data_cursor
+        data_cursor += len(obj.data)
+
+    # Step 2 — resolve globals. Walk each .oro's symbol table; defined
+    # globals enter the merged table (duplicate detection); local symbols
+    # are kept only on the per-obj symbol list so per-obj relocations can
+    # find them.
+    globals_: Dict[str, GlobalSymbol] = {}
+    for obj in objs:
+        for sym in obj.symbols:
+            if sym.binding != ORO_BIND_GLOBAL or sym.section == ORO_SEC_UNDEF:
+                continue
+            base = (text_offsets[obj] if sym.section == ORO_SEC_TEXT
+                    else data_offsets[obj] if sym.section == ORO_SEC_DATA
+                    else 0)
+            section_base_va = (TEXT_VA if sym.section == ORO_SEC_TEXT
+                               else DATA_VA if sym.section == ORO_SEC_DATA
+                               else 0)
+            value_va = section_base_va + base + sym.value
+            if sym.name in globals_:
+                prev = globals_[sym.name]
+                raise SystemExit(
+                    f"orld: duplicate definition of global symbol "
+                    f"{sym.name!r}: first in {prev.obj.path}, again in "
+                    f"{obj.path}")
+            globals_[sym.name] = GlobalSymbol(
+                name=sym.name, value=value_va, obj=obj)
+
+    # Step 3 — apply relocations per object. For each reloc, find the
+    # target symbol's final VA, then patch the appropriate bytes.
+    for obj in objs:
+        for reloc in obj.relocs:
+            sym = obj.symbols[reloc.sym_index]
+            target_va = _resolve_symbol_va(sym, obj, text_offsets,
+                                            data_offsets, globals_)
+            buf = obj.text if reloc.section == ORO_SEC_TEXT else obj.data
+            sec_base_va = (TEXT_VA if reloc.section == ORO_SEC_TEXT
+                           else DATA_VA)
+            obj_base = (text_offsets[obj] if reloc.section == ORO_SEC_TEXT
+                        else data_offsets[obj])
+            site_va = sec_base_va + obj_base + reloc.offset
+            _apply_reloc(buf, reloc, target_va, site_va, obj)
+
+    # Step 4 — assemble final text and data.
+    text_bytes = bytearray()
+    for obj in objs:
+        text_bytes += obj.text
+    data_bytes = bytearray()
+    for obj in objs:
+        data_bytes += obj.data
+
+    if len(text_bytes) % 4:
+        raise SystemExit(f"orld: total text size {len(text_bytes)} not a "
+                         f"multiple of 4 (alignment bug somewhere)")
+
+    # Step 5 — entry point.
+    entry_sym = globals_.get(entry_name)
+    if entry_sym is None:
+        raise SystemExit(f"orld: entry symbol {entry_name!r} not defined "
+                         f"in any input")
+    if not (TEXT_VA <= entry_sym.value < TEXT_VA + len(text_bytes)):
+        raise SystemExit(f"orld: entry symbol {entry_name!r} at "
+                         f"{entry_sym.value:#x} is not in the text section")
+    entry_offset = entry_sym.value - TEXT_VA
+
+    return bytes(text_bytes), bytes(data_bytes), entry_offset
+
+
+def _resolve_symbol_va(sym: Symbol, obj: ObjectFile,
+                        text_offsets: Dict[ObjectFile, int],
+                        data_offsets: Dict[ObjectFile, int],
+                        globals_: Dict[str, GlobalSymbol]) -> int:
+    """Return the final absolute VA of `sym`. Local symbols resolve via
+    the obj's own section base; undefined globals require a definition
+    elsewhere."""
+    if sym.section == ORO_SEC_UNDEF:
+        if sym.name not in globals_:
+            raise SystemExit(
+                f"orld: {obj.path}: undefined reference to {sym.name!r}")
+        return globals_[sym.name].value
+    if sym.binding == ORO_BIND_LOCAL:
+        section_base_va = (TEXT_VA if sym.section == ORO_SEC_TEXT
+                           else DATA_VA if sym.section == ORO_SEC_DATA
+                           else 0)
+        obj_base = (text_offsets[obj] if sym.section == ORO_SEC_TEXT
+                    else data_offsets[obj] if sym.section == ORO_SEC_DATA
+                    else 0)
+        return section_base_va + obj_base + sym.value
+    # Defined global — already in globals_.
+    return globals_[sym.name].value
+
+
+def _apply_reloc(buf: bytearray, reloc: Reloc, target_va: int,
+                  site_va: int, obj: ObjectFile) -> None:
+    o = reloc.offset
+    if reloc.rtype == R_ORISC_NONE:
+        return
+
+    if reloc.rtype == R_ORISC_ABS32:
+        buf[o:o + 4] = struct.pack(">I", target_va & 0xFFFFFFFF)
+        return
+
+    if reloc.rtype in (R_ORISC_HI16, R_ORISC_LO16):
+        word = struct.unpack(">I", bytes(buf[o:o + 4]))[0]
+        if reloc.rtype == R_ORISC_HI16:
+            patch = (target_va >> 16) & 0xFFFF
+        else:
+            patch = target_va & 0xFFFF
+        word = (word & 0xFFFF0000) | patch
+        buf[o:o + 4] = struct.pack(">I", word)
+        return
+
+    if reloc.rtype == R_ORISC_BRANCH16:
+        # Displacement from delay-slot (PC+4) in words; signed 16.
+        disp_bytes = target_va - (site_va + 4)
+        if disp_bytes & 3:
+            raise SystemExit(f"orld: {obj.path}: BRANCH16 target not "
+                             f"4-byte aligned at offset {o:#x}")
+        disp_words = disp_bytes // 4
+        if not (-(1 << 15) <= disp_words <= (1 << 15) - 1):
+            raise SystemExit(f"orld: {obj.path}: BRANCH16 displacement "
+                             f"{disp_words} out of 16-bit signed range "
+                             f"at offset {o:#x}")
+        word = struct.unpack(">I", bytes(buf[o:o + 4]))[0]
+        word = (word & 0xFFFF0000) | (disp_words & 0xFFFF)
+        buf[o:o + 4] = struct.pack(">I", word)
+        return
+
+    if reloc.rtype == R_ORISC_J26:
+        if target_va & 3:
+            raise SystemExit(f"orld: {obj.path}: J26 target not 4-byte "
+                             f"aligned at offset {o:#x}")
+        # The architectural rule (CONTRACT §5.4 / Vol II §6): high 4 bits
+        # of the target come from the delay-slot PC. Within our 256MB
+        # region the same way asmorisc encodes them (text loads at
+        # 0x10000), the encoded field is the 26-bit absolute word index.
+        ds_va = site_va + 4
+        if (target_va & 0xF0000000) != (ds_va & 0xF0000000):
+            raise SystemExit(f"orld: {obj.path}: J26 target outside 256MB "
+                             f"region of delay slot at offset {o:#x}")
+        word_index = (target_va >> 2) & 0x03FFFFFF
+        word = struct.unpack(">I", bytes(buf[o:o + 4]))[0]
+        word = (word & 0xFC000000) | word_index
+        buf[o:o + 4] = struct.pack(">I", word)
+        return
+
+    raise SystemExit(f"orld: {obj.path}: unknown relocation type "
+                     f"0x{reloc.rtype:02x} at offset {o:#x}")
+
+
+def write_orx(text: bytes, data: bytes, entry_offset: int) -> bytes:
+    hdr = (ORX_MAGIC
+           + struct.pack(">II", ORX_FORMAT_VERSION, 0)
+           + struct.pack(">III", entry_offset, len(text), len(data))
+           + struct.pack(">I", 0))                # stack_size = loader default
+    assert len(hdr) == ORX_HEADER_SIZE
+    return hdr + text + data
+
+
+# ---------------------------------------------------------------------------
+# Map-file output (for debugging)
+# ---------------------------------------------------------------------------
+
+def write_map(objs: List[ObjectFile], text: bytes, data: bytes,
+              entry: int) -> str:
+    out = []
+    out.append(f"; orld map — text {len(text)}B, data {len(data)}B, "
+               f"entry @ text+0x{entry:x} (VA 0x{TEXT_VA + entry:08x})")
+    out.append("")
+    text_cursor = 0
+    data_cursor = 0
+    for obj in objs:
+        out.append(f"; {obj.path}")
+        out.append(f";   text  +0x{text_cursor:06x}  +{len(obj.text):>5}B  "
+                   f"VA 0x{TEXT_VA + text_cursor:08x}")
+        out.append(f";   data  +0x{data_cursor:06x}  +{len(obj.data):>5}B  "
+                   f"VA 0x{DATA_VA + data_cursor:08x}")
+        for sym in obj.symbols:
+            if sym.section == ORO_SEC_UNDEF or sym.binding != ORO_BIND_GLOBAL:
+                continue
+            sec_va = TEXT_VA if sym.section == ORO_SEC_TEXT else DATA_VA
+            obj_base = (text_cursor if sym.section == ORO_SEC_TEXT
+                        else data_cursor)
+            out.append(f";     {sec_va + obj_base + sym.value:08x}  "
+                       f"{sym.name}")
+        text_cursor += len(obj.text)
+        data_cursor += len(obj.data)
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="orld",
+        description="Object RISC linker (.oro... -> .orx)")
+    ap.add_argument("inputs", nargs="+", type=Path,
+                    help="input .oro object files (linked in order)")
+    ap.add_argument("-o", "--output", type=Path,
+                    help="output .orx path (default: based on first input)")
+    ap.add_argument("-e", "--entry", default="_start",
+                    help="entry symbol name (default: _start)")
+    ap.add_argument("--map", type=Path,
+                    help="write a section/symbol map to this path")
+    args = ap.parse_args(argv)
+
+    out_path = args.output or args.inputs[0].with_suffix(".orx")
+
+    objs: List[ObjectFile] = []
+    for path in args.inputs:
+        try:
+            objs.append(load_oro(path))
+        except FileNotFoundError:
+            sys.exit(f"orld: {path}: no such file")
+
+    text, data, entry = link(objs, args.entry)
+    out_path.write_bytes(write_orx(text, data, entry))
+
+    if args.map:
+        args.map.write_text(write_map(objs, text, data, entry))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

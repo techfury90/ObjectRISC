@@ -950,13 +950,106 @@ independent processes, one host-side server, one shared
 boot image, eight independent OLW copy passes interleaved on
 the socket.
 
+## Phase 14 — A real linker
+
+The original asmorisc accepted multiple `.s` files but did the
+"linking" by concatenation: read every input into one stream, build
+a single global symbol table, resolve every reference at assembly
+time, emit one `.orx`. That worked for the demos but had a tell —
+`examples/cc/run_c.sh` had a `sed 's/L\([0-9]\+\)/LP\1/'` per-unit
+mangling step to dodge `L1` colliding with `L1`, because pcc emits
+unscoped local labels per translation unit. Time to do it properly.
+
+### The split
+
+`asmorisc -r` now emits a relocatable `.oro` object file (format
+spec in [`CONTRACT.md`](CONTRACT.md) §1.1) with text, data, a
+symbol table, and a relocation table. A new tool,
+[`tools/ld/orld`](tools/ld), takes one or more `.oro` files,
+merges sections, resolves cross-file globals, applies the
+relocations, and writes the final `.orx`. Pcc's pipeline becomes
+the natural shape: one `cpp + ccom + asmorisc -r` per translation
+unit, then one `orld` over all the produced `.oro` files. The
+sed-mangling hack is gone — local labels are scoped per `.oro`,
+so `L1`-vs-`L1` collisions stop happening.
+
+### Symbol scoping
+
+The default rule: any label name matching `L\d+` is local;
+everything else is global. That's the standard pcc convention and
+keeps the migration friction-free — existing `.s` files don't need
+changes. Two new directives let asm authors pin the binding
+explicitly: `.global NAME[, NAME2, ...]` exports a symbol;
+`.local NAME` keeps it private.
+
+### Relocations
+
+Six relocation types, deliberately minimal, each corresponding to
+one site `asmorisc` was already deferring to pass 2:
+
+| Code | Name | Patches | Where |
+|------|------|---------|-------|
+| `0x01` | `R_ORISC_ABS32` | full 32-bit word | `.word symbol` |
+| `0x02` | `R_ORISC_HI16`  | low 16 of an instr | `lui rd, hi(label)` (first half of `la`) |
+| `0x03` | `R_ORISC_LO16`  | low 16 of an instr | `ori rd, rd, lo(label)` (second half of `la`) |
+| `0x04` | `R_ORISC_BRANCH16` | low 16 of an instr | rare cross-`.oro` branches |
+| `0x05` | `R_ORISC_J26`     | low 26 of an instr | `j label` / `jal label` |
+
+Two architectural details worth flagging. First, `HI16` and `LO16`
+use the simple unsigned high/low split (no MIPS-style
+`((addr + 0x8000) >> 16)` adjustment), because `lui + ori` zero-
+extends the low half. Second, branches between two locally-defined
+labels in the same `.oro` don't generate relocations at all —
+their PC-relative displacements are invariant under section moves,
+so `asmorisc -r` still resolves them at pass 2 and emits the
+final encoded word. Only the absolute-address forms (`la`/`j`/
+`jal`/`.word symbol`) need the linker's help.
+
+### What didn't surface
+
+A surprising amount of the design was just "do the obvious
+ELF-shaped thing, but minimal." Big things that are NOT in this
+linker because nothing in the toolchain needed them yet:
+
+- **Archives (`.a`).** A `.a` is just a tar of `.o` files with an
+  index; trivial to add when we have a libc to link against.
+- **Weak symbols.** Useful for libc but not for the current pcc
+  output.
+- **Section types beyond `.text`/`.data`.** No `.rodata`, no
+  `.bss` (we always allocate zero-init in the loader). Adding
+  these is straightforward but uncalled for.
+- **Common symbols.** Same reason.
+- **Linker scripts.** `orld` always lays out `.text` then `.data`
+  in input order, with the standard text/data VAs from `CONTRACT`
+  §2. No `--script` knob.
+- **Position-independent code.** Not in the architecture's
+  vocabulary. Every reference resolves to an absolute VA.
+
+### Tests
+
+[`tools/ld/tests/`](tools/ld/tests) has six per-feature tests, each
+a self-contained shell script that builds its own `.oro` files in a
+tempdir, runs `orld`, and asserts on the simulator's exit code or
+the linker's error message. Cases: cross-file `jal` (J26),
+cross-file `la` (HI16+LO16 pair), per-file local-label scoping
+(both files define `L1`), undefined-reference error, duplicate-
+global error, explicit `.local` letting a non-`L\d+` name be
+file-private. All six pass; the linker passes the C demo suite as
+well — every one of the eleven `examples/cc/*.c` programs builds
+end-to-end through the new pipeline.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
   reflect everything learned in implementation.
-- An assembler (with `.set` and label arithmetic) and a simulator
+- An assembler (with `.set`, label arithmetic, and a `-r` mode that
+  emits relocatable `.oro` object files) and a simulator
   (~3,000 lines of Python, stdlib only) with single-CPU,
   in-process multi-CPU, and multi-process modes.
+- A linker (`tools/ld/orld`) that combines `.oro` object files
+  into executable `.orx`, with per-file local symbol scoping,
+  cross-file global resolution, and a small set of relocations
+  covering everything the toolchain emits.
 - A validation suite spanning thirteen categories (integer, logical,
   memory, control, oreg, omem, firmware, traps, call, golden,
   multi-CPU including link boot, loadable modules, receive queues),
@@ -968,10 +1061,15 @@ the socket.
 - A vendored pcc with an Object RISC backend that compiles real C
   programs end-to-end, including a working `__or` storage-class
   qualifier on parameters and register-bound variables (caller and
-  callee sides of the calling convention both wired).
+  callee sides of the calling convention both wired). The C
+  pipeline now goes through the linker — no more per-unit label
+  mangling.
 - A generic link-boot loader that lets you spin up extra CPUs whose
   code is decided at runtime — announce on the crossbar, receive a
   module by SEND, map and JR.
+- A Python-side link-boot server (`tools/devices/linkbootd`) that
+  hosts a boot image and answers any number of loader CPUs over the
+  wire.
 
 The two open consequences from the initial commit are both closed:
 

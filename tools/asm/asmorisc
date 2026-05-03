@@ -528,6 +528,55 @@ class DataBlob:
     fixups: list = field(default_factory=list)
 
 
+# .oro relocation types (CONTRACT.md §1.1).
+R_ORISC_NONE     = 0
+R_ORISC_ABS32    = 1
+R_ORISC_HI16     = 2
+R_ORISC_LO16     = 3
+R_ORISC_BRANCH16 = 4
+R_ORISC_J26      = 5
+
+# .oro container constants.
+ORO_MAGIC          = b"ORISCOBJ"
+ORO_FORMAT_VERSION = 1
+ORO_HEADER_SIZE    = 0x20
+ORO_SYMBOL_SIZE    = 16
+ORO_RELOC_SIZE     = 12
+
+# .oro symbol-section codes.
+ORO_SEC_UNDEF = 0
+ORO_SEC_TEXT  = 1
+ORO_SEC_DATA  = 2
+ORO_SEC_ABS   = 3
+
+ORO_BIND_LOCAL  = 0
+ORO_BIND_GLOBAL = 1
+
+
+@dataclass
+class Reloc:
+    """One pending relocation against `symbol` in a .oro file."""
+    section: str   # 'text' or 'data'
+    offset: int    # byte offset within the section
+    rtype: int     # R_ORISC_*
+    symbol: str    # name; resolved to symbol-table index when writing
+
+
+def is_local_label(name: str) -> bool:
+    """Default scoping rule for `-r` (relocatable) mode: pcc-style local
+    temps (`L\\d+`) are file-local; everything else is global.
+    Overridable via `.global` / `.local`."""
+    return bool(re.match(r'^L\d+$', name))
+
+
+def effective_binding(asm: "Assembler", name: str) -> str:
+    """Return 'local' or 'global' for `name`, consulting explicit
+    `.global` / `.local` declarations first, then the heuristic."""
+    if name in asm.bindings:
+        return asm.bindings[name]
+    return 'local' if is_local_label(name) else 'global'
+
+
 @dataclass
 class Assembler:
     text: list = field(default_factory=list)   # list[Inst|DataBlob]
@@ -536,6 +585,9 @@ class Assembler:
     data_size: int = 0
     labels: dict = field(default_factory=dict)  # name -> (section, offset)
     constants: dict = field(default_factory=dict)  # name -> Expr (from `.set`)
+    bindings: dict = field(default_factory=dict)   # name -> 'local'|'global'
+    relocations: list = field(default_factory=list)  # list[Reloc]
+    relocatable: bool = False
     entry_label: Optional[str] = None
     entry_file: Optional[str] = None
     entry_line: Optional[int] = None
@@ -688,8 +740,8 @@ def emit_data(asm: Assembler, sec: str, file: str, line: int, col: int,
 # ---------------------------------------------------------------------------
 # Pass 1: parse lines, define labels, build IR.
 
-def pass1(lines: list[SourceLine]) -> Assembler:
-    asm = Assembler()
+def pass1(lines: list[SourceLine], relocatable: bool = False) -> Assembler:
+    asm = Assembler(relocatable=relocatable)
     section = "text"
 
     for srcline in lines:
@@ -765,6 +817,22 @@ def handle_directive(asm: Assembler, section: str, src: SourceLine,
         asm.entry_label = rest[0].text
         asm.entry_file = file
         asm.entry_line = line
+        return section
+
+    if n in (".global", ".globl", ".local"):
+        # Override the default symbol scoping. `.global NAME` exports
+        # NAME from this .oro; `.local NAME` keeps it file-private.
+        # The default is "local for L\\d+, global otherwise" — these
+        # directives let asm authors pin it explicitly.
+        if not rest:
+            raise AsmError(f"{n} expects one or more symbol names",
+                           file, line, 1)
+        binding = 'local' if n == '.local' else 'global'
+        for grp in split_top_commas(rest):
+            if len(grp) != 1 or grp[0].kind != "sym":
+                raise AsmError(f"{n}: expected identifier",
+                               file, line, grp[0].col if grp else 1)
+            asm.bindings[grp[0].text] = binding
         return section
 
     if n == ".set":
@@ -1280,6 +1348,17 @@ def encode_jtype(asm: Assembler, section: str, src: SourceLine,
     if label_tok.kind != "sym":
         raise AsmError(f"{name}: operand must be a label",
                        file, line, label_tok.col)
+    if asm.relocatable:
+        # Emit a placeholder J/JAL with the 26-bit field zeroed; the
+        # linker patches it via R_ORISC_J26 at link time.
+        def enc_reloc(inst: Inst, asm: Assembler) -> int:
+            return encode_j(op, 0)
+        inst = emit(asm, section, file, line, label_tok.col, name, [], enc_reloc)
+        inst.label_target = label_tok.text
+        asm.relocations.append(Reloc(section=section, offset=inst.offset,
+                                     rtype=R_ORISC_J26,
+                                     symbol=label_tok.text))
+        return
     inst = emit(asm, section, file, line, label_tok.col, name, [],
                 make_jtype_encoder(op, label_tok.text, label_tok.col))
     inst.label_target = label_tok.text
@@ -1580,19 +1659,30 @@ def emit_la(asm: Assembler, section: str, file: str, line: int, col: int,
             rd: int, label: str) -> None:
     """Load address of a label into a GPR via deferred LUI/ORI emission.
 
-    We always reserve two instruction words; if the resolved address
-    fits in 16 signed bits, the second word is a NOP-style ori with 0,
-    which keeps the IR layout fixed across passes.
-
-    Actually — to keep the contract clean (`la` == `li imm`), we expand
-    to a fixed two-instruction sequence: `lui rd, hi` followed by
-    `ori rd, rd, lo`. This is one extra instruction in the rare case
-    that the address is small, but it makes pass 1 deterministic.
+    Always reserves two instruction words: `lui rd, hi` followed by
+    `ori rd, rd, lo`. In `-r` mode the LUI's high half and the ORI's
+    low half are emitted as zero placeholders and a HI16/LO16 reloc
+    pair is recorded against `label` for the linker to patch.
+    Otherwise the address is resolved at pass 2 via the in-memory
+    label table.
     """
-    # Reserve two slots; resolve in pass 2 by referencing the symbol table.
-    # Use a closure-style encoder that rewrites both words.
-    # We track the pair via a shared dict so the second encoder reads what
-    # the first emitted.
+    if asm.relocatable:
+        def enc1_reloc(inst: Inst, asm: Assembler) -> int:
+            return encode_i(MAJOR["lui"], 0, rd, 0)   # placeholder hi=0
+
+        def enc2_reloc(inst: Inst, asm: Assembler) -> int:
+            return encode_i(MAJOR["ori"], rd, rd, 0)  # placeholder lo=0
+
+        inst1 = emit(asm, section, file, line, col, "la", [], enc1_reloc)
+        inst1.label_target = label
+        asm.relocations.append(Reloc(section=section, offset=inst1.offset,
+                                     rtype=R_ORISC_HI16, symbol=label))
+        inst2 = emit(asm, section, file, line, col, "la", [], enc2_reloc)
+        asm.relocations.append(Reloc(section=section, offset=inst2.offset,
+                                     rtype=R_ORISC_LO16, symbol=label))
+        return
+
+    # Non-relocatable mode: resolve in pass 2 via shared closure state.
     state = {}
 
     def enc1(inst: Inst, asm: Assembler) -> int:
@@ -1604,8 +1694,6 @@ def emit_la(asm: Assembler, section: str, file: str, line: int, col: int,
 
     def enc2(inst: Inst, asm: Assembler) -> int:
         if "addr" not in state:
-            # If for any reason enc1 wasn't called first (shouldn't happen),
-            # resolve now.
             sec, off = lookup_label(asm, label, inst.file, inst.line, col)
             state["addr"] = (section_base(sec) + off) & 0xFFFF_FFFF
         lo = state["addr"] & 0xFFFF
@@ -1672,6 +1760,103 @@ def _resolve_blob(asm: Assembler, blob: DataBlob) -> bytes:
     return bytes(out)
 
 
+def assemble_oro(paths: list[Path]) -> bytes:
+    """Assemble in relocatable mode and emit an `.oro` object file
+    (see CONTRACT.md §1.1)."""
+    lines = read_lines(paths)
+    asm = pass1(lines, relocatable=True)
+
+    text_bytes, data_bytes = _encode_sections(asm)
+
+    # Build the symbol table. Defined labels come first (we need a stable
+    # name -> index mapping for the relocation table); undefined symbols
+    # referenced only in relocations are appended.
+    symbols = []                   # list of (name, value, section_code, binding)
+    name_to_index: dict[str, int] = {}
+
+    def add_symbol(name: str, value: int, sec_code: int, binding: int) -> int:
+        if name in name_to_index:
+            return name_to_index[name]
+        idx = len(symbols)
+        symbols.append((name, value, sec_code, binding))
+        name_to_index[name] = idx
+        return idx
+
+    # Pass 1 — defined labels.
+    for name, (sec, off) in asm.labels.items():
+        sec_code = ORO_SEC_TEXT if sec == "text" else ORO_SEC_DATA
+        binding_str = effective_binding(asm, name)
+        binding = ORO_BIND_GLOBAL if binding_str == 'global' else ORO_BIND_LOCAL
+        add_symbol(name, off, sec_code, binding)
+
+    # Pass 2 — referenced-but-undefined symbols (named in relocations).
+    for r in asm.relocations:
+        if r.symbol not in name_to_index:
+            add_symbol(r.symbol, 0, ORO_SEC_UNDEF, ORO_BIND_GLOBAL)
+
+    # Build the string table, accumulating name offsets for the symbol
+    # table layout.
+    str_buf = bytearray(b'\x00')   # idx 0 is the empty string by convention
+    name_offsets: list[int] = []
+    for (name, _value, _sec, _bind) in symbols:
+        name_offsets.append(len(str_buf))
+        str_buf += name.encode('utf-8') + b'\x00'
+
+    # Pack the symbol table.
+    sym_buf = bytearray()
+    for (name_offset, (name, value, sec_code, binding)) in zip(
+            name_offsets, symbols):
+        sym_buf += struct.pack(">II", name_offset, value & 0xFFFF_FFFF)
+        sym_buf += struct.pack(">BBB5x", sec_code, binding, 0)
+    assert len(sym_buf) == len(symbols) * ORO_SYMBOL_SIZE
+
+    # Pack the relocation table.
+    reloc_buf = bytearray()
+    for r in asm.relocations:
+        sym_idx = name_to_index[r.symbol]
+        sec_code = ORO_SEC_TEXT if r.section == "text" else ORO_SEC_DATA
+        reloc_buf += struct.pack(">IBB2xI",
+                                 r.offset & 0xFFFF_FFFF,
+                                 sec_code, r.rtype,
+                                 sym_idx & 0xFFFF_FFFF)
+    assert len(reloc_buf) == len(asm.relocations) * ORO_RELOC_SIZE
+
+    # Header.
+    hdr = (ORO_MAGIC
+           + struct.pack(">II", ORO_FORMAT_VERSION, 0)
+           + struct.pack(">II", len(text_bytes), len(data_bytes))
+           + struct.pack(">II", len(symbols), len(asm.relocations)))
+    assert len(hdr) == ORO_HEADER_SIZE
+
+    return (bytes(hdr) + bytes(text_bytes) + bytes(data_bytes)
+            + bytes(sym_buf) + bytes(reloc_buf) + bytes(str_buf))
+
+
+def _encode_sections(asm: Assembler) -> tuple[bytes, bytes]:
+    """Run the per-Inst / per-DataBlob encoders and return packed bytes
+    for both sections. Shared between `assemble` and `assemble_oro`."""
+    text_bytes = bytearray()
+    for item in asm.text:
+        if isinstance(item, DataBlob):
+            text_bytes += _resolve_blob(asm, item)
+            continue
+        word = item.encoder(item, asm)
+        item.encoded = word
+        text_bytes += struct.pack(">I", word & 0xFFFF_FFFF)
+
+    data_bytes = bytearray()
+    for item in asm.data:
+        if isinstance(item, DataBlob):
+            data_bytes += _resolve_blob(asm, item)
+        else:
+            raise AsmError("instruction emitted in data section",
+                           item.file, item.line, item.col)
+
+    if len(text_bytes) % 4:
+        raise AsmError(f"text size {len(text_bytes)} is not multiple of 4")
+    return bytes(text_bytes), bytes(data_bytes)
+
+
 def assemble(paths: list[Path]) -> bytes:
     lines = read_lines(paths)
     asm = pass1(lines)
@@ -1687,29 +1872,7 @@ def assemble(paths: list[Path]) -> bytes:
                            asm.entry_file or "?", asm.entry_line or 0, 1)
         entry_offset = off
 
-    # Encode text section.
-    text_bytes = bytearray()
-    for item in asm.text:
-        if isinstance(item, DataBlob):
-            # We don't allow .byte/.word in .text in this implementation.
-            text_bytes += _resolve_blob(asm, item)
-            continue
-        word = item.encoder(item, asm)
-        item.encoded = word
-        text_bytes += struct.pack(">I", word & 0xFFFF_FFFF)
-
-    # Encode data section.
-    data_bytes = bytearray()
-    for item in asm.data:
-        if isinstance(item, DataBlob):
-            data_bytes += _resolve_blob(asm, item)
-        else:
-            # Should not happen — .text directives never end up in .data.
-            raise AsmError("instruction emitted in data section",
-                           item.file, item.line, item.col)
-
-    if len(text_bytes) % 4:
-        raise AsmError(f"text size {len(text_bytes)} is not multiple of 4")
+    text_bytes, data_bytes = _encode_sections(asm)
 
     # Build header.
     hdr = (
@@ -2079,9 +2242,16 @@ def hex_dump(img: OrxImage) -> str:
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="asmorisc",
-                                description="Object RISC assembler (.s -> .orx)")
+                                description="Object RISC assembler "
+                                            "(.s -> .orx, or .s -> .oro with -r)")
     p.add_argument("inputs", nargs="*", help="input .s files (concatenated)")
-    p.add_argument("-o", "--output", help="output .orx path")
+    p.add_argument("-o", "--output", help="output path "
+                                          "(.orx by default; .oro with -r)")
+    p.add_argument("-r", "--relocatable", action="store_true",
+                   help="emit a relocatable .oro object file instead of a "
+                        "standalone .orx (the linker `tools/ld/orld` "
+                        "consumes one or more .oro files and produces an "
+                        "executable .orx). See CONTRACT.md §1.1.")
     p.add_argument("--disasm", metavar="FILE",
                    help="disassemble an .orx and print to stdout")
     p.add_argument("--hex", metavar="FILE",
@@ -2115,13 +2285,14 @@ def main(argv: list[str]) -> int:
             print(f"asmorisc: {inp}: no such file", file=sys.stderr)
             return 2
 
+    suffix = ".oro" if args.relocatable else ".orx"
     if args.output:
         out_path = Path(args.output)
     else:
-        out_path = inputs[0].with_suffix(".orx")
+        out_path = inputs[0].with_suffix(suffix)
 
     try:
-        blob = assemble(inputs)
+        blob = assemble_oro(inputs) if args.relocatable else assemble(inputs)
     except AsmError as e:
         print(f"asmorisc: error: {e}", file=sys.stderr)
         return 1

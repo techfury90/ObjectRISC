@@ -60,10 +60,12 @@ vendored pcc and needs `./configure && make` once (see
 
 | Tool                                         | Purpose                                              |
 |----------------------------------------------|------------------------------------------------------|
-| [`tools/asm/asmorisc`](tools/asm)            | Assembler — `.s` → `.orx`                            |
+| [`tools/asm/asmorisc`](tools/asm)            | Assembler — `.s` → `.orx`, or `.s` → `.oro` with `-r` |
+| [`tools/ld/orld`](tools/ld)                  | Linker — `.oro`… → `.orx`                            |
 | [`tools/sim/simorisc`](tools/sim)            | Simulator — runs `.orx` binaries, single or multi-CPU |
 | [`tools/sim/oriscbar`](tools/sim)            | Standalone wire-level crossbar daemon                |
 | [`tools/devices/oriscterm`](tools/devices)   | Tk-based terminal device that connects to `oriscbar` |
+| [`tools/devices/linkbootd`](tools/devices)   | Python-side link-boot server                         |
 | [`tools/oriscrun`](tools/oriscrun)           | Launcher: spawns crossbar + devices + CPU processes  |
 | [`tools/cc`](tools/cc/arch/orisc)            | Vendored pcc with an Object RISC backend (`arch/orisc/`) |
 

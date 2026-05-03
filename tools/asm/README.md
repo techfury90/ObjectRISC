@@ -28,8 +28,14 @@ If your installation does not have an executable bit, run via
 asmorisc examples/hello.s
 asmorisc examples/hello.s -o build/hello.orx
 
-# Multiple inputs are concatenated in order.
+# Multiple inputs are concatenated in order (no separate link step).
 asmorisc lib.s main.s -o app.orx
+
+# Relocatable mode: emit a .oro object file for the linker to consume.
+# Each .s typically becomes its own .oro; orld combines them into .orx.
+asmorisc -r lib.s -o lib.oro
+asmorisc -r main.s -o main.oro
+tools/ld/orld -o app.orx lib.oro main.oro
 
 # Decode a binary back to assembly (useful for round-trip checks).
 asmorisc --disasm hello.orx
@@ -37,6 +43,13 @@ asmorisc --disasm hello.orx
 # Hex dump with one instruction per line annotated with mnemonic.
 asmorisc --hex hello.orx
 ```
+
+The single-call concatenation mode and the assemble-then-link mode
+both work; pick whichever fits your workflow. Pcc's pipeline
+(`examples/cc/run_c.sh`) goes through the linker so each translation
+unit's local labels (pcc emits `L\d+`) stay scoped per file —
+without the linker the older pipeline needed a sed-rename hack to
+keep `L1` from colliding with `L1`.
 
 ## Syntax overview
 
@@ -54,16 +67,20 @@ At a glance:
 
 ### Directives
 
-| Directive          | Effect                                    |
-|--------------------|-------------------------------------------|
-| `.text`            | switch to text section                    |
-| `.data`            | switch to data section                    |
-| `.entry <label>`   | set program entry point to `<label>`      |
-| `.byte`, `.half`, `.word` | emit 1/2/4-byte values             |
-| `.string "..."`    | emit raw bytes (no NUL)                   |
-| `.asciz "..."`     | emit bytes plus a trailing `0x00`         |
-| `.align N`         | align to a 2^N boundary with zero bytes   |
-| `.skip N`          | emit N zero bytes                         |
+| Directive                | Effect                                                                 |
+|--------------------------|------------------------------------------------------------------------|
+| `.text`                  | switch to text section                                                 |
+| `.data`                  | switch to data section                                                 |
+| `.entry <label>`         | set program entry point to `<label>` (only used in non-`-r` mode)      |
+| `.byte`, `.half`, `.word`| emit 1/2/4-byte values                                                 |
+| `.string "..."`          | emit raw bytes (no NUL)                                                |
+| `.asciz "..."`           | emit bytes plus a trailing `0x00`                                      |
+| `.align N`               | align to a 2^N boundary with zero bytes                                |
+| `.skip N`                | emit N zero bytes                                                      |
+| `.global NAME[, ...]`    | mark symbols as exported across `.oro` boundaries (`-r` mode)          |
+| `.globl NAME[, ...]`     | alias for `.global`                                                    |
+| `.local NAME[, ...]`     | mark symbols as file-private (default for `L\d+`; explicit otherwise)  |
+| `.set NAME, EXPR`        | define a numeric constant for use in immediates and offsets            |
 
 ### Pseudo-instructions
 
