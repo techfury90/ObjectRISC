@@ -24,8 +24,10 @@ the home CPU's local descriptor table.
 """
 
 import argparse
+import re
 import struct
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -453,12 +455,143 @@ class Crossbar:
     `send_packet(packet)` routes one wire-format packet to the Port
     registered for its `dst_pid` field. Implementations may be
     in-process, over a socket, or over a real fabric — the rest of the
-    simulator only sees this method."""
+    simulator only sees this method.
+
+    `poll_incoming()` is called once per scheduler tick; it lets
+    transport-bearing implementations (e.g., SocketCrossbar) drain any
+    bytes from their wire and deliver complete packets into the local
+    Port. The default in-process implementation does nothing."""
     def send_packet(self, packet: bytes) -> None:
         raise NotImplementedError
 
     def attach_port(self, pid: int, port: Port) -> None:
         raise NotImplementedError
+
+    def poll_incoming(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        pass
+
+
+class SocketCrossbar(Crossbar):
+    """Crossbar implementation that talks to an external `oriscbar`
+    process over a UNIX domain socket. Wire framing and handshake are
+    documented in oriscbar's module docstring. The simulator runs in
+    single-CPU mode in this configuration; the external crossbar
+    routes between many such simorisc instances and any device
+    processes."""
+    HELLO_MAGIC  = 0xC0FFEEAA
+    HELLO_OK     = 0x00000000
+
+    def __init__(self, sock_path: str, my_pid: int,
+                 trace_enabled: bool = False):
+        import socket
+        self.sock_path = sock_path
+        self.my_pid = my_pid
+        self.trace_enabled = trace_enabled
+        self.local_port: Optional[Port] = None
+        self.recv_buf = bytearray()
+        self.connected = True
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # Brief retry loop in case the launcher is still bringing
+        # oriscbar up.
+        deadline = time.time() + 5.0
+        while True:
+            try:
+                self.sock.connect(sock_path)
+                break
+            except (FileNotFoundError, ConnectionRefusedError) as e:
+                if time.time() >= deadline:
+                    raise SystemExit(
+                        f"simorisc: could not connect to crossbar at "
+                        f"{sock_path}: {e}")
+                time.sleep(0.05)
+        # Handshake.
+        self.sock.sendall(struct.pack(">II", self.HELLO_MAGIC, my_pid))
+        reply = self._recv_exact(8)
+        magic, status = struct.unpack(">II", reply)
+        if magic != self.HELLO_MAGIC or status != self.HELLO_OK:
+            raise SystemExit(
+                f"simorisc: crossbar handshake failed "
+                f"(magic={magic:#x}, status={status:#x})")
+        self.sock.setblocking(False)
+
+    def _recv_exact(self, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise SystemExit("simorisc: crossbar closed during handshake")
+            out.extend(chunk)
+        return bytes(out)
+
+    def attach_port(self, pid: int, port: Port) -> None:
+        if pid != self.my_pid:
+            raise ValueError(f"SocketCrossbar can only host pid={self.my_pid}, "
+                             f"not pid={pid}")
+        self.local_port = port
+
+    def send_packet(self, packet: bytes) -> None:
+        try:
+            self.sock.sendall(struct.pack(">I", len(packet)) + packet)
+        except OSError as e:
+            print(f"simorisc: socket send failed: {e}", file=sys.stderr)
+            return
+        if self.trace_enabled:
+            self._trace_outgoing(packet)
+
+    def poll_incoming(self) -> bool:
+        worked = False
+        while True:
+            try:
+                chunk = self.sock.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                self.connected = False
+                break
+            if not chunk:
+                self.connected = False
+                break
+            self.recv_buf.extend(chunk)
+            worked = True
+        while len(self.recv_buf) >= 4:
+            (length,) = struct.unpack(">I", bytes(self.recv_buf[:4]))
+            if len(self.recv_buf) < 4 + length:
+                break
+            packet = bytes(self.recv_buf[4:4 + length])
+            del self.recv_buf[:4 + length]
+            if self.trace_enabled:
+                self._trace_incoming(packet)
+            if self.local_port is not None:
+                self.local_port.receive_packet(packet)
+            worked = True
+        return worked
+
+    def _trace_outgoing(self, packet: bytes) -> None:
+        try:
+            p = unpack_packet(packet)
+            print(f"  ; CROSSBAR(socket) tx -> CPU{p['dst_pid']} "
+                  f"type=0x{p['type']:02x} bytes={packet.hex()}", file=sys.stderr)
+        except ValueError:
+            print(f"  ; CROSSBAR(socket) tx malformed bytes={packet.hex()}",
+                  file=sys.stderr)
+
+    def _trace_incoming(self, packet: bytes) -> None:
+        try:
+            p = unpack_packet(packet)
+            print(f"  ; CROSSBAR(socket) rx <- CPU{p['src_pid']} "
+                  f"type=0x{p['type']:02x} bytes={packet.hex()}", file=sys.stderr)
+        except ValueError:
+            print(f"  ; CROSSBAR(socket) rx malformed bytes={packet.hex()}",
+                  file=sys.stderr)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 class InProcessCrossbar(Crossbar):
@@ -794,6 +927,7 @@ class System:
         self.cpus = [CPU(pid=i, system=self) for i in range(n_cpus)]
         self.n_cpus = n_cpus
         self.trace_enabled = False
+        self.serve_mode = False    # if True, don't exit on idle (socket-server mode)
         self.crossbar: Crossbar = InProcessCrossbar()
         for cpu in self.cpus:
             self.crossbar.attach_port(cpu.pid, cpu)
@@ -803,13 +937,10 @@ class System:
     def queue_send(self, msg: PendingSend) -> None:
         """Serialize a PendingSend to a wire-format SEND_DELIVER packet and
         push it onto the crossbar. Routing (inbox vs descriptor queue) is
-        the receiving CPU's responsibility — see CPU.receive_packet."""
+        the receiving CPU's responsibility — see CPU.receive_packet. In
+        socket mode the local System has only one CPU; the crossbar
+        validates that the destination is connected and drops otherwise."""
         home = ref_home(msg.recipient_ref)
-        if home >= self.n_cpus:
-            if self.trace_enabled:
-                print(f"  ; SEND dropped: recipient home {home} not configured",
-                      file=sys.stderr)
-            return
         packet = msg.to_wire(dst_pid=home)
         self.crossbar.send_packet(packet)
 
@@ -1040,7 +1171,12 @@ class System:
         ticks = 0
         while ticks < max_cycles:
             any_progress = False
-            # First, drain inbound OBJ_READ_REQ / OBJ_WRITE_REQ packets on
+            # Drain incoming bytes from the crossbar transport (no-op for
+            # InProcessCrossbar). This must happen before per-CPU work so
+            # that responses arriving via socket are visible this tick.
+            if self.crossbar.poll_incoming():
+                any_progress = True
+            # Then, drain inbound OBJ_READ_REQ / OBJ_WRITE_REQ packets on
             # every CPU. This represents the home processor's autonomous
             # memory-controller behaviour and runs regardless of the CPU's
             # task state — even idle or blocked CPUs answer remote reads.
@@ -1094,6 +1230,20 @@ class System:
                     if self.dispatch_handler(cpu):
                         any_progress = True
             if not any_progress:
+                # Stay alive if either: (a) the user asked us to serve
+                # forever via --serve, or (b) we're in socket mode and
+                # at least one CPU is blocked waiting on something
+                # the socket might deliver. In either case, exit only
+                # when the socket has EOF'd.
+                in_socket_mode = hasattr(self.crossbar, 'connected')
+                waiting_blocked = any(
+                    cpu.blocked_on is not None for cpu in self.cpus)
+                if self.serve_mode or (in_socket_mode and waiting_blocked):
+                    if in_socket_mode and not self.crossbar.connected:
+                        break
+                    time.sleep(0.001)
+                    ticks += 1
+                    continue
                 break
             ticks += 1
         else:
@@ -1896,20 +2046,20 @@ def step(cpu: CPU) -> None:
             raise Trap(CAUSE_NULL_DEREF, pc, f"SEND on null O{os_}")
         if (ref_caps(ref) & CAP_S) == 0:
             raise Trap(CAUSE_CAP_VIOLATION, pc, f"SEND lacks S on O{os_}")
-        # Validate via the home CPU's descriptor table.
+        # Validate against the home CPU's descriptor table only when that
+        # CPU is reachable from this process (in-process multi-CPU mode).
+        # In socket-mode the home lives behind the crossbar; the home
+        # validates on receipt and silently drops on mismatch.
         home = ref_home(ref)
-        if cpu.system is None:
-            descriptors = cpu.descriptors
-        elif home == cpu.pid:
-            descriptors = cpu.descriptors
-        else:
-            descriptors = cpu.system.cpus[home].descriptors
-        idx = ref_index(ref)
-        if idx >= len(descriptors) or descriptors[idx] is None:
-            raise Trap(CAUSE_STALE_REF, pc, f"SEND stale O{os_}")
-        desc = descriptors[idx]
-        if not desc.live or desc.generation != ref_generation(ref):
-            raise Trap(CAUSE_STALE_REF, pc, f"SEND stale O{os_}")
+        if cpu.system is not None and home < len(cpu.system.cpus):
+            descriptors = (cpu.descriptors if home == cpu.pid
+                           else cpu.system.cpus[home].descriptors)
+            idx = ref_index(ref)
+            if idx >= len(descriptors) or descriptors[idx] is None:
+                raise Trap(CAUSE_STALE_REF, pc, f"SEND stale O{os_}")
+            desc = descriptors[idx]
+            if not desc.live or desc.generation != ref_generation(ref):
+                raise Trap(CAUSE_STALE_REF, pc, f"SEND stale O{os_}")
         # Build payload: int = R4..R7, OR = O1..O4 (per Vol II Section 10).
         msg = PendingSend(
             recipient_ref=ref,
@@ -1974,34 +2124,113 @@ def report_trap(cpu: CPU, t: Trap) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+SERVICE_SPEC_RE = re.compile(
+    r'^(?P<pid>\d+)=(?P<idx>\d+)@(?P<caps>0[xX][0-9a-fA-F]+|\d+)$')
+
+
+def install_external_services(cpu: CPU, specs: List[str]) -> None:
+    """Synthesize references to remote services and install them in
+    O5..O5+len(specs)-1. Each spec is `PID=INDEX@CAPS` (caps may be
+    decimal or 0x-hex). Generation is fixed at 1 by convention; the
+    remote endpoint is responsible for using the same generation."""
+    slot = 5
+    for spec in specs:
+        m = SERVICE_SPEC_RE.match(spec)
+        if not m:
+            sys.exit(f"simorisc: bad --service spec: {spec!r}; "
+                     f"expected PID=INDEX@CAPS")
+        pid_v = int(m.group("pid"))
+        idx_v = int(m.group("idx"))
+        caps_v = int(m.group("caps"), 0)
+        if pid_v < 0 or pid_v > 255 or idx_v < 0 or idx_v >= (1 << 24) \
+                or caps_v < 0 or caps_v > 0xFF:
+            sys.exit(f"simorisc: --service spec out of range: {spec!r}")
+        if slot > 15:
+            sys.exit("simorisc: too many --service specs (O5..O15 limit)")
+        ref = make_ref(generation=1, home=pid_v, index=idx_v, caps=caps_v)
+        cpu.set_opr(slot, ref)
+        slot += 1
+
+
+def populate_self_service(cpu: CPU) -> None:
+    """In socket-mode single-CPU configurations, allocate a service
+    object on the local CPU and install its full-cap reference in O4
+    (mirrors the role of populate_service_objects in multi-CPU)."""
+    ref = cpu.alloc_object(SERVICE_OBJ_SIZE, type_tag=TAG_SERVICE,
+                           max_caps=CAP_R | CAP_W | CAP_S | CAP_V | CAP_C)
+    cpu.set_opr(4, ref)
+
+
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(prog="simorisc",
         description="Object RISC instruction-set simulator")
     ap.add_argument("orx", help="path to .orx binary")
     ap.add_argument("--processors", type=int, default=1,
-                    help="number of Object RISC processors (default 1)")
+                    help="number of Object RISC processors (in-process; "
+                         "default 1). Mutually exclusive with --connect.")
+    ap.add_argument("--connect", default=None, metavar="SOCKET",
+                    help="connect to an external oriscbar at this UNIX "
+                         "socket path; runs as a single-CPU process")
+    ap.add_argument("--pid", type=int, default=0,
+                    help="processor identifier this CPU presents to the "
+                         "external crossbar (default 0; ignored without "
+                         "--connect)")
+    ap.add_argument("--service", action="append", default=[],
+                    metavar="PID=INDEX@CAPS",
+                    help="install a synthesized remote service reference "
+                         "in O5..O15. Repeatable; ignored without "
+                         "--connect.")
+    ap.add_argument("--serve", action="store_true",
+                    help="in --connect mode: don't exit when the local "
+                         "task goes idle; keep polling the crossbar for "
+                         "incoming SENDs and handler dispatches until "
+                         "the socket closes or a signal arrives. Use this "
+                         "for server-style CPUs.")
     ap.add_argument("--trace", action="store_true",
                     help="print each retired instruction with register effects")
     ap.add_argument("--max-cycles", type=int, default=10_000_000,
                     help="cycle bound (default 10000000)")
     args = ap.parse_args(argv)
 
+    if args.connect is not None and args.processors != 1:
+        sys.exit("simorisc: --connect implies single-CPU; --processors "
+                 "must be 1 (its default)")
     if args.processors < 1 or args.processors > 16:
-        sys.exit(f"simorisc: --processors must be in [1, 16]")
+        sys.exit("simorisc: --processors must be in [1, 16]")
 
     text_bytes, data_bytes, entry, stack_size = load_orx_file(args.orx)
 
     system = System(args.processors)
     system.trace_enabled = args.trace
-    system.crossbar.trace_enabled = args.trace
-    for cpu in system.cpus:
+
+    if args.connect is not None:
+        # Replace the default in-process crossbar with a socket one
+        # bound to the user-specified pid.
+        cpu = system.cpus[0]
+        cpu.pid = args.pid
+        socket_xbar = SocketCrossbar(args.connect, args.pid,
+                                     trace_enabled=args.trace)
+        system.crossbar = socket_xbar
+        system.serve_mode = args.serve
+        socket_xbar.attach_port(args.pid, cpu)
         cpu.trace_enabled = args.trace
         init_cpu(cpu, text_bytes, data_bytes, entry, stack_size)
-    populate_service_objects(system)
-    for cpu in system.cpus:
+        populate_self_service(cpu)
+        install_external_services(cpu, args.service)
         snapshot_boot_state(cpu)
+    else:
+        system.crossbar.trace_enabled = args.trace
+        for cpu in system.cpus:
+            cpu.trace_enabled = args.trace
+            init_cpu(cpu, text_bytes, data_bytes, entry, stack_size)
+        populate_service_objects(system)
+        for cpu in system.cpus:
+            snapshot_boot_state(cpu)
 
-    return system.run(args.max_cycles)
+    try:
+        return system.run(args.max_cycles)
+    finally:
+        system.crossbar.close()
 
 
 if __name__ == "__main__":

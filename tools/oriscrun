@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""oriscrun — launch a multi-process Object RISC system.
+
+Spawns:
+    1. one oriscbar (the crossbar process)
+    2. zero or more device processes (currently: oriscterm)
+    3. one or more simorisc CPU processes connected to the crossbar
+
+Waits for the "leader" CPU (default: pid 0) to exit, then signals every
+other process to shut down. Forwards each process's stdout/stderr to
+this script's stdout/stderr with a small per-source prefix so it's
+clear what came from where.
+
+Typical usage (the hello-world-on-terminal demo):
+
+    tools/oriscrun \\
+        --terminal pid=16 \\
+        --cpu pid=0:program=examples/hello_terminal.orx,service=16=1@9
+
+The --cpu spec is `pid=N:program=PATH[,service=SPEC[,service=SPEC...]][,serve]`
+where each `service=` becomes a `--service PID=INDEX@CAPS` argument
+passed through to simorisc, installing a synthesized remote reference
+into the next available `O5..O15` slot.
+"""
+
+import argparse
+import os
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ORISCBAR  = ROOT / "tools" / "sim"     / "oriscbar"
+SIMORISC  = ROOT / "tools" / "sim"     / "simorisc"
+ORISCTERM = ROOT / "tools" / "devices" / "oriscterm"
+
+
+def parse_cpu_spec(spec: str) -> dict:
+    """Parse 'pid=N:program=PATH[,service=SPEC...][,serve]' into a dict."""
+    if ":" not in spec:
+        raise SystemExit(f"oriscrun: bad --cpu spec: {spec!r} (missing ':')")
+    head, rest = spec.split(":", 1)
+    if not head.startswith("pid="):
+        raise SystemExit(f"oriscrun: --cpu must start with pid=N, got {spec!r}")
+    out = {"pid": int(head[len("pid="):]), "program": None,
+           "services": [], "serve": False}
+    for part in rest.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("program="):
+            out["program"] = part[len("program="):]
+        elif part.startswith("service="):
+            out["services"].append(part[len("service="):])
+        elif part == "serve":
+            out["serve"] = True
+        else:
+            raise SystemExit(f"oriscrun: unknown --cpu field {part!r}")
+    if out["program"] is None:
+        raise SystemExit(f"oriscrun: --cpu spec missing program=PATH: {spec!r}")
+    return out
+
+
+def parse_terminal_spec(spec: str) -> dict:
+    """Parse 'pid=N' into a dict."""
+    if not spec.startswith("pid="):
+        raise SystemExit(f"oriscrun: --terminal spec must start with pid=, "
+                         f"got {spec!r}")
+    return {"pid": int(spec[len("pid="):])}
+
+
+# ---------------------------------------------------------------------------
+# Pipe-line forwarder: tag each child's output with a [name] prefix.
+# ---------------------------------------------------------------------------
+
+def _forward(name: str, stream, target):
+    try:
+        for line in iter(stream.readline, b''):
+            try:
+                text = line.decode("utf-8", errors="replace")
+            except Exception:
+                text = repr(line)
+            target.write(f"[{name}] {text}")
+            target.flush()
+    except Exception:
+        pass
+
+
+def _attach_forwarders(name: str, proc: subprocess.Popen):
+    threading.Thread(target=_forward,
+                     args=(name, proc.stdout, sys.stdout),
+                     daemon=True).start()
+    threading.Thread(target=_forward,
+                     args=(name, proc.stderr, sys.stderr),
+                     daemon=True).start()
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="oriscrun",
+        description="Launch a multi-process Object RISC system "
+                    "(crossbar + devices + CPUs)")
+    ap.add_argument("--socket", default=None,
+                    help="UNIX socket path the crossbar listens on. "
+                         "Default: a tempfile-based path.")
+    ap.add_argument("--terminal", action="append", default=[],
+                    metavar="pid=N",
+                    help="spawn an oriscterm at the given pid")
+    ap.add_argument("--cpu", action="append", default=[], required=True,
+                    metavar="SPEC",
+                    help="spawn a simorisc CPU; SPEC is "
+                         "pid=N:program=PATH[,service=SPEC...][,serve]")
+    ap.add_argument("--leader", type=int, default=0,
+                    help="when this CPU exits, all other processes are "
+                         "shut down (default: pid 0)")
+    ap.add_argument("--leader-timeout", type=float, default=30.0,
+                    help="kill everything if the leader hasn't exited "
+                         "after this many seconds (default 30)")
+    ap.add_argument("--linger", type=float, default=0.4,
+                    help="seconds to wait after the leader exits before "
+                         "shutting devices/crossbar down (default 0.4); "
+                         "useful with GUI devices so you can see the "
+                         "result before the window closes")
+    args = ap.parse_args(argv)
+
+    cpu_specs = [parse_cpu_spec(s) for s in args.cpu]
+    term_specs = [parse_terminal_spec(s) for s in args.terminal]
+    if not any(c["pid"] == args.leader for c in cpu_specs):
+        sys.exit(f"oriscrun: --leader pid {args.leader} has no matching --cpu")
+
+    if args.socket is None:
+        args.socket = tempfile.mktemp(prefix="oriscbar-", suffix=".sock")
+    sock_path = args.socket
+
+    procs = []   # list of (name, Popen)
+
+    def cleanup_and_exit(rc: int) -> int:
+        # Tear down in reverse order: CPUs first (they may still be
+        # waiting on socket I/O), then devices, then the crossbar.
+        for name, p in reversed(procs):
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                except ProcessLookupError:
+                    pass
+        for name, p in reversed(procs):
+            try:
+                p.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                except ProcessLookupError:
+                    pass
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+        return rc
+
+    # ---- 1. Spawn the crossbar -------------------------------------------
+    bar = subprocess.Popen(
+        [sys.executable, str(ORISCBAR), "--socket", sock_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    procs.append(("xbar", bar))
+    # Wait for "READY" line on stdout (with timeout).
+    deadline = time.time() + 5.0
+    ready_line = b''
+    while time.time() < deadline:
+        rd, _, _ = select.select([bar.stdout], [], [], 0.1)
+        if bar.stdout in rd:
+            ready_line = bar.stdout.readline()
+            if b"READY" in ready_line:
+                break
+    if b"READY" not in ready_line:
+        sys.stderr.write("oriscrun: crossbar failed to start (no READY)\n")
+        return cleanup_and_exit(1)
+    sys.stdout.write(f"[xbar] {ready_line.decode('utf-8', errors='replace')}")
+    _attach_forwarders("xbar", bar)
+
+    # ---- 2. Spawn devices -------------------------------------------------
+    for tspec in term_specs:
+        term = subprocess.Popen(
+            [sys.executable, str(ORISCTERM),
+             "--socket", sock_path, "--pid", str(tspec["pid"]),
+             "-v"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        procs.append((f"term{tspec['pid']}", term))
+        # Wait for the device's READY line so the CPU doesn't SEND
+        # before it's connected.
+        deadline = time.time() + 5.0
+        line = b''
+        while time.time() < deadline:
+            rd, _, _ = select.select([term.stdout], [], [], 0.1)
+            if term.stdout in rd:
+                line = term.stdout.readline()
+                if b"READY" in line:
+                    break
+        if b"READY" not in line:
+            sys.stderr.write(f"oriscrun: terminal pid={tspec['pid']} "
+                             f"failed to start\n")
+            return cleanup_and_exit(1)
+        sys.stdout.write(f"[term{tspec['pid']}] "
+                         f"{line.decode('utf-8', errors='replace')}")
+        _attach_forwarders(f"term{tspec['pid']}", term)
+
+    # ---- 3. Spawn CPUs ----------------------------------------------------
+    leader_proc = None
+    for cspec in cpu_specs:
+        cmd = [sys.executable, str(SIMORISC),
+               "--connect", sock_path,
+               "--pid", str(cspec["pid"])]
+        for svc in cspec["services"]:
+            cmd.extend(["--service", svc])
+        if cspec["serve"]:
+            cmd.append("--serve")
+        cmd.append(cspec["program"])
+        cpu_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        procs.append((f"cpu{cspec['pid']}", cpu_proc))
+        _attach_forwarders(f"cpu{cspec['pid']}", cpu_proc)
+        if cspec["pid"] == args.leader:
+            leader_proc = cpu_proc
+
+    if leader_proc is None:
+        sys.stderr.write("oriscrun: internal error: leader proc not found\n")
+        return cleanup_and_exit(1)
+
+    # ---- 4. Wait for the leader, then shut down ---------------------------
+    try:
+        leader_rc = leader_proc.wait(timeout=args.leader_timeout)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"oriscrun: leader timed out after "
+                         f"{args.leader_timeout}s; tearing down\n")
+        return cleanup_and_exit(2)
+    # Give the rest a brief moment to flush remaining work; with a
+    # GUI device this also leaves the window on screen long enough
+    # for the human to read it before teardown.
+    time.sleep(args.linger)
+    return cleanup_and_exit(leader_rc)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

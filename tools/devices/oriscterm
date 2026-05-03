@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""oriscterm — graphics terminal device for the Object RISC crossbar.
+
+A tkinter window that connects to an oriscbar process like any other
+participant on the wire. It exposes a single "console" object at a
+known (pid, index, generation, caps) tuple. When a CPU SENDs to this
+object, the terminal:
+
+    1. Parses the SEND_DELIVER packet from the crossbar.
+    2. Reads the SEND payload's first OR slot as a *source buffer*
+       reference, the first int slot as an *offset*, and the second
+       as a *length*.
+    3. Issues an OBJ_READ_REQ packet to the source's home pid for
+       `length` bytes starting at `offset` within the source object.
+    4. When the OBJ_READ_RESP arrives, decodes the data words back
+       into bytes and appends them to the on-screen text widget.
+
+The protocol is the same wire format as everything else on the
+crossbar; the terminal is just another Port participating in the
+Volume IV §3 packet exchange. No special simulator support needed.
+
+Usage:
+    tools/devices/oriscterm --socket /tmp/oriscbar.sock --pid 16
+
+The console object's index (1) and generation (1) are fixed by
+convention; CPUs synthesize a `pid=16, index=1, caps=R|S` reference
+to reach it (typically via simorisc's `--service 16=1@9`).
+"""
+
+import argparse
+import struct
+import sys
+import time
+import tkinter as tk
+import tkinter.font as tkfont
+from typing import Dict, Optional
+
+# Wire-format constants must agree with simorisc/oriscbar.
+HELLO_MAGIC  = 0xC0FFEEAA
+HELLO_OK     = 0x00000000
+
+PKT_OBJ_READ_REQ   = 0x10
+PKT_OBJ_READ_RESP  = 0x11
+PKT_SEND_DELIVER   = 0x20
+
+# Console object parameters (pinned by the demo convention).
+CONSOLE_INDEX      = 1
+CONSOLE_GENERATION = 1
+CONSOLE_MAX_CAPS   = 0x5B   # R|W|S|V|C — the terminal's view of itself
+
+POLL_INTERVAL_MS = 30        # how often the UI checks the socket
+
+
+def pack_packet(src_pid: int, dst_pid: int, msg_type: int, flags: int,
+                trans_id: int, payload_words) -> bytes:
+    length_words = len(payload_words)
+    header = struct.pack(">BBBBHH",
+                         src_pid & 0xFF, dst_pid & 0xFF,
+                         msg_type & 0xFF, flags & 0xFF,
+                         trans_id & 0xFFFF, length_words & 0xFFFF)
+    payload = b''.join(struct.pack(">I", w & 0xFFFFFFFF)
+                       for w in payload_words)
+    h0, h1 = struct.unpack(">II", header)
+    chk = h0 ^ h1
+    for w in payload_words:
+        chk ^= w & 0xFFFFFFFF
+    return header + payload + struct.pack(">I", chk & 0xFFFFFFFF)
+
+
+def unpack_packet(data: bytes) -> Dict:
+    if len(data) < 12:
+        raise ValueError("packet too short")
+    src, dst, mtype, flags, trans_id, length_words = \
+        struct.unpack(">BBBBHH", data[:8])
+    expected = 8 + length_words * 4 + 4
+    if len(data) != expected:
+        raise ValueError(f"length mismatch ({len(data)} != {expected})")
+    payload_bytes = data[8:8 + length_words * 4]
+    words = list(struct.unpack(f">{length_words}I", payload_bytes)) \
+        if length_words else []
+    h0, h1 = struct.unpack(">II", data[:8])
+    chk = h0 ^ h1
+    for w in words:
+        chk ^= w
+    expected_chk = struct.unpack(">I", data[-4:])[0]
+    if chk != expected_chk:
+        raise ValueError("checksum mismatch")
+    return {"src_pid": src, "dst_pid": dst, "type": mtype,
+            "flags": flags, "trans_id": trans_id, "payload": words}
+
+
+def ref_home(ref: int)  -> int: return (ref >> 40) & 0xFF
+def ref_index(ref: int) -> int: return (ref >> 16) & 0xFFFFFF
+
+
+def build_obj_read_req(src_pid: int, dst_pid: int, trans_id: int,
+                       ref: int, offset: int, width: int) -> bytes:
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF,
+               offset & 0xFFFFFFFF, width & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_REQ, 0, trans_id, payload)
+
+
+def parse_send_deliver(pkt: Dict):
+    p = pkt["payload"]
+    if len(p) != 14:
+        raise ValueError("SEND_DELIVER payload must be 14 words")
+    recipient_ref = p[0] | (p[1] << 32)
+    int_payload = list(p[2:6])
+    or_payload = []
+    for i in range(4):
+        ref = p[6 + 2*i] | (p[7 + 2*i] << 32)
+        or_payload.append(ref)
+    return recipient_ref, int_payload, or_payload
+
+
+# ---------------------------------------------------------------------------
+# Terminal
+# ---------------------------------------------------------------------------
+
+class Terminal:
+    def __init__(self, sock_path: str, my_pid: int, verbose: bool = False):
+        import socket
+        self.my_pid = my_pid
+        self.verbose = verbose
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.recv_buf = bytearray()
+        self.connected = True
+        self.next_trans_id = 0
+        # Map our outbound OBJ_READ_REQ trans_ids to a pending action,
+        # so we know what to do with the corresponding RESP.
+        self.pending_reads: Dict[int, str] = {}
+
+        # Connect + handshake (with a brief retry while the launcher
+        # brings the crossbar up).
+        deadline = time.time() + 5.0
+        while True:
+            try:
+                self.sock.connect(sock_path)
+                break
+            except (FileNotFoundError, ConnectionRefusedError) as e:
+                if time.time() >= deadline:
+                    raise SystemExit(f"oriscterm: connect failed: {e}")
+                time.sleep(0.05)
+        self.sock.sendall(struct.pack(">II", HELLO_MAGIC, my_pid))
+        reply = self._recv_exact(8)
+        magic, status = struct.unpack(">II", reply)
+        if magic != HELLO_MAGIC or status != HELLO_OK:
+            raise SystemExit(f"oriscterm: handshake failed "
+                             f"(magic={magic:#x}, status={status:#x})")
+        self.sock.setblocking(False)
+
+        # Build the UI.
+        self.root = tk.Tk()
+        self.root.title(f"Object RISC Terminal · pid={my_pid}")
+        # Bring the window to the front on launch — when oriscterm is
+        # spawned by oriscrun the parent app keeps focus, leaving the
+        # tk window buried.
+        self.root.lift()
+        self.root.attributes('-topmost', True)
+        self.root.after(150, lambda: self.root.attributes('-topmost', False))
+        font = tkfont.Font(family="Menlo", size=14)
+        self.text = tk.Text(self.root, width=60, height=20,
+                            bg="#0a0a14", fg="#d8d8d8",
+                            insertbackground="#d8d8d8",
+                            font=font, padx=12, pady=12,
+                            wrap="word", borderwidth=0,
+                            highlightthickness=0)
+        self.text.pack(fill="both", expand=True)
+        self.text.insert("end",
+            f"oriscterm online · pid={my_pid} · console object idx={CONSOLE_INDEX}\n")
+        self.text.see("end")
+        self.text.configure(state="disabled")
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(POLL_INTERVAL_MS, self._poll)
+
+    # ---- network -----------------------------------------------------------
+
+    def _recv_exact(self, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise SystemExit("oriscterm: crossbar closed during handshake")
+            out.extend(chunk)
+        return bytes(out)
+
+    def send_packet(self, packet: bytes) -> None:
+        try:
+            self.sock.sendall(struct.pack(">I", len(packet)) + packet)
+        except OSError as e:
+            self._log(f"send failed: {e}")
+            self.connected = False
+
+    def _poll(self) -> None:
+        # Drain bytes from socket.
+        got_bytes = 0
+        try:
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    self.connected = False
+                    break
+                self.recv_buf.extend(chunk)
+                got_bytes += len(chunk)
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            self.connected = False
+        if got_bytes and self.verbose:
+            self._log(f"poll: drained {got_bytes} bytes "
+                      f"(buf now {len(self.recv_buf)})")
+
+        # Frame and dispatch packets.
+        while len(self.recv_buf) >= 4:
+            (length,) = struct.unpack(">I", bytes(self.recv_buf[:4]))
+            if len(self.recv_buf) < 4 + length:
+                break
+            packet = bytes(self.recv_buf[4:4 + length])
+            del self.recv_buf[:4 + length]
+            self._handle_packet(packet)
+
+        if self.connected:
+            self.root.after(POLL_INTERVAL_MS, self._poll)
+        else:
+            self._append("\n[crossbar closed]\n")
+            # Leave the window open briefly so the user can read the
+            # final state, then quit.
+            self.root.after(1500, self.root.destroy)
+
+    def _handle_packet(self, packet: bytes) -> None:
+        try:
+            pkt = unpack_packet(packet)
+        except ValueError as e:
+            self._log(f"malformed packet: {e}")
+            return
+        if pkt["type"] == PKT_SEND_DELIVER:
+            self._handle_send_deliver(pkt)
+        elif pkt["type"] == PKT_OBJ_READ_RESP:
+            self._handle_read_resp(pkt)
+        else:
+            self._log(f"unhandled packet type 0x{pkt['type']:02x}")
+
+    def _handle_send_deliver(self, pkt: Dict) -> None:
+        try:
+            recipient_ref, int_payload, or_payload = parse_send_deliver(pkt)
+        except ValueError as e:
+            self._log(f"bad SEND_DELIVER: {e}")
+            return
+        if ref_index(recipient_ref) != CONSOLE_INDEX:
+            self._log(f"SEND to unknown obj idx={ref_index(recipient_ref)}")
+            return
+        # Wire OR slot 0 is the sender's O1, which is by SEND convention
+        # the recipient itself (= our console, irrelevant here). The
+        # actual data ref is at slot 1 (sender's O2), and an optional
+        # reply capability at slot 2 (sender's O3).
+        source_ref = or_payload[1]
+        reply_cap  = or_payload[2]
+        offset = int_payload[0]
+        length = int_payload[1]
+        if source_ref == 0 or length == 0:
+            return
+        src_pid = ref_home(source_ref)
+        trans = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        self.pending_reads[trans] = ("display", length, reply_cap)
+        req = build_obj_read_req(self.my_pid, src_pid, trans,
+                                 source_ref, offset, length)
+        self.send_packet(req)
+
+    def _handle_read_resp(self, pkt: Dict) -> None:
+        trans = pkt["trans_id"]
+        info = self.pending_reads.pop(trans, None)
+        if info is None:
+            self._log(f"unexpected OBJ_READ_RESP trans={trans}")
+            return
+        action, expected_len, reply_cap = info
+        flags = pkt["flags"] & 0x3F
+        if flags != 0:
+            self._append(f"[read failed: flags=0x{flags:02x}]")
+        else:
+            words = pkt["payload"]
+            raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in words)
+            text = raw[:expected_len].decode("utf-8", errors="replace")
+            if action == "display":
+                self._append(text)
+        # If the sender provided a reply capability, send a header-only
+        # ack SEND_DELIVER through it so the sender can unblock from a
+        # poll on its reply queue and exit cleanly.
+        if reply_cap != 0:
+            ack_trans = self.next_trans_id & 0xFFFF
+            self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+            ack = self._build_ack(reply_cap, ack_trans)
+            self.send_packet(ack)
+
+    def _build_ack(self, recipient_ref: int, trans_id: int) -> bytes:
+        """Build a SEND_DELIVER packet with empty payload aimed at
+        `recipient_ref`. Reuses the same wire builder simorisc uses on
+        the SEND instruction."""
+        payload = []
+        payload.append(recipient_ref & 0xFFFFFFFF)
+        payload.append((recipient_ref >> 32) & 0xFFFFFFFF)
+        payload.extend([0, 0, 0, 0])      # int payload
+        for _ in range(4):                 # OR payload (all null)
+            payload.append(0); payload.append(0)
+        dst = ref_home(recipient_ref)
+        return pack_packet(self.my_pid, dst, PKT_SEND_DELIVER, 0,
+                           trans_id, payload)
+
+    # ---- UI helpers --------------------------------------------------------
+
+    def _append(self, s: str) -> None:
+        self.text.configure(state="normal")
+        self.text.insert("end", s)
+        self.text.see("end")
+        self.text.configure(state="disabled")
+        # Also surface rendered text on stderr so the launcher / tests
+        # can verify the demo without screen-capture access.
+        sys.stderr.write(f"RENDER: {s!r}\n")
+        sys.stderr.flush()
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"oriscterm: {msg}", file=sys.stderr)
+
+    def _on_close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.root.destroy()
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="oriscterm",
+        description="Object RISC graphics terminal device")
+    ap.add_argument("--socket", required=True,
+                    help="path to oriscbar's UNIX domain socket")
+    ap.add_argument("--pid", type=int, required=True,
+                    help="processor identifier this terminal presents to "
+                         "the crossbar (typically 16+ to avoid clashing "
+                         "with CPU pids)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    term = Terminal(args.socket, args.pid, verbose=args.verbose)
+    print(f"oriscterm READY pid={args.pid}", flush=True)
+    term.root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

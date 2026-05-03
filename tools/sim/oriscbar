@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""oriscbar — Object RISC crossbar process.
+
+Listens on a UNIX domain socket. Each CPU (and device) participating in
+the simulated system connects, performs a small handshake announcing
+its `pid`, and then exchanges wire-format packets per Volume IV §3.
+The crossbar inspects each packet's `dst_pid` field and forwards the
+packet bytes to the connection registered for that pid.
+
+Wire framing on the socket is length-prefixed: each message is
+    [length:4 BE][packet:length bytes]
+where `length` is the byte count of the packet body (including its own
+internal header + payload + checksum per Volume IV).
+
+Handshake is sent before any packets:
+    client → server: HELLO_MAGIC (0xC0FFEEAA, 4B BE) | pid (4B BE)
+    server → client: HELLO_MAGIC (4B BE)             | status (4B BE)
+                     status: 0 = OK, non-zero = rejected (e.g., pid in use)
+
+This program is content-blind: it knows nothing about ISA semantics or
+packet types beyond the dst_pid field in the header. CPUs/devices do
+all the protocol work; the crossbar just routes bytes.
+"""
+
+import argparse
+import os
+import selectors
+import signal
+import socket
+import struct
+import sys
+import time
+from typing import Dict, Optional
+
+HELLO_MAGIC  = 0xC0FFEEAA
+HELLO_OK     = 0x00000000
+HELLO_BUSY   = 0x00000001
+HELLO_BADMSG = 0x00000002
+
+DEFAULT_SOCK = "/tmp/oriscbar.sock"
+
+
+class Connection:
+    """One connected client (CPU or device). We accumulate raw bytes
+    from the socket and parse them into framed messages on demand."""
+    def __init__(self, sock: socket.socket, addr):
+        self.sock = sock
+        self.addr = addr
+        self.buf = bytearray()
+        self.pid: Optional[int] = None    # set after handshake
+        self.handshake_done = False
+
+    def read_some(self) -> bool:
+        """Pull whatever's available into our buffer. Returns False on
+        clean EOF (peer closed)."""
+        try:
+            chunk = self.sock.recv(65536)
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        self.buf.extend(chunk)
+        return True
+
+    def take_handshake(self) -> Optional[int]:
+        """If 8 bytes are buffered, parse + return pid, else None."""
+        if len(self.buf) < 8:
+            return None
+        magic, pid = struct.unpack(">II", bytes(self.buf[:8]))
+        del self.buf[:8]
+        if magic != HELLO_MAGIC:
+            return -1
+        return pid
+
+    def take_packet(self) -> Optional[bytes]:
+        """If a full length-prefixed packet is buffered, return it; else None."""
+        if len(self.buf) < 4:
+            return None
+        (length,) = struct.unpack(">I", bytes(self.buf[:4]))
+        if len(self.buf) < 4 + length:
+            return None
+        packet = bytes(self.buf[4:4 + length])
+        del self.buf[:4 + length]
+        return packet
+
+    def write_handshake_response(self, status: int) -> None:
+        try:
+            self.sock.sendall(struct.pack(">II", HELLO_MAGIC, status))
+        except OSError:
+            pass
+
+    def write_packet(self, packet: bytes) -> bool:
+        """Frame and send a packet. Returns False on failure (e.g.,
+        peer closed)."""
+        try:
+            self.sock.sendall(struct.pack(">I", len(packet)) + packet)
+        except OSError:
+            return False
+        return True
+
+
+class Crossbar:
+    def __init__(self, sock_path: str, verbose: bool = False):
+        self.sock_path = sock_path
+        self.verbose = verbose
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.setblocking(False)
+        # Clean up any stale socket file (we own this path).
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+        self.listener.bind(sock_path)
+        self.listener.listen(64)
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.listener, selectors.EVENT_READ, data=None)
+        self.connections: Dict[int, Connection] = {}   # by pid
+        self.pending: Dict[int, Connection] = {}       # by fd, pre-handshake
+        self.shutdown_requested = False
+
+    def log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"oriscbar: {msg}", file=sys.stderr)
+
+    def accept(self) -> None:
+        try:
+            csock, addr = self.listener.accept()
+        except (BlockingIOError, InterruptedError):
+            return
+        csock.setblocking(False)
+        conn = Connection(csock, addr)
+        self.selector.register(csock, selectors.EVENT_READ, data=conn)
+        self.pending[csock.fileno()] = conn
+        self.log(f"accepted fd={csock.fileno()}")
+
+    def close_connection(self, conn: Connection) -> None:
+        try:
+            self.selector.unregister(conn.sock)
+        except KeyError:
+            pass
+        try:
+            conn.sock.close()
+        except OSError:
+            pass
+        if conn.pid is not None and self.connections.get(conn.pid) is conn:
+            del self.connections[conn.pid]
+            self.log(f"connection for pid={conn.pid} closed")
+        # Drop from pending map if present.
+        for fd, c in list(self.pending.items()):
+            if c is conn:
+                del self.pending[fd]
+
+    def handle_handshake(self, conn: Connection) -> None:
+        result = conn.take_handshake()
+        if result is None:
+            return  # need more bytes
+        if result == -1:
+            self.log(f"bad handshake magic from fd={conn.sock.fileno()}; rejecting")
+            conn.write_handshake_response(HELLO_BADMSG)
+            self.close_connection(conn)
+            return
+        pid = result
+        if pid in self.connections:
+            self.log(f"pid {pid} already connected; rejecting new attempt")
+            conn.write_handshake_response(HELLO_BUSY)
+            self.close_connection(conn)
+            return
+        conn.pid = pid
+        conn.handshake_done = True
+        self.connections[pid] = conn
+        self.pending.pop(conn.sock.fileno(), None)
+        conn.write_handshake_response(HELLO_OK)
+        self.log(f"pid={pid} connected on fd={conn.sock.fileno()}")
+
+    def route_packet(self, conn: Connection, packet: bytes) -> None:
+        if len(packet) < 8:
+            self.log(f"packet too short from pid={conn.pid}; dropped")
+            return
+        # Parse just the header to get dst_pid.
+        _src, dst, _type, _flags, _trans, _length = \
+            struct.unpack(">BBBBHH", packet[:8])
+        target = self.connections.get(dst)
+        if target is None:
+            self.log(f"drop pid={conn.pid} -> dst={dst} (no such connection)")
+            return
+        if not target.write_packet(packet):
+            self.log(f"write failed to pid={dst}; closing")
+            self.close_connection(target)
+
+    def handle_readable(self, conn: Connection) -> None:
+        alive = conn.read_some()
+        if not alive:
+            self.log(f"EOF from pid={conn.pid}")
+            self.close_connection(conn)
+            return
+        if not conn.handshake_done:
+            self.handle_handshake(conn)
+            if not conn.handshake_done:
+                return
+        while True:
+            packet = conn.take_packet()
+            if packet is None:
+                return
+            self.route_packet(conn, packet)
+
+    def run(self) -> None:
+        self.log(f"listening on {self.sock_path}")
+        try:
+            while not self.shutdown_requested:
+                events = self.selector.select(timeout=0.25)
+                for key, _mask in events:
+                    if key.data is None:
+                        self.accept()
+                    else:
+                        self.handle_readable(key.data)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        for conn in list(self.connections.values()):
+            self.close_connection(conn)
+        for conn in list(self.pending.values()):
+            self.close_connection(conn)
+        try:
+            self.selector.close()
+            self.listener.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(self.sock_path)
+        except FileNotFoundError:
+            pass
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="oriscbar",
+        description="Object RISC crossbar process")
+    ap.add_argument("--socket", default=DEFAULT_SOCK,
+                    help=f"UNIX socket path to listen on (default: {DEFAULT_SOCK})")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="print every connection / disconnect / drop event")
+    args = ap.parse_args(argv)
+
+    cb = Crossbar(args.socket, verbose=args.verbose)
+    # Translate SIGINT/SIGTERM into a clean shutdown.
+    def _signal(_signo, _frame):
+        cb.shutdown_requested = True
+    signal.signal(signal.SIGINT,  _signal)
+    signal.signal(signal.SIGTERM, _signal)
+    print(f"oriscbar READY {args.socket}", flush=True)
+    cb.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
