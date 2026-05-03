@@ -4,30 +4,51 @@
 ;
 ;     int console_write(const char *buf, int count);
 ;
-; Treats `buf` as a virtual address in the data section (mapped at
-; 0x40000 by the loader per CONTRACT.md §2). Subtracts the data base
-; to get the byte offset within the data object, then issues the
-; firmware ConsoleWrite primitive (0x320) with O1 = the data
-; section's object reference (preserved at O3 since boot — pcc-
-; compiled C never touches the OR file in this iteration).
+; Picks the right object reference based on `buf`'s VA range:
+;   - VAs in [0x40000, 0x1f0000)   →  data section  (O3)
+;   - VAs in [0x1f0000, 0x200000)  →  default stack (O2)
+; The boundary assumes the default stack_size of 0x10000 from
+; CONTRACT.md §2; programs with a non-default stack_size need a
+; different bridge until the C compiler grows the `__or` qualifier
+; and SEND/OL/OS patterns.
 ;
-; This wrapper exists because the OR file isn't yet exposed to C
-; (no `__or` qualifier in our pcc port, no OL/OS patterns in
-; table.c). Once that lands, this file goes away — C will be able
-; to call the firmware primitive directly via __builtin_orisc_call.
+; Code section (O1) is also readable but excluded — there's no
+; sensible reason to ConsoleWrite from a code object.
+;
+; Once `__or` lands, this whole file goes away — C will be able to
+; carry around real object references and call ConsoleWrite (or any
+; firmware primitive) directly via __builtin_orisc_call.
+
+.set DATA_BASE,    0x40000
+.set STACK_BOTTOM, 0x1f0000   ; 0x200000 - default stack_size (0x10000)
 
 .text
 
 console_write:
-    ; r4 = source VA (in data section), r5 = byte count.
-    ; Convert VA → offset within data: offset = r4 - 0x40000.
-    li    r1, 0x40000
+    ; r4 = source VA, r5 = byte count.
+    ; Decide stack vs data by comparing against STACK_BOTTOM.
+    li    r1, STACK_BOTTOM
+    sltu  r2, r4, r1              ; r2 = (va < 0x1f0000) ? 1 : 0
+    beqz  r2, cw_stack
+    nop
+
+cw_data:
+    ; offset = va - 0x40000
+    li    r1, DATA_BASE
     subu  r4, r4, r1
+    omov  o1, o3                  ; data section reference (R cap)
+    j     cw_call
+    nop
 
-    omov  o1, o3              ; data section reference (full caps)
-    call  #0x320              ; ConsoleWrite — clobbers r2, r3
-    nop                       ; (CALL has no delay slot, but pad
-                              ;  for symmetry with adjacent calls)
+cw_stack:
+    ; offset = va - 0x1f0000
+    li    r1, STACK_BOTTOM
+    subu  r4, r4, r1
+    omov  o1, o2                  ; stack object reference (R+W cap)
 
-    jr    r31                 ; return to caller; r2 holds status
-    nop                       ; (jr delay slot)
+cw_call:
+    call  #0x320                  ; ConsoleWrite — clobbers r2, r3
+    nop
+
+    jr    r31                     ; r2 holds status from ConsoleWrite
+    nop                           ; (jr delay slot)

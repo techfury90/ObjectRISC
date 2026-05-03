@@ -98,21 +98,32 @@ wire-format crossbar in its own process:
 examples/run_hello_terminal.sh
 ```
 
-Hello, world! from C — compiled by our in-tree pcc port. Build pcc
-once (`cd tools/cc && ./configure --target=orisc-unknown-none && make`
-into a build dir of your choice — `/tmp/pcc-build` is the default),
-then:
+C compiled by our in-tree pcc port. Build pcc once (`cd tools/cc &&
+./configure --target=orisc-unknown-none && make` into a build dir
+of your choice — `/tmp/pcc-build` is the default), then run any
+`.c` through the pipeline:
 
 ```sh
-examples/cc/run_hello_c.sh
+examples/cc/run_c.sh examples/cc/hello.c
 # Hello, world!
+
+examples/cc/run_c.sh examples/cc/factab.c
+# 1! = 1
+# 2! = 2
+# 3! = 6
+# 4! = 24
+# 5! = 120
+# 6! = 720
+# 7! = 5040
 ```
 
-The C source is `examples/cc/hello.c`. It links against `crt0.s`
-(provides `.entry _start`, calls main, TaskExits with main's R2 as
-the exit code) and `console_io.s` (a small bridge to firmware
-ConsoleWrite — temporary until the C compiler grows the `__or`
-qualifier and OR-file patterns). Both live in
+`factab.c` exercises a fair slice of C: recursion, loops,
+conditionals, stack-allocated arrays, pointer arithmetic, string
+literals, integer division and modulo. Each program links against
+`crt0.s` (provides `.entry _start`, calls main, TaskExits with
+main's R2 as the exit code) and `console_io.s` (a small bridge to
+firmware ConsoleWrite — temporary until the C compiler grows the
+`__or` qualifier and OR-file patterns). Both live in
 `tools/cc/arch/orisc/`.
 
 Parallel π(N) across K+1 CPUs, results streamed live to the

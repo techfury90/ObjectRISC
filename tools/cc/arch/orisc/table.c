@@ -70,7 +70,7 @@ struct optab table[] = {
 	SAREG,	TWORD|TPOINT,
 	SAREG,	TWORD|TPOINT,
 		0,	RLEFT,
-		"	# pconv: int<->ptr\n", },
+		"	; pconv: int<->ptr\n", },
 
 /* int <-> ptr */
 { SCONV,	INAREG,
