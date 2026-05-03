@@ -1230,13 +1230,95 @@ the callee-save band; not for this commit.
 - **Raster blit.** The protocol's reserved (index 5, SEND
   payload pinned in oriscterm) but the implementation just logs
   and drops. Lands when something actually needs it.
-- **Mouse events.** Easy to add (Tk gives us `<Button-N>` and
-  `<Motion>` for free) but no demo wants them yet.
 - **Window control** (title, resize, query dimensions). Useful
   but pure plumbing; deferred.
-- **Multiple keyboard subscribers.** Currently a null SEND
-  removes all subscriptions — coarse, fine for the demo. Would
-  refine to per-CPU unsubscribe when multiple subs are needed.
+- **Multiple keyboard / pointer subscribers.** Currently a null
+  SEND removes all subscriptions — coarse, fine for the demos.
+  Would refine to per-CPU unsubscribe when multiple subs are
+  needed.
+
+## Phase 17 — Pointer service and the OR-hygiene discipline
+
+The terminal had keyboard and graphics; mouse was the obvious
+next gap. Per the user: tablet-style absolute coordinates — the
+terminal owns cursor display, the protocol just delivers `(x, y)`
+— rather than the "terminal CPU manages cursor visible state"
+model. Cleaner separation, less protocol surface.
+
+### The pointer service (idx 6)
+
+Same shape as keyboard: subscribe-and-receive. The CPU SENDs a
+derived `R|S` self-ref; the terminal records it and SENDs an
+event back through that ref on every motion / button change.
+Each event carries:
+
+- `R4` = event type (0 motion, 1 button-down, 2 button-up)
+- `R5` = packed `(x << 16) | y` in canvas pixel coordinates
+- `R6` = button (1=L, 2=M, 3=R; 0 for motion)
+- `R7` = button-state mask (bit N set if button N is held)
+
+Bound on Tk's `<Motion>`, `<ButtonPress-N>`, `<ButtonRelease-N>`
+on the canvas widget directly, so coordinates arrive in canvas
+space — no widget-translation math.
+
+### `mouse_paint.c`
+
+The canonical demo. Click drops a small filled square; drag
+draws a stroke (line segments between successive motion samples
+while button 1 is held); middle click cycles the pen colour;
+right click clears. ~200 lines of C. The user closes the Tk
+window to quit (oriscrun tears the rest down).
+
+### The OR-hygiene discipline, formalised
+
+Every demo so far has tripped over the same trap: the
+ReceiveQueuePoll overlay sets `O1..O4` from the wire payload
+(Vol VI §6), and any SEND clobbers `O1/O2/O3` too — so after
+either operation, libc calls reading from `O2` (stack ref) or
+`O3` (data ref) silently fail. We discovered this once with
+`O3` (Phase 16), then again with `O4` and `O2` after the user
+reported the keyboard demo printing garbage and exiting on the
+first keystroke.
+
+`mouse_paint.c` introduces the discipline that makes the
+problem go away for good: every helper function that issues a
+primitive or a SEND calls `restore_or_state()` on its way out,
+which copies the boot-time stack/data/self refs from
+`O13/O14/O15` back into `O2/O3/O4`. The boot values are parked
+in the high three slots once at startup. Callers in `main()`
+never have to think about it — `print_str` / `print_int` "just
+work" after any helper returns.
+
+Documented in `tools/devices/README.md` for both keyboard and
+pointer subscriber patterns. `paint.c` was migrated to the new
+shape too; `kbd_echo.c` already had restore-after-each-asm
+because it predated the helpers.
+
+### Headless test infrastructure
+
+`fake_terminal.py` was extended to emit pointer events alongside
+keyboard. Its CLI is now an event-spec list:
+
+    --event key:A
+    --event motion:120,170
+    --event down:100,150,1
+    --event up:120,170,1
+
+Each spec waits for the corresponding subscription to arrive
+(kbd events wait for kbd subscribe; pointer events wait for
+pointer subscribe). New `test_mouse_paint.sh` exercises the
+full mouse flow — click + drag + release, middle-click, right-
+click — and asserts on cpu0's stdout. The kbd test was
+migrated to the new event-spec format and still PASSes.
+
+### Status
+
+7/7 asm tests, 9/9 ld tests, 115/115 sim tests, 12/12 C demos,
+both device tests (kbd_echo + mouse_paint) PASS deterministically.
+The terminal now has six service objects on one port — text
+console, keyboard, grid, vector, pointer, and the (still
+deferred) raster — and the demos cover end-to-end interactive
+use of the first five.
 
 ## Where things stand now
 
@@ -1259,9 +1341,9 @@ the callee-save band; not for this commit.
 - A wire-level crossbar daemon (`oriscbar`), separate-process CPU
   runtime (`simorisc --bar`), and a graphical terminal
   (`oriscterm`) that's now genuinely two-way and graphical:
-  five capability-shaped service objects (console, keyboard,
-  grid-positioned text, vector drawing, raster) on the same
-  port, each a separate ref a CPU can choose to hold.
+  six capability-shaped service objects (console, keyboard,
+  grid-positioned text, vector drawing, raster, pointer) on the
+  same port, each a separate ref a CPU can choose to hold.
 - A vendored pcc with an Object RISC backend that compiles real C
   programs end-to-end, including a working `__or` storage-class
   qualifier on parameters and register-bound variables (caller and

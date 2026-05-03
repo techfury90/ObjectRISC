@@ -140,13 +140,13 @@ examples/cc/run_c.sh examples/cc/or_callee_inspect.c # OISN/OLEN inside __or cal
 examples/cc/run_c.sh examples/cc/strings_demo.c    # exercises liborisc string fns
 ```
 
-Two interactive C demos that use oriscterm's keyboard and
-graphics capabilities — each opens a Tk window and waits for
-keypresses (ESC to exit):
+Three interactive C demos that use oriscterm's keyboard, mouse,
+and graphics capabilities — each opens a Tk window:
 
 ```sh
 examples/cc/run_kbd_echo.sh    # echoes every keystroke (codepoint + mods)
 examples/cc/run_paint.sh       # arrow + letter keys → vector drawing on canvas
+examples/cc/run_mouse_paint.sh # mouse: click drops dot, drag draws stroke
 ```
 
 The `hello_or.c` and `print_or.c` variants use the `__or`

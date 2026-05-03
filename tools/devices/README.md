@@ -100,6 +100,7 @@ synthesizes refs to them.
 | `3`   | **grid**    | CPU SENDs here to write text at a fixed (col, row) on the graphics canvas |
 | `4`   | **vector**  | CPU SENDs here to draw lines, rectangles, ovals on the graphics canvas |
 | `5`   | **raster**  | (protocol pinned, implementation deferred) bitmap blit      |
+| `6`   | **pointer** | CPU SENDs here to subscribe to (or unsubscribe from) pointer / mouse events |
 
 The terminal window has two regions: a scrolling text pane on top
 (driven by service `1`) and a fixed-size graphics canvas below
@@ -352,6 +353,50 @@ pixel along with a destination rectangle. The protocol is pinned
 in the source but not yet implemented; SENDs to it currently log
 and drop. v1 will land alongside the first demo that actually
 needs raster (probably a small framebuffer animation).
+
+### The pointer-subscription protocol
+
+The pointer service (index `6`) is the terminal's mouse / tablet
+input. Same shape as keyboard: CPUs SEND a derived self-ref to
+subscribe; the terminal records it and SENDs a pointer event back
+through that ref every time the mouse moves or a button changes
+state. Coordinates are absolute canvas pixel coordinates (the
+"tablet / touchscreen" model — the terminal owns cursor display,
+the protocol just delivers (x, y)).
+
+**Subscribe / unsubscribe** — same payload shape as keyboard
+(`O2 = subscriber ref` to subscribe, `O2 = null` to unsubscribe
+all).
+
+**Event payload** (terminal → CPU):
+
+| Slot      | Meaning                                                              |
+|-----------|----------------------------------------------------------------------|
+| `O1`      | The subscription ref (the recipient at the SEND layer)               |
+| `O2..O4`  | Null                                                                 |
+| `R4`      | Event type — `0` motion, `1` button-down, `2` button-up              |
+| `R5`      | Packed coordinates: `(x << 16) \| y`, both 16-bit unsigned, in canvas pixels |
+| `R6`      | Button (`1` left, `2` middle, `3` right). Zero for motion events.    |
+| `R7`      | Button-state mask (bit N for button N currently held). Updated *before* the event is dispatched, so a `down` event for button 1 reports `state | 0x02`. |
+
+Queue dispatch lands the wire ints in `R3..R6`, so a polling
+receiver reads:
+- `R3` = event type
+- `R4` = packed (x, y)
+- `R5` = button
+- `R6` = button-state mask
+
+Coordinates are clamped to `[0, 0xFFFF]` and to the canvas bounds
+before packing — events generated outside the canvas during a drag
+are reported at the nearest edge.
+
+**OR hygiene applies the same way as for keyboard subscribers**:
+ReceiveQueuePoll's overlay clobbers `O2/O3/O4`, so a polling
+receiver should park them at startup and restore on the way out
+of every helper that polls or SENDs. See
+[`examples/cc/mouse_paint.c`](../../examples/cc/mouse_paint.c)
+for the canonical pattern (each helper calls `restore_or_state()`
+on its way out, so the loop body never has to think about it).
 
 ## linkbootd
 

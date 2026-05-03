@@ -42,7 +42,8 @@ for _ in $(seq 50); do [ -S "$SOCK" ] && break; sleep 0.05; done
 # fires its subscribe SEND — the crossbar drops packets aimed at
 # unknown pids, and kbd_echo has no retry loop).
 python3 tools/devices/tests/fake_terminal.py \
-    --socket "$SOCK" --pid 16 --keys "AB" \
+    --socket "$SOCK" --pid 16 \
+    --event key:A --event key:B --event key:0x11B \
     > "$TMP/term.out" 2>&1 &
 TERM_PID=$!
 # Wait for fake_terminal's READY line.

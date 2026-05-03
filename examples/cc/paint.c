@@ -43,9 +43,19 @@
 
 #define STEP 8        /* pixels per arrow keypress */
 
-/* --- helpers in their own functions so main's register pressure
- *     stays manageable. Each one does the inline-asm and restores O3
- *     on the way out so callers can use print_str freely. --- */
+/* --- OR hygiene: every helper that issues a primitive or a SEND
+ *     restores O2/O3/O4 on its way out. The boot values live in
+ *     O13/O14/O15 (parked once by main). After this discipline,
+ *     callers in main never have to worry about OR state — print_str
+ *     / print_int "just work" after any helper returns. --- */
+
+static void
+restore_or_state(void)
+{
+	asm volatile("omov o2, o13");
+	asm volatile("omov o3, o15");
+	asm volatile("omov o4, o14");
+}
 
 static int
 attach_self_queue_16(void)
@@ -61,6 +71,7 @@ attach_self_queue_16(void)
 		:
 		: "r1", "r2", "r3", "r4"
 	);
+	restore_or_state();
 	return status;
 }
 
@@ -94,6 +105,7 @@ kbd_subscribe(void)
 		:
 		: "r1", "r4", "r5", "r6", "r7"
 	);
+	restore_or_state();
 	return 0;
 }
 
@@ -117,6 +129,7 @@ kbd_poll(int *out_code, int *out_mods)
 	);
 	*out_code = code;
 	*out_mods = mods;
+	restore_or_state();
 	return status;
 }
 
@@ -139,6 +152,7 @@ vec_cmd(int cmd, int a, int b)
 		: "r"(cmd), "r"(a), "r"(b)
 		: "r1", "r4", "r5", "r6", "r7"
 	);
+	restore_or_state();
 }
 
 /* SEND a grid-write command to the terminal's grid service (in O7).
@@ -160,27 +174,13 @@ grid_text(int offset, int length, int col, int row)
 		: "r"(offset), "r"(length), "r"(col), "r"(row)
 		: "r1", "r4", "r5", "r6", "r7"
 	);
+	restore_or_state();
 }
 
 static int
 pack16(int hi, int lo)
 {
 	return ((hi & 0xFFFF) << 16) | (lo & 0xFFFF);
-}
-
-/* Restore O2 (stack), O3 (data), O4 (self-svc) after any block that
- * polls or SENDs. The poll's queue overlay sets O1..O4 from the wire
- * payload, so:
- *   - O2 (stack ref) — needed by print_int / print_char (stack bufs)
- *   - O3 (data ref) — needed by print_str (data-segment string lits)
- *   - O4 (self-svc) — needed by the next ReceiveQueuePoll
- * All three are parked in O13/O14/O15 by main once at startup. */
-static void
-restore_or_state(void)
-{
-	asm volatile("omov o2, o13");
-	asm volatile("omov o3, o15");
-	asm volatile("omov o4, o14");
 }
 
 const char title_str[] = "PAINT — Object RISC vector demo";
@@ -205,18 +205,14 @@ main(void)
 	o15_data_save  = o3_data;
 
 	if (attach_self_queue_16() != 0) {
-		restore_or_state();
 		print_str("attach failed\n");
 		return 1;
 	}
-	restore_or_state();
 
 	kbd_subscribe();
-	restore_or_state();
 
 	vec_cmd(VEC_CLEAR,     0, 0);
 	vec_cmd(VEC_SET_COLOR, color, 0);
-	restore_or_state();
 
 	/* Render a title via the grid service. The data ref's storage
 	 * starts at VA 0x40000 (CONTRACT.md §2); subtract that to get
@@ -224,13 +220,11 @@ main(void)
 	title_off = (int)title_str - 0x40000;
 	title_len = (int)strlen(title_str);
 	grid_text(title_off, title_len, 2, 0);
-	restore_or_state();
 
 	print_str("paint demo running — focus the terminal\n");
 
 	while (1) {
 		if (kbd_poll(&code, &mods) != 0) break;
-		restore_or_state();
 		if (code == KEY_ESCAPE) break;
 
 		if (code == KEY_UP)         { y -= STEP; if (y < 0) y = 0; }
@@ -263,7 +257,6 @@ main(void)
 			vec_cmd(VEC_CLEAR, 0, 0);
 			vec_cmd(VEC_SET_COLOR, color, 0);
 		}
-		restore_or_state();
 
 		print_str("cursor (");
 		print_int(x);
@@ -274,7 +267,6 @@ main(void)
 		print_str("\n");
 	}
 
-	restore_or_state();
 	print_str("paint demo exiting\n");
 	return 0;
 }

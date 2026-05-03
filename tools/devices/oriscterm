@@ -51,6 +51,7 @@ KEYBOARD_INDEX = 2       # keyboard subscription — receive key events back
 GRID_INDEX     = 3       # grid text — write at (col, row) on the canvas
 VECTOR_INDEX   = 4       # vector graphics — line / rect / oval / clear
 RASTER_INDEX   = 5       # raster blit (protocol pinned, impl deferred)
+POINTER_INDEX  = 6       # pointer / mouse — subscribe to receive events
 
 # Generation is fixed at 1 by simorisc convention (--service spec).
 SERVICE_GENERATION = 1
@@ -70,6 +71,17 @@ VEC_SET_COLOR    = 0x06
 
 # Tiny palette — picked for an "early-1980s graphics terminal" feel.
 # Index 0 is the background, 1 is the default stroke colour.
+# ---- pointer service event types (R4 in the SEND payload) ------------------
+PTR_MOTION  = 0x00
+PTR_DOWN    = 0x01
+PTR_UP      = 0x02
+
+# ---- pointer button codes (R6 in down/up events; bits in R7 state mask) ---
+PTR_BTN_LEFT   = 1
+PTR_BTN_MIDDLE = 2
+PTR_BTN_RIGHT  = 3
+
+
 VEC_PALETTE = {
     0:  "#0a0a14",   # background (matches the text widget's bg)
     1:  "#d8d8d8",   # default foreground
@@ -207,6 +219,10 @@ class Terminal:
         # (a non-null O3 payload subscribes that ref; a null O3
         # unsubscribes the sender's last subscription).
         self.kbd_subscribers: list = []
+        # Active pointer subscribers — same pattern as keyboard.
+        # Bitmask of currently-pressed buttons (bit N == button N down).
+        self.ptr_subscribers: list = []
+        self.ptr_button_state: int = 0
 
         # Connect + handshake (with a brief retry while the launcher
         # brings the crossbar up).
@@ -251,7 +267,8 @@ class Terminal:
         self.text.insert("end",
             f"oriscterm online · pid={my_pid}\n"
             f"  console  idx={CONSOLE_INDEX}    keyboard idx={KEYBOARD_INDEX}\n"
-            f"  grid     idx={GRID_INDEX}    vector   idx={VECTOR_INDEX}\n")
+            f"  grid     idx={GRID_INDEX}    vector   idx={VECTOR_INDEX}\n"
+            f"  pointer  idx={POINTER_INDEX}\n")
         self.text.see("end")
         self.text.configure(state="disabled")
 
@@ -280,6 +297,15 @@ class Terminal:
         # the root after a focus-in so key bindings keep firing.
         self.text.bind("<FocusIn>", lambda _e: self.root.focus_set())
         self.root.focus_set()
+
+        # Pointer events bind to the canvas — coords arrive in canvas
+        # pixel space directly, no widget-translation math needed.
+        for btn in (1, 2, 3):
+            self.canvas.bind(f"<ButtonPress-{btn}>",
+                             lambda e, b=btn: self._on_mouse_button(e, b, True))
+            self.canvas.bind(f"<ButtonRelease-{btn}>",
+                             lambda e, b=btn: self._on_mouse_button(e, b, False))
+        self.canvas.bind("<Motion>", self._on_mouse_motion)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(POLL_INTERVAL_MS, self._poll)
@@ -366,6 +392,8 @@ class Terminal:
             self._handle_grid_send(int_payload, or_payload)
         elif target == VECTOR_INDEX:
             self._handle_vector_send(int_payload, or_payload)
+        elif target == POINTER_INDEX:
+            self._handle_pointer_send(int_payload, or_payload)
         elif target == RASTER_INDEX:
             self._log(f"SEND to raster service (idx {RASTER_INDEX}) — "
                       f"protocol pinned but implementation not yet landed")
@@ -488,6 +516,27 @@ class Terminal:
             return
 
         self._log(f"vector: unknown command 0x{cmd:02x}")
+
+    # ---- pointer (idx 6) — subscribe / unsubscribe ------------------------
+
+    def _handle_pointer_send(self, int_payload, or_payload) -> None:
+        """SEND payload convention for the pointer service:
+            O2 = subscriber's reply ref (terminal SENDs each pointer
+                 event to this ref). Null O2 unsubscribes everyone
+                 (same coarse v1 behaviour as keyboard).
+        """
+        sub_ref = or_payload[1]
+        if sub_ref == 0:
+            n = len(self.ptr_subscribers)
+            self.ptr_subscribers.clear()
+            self._log(f"pointer: unsubscribed {n} subscriber(s)")
+            return
+        if sub_ref in self.ptr_subscribers:
+            self._log(f"pointer: subscriber 0x{sub_ref:016x} already known")
+            return
+        self.ptr_subscribers.append(sub_ref)
+        self._log(f"pointer: subscribed 0x{sub_ref:016x} "
+                  f"(now {len(self.ptr_subscribers)} subscriber(s))")
 
     # ---- keyboard (idx 2) — subscribe / unsubscribe ------------------------
 
@@ -645,6 +694,53 @@ class Terminal:
         # some builds; we accept the common one.
         if s & 0x40000:    mods |= MOD_META
         return mods
+
+    # ---- pointer event dispatch -------------------------------------------
+
+    def _on_mouse_motion(self, event) -> None:
+        if not self.ptr_subscribers:
+            return
+        self._dispatch_pointer_event(PTR_MOTION, event.x, event.y, 0)
+
+    def _on_mouse_button(self, event, button: int, down: bool) -> None:
+        # Update internal button-state mask first so the event we send
+        # reflects the post-event state (consistent with keyboard
+        # modifier reporting).
+        bit = 1 << button
+        if down:
+            self.ptr_button_state |= bit
+            evt_type = PTR_DOWN
+        else:
+            self.ptr_button_state &= ~bit
+            evt_type = PTR_UP
+        if not self.ptr_subscribers:
+            return
+        self._dispatch_pointer_event(evt_type, event.x, event.y, button)
+
+    def _dispatch_pointer_event(self, evt_type: int, x: int, y: int,
+                                 button: int) -> None:
+        # Clamp to canvas bounds and a 16-bit unsigned range so the
+        # packed (x<<16)|y word stays well-formed even if Tk reports
+        # an event outside the canvas (which it occasionally does
+        # during a drag that escapes the widget).
+        if x < 0: x = 0
+        if y < 0: y = 0
+        if x > 0xFFFF: x = 0xFFFF
+        if y > 0xFFFF: y = 0xFFFF
+        packed_xy = ((x & 0xFFFF) << 16) | (y & 0xFFFF)
+        for sub_ref in list(self.ptr_subscribers):
+            trans = self.next_trans_id & 0xFFFF
+            self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+            evt_pkt = build_send_deliver(
+                src_pid=self.my_pid,
+                dst_pid=ref_home(sub_ref),
+                trans_id=trans,
+                recipient_ref=sub_ref,
+                int_payload=[evt_type, packed_xy, button,
+                             self.ptr_button_state],
+                or_payload=[sub_ref, 0, 0, 0],
+            )
+            self.send_packet(evt_pkt)
 
     # ---- UI helpers --------------------------------------------------------
 
