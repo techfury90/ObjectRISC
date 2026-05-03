@@ -43,10 +43,45 @@ PKT_OBJ_READ_REQ   = 0x10
 PKT_OBJ_READ_RESP  = 0x11
 PKT_SEND_DELIVER   = 0x20
 
-# Console object parameters (pinned by the demo convention).
-CONSOLE_INDEX      = 1
-CONSOLE_GENERATION = 1
-CONSOLE_MAX_CAPS   = 0x5B   # R|W|S|V|C — the terminal's view of itself
+# Service objects exposed by oriscterm. Each is a separate capability:
+# CPUs hold an OR per service they want to use, and the dispatch goes
+# by the recipient ref's index field (Vol III §2.1).
+CONSOLE_INDEX      = 1       # text console — CPU writes here
+KEYBOARD_INDEX     = 2       # keyboard subscription — CPU registers here
+                             # to receive keystroke events back
+
+# Generation is fixed at 1 by simorisc convention (--service spec).
+SERVICE_GENERATION = 1
+
+# Caps the terminal grants when it synthesizes refs to its own service
+# objects. Equivalent to the ones simorisc's `populate_service_objects`
+# uses for inter-CPU service refs.
+CONSOLE_MAX_CAPS   = 0x5B   # R|W|S|V|C
+KEYBOARD_MAX_CAPS  = 0x5B   # R|W|S|V|C
+
+# Special-key codepoints — used in keyboard SEND payloads (R4) for
+# keys that don't map to a printable ASCII byte. Anything ≥ 0x100 is
+# a special key; anything < 0x80 is plain ASCII (bytes 0x00..0x7F).
+KEY_BACKSPACE = 0x108
+KEY_TAB       = 0x109
+KEY_RETURN    = 0x10D
+KEY_ESCAPE    = 0x11B
+KEY_DELETE    = 0x17F
+KEY_UP        = 0x180
+KEY_DOWN      = 0x181
+KEY_LEFT      = 0x182
+KEY_RIGHT     = 0x183
+KEY_HOME      = 0x184
+KEY_END       = 0x185
+KEY_PAGE_UP   = 0x186
+KEY_PAGE_DOWN = 0x187
+KEY_F1        = 0x190    # F2..F12 are 0x191..0x19B
+
+# Modifier mask (R5 in keyboard event SENDs). One bit per modifier.
+MOD_SHIFT = 0x01
+MOD_CTRL  = 0x02
+MOD_ALT   = 0x04        # Option on macOS
+MOD_META  = 0x08        # Command on macOS
 
 POLL_INTERVAL_MS = 30        # how often the UI checks the socket
 
@@ -113,6 +148,21 @@ def parse_send_deliver(pkt: Dict):
     return recipient_ref, int_payload, or_payload
 
 
+def build_send_deliver(src_pid: int, dst_pid: int, trans_id: int,
+                       recipient_ref: int,
+                       int_payload, or_payload) -> bytes:
+    """Pack a SEND_DELIVER per Vol IV §4.2 — 14 payload words: 2 for
+    the recipient ref, 4 for R4..R7, 8 for the four OR slots."""
+    payload = [recipient_ref & 0xFFFFFFFF, (recipient_ref >> 32) & 0xFFFFFFFF]
+    for i in range(4):
+        payload.append(int_payload[i] & 0xFFFFFFFF if i < len(int_payload) else 0)
+    for i in range(4):
+        ref = or_payload[i] if i < len(or_payload) else 0
+        payload.append(ref & 0xFFFFFFFF)
+        payload.append((ref >> 32) & 0xFFFFFFFF)
+    return pack_packet(src_pid, dst_pid, PKT_SEND_DELIVER, 0, trans_id, payload)
+
+
 # ---------------------------------------------------------------------------
 # Terminal
 # ---------------------------------------------------------------------------
@@ -129,6 +179,11 @@ class Terminal:
         # Map our outbound OBJ_READ_REQ trans_ids to a pending action,
         # so we know what to do with the corresponding RESP.
         self.pending_reads: Dict[int, str] = {}
+        # Active keyboard subscribers — recipient refs the terminal
+        # SENDs key events to. Updated by SENDs to KEYBOARD_INDEX
+        # (a non-null O3 payload subscribes that ref; a null O3
+        # unsubscribes the sender's last subscription).
+        self.kbd_subscribers: list = []
 
         # Connect + handshake (with a brief retry while the launcher
         # brings the crossbar up).
@@ -167,9 +222,19 @@ class Terminal:
                             highlightthickness=0)
         self.text.pack(fill="both", expand=True)
         self.text.insert("end",
-            f"oriscterm online · pid={my_pid} · console object idx={CONSOLE_INDEX}\n")
+            f"oriscterm online · pid={my_pid}\n"
+            f"  console object idx={CONSOLE_INDEX}\n"
+            f"  keyboard object idx={KEYBOARD_INDEX}\n")
         self.text.see("end")
         self.text.configure(state="disabled")
+
+        # Capture every keystroke at the toplevel so we get them whether
+        # focus is on the (disabled) text widget or the root.
+        self.root.bind("<Key>", self._on_key_press)
+        # The text widget steals focus via mouse-click; redirect back to
+        # the root after a focus-in so key bindings keep firing.
+        self.text.bind("<FocusIn>", lambda _e: self.root.focus_set())
+        self.root.focus_set()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(POLL_INTERVAL_MS, self._poll)
@@ -247,9 +312,17 @@ class Terminal:
         except ValueError as e:
             self._log(f"bad SEND_DELIVER: {e}")
             return
-        if ref_index(recipient_ref) != CONSOLE_INDEX:
-            self._log(f"SEND to unknown obj idx={ref_index(recipient_ref)}")
-            return
+        target = ref_index(recipient_ref)
+        if target == CONSOLE_INDEX:
+            self._handle_console_send(int_payload, or_payload)
+        elif target == KEYBOARD_INDEX:
+            self._handle_keyboard_send(int_payload, or_payload)
+        else:
+            self._log(f"SEND to unknown obj idx={target}")
+
+    # ---- console (idx 1) — text output -------------------------------------
+
+    def _handle_console_send(self, int_payload, or_payload) -> None:
         # Wire OR slot 0 is the sender's O1, which is by SEND convention
         # the recipient itself (= our console, irrelevant here). The
         # actual data ref is at slot 1 (sender's O2), and an optional
@@ -267,6 +340,32 @@ class Terminal:
         req = build_obj_read_req(self.my_pid, src_pid, trans,
                                  source_ref, offset, length)
         self.send_packet(req)
+
+    # ---- keyboard (idx 2) — subscribe / unsubscribe ------------------------
+
+    def _handle_keyboard_send(self, int_payload, or_payload) -> None:
+        """SEND payload convention for the keyboard service:
+            O2 = subscriber's reply ref to receive key events
+                 (the terminal will SEND each event to this ref).
+                 If null, unsubscribe everything previously subscribed
+                 by senders carrying this same ref.
+        """
+        sub_ref = or_payload[1]   # sender's O2 → wire slot 1 → handler O3
+        if sub_ref == 0:
+            # Unsubscribe-all (this is intentionally coarse for v1; if
+            # we ever support multiple subs per CPU, refine to "remove
+            # subs whose home matches the sender"). Currently a single
+            # null SEND clears everyone — fine for the demo.
+            n = len(self.kbd_subscribers)
+            self.kbd_subscribers.clear()
+            self._log(f"keyboard: unsubscribed {n} subscriber(s)")
+            return
+        if sub_ref in self.kbd_subscribers:
+            self._log(f"keyboard: subscriber 0x{sub_ref:016x} already known")
+            return
+        self.kbd_subscribers.append(sub_ref)
+        self._log(f"keyboard: subscribed 0x{sub_ref:016x} "
+                  f"(now {len(self.kbd_subscribers)} subscriber(s))")
 
     def _handle_read_resp(self, pkt: Dict) -> None:
         trans = pkt["trans_id"]
@@ -306,6 +405,85 @@ class Terminal:
         dst = ref_home(recipient_ref)
         return pack_packet(self.my_pid, dst, PKT_SEND_DELIVER, 0,
                            trans_id, payload)
+
+    # ---- keyboard event dispatch ------------------------------------------
+
+    # Tk keysym → our portable keycode (≥ 0x100 means "special key";
+    # printable characters use their plain byte value via event.char).
+    _KEYSYM_TO_CODE = {
+        "BackSpace": KEY_BACKSPACE,
+        "Tab":       KEY_TAB,
+        "Return":    KEY_RETURN,
+        "Escape":    KEY_ESCAPE,
+        "Delete":    KEY_DELETE,
+        "Up":        KEY_UP,
+        "Down":      KEY_DOWN,
+        "Left":      KEY_LEFT,
+        "Right":     KEY_RIGHT,
+        "Home":      KEY_HOME,
+        "End":       KEY_END,
+        "Prior":     KEY_PAGE_UP,    # Tk's name for Page Up
+        "Next":      KEY_PAGE_DOWN,  # Tk's name for Page Down
+        **{f"F{i}": KEY_F1 + (i - 1) for i in range(1, 13)},
+    }
+
+    def _on_key_press(self, event) -> None:
+        if not self.kbd_subscribers:
+            return  # nobody listening; drop
+        code = self._codepoint_from_event(event)
+        if code is None:
+            return  # uninteresting key (modifier-only, etc.)
+        mods = self._modifiers_from_event(event)
+        # SEND one key event per subscriber. Each SEND carries:
+        #   recipient = the subscriber's reply ref
+        #   R4 = codepoint, R5 = modifier mask
+        for sub_ref in list(self.kbd_subscribers):
+            trans = self.next_trans_id & 0xFFFF
+            self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+            evt_pkt = build_send_deliver(
+                src_pid=self.my_pid,
+                dst_pid=ref_home(sub_ref),
+                trans_id=trans,
+                recipient_ref=sub_ref,
+                int_payload=[code, mods, 0, 0],
+                or_payload=[sub_ref, 0, 0, 0],
+            )
+            self.send_packet(evt_pkt)
+
+    def _codepoint_from_event(self, event) -> Optional[int]:
+        # Tk fills `keysym` for every key and `char` for printable ones.
+        # If keysym names a special key we know about, prefer that; else
+        # fall back to the printable char's first byte.
+        sym = event.keysym
+        if sym in self._KEYSYM_TO_CODE:
+            return self._KEYSYM_TO_CODE[sym]
+        ch = event.char
+        if ch and len(ch) >= 1:
+            b = ch.encode('utf-8', errors='ignore')
+            if not b:
+                return None
+            # Single ASCII byte gets passed through as-is; multibyte
+            # characters use the Unicode codepoint above 0x80 (still
+            # below 0x100, where our special-key range starts).
+            return b[0] if len(b) == 1 else ord(ch)
+        return None  # bare modifier press, etc.
+
+    def _modifiers_from_event(self, event) -> int:
+        # Tk's event.state is platform-dependent; the documented bits
+        # below are stable on the platforms we care about. This is a
+        # best-effort decoder — clients that want wire-perfect modifier
+        # info should rely on the codepoint primarily.
+        s = event.state
+        mods = 0
+        if s & 0x1:        mods |= MOD_SHIFT
+        if s & 0x4:        mods |= MOD_CTRL
+        # Alt: bit 0x8 (X11) or 0x10 (mac Option/Alt depending on Tk version)
+        if s & 0x8 or s & 0x10:
+            mods |= MOD_ALT
+        # Meta/Command on macOS shows up as 0x40000 (Tk 8.6) or 0x8 in
+        # some builds; we accept the common one.
+        if s & 0x40000:    mods |= MOD_META
+        return mods
 
     # ---- UI helpers --------------------------------------------------------
 

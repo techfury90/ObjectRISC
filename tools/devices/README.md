@@ -87,8 +87,16 @@ connection. CPUs and devices share this discipline equally.
 
 A graphical terminal device. Opens a Tk window, connects to the
 crossbar at a chosen pid (typically `16+` to avoid clashing with
-CPU pids), exposes a single *console object* at index `1`,
-generation `1`, max caps `R|W|S|V|C` (`0x5B`).
+CPU pids), and exposes two *service objects*: a text console and a
+keyboard subscription endpoint. Each is a separate capability;
+CPUs hold a ref to whichever they want to use. Both live at
+generation `1` and grant `R|W|S|V|C` (`0x5B`) when the launcher
+synthesizes refs to them.
+
+| Index | Service     | What it does                                                |
+|-------|-------------|-------------------------------------------------------------|
+| `1`   | **console** | CPU SENDs here to write text to the screen                  |
+| `2`   | **keyboard**| CPU SENDs here to subscribe to (or unsubscribe from) keystroke events |
 
 Usage:
 
@@ -103,6 +111,19 @@ Or, more typically, via the launcher:
 The `--service 16=1@9` clause synthesizes a `R|S = 0x09` (read +
 send-permitted) capability on the terminal's console object and
 installs it into the CPU's next free `O5..O15` slot at boot.
+
+For interactive programs that want both output AND keyboard input,
+pass both services:
+
+    python3 tools/oriscrun \
+        --terminal pid=16 \
+        --cpu "pid=0:program=demo.orx,service=16=1@9,service=16=2@9"
+
+The CPU then sees the console at `O5` and the keyboard at `O6`
+(slots are filled in `--service` order). See the keyboard section
+below for the subscribe/event protocol, and
+[`examples/cc/run_kbd_echo.sh`](../../examples/cc/run_kbd_echo.sh)
+for a worked C demo.
 
 ### The console-write protocol
 
@@ -169,6 +190,77 @@ CROSSBAR CPU0  -> CPU16 OBJ_READ_RESP trans=0001 len=4w
 ```
 
 The terminal's text widget then shows `Hello, world!`.
+
+### The keyboard-subscription protocol
+
+The keyboard service (index `2`) is the terminal's input side. CPUs
+register a *subscription capability* — a reference the terminal will
+SEND keystroke events back through.
+
+**Subscribe.** SEND to the keyboard service with:
+
+| Slot                 | Meaning                                                 |
+|----------------------|---------------------------------------------------------|
+| `O1` (recipient)     | The keyboard-service reference                          |
+| `O2` (subscription)  | An object the terminal will SEND key events to. Typically the CPU's own `R|S`-derived self-service. |
+| `O3`, `O4`, `R4..R7` | Unused; should be zero                                  |
+
+The terminal records the `O2` reference in its subscriber list.
+Every subsequent key press is dispatched as a SEND aimed at that
+ref, with payload:
+
+| Slot      | Meaning                                                              |
+|-----------|----------------------------------------------------------------------|
+| `O1`      | The subscription ref itself (the recipient at the SEND layer)        |
+| `O2..O4`  | Null                                                                 |
+| `R4`      | Codepoint (see table below)                                          |
+| `R5`      | Modifier mask (`MOD_*` bits below)                                   |
+| `R6`, `R7`| Reserved (zero)                                                      |
+
+CPUs typically attach a receive queue to the subscription target
+and `ReceiveQueuePoll` for events. Queue dispatch lands the wire
+ints in `R3..R6`, so the codepoint reads from `R3` and the modifier
+mask from `R4`.
+
+**Unsubscribe.** SEND to the keyboard service with `O2 = null`. The
+terminal clears its subscriber list. (v1 is coarse — a null SEND
+removes *all* subscriptions; per-CPU unsubscribe will land when
+multiple subscribers are needed.)
+
+**Codepoints.** Plain ASCII bytes 0x00–0x7F come through verbatim
+in `R4`. Special keys use a portable encoding ≥ `0x100`:
+
+| Code    | Key            |
+|---------|----------------|
+| `0x108` | BackSpace      |
+| `0x109` | Tab            |
+| `0x10D` | Return / Enter |
+| `0x11B` | Escape         |
+| `0x17F` | Delete         |
+| `0x180` | Up arrow       |
+| `0x181` | Down arrow     |
+| `0x182` | Left arrow     |
+| `0x183` | Right arrow    |
+| `0x184` | Home           |
+| `0x185` | End            |
+| `0x186` | Page Up        |
+| `0x187` | Page Down      |
+| `0x190` | F1             |
+| …       | …              |
+| `0x19B` | F12            |
+
+**Modifiers.** `R5` is a bitmask:
+
+| Bit    | Modifier                           |
+|--------|------------------------------------|
+| `0x01` | Shift                              |
+| `0x02` | Control                            |
+| `0x04` | Alt (Option on macOS)              |
+| `0x08` | Meta (Command on macOS)            |
+
+The modifier bits decode best-effort from Tk's `event.state`; rely
+on the codepoint as the primary indicator and use modifiers as
+hints rather than ground truth on macOS edge cases.
 
 ## linkbootd
 
