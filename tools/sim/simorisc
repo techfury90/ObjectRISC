@@ -129,6 +129,8 @@ class Descriptor:
     live: bool = True
     send_handler_ref: int = 0
     send_handler_off: int = 0
+    send_handler_va:  int = 0   # populated by InstallHandler from object's mapping
+    objstore: bool = False      # if True, storage is OR-typed (OREFLD/OREFST only)
 
 
 def make_ref(generation: int, home: int, index: int, caps: int) -> int:
@@ -241,9 +243,12 @@ class CPU:
     # ---- object table -------------------------------------------------------
 
     def alloc_object(self, size: int, type_tag: int, max_caps: int,
-                     init_bytes: Optional[bytes] = None) -> int:
+                     init_bytes: Optional[bytes] = None,
+                     objstore: bool = False) -> int:
         """Allocate an object on this CPU; return its reference (caps =
-        max_caps; home = self.pid)."""
+        max_caps; home = self.pid). When `objstore` is True the descriptor
+        is flagged as OR-typed: integer OL/OS trap on it, and only
+        OREFLD/OREFST can read or write its storage."""
         storage = bytearray(size)
         if init_bytes is not None:
             storage[:len(init_bytes)] = init_bytes
@@ -253,12 +258,12 @@ class CPU:
             prior_gen = self.descriptors[idx].generation if self.descriptors[idx] else 1
             desc = Descriptor(storage=storage, length=size,
                               generation=prior_gen, type_tag=type_tag,
-                              max_caps=max_caps)
+                              max_caps=max_caps, objstore=objstore)
             self.descriptors[idx] = desc
         else:
             desc = Descriptor(storage=storage, length=size,
                               generation=1, type_tag=type_tag,
-                              max_caps=max_caps)
+                              max_caps=max_caps, objstore=objstore)
             idx = self.next_obj_idx
             self.next_obj_idx += 1
             self.descriptors.append(desc)
@@ -338,12 +343,14 @@ class CPU:
     # ---- object register access ---------------------------------------------
 
     def deref_obj(self, oreg_idx: int, offset: int, width: int,
-                  required_cap: int, faulting_pc: int) -> Tuple[Descriptor, int, int]:
-        """Validate (null/stale/bounds/cap) an OL/OS reference and return
-        (descriptor, byte offset in storage, home_pid). For a remote object,
-        the descriptor is the home CPU's descriptor (returned by reference;
-        callers may read/write its storage). All four checks per Volume II
-        Section 9 happen here precisely."""
+                  required_cap: int, faulting_pc: int,
+                  *, expect_objstore: bool = False) -> Tuple[Descriptor, int, int]:
+        """Validate (null/stale/bounds/cap/storage-type) an OL/OS or
+        OREFLD/OREFST reference and return (descriptor, byte offset in
+        storage, home_pid). When `expect_objstore` is True (OREFLD/OREFST
+        path) the descriptor's `objstore` flag must be set; when False
+        (integer OL/OS path) the flag must be clear. A mismatch traps
+        capability-violation."""
         ref = self.get_opr(oreg_idx)
         if ref == 0:
             raise Trap(CAUSE_NULL_DEREF, faulting_pc,
@@ -373,11 +380,17 @@ class CPU:
                        f"O{oreg_idx} generation {ref_generation(ref)} != "
                        f"descriptor {desc.generation}")
 
+        if desc.objstore != expect_objstore:
+            kind = "OR-typed (OBJSTORE)" if desc.objstore else "byte-typed"
+            wanted = "OBJSTORE" if expect_objstore else "byte-typed"
+            raise Trap(CAUSE_CAP_VIOLATION, faulting_pc,
+                       f"O{oreg_idx} storage is {kind}; access requires {wanted}")
+
         if offset < 0 or offset + width > desc.length or width <= 0:
             raise Trap(CAUSE_BOUNDS, faulting_pc,
                        f"O{oreg_idx} offset {offset} width {width} "
                        f"outside [0,{desc.length})")
-        if width in (2, 4) and (offset & (width - 1)):
+        if width in (2, 4, 8) and (offset & (width - 1)):
             raise Trap(CAUSE_ADDR_MISALIGN_D, faulting_pc,
                        f"O{oreg_idx} offset {offset} not aligned to {width}")
         return desc, offset, home
@@ -475,12 +488,11 @@ class System:
         for i, val in enumerate(msg.int_payload[:4]):
             cpu.set_gpr(4 + i, val)
 
-        # PC = handler entry within the handler code object's mapped range.
-        handler_idx = ref_index(desc.send_handler_ref)
-        # We require the handler's code object to be the same as the program's
-        # boot code object (mapped at 0x10000). Future revisions can map
-        # additional code objects.
-        cpu.pc = (snap["code_va_base"] + desc.send_handler_off) & 0xFFFFFFFF
+        # PC = handler VA computed at install time from the handler code
+        # object's executable mapping. Loadable modules mapped at any VA
+        # work transparently here; InstallHandler is responsible for
+        # rejecting handlers whose offset is not in any executable mapping.
+        cpu.pc = desc.send_handler_va & 0xFFFFFFFF
         cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
         cpu.active = True
 
@@ -722,6 +734,23 @@ def primitive_ObjAlloc(cpu: CPU) -> None:
         cpu.set_gpr(2, ERR_ENOMEM); cpu.set_opr(1, 0); return
     cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
 
+def primitive_ObjAllocStore(cpu: CPU) -> None:
+    """Like ObjAlloc but the new object's storage is OR-typed: OREFLD/
+    OREFST may access it; integer OL/OS trap. Length must be a multiple
+    of 8 bytes (one OR slot)."""
+    length = cpu.get_gpr(4)
+    type_tag = cpu.get_gpr(5) & 0xFFFF
+    init_caps = cpu.get_gpr(6) & 0xFF
+    if length == 0 or length > (1 << 24) or (length & 0x07) != 0:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_opr(1, 0); return
+    try:
+        ref = cpu.alloc_object(length, type_tag=type_tag,
+                               max_caps=init_caps, objstore=True)
+    except Exception:
+        cpu.set_gpr(2, ERR_ENOMEM); cpu.set_opr(1, 0); return
+    cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
+
+
 def primitive_ObjFree(cpu: CPU) -> None:
     o1 = cpu.get_opr(1)
     if o1 == 0:
@@ -769,6 +798,20 @@ def primitive_InstallHandler(cpu: CPU) -> None:
     if ref_home(target) != cpu.pid:
         cpu.set_gpr(2, ERR_EREMOTE); return
 
+    # Find an executable mapping for the handler code object on this CPU,
+    # so dispatch knows the VA at which to begin execution. Boot text is
+    # mapped at 0x10000 by init_cpu; loadable modules are mapped wherever
+    # MapObject placed them.
+    handler_idx = ref_index(handler)
+    handler_va = None
+    for (lo, hi, idx, base, prot) in cpu.mappings:
+        if idx == handler_idx and (prot & CAP_X) and \
+                base <= handler_off < base + (hi - lo):
+            handler_va = lo + (handler_off - base)
+            break
+    if handler_va is None:
+        cpu.set_gpr(2, ERR_EINVAL); return
+
     idx = ref_index(target)
     if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
         cpu.set_gpr(2, ERR_ESTALE); return
@@ -778,7 +821,50 @@ def primitive_InstallHandler(cpu: CPU) -> None:
 
     desc.send_handler_ref = handler
     desc.send_handler_off = handler_off
+    desc.send_handler_va  = handler_va
     cpu.set_gpr(2, ERR_OK)
+
+
+def primitive_MapObject(cpu: CPU) -> None:
+    target  = cpu.get_opr(1)
+    va_hint = cpu.get_gpr(4)
+    offset  = cpu.get_gpr(5)
+    prot    = cpu.get_gpr(6) & (CAP_R | CAP_W | CAP_X)
+    length  = cpu.get_gpr(7)
+
+    if target == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if ref_home(target) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+    # Requested protection must be a subset of the reference's effective
+    # capabilities (Volume VI Section 5.2).
+    if (ref_caps(target) & prot) != prot:
+        cpu.set_gpr(2, ERR_EPERM); return
+
+    idx = ref_index(target)
+    if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); return
+    desc = cpu.descriptors[idx]
+    if not desc.live or desc.generation != ref_generation(target):
+        cpu.set_gpr(2, ERR_ESTALE); return
+
+    if length <= 0 or offset < 0 or offset + length > desc.length:
+        cpu.set_gpr(2, ERR_EINVAL); return
+
+    # Choose VA. With va_hint == 0, pick a fresh region above the loadable-
+    # module floor (0x00100000); with va_hint != 0, honour it verbatim
+    # without checking for collisions (the program is responsible).
+    if va_hint == 0:
+        va = 0x00100000
+        while any(lo <= va < hi or va <= lo < va + length
+                  for (lo, hi, _, _, _) in cpu.mappings):
+            va += (length + 0xFFF) & ~0xFFF
+    else:
+        va = va_hint & 0xFFFFFFFF
+
+    cpu.map_object(target, va=va, offset=offset, length=length, prot=prot)
+    cpu.set_gpr(2, ERR_OK)
+    cpu.set_gpr(3, va)
 
 def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
     if prim == 0x001:
@@ -787,8 +873,12 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjAlloc(cpu)
     elif prim == 0x101:
         primitive_ObjFree(cpu)
+    elif prim == 0x102:
+        primitive_ObjAllocStore(cpu)
     elif prim == 0x103:
         primitive_ObjDerive(cpu)
+    elif prim == 0x110:
+        primitive_MapObject(cpu)
     elif prim == 0x200:
         primitive_InstallHandler(cpu)
     elif prim == 0x320:
@@ -874,6 +964,12 @@ def fmt_instr(pc: int, word: int, cpu: CPU) -> str:
         m = {0x31:"olb",0x32:"olh",0x33:"olw",0x34:"olbu",
              0x35:"olhu",0x38:"osb",0x39:"osh",0x3B:"osw"}[op]
         return f"{m} r{rt_ & 0x1F}, {off}(o{os_})"
+    if op in (0x36, 0x37):
+        os_ = (word >> 22) & 0xF
+        od  = (word >> 18) & 0xF
+        off = sext16(word & 0xFFFF)
+        m = "orefld" if op == 0x36 else "orefst"
+        return f"{m} o{od}, {off}(o{os_})"
     if op == 0x3C:
         os_ = (word >> 22) & 0xF
         return f"send o{os_}"
@@ -1110,6 +1206,23 @@ def step(cpu: CPU) -> None:
         elif op == 0x3B:
             desc, off, _ = cpu.deref_obj(os_, offset, 4, CAP_W, pc)
             desc.storage[off:off+4] = struct.pack(">I", cpu.get_gpr(rt5))
+    elif op in (0x36, 0x37):  # OREFLD / OREFST
+        os_  = (word >> 22) & 0xF
+        od   = (word >> 18) & 0xF
+        rsv  = (word >> 16) & 0x3
+        if rsv != 0:
+            raise Trap(CAUSE_RESERVED_INSTR, pc, "OREF rsv must be zero")
+        offset = sext16(word & 0xFFFF)
+        if op == 0x36:  # OREFLD Od, offset(Os)
+            desc, off, _ = cpu.deref_obj(os_, offset, 8, CAP_R, pc,
+                                         expect_objstore=True)
+            ref_value = struct.unpack(">Q", bytes(desc.storage[off:off+8]))[0]
+            cpu.set_opr(od, ref_value)
+        else:           # OREFST Od, offset(Os)
+            ref_value = cpu.get_opr(od)
+            desc, off, _ = cpu.deref_obj(os_, offset, 8, CAP_W, pc,
+                                         expect_objstore=True)
+            desc.storage[off:off+8] = struct.pack(">Q", ref_value)
     elif op == 0x3C:  # SEND
         os_ = (word >> 22) & 0xF
         ref = cpu.get_opr(os_)

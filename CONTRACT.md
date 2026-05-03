@@ -139,6 +139,27 @@ Returns:
 - `R2` = `OK` on success, `EINVAL` for zero or oversized length,
   `ENOMEM` on allocator failure.
 
+### 3.2.1 `0x102 ObjAllocStore`
+
+Like `ObjAlloc` but the new object's storage is *OR-typed*
+(`OBJSTORE` flag set in the descriptor): integer `OL*`/`OS*` trap
+on it with `capability-violation`, and only `OREFLD`/`OREFST`
+(Section 5.12) may read or write the storage. This is the mechanism
+by which object references can be saved to memory without breaching
+the capability invariant — the bytes are never observable as
+integers, and the storage cannot be written with arbitrary patterns.
+
+Inputs:
+- `R4` = length in bytes (must be a non-zero multiple of `8` and
+  ≤ 2^24).
+- `R5` = type tag (low 16 bits).
+- `R6` = initial maximum capabilities (low 8 bits).
+
+Returns:
+- `O1` = reference to the new OBJSTORE object.
+- `R2` = `OK` or `EINVAL` (length zero, not a multiple of 8, or too
+  large) or `ENOMEM`.
+
 ### 3.3 `0x101 ObjFree`
 
 Increment the descriptor's generation and recycle its slot. All
@@ -159,7 +180,29 @@ Inputs: `O1` = reference (must carry `C`); `R4` = capability mask
 Returns: `O1` = derived reference with caps = `O1.caps & R4`;
 `R2` = `OK` or `EPERM`/`EFAULT`.
 
-### 3.5 `0x200 InstallHandler`
+### 3.5 `0x110 MapObject`
+
+Install page-table entries that resolve a chosen virtual range to the
+storage of a target object. The object's home must be the calling
+CPU. Future revisions may add an `Unmap` companion primitive.
+
+Inputs:
+- `O1` = target object (home must be calling CPU).
+- `R4` = virtual address hint, or `0` to let firmware choose. With a
+  non-zero hint the address is honoured verbatim and the program is
+  responsible for collision avoidance; with `0` firmware picks a
+  fresh region above the loadable-module floor (`0x00100000`).
+- `R5` = byte offset within the object at which the mapping begins.
+- `R6` = protection bits (low three bits: R, W, X). Must be a subset
+  of the calling reference's effective capabilities restricted to
+  R/W/X.
+- `R7` = length of the mapping in bytes.
+
+Returns:
+- `R2` = `OK`, `EFAULT`, `EREMOTE`, `EPERM`, `ESTALE`, or `EINVAL`.
+- `R3` = the virtual address at which the mapping was installed.
+
+### 3.6 `0x200 InstallHandler`
 
 Install a SEND handler on a target object. The handler runs as a
 fresh task on the target's home CPU when a SEND_DELIVER arrives and
@@ -168,14 +211,18 @@ that CPU is idle.
 Inputs:
 - `O1` = target object (must carry both `S` and `V`; home must be the
   calling CPU).
-- `O2` = handler code object (must carry `X`). For this revision the
-  handler code object must be the same as the program's boot text
-  (mapped at `0x00010000`); future revisions may relax this.
+- `O2` = handler code object (must carry `X`). The code object must
+  have an executable mapping (`prot & X`) installed on the calling
+  CPU that contains the byte offset specified in `R4`. The boot text
+  satisfies this trivially (`init_cpu` maps it at `0x00010000`);
+  loadable modules satisfy it once they have been `MapObject`'d as
+  R+X (Section 3.5).
 - `R4` = byte offset within the handler code object at which the
   handler begins.
 
 Returns: `R2` = `OK`, `EPERM` (caps), `EREMOTE` (target lives
-elsewhere), `EFAULT`, or `ESTALE`.
+elsewhere), `EINVAL` (handler offset not in any executable mapping
+of the handler code object on this CPU), `EFAULT`, or `ESTALE`.
 
 ### 3.6 `0x320 ConsoleWrite`
 
@@ -296,8 +343,10 @@ section.
 | `0x0B`| SLTIU    | `0x33`| OLW      |
 | `0x0C`| ANDI     | `0x34`| OLBU     |
 | `0x0D`| ORI      | `0x35`| OLHU     |
-| `0x0E`| XORI     | `0x38`| OSB      |
-| `0x0F`| LUI      | `0x39`| OSH      |
+| `0x0E`| XORI     | `0x36`| OREFLD   |
+| `0x0F`| LUI      | `0x37`| OREFST   |
+|       |          | `0x38`| OSB      |
+|       |          | `0x39`| OSH      |
 |       |          | `0x3B`| OSW      |
 |       |          | `0x3C`| SEND     |
 |       |          | `0x3D`| CALL     |
@@ -438,6 +487,34 @@ The `rt'` field is six bits, of which the high bit is the reserved
 "future register-file widening" bit and must be zero. The remaining
 five bits are the GPR number. The `offset` is a signed 16-bit byte
 offset from the start of the object.
+
+### 5.9.1 OREFLD/OREFST Layout (opcodes `0x36`, `0x37`)
+
+```
+ 31      26 25 22 21 18 17 16 15                  0
++----------+----+----+-----+----------------------+
+|  opcode  | os | od | rsv |        offset        |
++----------+----+----+-----+----------------------+
+     6       4    4    2             16
+```
+
+Both `os` and `od` are object register fields (4 bits each). `OREFLD
+Od, offset(Os)` reads an 8-byte object reference at byte `offset` of
+the object referenced by `Os` and writes it to `Od`. `OREFST Od,
+offset(Os)` reads `Od` and writes its bits to the same location.
+
+The target object must have its `OBJSTORE` flag set in the
+descriptor (allocated through `ObjAllocStore`); the access traps
+`capability-violation` otherwise. Conversely, integer `OL*`/`OS*`
+on an `OBJSTORE` object also traps `capability-violation`. The
+offset must be 8-byte aligned; misalignment traps
+`address-misaligned-d`. Bounds and capability checks are otherwise
+identical to `OL*`/`OS*` (Section 5.9): `R` is required for
+`OREFLD`, `W` for `OREFST`, plus the live-generation and
+in-bounds-by-8-bytes checks.
+
+The `rsv` bits (17:16) must be zero in this revision; non-zero
+traps `reserved-instruction`.
 
 ### 5.10 SEND Layout (opcode = `0x3C`)
 

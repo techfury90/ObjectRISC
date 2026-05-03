@@ -288,10 +288,11 @@ MAJOR = {
     "lb":    0x20, "lh":    0x21, "lw":    0x23,
     "lbu":   0x24, "lhu":   0x25,
     "sb":    0x28, "sh":    0x29, "sw":    0x2B,
-    "olb":   0x31, "olh":   0x32, "olw":   0x33,
-    "olbu":  0x34, "olhu":  0x35,
-    "osb":   0x38, "osh":   0x39, "osw":   0x3B,
-    "send":  0x3C, "call":  0x3D,
+    "olb":    0x31, "olh":    0x32, "olw":    0x33,
+    "olbu":   0x34, "olhu":   0x35,
+    "orefld": 0x36, "orefst": 0x37,
+    "osb":    0x38, "osh":    0x39, "osw":    0x3B,
+    "send":   0x3C, "call":   0x3D,
 }
 
 # REGIMM rt sub-codes
@@ -349,6 +350,16 @@ def encode_o_ls(opcode: int, os: int, rt: int, offset16: int) -> int:
     return ((opcode & 0x3F) << 26 |
             (os & 0xF) << 22 |
             (rt & 0x1F) << 16 |
+            (offset16 & 0xFFFF))
+
+
+def encode_oref(opcode: int, os: int, od: int, offset16: int) -> int:
+    """OREFLD/OREFST layout (opcodes 0x36/0x37):
+    [opcode:6 | os:4 | od:4 | rsv:2 | offset:16]. Both os and od are
+    object registers (4 bits each)."""
+    return ((opcode & 0x3F) << 26 |
+            (os & 0xF) << 22 |
+            (od & 0xF) << 18 |
             (offset16 & 0xFFFF))
 
 
@@ -816,6 +827,9 @@ def handle_instruction(asm: Assembler, section: str, src: SourceLine,
         if name in ("olb", "olh", "olw", "olbu", "olhu", "osb", "osh", "osw"):
             encode_obj_ls(asm, section, src, name, op, operands)
             return
+        if name in ("orefld", "orefst"):
+            encode_obj_oref(asm, section, src, name, op, operands)
+            return
         if name == "send":
             encode_send_inst(asm, section, src, operands)
             return
@@ -1143,6 +1157,29 @@ def encode_obj_ls(asm: Assembler, section: str, src: SourceLine,
     emit_const(asm, section, file, line, 1, name, word)
 
 
+# ---- OREFLD / OREFST (object-typed memory access) ----
+
+def encode_obj_oref(asm: Assembler, section: str, src: SourceLine,
+                    name: str, op: int, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 2:
+        raise AsmError(f"{name} expects `od, offset(os)`", file, line, 1)
+    od = parse_obj(_need_one_token(operands[0], file, line, "od").text,
+                   file, line, operands[0][0].col)
+    offset_toks, base_tok = parse_mem_operand(operands[1], file, line)
+    if offset_toks:
+        if len(offset_toks) != 1 or offset_toks[0].kind not in ("num", "char"):
+            raise AsmError(f"{name}: offset must be a single integer literal",
+                           file, line, offset_toks[0].col)
+        off = parse_int(offset_toks[0].text, file, line, offset_toks[0].col)
+    else:
+        off = 0
+    os_ = parse_obj(base_tok.text, file, line, base_tok.col)
+    off16 = check_simm_or_uimm(off, 16, file, line, base_tok.col, f"{name} offset")
+    word = encode_oref(op, os_, od, off16)
+    emit_const(asm, section, file, line, 1, name, word)
+
+
 # ---- O-type register-register (OBJECT funct codes) ----
 
 def encode_object_rr(asm: Assembler, section: str, src: SourceLine,
@@ -1431,6 +1468,8 @@ def disasm_word(word: int, pc: int = 0,
         return disasm_object_rr(word)
     if op in (0x31, 0x32, 0x33, 0x34, 0x35, 0x38, 0x39, 0x3B):
         return disasm_obj_ls(word, op)
+    if op in (0x36, 0x37):
+        return disasm_obj_oref(word, op)
     if op == 0x3C:
         return disasm_send(word)
     if op == 0x3D:
@@ -1580,6 +1619,14 @@ def disasm_obj_ls(word: int, op: int) -> str:
     rt = field(word, 20, 16)  # low 5 bits — high bit (21) is reserved
     imm = sxt(field(word, 15, 0), 16)
     return f"{name} {gpr_name(rt)}, {imm}({obj_name(os_)})"
+
+
+def disasm_obj_oref(word: int, op: int) -> str:
+    name = MAJOR_REV[op]
+    os_ = field(word, 25, 22)
+    od  = field(word, 21, 18)
+    imm = sxt(field(word, 15, 0), 16)
+    return f"{name} {obj_name(od)}, {imm}({obj_name(os_)})"
 
 
 def disasm_send(word: int) -> str:
