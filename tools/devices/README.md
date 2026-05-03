@@ -170,6 +170,66 @@ CROSSBAR CPU0  -> CPU16 OBJ_READ_RESP trans=0001 len=4w
 
 The terminal's text widget then shows `Hello, world!`.
 
+## linkbootd
+
+A Python-side link-boot server. Connects to the crossbar like any
+other port, hosts a boot image (extracted from a `.orx` file or
+read raw), and answers link-boot requests from CPUs running
+[`examples/linkboot/linkboot.s`](../../examples/linkboot/linkboot.s).
+Same shape as `oriscterm` — the only difference is what each does
+with the SENDs it receives. (`oriscterm` renders bytes; `linkbootd`
+ships executable code.)
+
+Usage:
+
+    python3 tools/devices/linkbootd \
+        --socket /tmp/oriscbar.sock --pid 0 \
+        --image path/to/module.orx [--entry OFFSET]
+
+The image is either a `.orx` file (text section is extracted
+automatically — magic `"ORISC\0\0\0"`) or a raw byte file.
+
+### How it works
+
+`linkbootd` synthesizes one descriptor for the hosted image at
+`(home=our_pid, index=0x100, generation=1, caps=R|S|V|C)` — that
+ref is what CPUs end up holding as their "code source" after
+boot. Then it loops on the socket waiting for two packet kinds:
+
+- **`SEND_DELIVER`** — treated as a boot announce. The sender's
+  R|S self-ref is in OR slot 1 of the payload (per `linkboot.s`),
+  and the sender's PROCID is in `R4`. `linkbootd` replies with
+  another `SEND_DELIVER` aimed at the loader's self-ref:
+  - `O2` = `image_ref` (the synthesized descriptor)
+  - `R4` = byte length of the image
+  - `R5` = entry offset (`--entry`, default 0)
+- **`OBJ_READ_REQ`** — generated when the loader OLW's words from
+  `image_ref` during its copy stage. `linkbootd` validates the
+  reference (home/index/generation/caps), bounds-checks the
+  offset and width, and replies with an `OBJ_READ_RESP` carrying
+  the bytes (or a fault flag).
+
+A single `linkbootd` can serve any number of loader CPUs — each
+announce gets its own boot reply with the same image. To boot
+different CPUs with different images, run one `linkbootd` per
+image (each at a distinct pid) and arrange `--service` accordingly
+on each loader.
+
+### Try it
+
+The runner script wires it all up: crossbar + `linkbootd` + N
+loader CPUs running `linkboot.orx`, all in separate processes:
+
+```sh
+examples/linkboot/run_python_master.sh                # 1 CPU boots
+NCPUS=4 examples/linkboot/run_python_master.sh        # 4 CPUs boot
+NCPUS=8 examples/linkboot/run_python_master.sh        # 8 CPUs boot
+```
+
+Each CPU prints `Booted!` from its loaded module. The boot image
+is a tiny .orx assembled inline by the runner; swap it out for
+your own to ship arbitrary code to dynamic worker pools.
+
 ## Adding new devices
 
 A device is anything that:

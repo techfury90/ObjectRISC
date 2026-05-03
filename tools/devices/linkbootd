@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""linkbootd — Python-side link-boot server for the Object RISC crossbar.
+
+A non-CPU participant that connects to oriscbar like any other port,
+hosts a boot image (extracted from a `.orx` file or read raw), and
+answers link-boot requests from CPUs running examples/linkboot/
+linkboot.s. For each loader CPU that announces, linkbootd replies
+with a SEND_DELIVER carrying:
+
+    O2 = synthesized reference to our hosted boot image
+    R4 = byte length of the image
+    R5 = entry offset within the image (default 0)
+
+When the loader subsequently OLW's words from that reference, the
+crossbar routes the OBJ_READ_REQ packets to us; we answer with
+OBJ_READ_RESP carrying the bytes from the hosted image.
+
+Same shape as oriscterm — both are external programs that present
+themselves to the crossbar as Volume IV §3 ports. The difference is
+just what they do with the SENDs they receive.
+
+Usage:
+    tools/devices/linkbootd --socket /tmp/oriscbar.sock --pid 0 \\
+                            --image path/to/module.orx [--entry OFFSET]
+
+If the image is a `.orx` file (magic = "ORISC\\0\\0\\0"), the text
+section is extracted automatically. Otherwise the file is treated as
+raw bytes — useful for testing with hand-encoded module images that
+don't go through asmorisc.
+"""
+
+import argparse
+import errno
+import os
+import selectors
+import signal
+import socket
+import struct
+import sys
+from pathlib import Path
+from typing import Dict, Optional
+
+# Wire-format constants — must agree with oriscbar / simorisc / oriscterm.
+HELLO_MAGIC      = 0xC0FFEEAA
+HELLO_OK         = 0x00000000
+
+PKT_OBJ_READ_REQ  = 0x10
+PKT_OBJ_READ_RESP = 0x11
+PKT_SEND_DELIVER  = 0x20
+
+RESP_OK     = 0x00
+RESP_STALE  = 0x01
+RESP_BOUNDS = 0x02
+RESP_CAP    = 0x03
+
+# Cap bits — Vol III §2.2.
+CAP_R = 0x01
+CAP_S = 0x08
+CAP_V = 0x10
+CAP_C = 0x40
+
+# Synthetic descriptor index for the hosted boot image. Picked to be
+# distinct from anything a real CPU would assign (init_cpu starts at 1
+# and a few are taken by code/stack/data/service).
+IMAGE_DESC_INDEX = 0x100
+IMAGE_DESC_GEN   = 1
+
+# `.orx` magic; if the input file starts with this we extract the text
+# section, otherwise treat it as raw bytes.
+ORX_MAGIC = b"ORISC\x00\x00\x00"
+
+
+# ---------------------------------------------------------------------------
+# Wire helpers — same as in simorisc / oriscterm.
+# ---------------------------------------------------------------------------
+
+def make_ref(generation: int, home: int, index: int, caps: int) -> int:
+    return (((generation & 0xFFFF) << 48)
+            | ((home       & 0xFF)   << 40)
+            | ((index      & 0xFFFFFF) << 16)
+            | ((caps       & 0xFF)   << 8))
+
+
+def ref_home(ref: int)       -> int: return (ref >> 40) & 0xFF
+def ref_index(ref: int)      -> int: return (ref >> 16) & 0xFFFFFF
+def ref_generation(ref: int) -> int: return (ref >> 48) & 0xFFFF
+def ref_caps(ref: int)       -> int: return (ref >>  8) & 0xFF
+
+
+def pack_packet(src_pid: int, dst_pid: int, msg_type: int, flags: int,
+                trans_id: int, payload_words) -> bytes:
+    header = struct.pack(">BBBBHH",
+                         src_pid & 0xFF, dst_pid & 0xFF,
+                         msg_type & 0xFF, flags & 0xFF,
+                         trans_id & 0xFFFF, len(payload_words) & 0xFFFF)
+    payload = b''.join(struct.pack(">I", w & 0xFFFFFFFF)
+                       for w in payload_words)
+    h0, h1 = struct.unpack(">II", header)
+    chk = h0 ^ h1
+    for w in payload_words:
+        chk ^= w & 0xFFFFFFFF
+    return header + payload + struct.pack(">I", chk & 0xFFFFFFFF)
+
+
+def unpack_packet(data: bytes) -> Dict:
+    if len(data) < 12:
+        raise ValueError("packet too short")
+    src, dst, mtype, flags, trans_id, length_words = \
+        struct.unpack(">BBBBHH", data[:8])
+    expected = 8 + length_words * 4 + 4
+    if len(data) != expected:
+        raise ValueError(f"length mismatch ({len(data)} != {expected})")
+    payload_bytes = data[8:8 + length_words * 4]
+    words = list(struct.unpack(f">{length_words}I", payload_bytes)) \
+        if length_words else []
+    h0, h1 = struct.unpack(">II", data[:8])
+    chk = h0 ^ h1
+    for w in words:
+        chk ^= w
+    expected_chk = struct.unpack(">I", data[-4:])[0]
+    if chk != expected_chk:
+        raise ValueError("checksum mismatch")
+    return {"src_pid": src, "dst_pid": dst, "type": mtype,
+            "flags": flags, "trans_id": trans_id, "payload": words}
+
+
+def parse_send_deliver(pkt: Dict):
+    """Return (recipient_ref, int_payload[0..3], or_payload[0..3])."""
+    p = pkt["payload"]
+    if len(p) != 14:
+        raise ValueError(f"SEND_DELIVER payload must be 14 words, got {len(p)}")
+    recipient_ref = p[0] | (p[1] << 32)
+    int_payload = list(p[2:6])
+    or_payload = []
+    for i in range(4):
+        or_payload.append(p[6 + 2*i] | (p[7 + 2*i] << 32))
+    return recipient_ref, int_payload, or_payload
+
+
+def build_send_deliver(src_pid: int, dst_pid: int, trans_id: int,
+                       recipient_ref: int,
+                       int_payload, or_payload) -> bytes:
+    payload = [recipient_ref & 0xFFFFFFFF, (recipient_ref >> 32) & 0xFFFFFFFF]
+    for i in range(4):
+        payload.append(int_payload[i] & 0xFFFFFFFF if i < len(int_payload) else 0)
+    for i in range(4):
+        ref = or_payload[i] if i < len(or_payload) else 0
+        payload.append(ref & 0xFFFFFFFF)
+        payload.append((ref >> 32) & 0xFFFFFFFF)
+    return pack_packet(src_pid, dst_pid, PKT_SEND_DELIVER, 0, trans_id, payload)
+
+
+def build_obj_read_resp(src_pid: int, dst_pid: int, trans_id: int,
+                        flags: int, data: bytes) -> bytes:
+    if flags == RESP_OK:
+        pad = (-len(data)) % 4
+        padded = data + bytes(pad)
+        words = list(struct.unpack(f">{len(padded)//4}I", padded)) \
+            if padded else []
+    else:
+        words = []
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_RESP,
+                       flags, trans_id, words)
+
+
+# ---------------------------------------------------------------------------
+# Image loading
+# ---------------------------------------------------------------------------
+
+def load_image(path: Path) -> bytes:
+    """Return the raw module bytes from `path`. If the file is a .orx
+    (starts with the ORISC magic), extract just the text section;
+    otherwise treat the file contents as raw bytes."""
+    blob = path.read_bytes()
+    if blob[:8] == ORX_MAGIC:
+        if len(blob) < 0x20:
+            raise SystemExit(f"linkbootd: {path}: .orx too short for header")
+        version, _flags, _entry, text_size, _data_size, _stack = \
+            struct.unpack(">IIIIII", blob[0x08:0x20])
+        if version != 1:
+            raise SystemExit(f"linkbootd: {path}: unsupported .orx version "
+                             f"{version}")
+        return blob[0x20:0x20 + text_size]
+    return blob
+
+
+# ---------------------------------------------------------------------------
+# The server
+# ---------------------------------------------------------------------------
+
+class LinkBootD:
+    def __init__(self, sock_path: str, my_pid: int, image: bytes,
+                 entry: int, verbose: bool = False):
+        self.my_pid = my_pid
+        self.image = image
+        self.entry = entry
+        self.verbose = verbose
+        self.next_trans_id = 0
+
+        # Synthesize one descriptor for the boot image. CPUs see this as
+        # a foreign reference whose home is our pid; their OLW's land here
+        # and we answer with bytes.
+        self.image_ref = make_ref(generation=IMAGE_DESC_GEN,
+                                  home=my_pid,
+                                  index=IMAGE_DESC_INDEX,
+                                  caps=CAP_R | CAP_S | CAP_V | CAP_C)
+
+        # Connect + handshake.
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.connect(sock_path)
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            raise SystemExit(f"linkbootd: connect to {sock_path}: {e}")
+        self.sock.sendall(struct.pack(">II", HELLO_MAGIC, my_pid))
+        reply = self._recv_exact(8)
+        magic, status = struct.unpack(">II", reply)
+        if magic != HELLO_MAGIC or status != HELLO_OK:
+            raise SystemExit(f"linkbootd: handshake failed "
+                             f"(magic={magic:#x}, status={status:#x})")
+        self.sock.setblocking(False)
+
+        self.recv_buf = bytearray()
+        self.shutdown_requested = False
+
+        self._log(f"online · pid={my_pid} · image_idx={IMAGE_DESC_INDEX} · "
+                  f"image_size={len(image)} · entry={entry}")
+
+    # ---- network ----------------------------------------------------------
+
+    def _recv_exact(self, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise SystemExit("linkbootd: crossbar closed during handshake")
+            out.extend(chunk)
+        return bytes(out)
+
+    def send_packet(self, packet: bytes) -> None:
+        try:
+            self.sock.sendall(struct.pack(">I", len(packet)) + packet)
+        except OSError as e:
+            self._log(f"send failed: {e}")
+            self.shutdown_requested = True
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"linkbootd: {msg}", file=sys.stderr, flush=True)
+
+    # ---- main loop --------------------------------------------------------
+
+    def run(self) -> None:
+        # Tell the launcher we're ready (oriscrun watches stdout for a
+        # READY line before spawning CPUs that depend on us).
+        print(f"linkbootd READY pid={self.my_pid}", flush=True)
+
+        sel = selectors.DefaultSelector()
+        sel.register(self.sock, selectors.EVENT_READ)
+        try:
+            while not self.shutdown_requested:
+                events = sel.select(timeout=0.25)
+                if not events:
+                    continue
+                if not self._drain():
+                    self._log("crossbar closed")
+                    break
+                while True:
+                    pkt = self._take_packet()
+                    if pkt is None:
+                        break
+                    self._handle_packet(pkt)
+        finally:
+            sel.close()
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    def _drain(self) -> bool:
+        try:
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    return False
+                self.recv_buf.extend(chunk)
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError as e:
+            if e.errno in (errno.ECONNRESET, errno.EPIPE):
+                return False
+            raise
+
+    def _take_packet(self) -> Optional[bytes]:
+        if len(self.recv_buf) < 4:
+            return None
+        (length,) = struct.unpack(">I", bytes(self.recv_buf[:4]))
+        if len(self.recv_buf) < 4 + length:
+            return None
+        pkt = bytes(self.recv_buf[4:4 + length])
+        del self.recv_buf[:4 + length]
+        return pkt
+
+    def _handle_packet(self, raw: bytes) -> None:
+        try:
+            pkt = unpack_packet(raw)
+        except ValueError as e:
+            self._log(f"malformed packet: {e}")
+            return
+        if pkt["type"] == PKT_SEND_DELIVER:
+            self._handle_send_deliver(pkt)
+        elif pkt["type"] == PKT_OBJ_READ_REQ:
+            self._handle_obj_read_req(pkt)
+        else:
+            self._log(f"unhandled packet type 0x{pkt['type']:02x} "
+                      f"from pid={pkt['src_pid']}")
+
+    # ---- handlers ---------------------------------------------------------
+
+    def _handle_send_deliver(self, pkt: Dict) -> None:
+        """Treat any SEND_DELIVER landing on us as a boot announce. The
+        sender's PROCID is in R4 (per the announce protocol); the
+        sender's R|S self-ref (the recipient for our boot reply) is in
+        OR slot 1 of the payload."""
+        try:
+            recipient_ref, int_payload, or_payload = parse_send_deliver(pkt)
+        except ValueError as e:
+            self._log(f"bad SEND_DELIVER: {e}")
+            return
+        loader_self_ref = or_payload[1]
+        loader_pid = int_payload[0]
+        if loader_self_ref == 0:
+            self._log(f"announce from pid={pkt['src_pid']} carries null "
+                      f"loader-self-ref; dropping")
+            return
+        self._log(f"announce: pid={loader_pid} (sender pid={pkt['src_pid']}); "
+                  f"replying with image (len={len(self.image)} entry="
+                  f"{self.entry})")
+
+        # Build the boot SEND. Per linkboot.s:
+        #   sender O2 → handler/queue O2 → loader's "code ref" → our image_ref
+        #   sender R4 → R3 (queue) / R4 (handler) → length
+        #   sender R5 → R4 (queue) / R5 (handler) → entry offset
+        # (Queue dispatch lands ints in R3..R6; the loader knows that.)
+        trans = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        boot = build_send_deliver(
+            src_pid=self.my_pid,
+            dst_pid=ref_home(loader_self_ref),
+            trans_id=trans,
+            recipient_ref=loader_self_ref,
+            int_payload=[len(self.image), self.entry, 0, 0],
+            or_payload=[loader_self_ref, self.image_ref, 0, 0],
+        )
+        self.send_packet(boot)
+
+    def _handle_obj_read_req(self, pkt: Dict) -> None:
+        """A loader is OLW-ing words from our hosted boot image."""
+        p = pkt["payload"]
+        if len(p) < 4:
+            self._log(f"OBJ_READ_REQ from pid={pkt['src_pid']} payload too "
+                      f"short ({len(p)} words)")
+            return
+        ref = p[0] | (p[1] << 32)
+        # offset is unsigned in the packet but signed semantically; treat
+        # high bit as negative for the bounds check.
+        offset = p[2] if p[2] < 0x80000000 else p[2] - 0x100000000
+        width = p[3]
+        issuer = pkt["src_pid"]
+
+        # Validate at home (us). Volume IV §4.1.
+        if ref_home(ref) != self.my_pid \
+                or ref_index(ref) != IMAGE_DESC_INDEX \
+                or ref_generation(ref) != IMAGE_DESC_GEN:
+            fault = RESP_STALE
+        elif (ref_caps(ref) & CAP_R) != CAP_R:
+            fault = RESP_CAP
+        elif offset < 0 or width <= 0 or offset + width > len(self.image):
+            fault = RESP_BOUNDS
+        else:
+            fault = RESP_OK
+
+        if fault == RESP_OK:
+            data = self.image[offset:offset + width]
+            response = build_obj_read_resp(self.my_pid, issuer,
+                                           pkt["trans_id"], RESP_OK, data)
+        else:
+            response = build_obj_read_resp(self.my_pid, issuer,
+                                           pkt["trans_id"], fault, b'')
+            self._log(f"OBJ_READ_REQ from pid={issuer} faulted: "
+                      f"flags={fault:#x} (off={offset} width={width})")
+        self.send_packet(response)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="linkbootd",
+        description="Object RISC link-boot server (Python-side, "
+                    "non-CPU crossbar participant)")
+    ap.add_argument("--socket", required=True,
+                    help="path to oriscbar's UNIX domain socket")
+    ap.add_argument("--pid", type=int, required=True,
+                    help="processor identifier this server presents to "
+                         "the crossbar (typically 0; loaders by convention "
+                         "announce to whatever lives in their O5)")
+    ap.add_argument("--image", required=True, type=Path,
+                    help="boot image: either a .orx file (text section "
+                         "extracted automatically) or a raw byte file")
+    ap.add_argument("--entry", type=int, default=0,
+                    help="entry offset within the image (default 0)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    image = load_image(args.image)
+    if not image:
+        sys.exit(f"linkbootd: {args.image}: empty image")
+    if args.entry < 0 or args.entry >= len(image):
+        sys.exit(f"linkbootd: --entry {args.entry} out of range "
+                 f"[0, {len(image)})")
+
+    server = LinkBootD(args.socket, args.pid, image, args.entry,
+                       verbose=args.verbose)
+
+    def _signal(_signo, _frame):
+        server.shutdown_requested = True
+    signal.signal(signal.SIGINT,  _signal)
+    signal.signal(signal.SIGTERM, _signal)
+
+    server.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

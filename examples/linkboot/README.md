@@ -13,13 +13,14 @@ system is launched.
 
 ## Files
 
-| File              | Role                                                                                |
-|-------------------|-------------------------------------------------------------------------------------|
-| `gen_linkboot.py` | Generator. Run this to produce the four files below.                                |
-| `linkboot.s`      | Standalone loader `.orx` source. Use under `oriscrun --cpu .../linkboot.orx,...`.   |
-| `master.s`        | Standalone master `.orx` source. Drives one loader, sends an 8-instruction module.  |
-| `demo.s`          | Combined master + loader for `simorisc --processors 2`. Branches on PROCID.         |
-| `run.sh`          | Multi-process runner. Builds and launches under `oriscrun`.                         |
+| File                   | Role                                                                                |
+|------------------------|-------------------------------------------------------------------------------------|
+| `gen_linkboot.py`      | Generator. Run this to produce the four files below.                                |
+| `linkboot.s`           | Standalone loader `.orx` source.                                                    |
+| `master.s`             | Standalone asm master `.orx` source. Drives one loader, sends an 8-instruction module. |
+| `demo.s`               | Combined master + loader for `simorisc --processors 2`. Branches on PROCID.         |
+| `run.sh`               | Multi-process runner with the asm master, under `oriscrun`.                         |
+| `run_python_master.sh` | Multi-process runner with [`tools/devices/linkbootd`](../../tools/devices/linkbootd) (Python boot server) standing in for the asm master. Scales to N loader CPUs (`NCPUS=N`). |
 
 `linkboot.s`, `master.s`, `demo.s`, and the validation test at
 [`tools/sim/tests/validation/11_multicpu/13_linkboot_loader.s`](../../tools/sim/tests/validation/11_multicpu/13_linkboot_loader.s)
@@ -35,10 +36,18 @@ python3 tools/asm/asmorisc examples/linkboot/demo.s -o /tmp/demo.orx
 python3 tools/sim/simorisc --processors 2 /tmp/demo.orx
 # → Booted!
 
-# Multi-process (real wire-format crossbar over UNIX socket):
+# Multi-process with the asm master (one boot, fixed pid layout):
 examples/linkboot/run.sh
 # → [xbar] oriscbar READY ...
 # → [cpu1] Booted!
+
+# Multi-process with the Python boot server (linkbootd):
+examples/linkboot/run_python_master.sh                # 1 loader
+NCPUS=4 examples/linkboot/run_python_master.sh        # 4 loaders
+# → [cpu1] Booted!
+# → [cpu2] Booted!
+# → [cpu3] Booted!
+# → [cpu4] Booted!
 ```
 
 ## How it works
