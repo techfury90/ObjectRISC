@@ -130,6 +130,57 @@ spalloc(NODE *t, NODE *p, OFFSZ off)
 }
 
 /*
+ * Char-init coalescing: pcc invokes ninval once per element when
+ * initializing a char array (including from a string literal). The
+ * naive output is one `.byte N` per character — readable but ugly.
+ * We buffer consecutive char inits at consecutive offsets and emit
+ * them as a single `.ascii "..."` directive when the run ends.
+ *
+ * Run end is detected three ways:
+ *   - ninval is called for a non-char or a non-consecutive offset
+ *     (handled inline below)
+ *   - defloc is called for a new label (flush_charbuf called from
+ *     code.c::defloc before the new label's code)
+ *   - End of compilation (we don't currently hook ejobcode for this
+ *     because pcc emits a final newline-terminated label anyway)
+ */
+#define CHARBUF_CAP 80
+static char charbuf[CHARBUF_CAP];
+static int  charbuf_len = 0;
+static CONSZ charbuf_next_off = 0;	/* next-expected offset */
+
+static void
+charbuf_emit_one(int c)
+{
+	switch (c) {
+	case '"':  fputs("\\\"", stdout); break;
+	case '\\': fputs("\\\\", stdout); break;
+	case '\n': fputs("\\n",  stdout); break;
+	case '\t': fputs("\\t",  stdout); break;
+	case '\r': fputs("\\r",  stdout); break;
+	case '\0': fputs("\\0",  stdout); break;
+	default:
+		if (c >= 0x20 && c < 0x7f)
+			putchar(c);
+		else
+			printf("\\%o", c & 0xff);
+	}
+}
+
+void
+flush_charbuf(void)
+{
+	int i;
+	if (charbuf_len == 0)
+		return;
+	printf("\t.ascii \"");
+	for (i = 0; i < charbuf_len; i++)
+		charbuf_emit_one((unsigned char)charbuf[i]);
+	printf("\"\n");
+	charbuf_len = 0;
+}
+
+/*
  * Print out a constant initializer in a way the assembler will
  * accept. `fsz` is the number of bits of `p` to emit.
  */
@@ -137,12 +188,30 @@ int
 ninval(CONSZ off, int fsz, NODE *p)
 {
 	switch (p->n_type) {
+	case CHAR:
+	case UCHAR:
+		/* Coalesce consecutive char inits into one .ascii. pcc
+		 * emits inits sequentially in call order; the `off`
+		 * parameter is set per-call but unused by the standard
+		 * sequential path (often 0). We don't validate against
+		 * it — just accumulate and flush on the next non-char
+		 * init or label.
+		 */
+		if (p->n_op == ICON && p->n_sp == NULL) {
+			if (charbuf_len >= CHARBUF_CAP)
+				flush_charbuf();
+			charbuf[charbuf_len++] = (char)glval(p);
+			return 1;
+		}
+		break;
+
 	case FLOAT:
 	case DOUBLE:
 	case LDOUBLE:
 		uerror("FP initializers not supported on Object RISC yet");
 		return 0;
 	}
+	flush_charbuf();
 	return 0;
 }
 

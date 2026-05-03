@@ -22,6 +22,8 @@
 #define tfree p1tfree
 #endif
 
+extern void flush_charbuf(void);	/* in local.c */
+
 /*
  * Print the assembler segment directive corresponding to a pcc
  * section enum. Asmorisc supports `.text`, `.data`, and the related
@@ -31,6 +33,11 @@
 void
 setseg(int seg, char *name)
 {
+	/* Flush any pending .ascii accumulation before changing
+	 * sections — the chars must close out under their original
+	 * section directive. */
+	flush_charbuf();
+
 	switch (seg) {
 	case PROG: name = ".text"; break;
 	case DATA:
@@ -63,6 +70,11 @@ void
 defloc(struct symtab *sp)
 {
 	char *n;
+
+	/* Flush any pending .ascii accumulation before starting a new
+	 * symbol — char inits for the previous symbol must close out
+	 * with their own .ascii directive before we emit the label. */
+	flush_charbuf();
 
 	if (ISFTN(sp->stype))
 		return; /* function labels emitted by prologue */

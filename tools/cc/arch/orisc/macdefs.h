@@ -222,10 +222,14 @@ typedef long long OFFSZ;
 	SAREG|TEMPREG, SAREG|TEMPREG,					\
 	SAREG|TEMPREG, SAREG|TEMPREG,					\
 	SAREG|TEMPREG, SAREG|TEMPREG,					\
-	SAREG|PERMREG, SAREG|PERMREG,	/* R16..R23 — callee-preserved */ \
-	SAREG|PERMREG, SAREG|PERMREG,					\
-	SAREG|PERMREG, SAREG|PERMREG,					\
-	SAREG|PERMREG, SAREG|PERMREG,					\
+	0, 0, 0, 0,			/* R16..R23 — callee-preserved */ \
+	0, 0, 0, 0,			/* (marked unallocatable for now */ \
+					/*  to avoid pcc's allocator emitting */ \
+					/*  spurious save/restore code; cuts */ \
+					/*  ~16 instructions per function with */ \
+					/*  no functional cost on small demos. */ \
+					/*  Re-enable with PERMREG once pcc */ \
+					/*  optimizer eliminates dead saves.) */ \
 	SAREG|TEMPREG, SAREG|TEMPREG,	/* R24..R28 — caller-saved */	\
 	SAREG|TEMPREG, SAREG|TEMPREG, SAREG|TEMPREG,			\
 	0, 0, 0,			/* SP, FP, RA — reserved */	\
@@ -238,8 +242,8 @@ typedef long long OFFSZ;
 	SBREG|TEMPREG, SBREG|TEMPREG,	/* R6R7, R8R9 */		\
 	SBREG|TEMPREG, SBREG|TEMPREG,	/* R10R11, R12R13 */		\
 	SBREG|TEMPREG,			/* R14R15 */			\
-	SBREG|PERMREG, SBREG|PERMREG,	/* R16R17, R18R19 */		\
-	SBREG|PERMREG, SBREG|PERMREG,	/* R20R21, R22R23 */		\
+	0, 0,				/* R16R17, R18R19 */		\
+	0, 0,				/* R20R21, R22R23 */		\
 	SBREG|TEMPREG, SBREG|TEMPREG,	/* R24R25, R26R27 */		\
 	0, 0,				/* R28R29, R30R31 — reserved */	\
 									\
