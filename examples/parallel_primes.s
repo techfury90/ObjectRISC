@@ -42,6 +42,13 @@
 
 .entry main
 
+; ---- Constants ---------------------------------------------------------
+; CODE_BASE is the VA at which the loader maps the boot code object
+; (CONTRACT.md §2). We need the offset of prime_handler *within* the
+; code object — InstallHandler wants that, not the absolute VA — so we
+; subtract CODE_BASE from the label.
+.set CODE_BASE, 0x10000
+
 .text
 
 ;========================================================================
@@ -258,9 +265,7 @@ worker:
     omov  o9, o1                  ; o9 = code object
     omov  o1, o4                  ; target = own service
     omov  o2, o9
-    la    r5, prime_handler
-    lui   r6, 0x0001              ; 0x10000 = code base
-    subu  r4, r5, r6
+    li    r4, prime_handler - CODE_BASE   ; offset within code object
     call  #0x200                  ; InstallHandler
     bne   r2, r0, fatal
     nop
@@ -509,7 +514,7 @@ print_header:
     la    r4, str_parallel
     addu  r5, r24, r0
     addu  r5, r5, r18
-    addiu r6, r0, 12
+    addiu r6, r0, str_parallel_end - str_parallel
     jal   emit_lit
     nop
     addu  r18, r18, r2
@@ -526,7 +531,7 @@ print_header:
     la    r4, str_across
     addu  r5, r24, r0
     addu  r5, r5, r18
-    addiu r6, r0, 9
+    addiu r6, r0, str_across_end - str_across
     jal   emit_lit
     nop
     addu  r18, r18, r2
@@ -543,7 +548,7 @@ print_header:
     la    r4, str_cpus_nl
     addu  r5, r24, r0
     addu  r5, r5, r18
-    addiu r6, r0, 7
+    addiu r6, r0, str_cpus_nl_end - str_cpus_nl
     jal   emit_lit
     nop
     addu  r18, r18, r2
@@ -579,7 +584,7 @@ print_result:
     la    r4, str_cpu
     addu  r5, r24, r0
     addu  r5, r5, r19
-    addiu r6, r0, 4
+    addiu r6, r0, str_cpu_end - str_cpu
     jal   emit_lit
     nop
     addu  r19, r19, r2
@@ -594,7 +599,7 @@ print_result:
     la    r4, str_colon
     addu  r5, r24, r0
     addu  r5, r5, r19
-    addiu r6, r0, 2
+    addiu r6, r0, str_colon_end - str_colon
     jal   emit_lit
     nop
     addu  r19, r19, r2
@@ -609,7 +614,7 @@ print_result:
     la    r4, str_primesin
     addu  r5, r24, r0
     addu  r5, r5, r19
-    addiu r6, r0, 11
+    addiu r6, r0, str_primesin_end - str_primesin
     jal   emit_lit
     nop
     addu  r19, r19, r2
@@ -624,7 +629,7 @@ print_result:
     la    r4, str_cyclesnl
     addu  r5, r24, r0
     addu  r5, r5, r19
-    addiu r6, r0, 8
+    addiu r6, r0, str_cyclesnl_end - str_cyclesnl
     jal   emit_lit
     nop
     addu  r19, r19, r2
@@ -659,7 +664,7 @@ print_total:
     la    r4, str_total_pre
     addu  r5, r24, r0
     addu  r5, r5, r18
-    addiu r6, r0, 10
+    addiu r6, r0, str_total_pre_end - str_total_pre
     jal   emit_lit
     nop
     addu  r18, r18, r2
@@ -674,7 +679,7 @@ print_total:
     la    r4, str_eq
     addu  r5, r24, r0
     addu  r5, r5, r18
-    addiu r6, r0, 4
+    addiu r6, r0, str_eq_end - str_eq
     jal   emit_lit
     nop
     addu  r18, r18, r2
@@ -689,7 +694,7 @@ print_total:
     la    r4, str_nl
     addu  r5, r24, r0
     addu  r5, r5, r18
-    addiu r6, r0, 1
+    addiu r6, r0, str_nl_end - str_nl
     jal   emit_lit
     nop
     addu  r18, r18, r2
@@ -800,24 +805,26 @@ fatal:
 config_N:    .word 2000           ; upper bound for prime counting
 config_K:    .word 3              ; number of worker CPUs
 
-; --- String fragments (each emitted via emit_lit at known length) -------
-str_parallel:                     ; "Parallel pi(" — 12 bytes
-    .string "Parallel pi("
-str_across:                       ; ") across " — 9 bytes
-    .string ") across "
-str_cpus_nl:                      ; " CPUs:\n" — 7 bytes
-    .string " CPUs:\n"
-str_cpu:                          ; "CPU " — 4 bytes
-    .string "CPU "
-str_colon:                        ; ": " — 2 bytes
-    .string ": "
-str_primesin:                     ; " primes in " — 11 bytes
-    .string " primes in "
-str_cyclesnl:                     ; " cycles\n" — 8 bytes
-    .string " cycles\n"
-str_total_pre:                    ; "Total: pi(" — 10 bytes
-    .string "Total: pi("
-str_eq:                           ; ") = " — 4 bytes
-    .string ") = "
-str_nl:                           ; "\n" — 1 byte
-    .string "\n"
+; --- String fragments. Length of each is `<label>_end - <label>` and is
+;     used directly at the call site via the assembler's label arithmetic.
+
+str_parallel:    .string "Parallel pi("
+str_parallel_end:
+str_across:      .string ") across "
+str_across_end:
+str_cpus_nl:     .string " CPUs:\n"
+str_cpus_nl_end:
+str_cpu:         .string "CPU "
+str_cpu_end:
+str_colon:       .string ": "
+str_colon_end:
+str_primesin:    .string " primes in "
+str_primesin_end:
+str_cyclesnl:    .string " cycles\n"
+str_cyclesnl_end:
+str_total_pre:   .string "Total: pi("
+str_total_pre_end:
+str_eq:          .string ") = "
+str_eq_end:
+str_nl:          .string "\n"
+str_nl_end:

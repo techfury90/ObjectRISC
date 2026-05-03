@@ -325,21 +325,24 @@ Errors:
 
 ### 4.2 Directives
 
-| Directive          | Effect                                              |
-|--------------------|-----------------------------------------------------|
-| `.text`            | Switch to the text section                          |
-| `.data`            | Switch to the data section                          |
-| `.entry <label>`   | Set the program entry point to the byte offset of `<label>` within the text section |
-| `.byte b, b, ...`  | Emit one or more bytes                              |
-| `.half h, h, ...`  | Emit one or more 16-bit halfwords (big-endian)      |
-| `.word w, w, ...`  | Emit one or more 32-bit words (big-endian)          |
-| `.string "..."`    | Emit the string bytes (no null terminator)          |
-| `.asciz "..."`     | Emit the string bytes followed by a `0x00`          |
-| `.align N`         | Align the current section to a 2^N byte boundary by inserting zero bytes (N is small, e.g. 0–4) |
-| `.skip N`          | Emit N zero bytes                                   |
+| Directive             | Effect                                              |
+|-----------------------|-----------------------------------------------------|
+| `.text`               | Switch to the text section                          |
+| `.data`               | Switch to the data section                          |
+| `.entry <label>`      | Set the program entry point to the byte offset of `<label>` within the text section |
+| `.set NAME, EXPR`     | Define a numeric constant (see Section 4.8)         |
+| `.byte b, b, ...`     | Emit one or more bytes (each may be an expression)  |
+| `.half h, h, ...`     | Emit one or more 16-bit halfwords (big-endian)      |
+| `.word w, w, ...`     | Emit one or more 32-bit words (big-endian)          |
+| `.string "..."`       | Emit the string bytes (no null terminator)          |
+| `.asciz "..."`        | Emit the string bytes followed by a `0x00`          |
+| `.align N`            | Align the current section to a 2^N byte boundary by inserting zero bytes (N is small, e.g. 0–4); N must be constant |
+| `.skip N`             | Emit N zero bytes; N must be constant               |
 
 A label of the form `name:` defines a symbol whose value is the
-current section's byte offset.
+current section's byte offset (and resolves at use sites to its
+absolute virtual address — `0x10000 + offset` for text labels,
+`0x40000 + offset` for data labels).
 
 ### 4.3 Register Aliases
 
@@ -386,6 +389,55 @@ section.
 ### 4.7 `SEND`
 
 `send Os` takes a single object register operand.
+
+### 4.8 Expressions and `.set`
+
+Anywhere a numeric immediate is accepted — instruction operands
+(`addiu`, `lui`, `li`, load/store/OREFLD/OREFST offsets, etc.) and
+`.byte`/`.half`/`.word` data values — the operand may be an
+*expression*: a sum of numeric literals and identifiers, joined by
+`+` and `-` operators (with whitespace).
+
+```
+expression  := term (('+' | '-') term)*
+term        := numeric_literal | identifier
+identifier  := label_name | constant_name
+```
+
+An identifier resolves to:
+- the value of a `.set` constant, recursively (cycles are detected);
+- otherwise, the absolute virtual address of a label.
+
+`.set NAME, EXPR` defines a numeric constant. The expression is
+stored unevaluated and resolved at pass 2, so it may freely refer to
+labels (including ones defined later in the source) and to other
+constants.
+
+Expressions accepting forward references (immediates, `.byte/.half/
+.word` values) are resolved in pass 2 via the assembler's existing
+deferred-encoding path — the layout is fixed at parse time, so a
+symbolic immediate to `li` always emits the two-instruction
+`lui`+`ori` form regardless of whether the resolved value would have
+fit in a single ADDIU.
+
+`.align` and `.skip` arguments must be *constant* expressions (no
+symbol references), since they affect layout and resolve eagerly at
+parse time.
+
+Examples:
+
+```
+.set N, 2000
+.set FOO, N - 1              ; constants may chain
+
+addiu r4, r0, N              ; immediate from .set
+addiu r5, r0, str_end - str  ; length via label arithmetic
+li    r6, prime_handler - CODE_BASE   ; offset into a code object
+.word my_label               ; symbolic .word (deferred fixup)
+```
+
+This revision supports `+` and `-` only. Multiplication, division,
+and shifts are not yet implemented.
 
 ## 5. Instruction Encodings
 

@@ -186,6 +186,120 @@ def parse_int(tok: str, file: str, line: int, col: int) -> int:
     return -v if neg else v
 
 
+# ---------------------------------------------------------------------------
+# Expressions: late-bound numeric values built from numeric literals,
+# identifier references (labels and `.set` constants), and `+`/`-` operators.
+#
+# An Expr is a flat list of (sign, kind, value) terms summed together.
+# Unary minus on an identifier lowers to a negative-sign term.
+
+@dataclass
+class Expr:
+    """A late-bound numeric expression evaluated at pass 2.
+
+    `terms` is a list of (sign, kind, value):
+       sign:  +1 or -1
+       kind:  'num' (value is int) or 'sym' (value is identifier name)
+    The expression's value is the sum of `sign * resolved(value)` over terms.
+    """
+    terms: list           # list[tuple[int, str, Any]]
+    file: str
+    line: int
+    col: int
+
+
+def parse_expression(toks: list["Token"], file: str, line: int) -> Expr:
+    """Parse `expr := term (('+'|'-') term)*` from the supplied tokens, which
+    must contain ONLY the expression (no trailing junk). Each `term` is a
+    numeric literal or an identifier; numeric literals may carry their own
+    leading minus sign in the token text, in addition to any binary operator
+    sign in the surrounding context.
+    """
+    if not toks:
+        raise AsmError("expected expression, got nothing", file, line, 1)
+    terms: list = []
+    sign = 1
+    expect_term = True
+    col = toks[0].col
+    for t in toks:
+        if expect_term:
+            if t.kind == "num":
+                v = parse_int(t.text, file, line, t.col)
+                terms.append((sign, "num", v))
+                expect_term = False
+            elif t.kind == "char":
+                v = parse_int(t.text, file, line, t.col)
+                terms.append((sign, "num", v))
+                expect_term = False
+            elif t.kind == "sym":
+                terms.append((sign, "sym", t.text))
+                expect_term = False
+            elif t.kind == "punct" and t.text in ("+", "-"):
+                # Allow leading unary +/- (and chains thereof, harmlessly).
+                if t.text == "-":
+                    sign = -sign
+                # else '+' is a no-op
+            else:
+                raise AsmError(f"expected term in expression, got {t.text!r}",
+                               file, line, t.col)
+        else:
+            if t.kind == "punct" and t.text in ("+", "-"):
+                sign = +1 if t.text == "+" else -1
+                expect_term = True
+            else:
+                raise AsmError(f"expected '+' or '-' in expression, got {t.text!r}",
+                               file, line, t.col)
+    if expect_term:
+        raise AsmError("expression ends with a dangling operator",
+                       file, line, toks[-1].col)
+    return Expr(terms=terms, file=file, line=line, col=col)
+
+
+def expr_is_constant(expr: Expr) -> bool:
+    """True if every term is a literal number — evaluable without symbols."""
+    return all(kind == "num" for _, kind, _ in expr.terms)
+
+
+def eval_expr(asm: "Assembler", expr: Expr) -> int:
+    """Resolve all symbols and sum. Used at pass 2 (and at parse time when
+    the expression is purely numeric)."""
+    return _eval_expr_inner(asm, expr, set())
+
+
+def _eval_expr_inner(asm: "Assembler", expr: Expr, in_progress: set) -> int:
+    total = 0
+    for sign, kind, value in expr.terms:
+        if kind == "num":
+            total += sign * value
+        else:  # 'sym'
+            total += sign * _resolve_symbol(asm, value, expr,
+                                            in_progress=in_progress)
+    # Keep the value as a Python int (no wrap). Range checks at use sites
+    # handle bit-width validation; absolute label references need unsigned
+    # 32-bit interpretation, which the caller can do via `& 0xFFFFFFFF`.
+    return total
+
+
+def _resolve_symbol(asm: "Assembler", name: str, ctx: Expr,
+                    in_progress: set) -> int:
+    """Resolve a symbol: first check `.set` constants (recursively), then
+    labels (their absolute VA via section_base + offset)."""
+    # `.set` constants take precedence over labels — and we look up
+    # constants first because labels are populated in pass 1 while constant
+    # values may transitively refer to other constants and labels.
+    if name in asm.constants:
+        if name in in_progress:
+            raise AsmError(f"circular `.set` reference involving {name!r}",
+                           ctx.file, ctx.line, ctx.col)
+        in_progress = in_progress | {name}
+        return _eval_expr_inner(asm, asm.constants[name], in_progress)
+    if name in asm.labels:
+        sec, off = asm.labels[name]
+        return section_base(sec) + off
+    raise AsmError(f"undefined symbol {name!r} in expression",
+                   ctx.file, ctx.line, ctx.col)
+
+
 _ESCAPES = {
     "n": 0x0A, "t": 0x09, "r": 0x0D,
     "\\": 0x5C, '"': 0x22, "'": 0x27,
@@ -393,6 +507,10 @@ class DataBlob:
     section: str
     offset: int
     data: bytes
+    # Late-bound fixups for symbolic .byte/.half/.word values. Each entry
+    # is (byte_offset_within_blob, width_bytes, expr, source_col); pass 2
+    # evaluates the expression and overwrites the corresponding bytes.
+    fixups: list = field(default_factory=list)
 
 
 @dataclass
@@ -402,6 +520,7 @@ class Assembler:
     text_size: int = 0
     data_size: int = 0
     labels: dict = field(default_factory=dict)  # name -> (section, offset)
+    constants: dict = field(default_factory=dict)  # name -> Expr (from `.set`)
     entry_label: Optional[str] = None
     entry_file: Optional[str] = None
     entry_line: Optional[int] = None
@@ -430,7 +549,7 @@ _TOKEN_RE = re.compile(
     (?P<sym>[A-Za-z_.][A-Za-z0-9_.]*:?) |              # identifier / label
     (?P<num>-?(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+)) |  # number
     (?P<hash>\#) |                                     # call '#' sigil
-    (?P<punct>[(),])                                   # punctuation
+    (?P<punct>[(),+\-])                                # punctuation (incl. expression ops)
     """,
     re.VERBOSE,
 )
@@ -543,9 +662,10 @@ def emit(asm: Assembler, sec: str, file: str, line: int, col: int,
 
 
 def emit_data(asm: Assembler, sec: str, file: str, line: int, col: int,
-              data: bytes) -> None:
+              data: bytes, fixups: Optional[list] = None) -> None:
     blob = DataBlob(file=file, line=line, col=col, section=sec,
-                    offset=asm.cur_size(sec), data=data)
+                    offset=asm.cur_size(sec), data=data,
+                    fixups=fixups or [])
     asm.section_list(sec).append(blob)
     asm.bump(sec, len(data))
 
@@ -629,6 +749,33 @@ def handle_directive(asm: Assembler, section: str, src: SourceLine,
         asm.entry_line = line
         return section
 
+    if n == ".set":
+        # `.set NAME, EXPR` — define a numeric constant. EXPR may reference
+        # other constants and labels (resolved lazily in pass 2). The name
+        # cannot collide with an existing label or constant.
+        groups = split_top_commas(rest)
+        if len(groups) != 2:
+            raise AsmError(".set expects `NAME, EXPR`",
+                           file, line, rest[0].col if rest else 1)
+        name_g, expr_g = groups
+        if len(name_g) != 1 or name_g[0].kind != "sym":
+            raise AsmError(".set: first operand must be an identifier",
+                           file, line, name_g[0].col if name_g else 1)
+        const_name = name_g[0].text
+        if const_name.endswith(":"):
+            raise AsmError(".set: name must not end with ':'",
+                           file, line, name_g[0].col)
+        if const_name in asm.labels:
+            sec, off = asm.labels[const_name]
+            raise AsmError(f".set: name {const_name!r} already defined as a "
+                           f"label at {sec}+0x{off:x}",
+                           file, line, name_g[0].col)
+        if const_name in asm.constants:
+            raise AsmError(f".set: name {const_name!r} already defined",
+                           file, line, name_g[0].col)
+        asm.constants[const_name] = parse_expression(expr_g, file, line)
+        return section
+
     if n in (".byte", ".half", ".word"):
         groups = split_top_commas(rest)
         if not groups:
@@ -637,33 +784,34 @@ def handle_directive(asm: Assembler, section: str, src: SourceLine,
         widths = {".byte": 1, ".half": 2, ".word": 4}
         w = widths[n]
         out = bytearray()
+        fixups: list = []
         for g in groups:
             if not g:
                 raise AsmError(f"empty operand in {n}", file, line, 1)
-            if len(g) != 1:
-                raise AsmError(f"{n} operand must be a single literal",
-                               file, line, g[0].col)
-            t = g[0]
-            if t.kind not in ("num", "char"):
-                raise AsmError(f"{n} operand must be a numeric literal",
-                               file, line, t.col)
-            v = parse_int(t.text, file, line, t.col)
-            if w == 1:
-                if not (-128 <= v <= 255):
-                    raise AsmError(f".byte value {v} out of range",
-                                   file, line, t.col)
-                out.append(v & 0xFF)
-            elif w == 2:
-                if not (-(1 << 15) <= v <= 0xFFFF):
-                    raise AsmError(f".half value {v} out of range",
-                                   file, line, t.col)
-                out += struct.pack(">H", v & 0xFFFF)
+            expr = parse_expression(g, file, line)
+            col = g[0].col
+            if expr_is_constant(expr):
+                v = eval_expr(_EMPTY_ASM, expr)
+                if w == 1:
+                    if not (-128 <= v <= 255):
+                        raise AsmError(f".byte value {v} out of range",
+                                       file, line, col)
+                    out.append(v & 0xFF)
+                elif w == 2:
+                    if not (-(1 << 15) <= v <= 0xFFFF):
+                        raise AsmError(f".half value {v} out of range",
+                                       file, line, col)
+                    out += struct.pack(">H", v & 0xFFFF)
+                else:
+                    if not (-(1 << 31) <= v <= 0xFFFF_FFFF):
+                        raise AsmError(f".word value {v} out of range",
+                                       file, line, col)
+                    out += struct.pack(">I", v & 0xFFFF_FFFF)
             else:
-                if not (-(1 << 31) <= v <= 0xFFFF_FFFF):
-                    raise AsmError(f".word value {v} out of range",
-                                   file, line, t.col)
-                out += struct.pack(">I", v & 0xFFFF_FFFF)
-        emit_data(asm, section, file, line, 1, bytes(out))
+                # Defer: emit zero bytes and register a fixup for pass 2.
+                fixups.append((len(out), w, expr, col))
+                out += b"\x00" * w
+        emit_data(asm, section, file, line, 1, bytes(out), fixups=fixups)
         return section
 
     if n in (".string", ".asciz"):
@@ -680,12 +828,18 @@ def handle_directive(asm: Assembler, section: str, src: SourceLine,
         return section
 
     if n == ".align":
-        if len(rest) != 1 or rest[0].kind != "num":
-            raise AsmError(".align expects a numeric literal",
-                           file, line, rest[0].col if rest else 1)
-        k = parse_int(rest[0].text, file, line, rest[0].col)
+        # Constant expression required — alignment affects layout, so
+        # symbol references aren't allowed (they'd resolve in pass 2,
+        # too late to influence layout).
+        if not rest:
+            raise AsmError(".align expects an integer", file, line, 1)
+        expr = parse_expression(rest, file, line)
+        if not expr_is_constant(expr):
+            raise AsmError(".align argument must be constant (no symbols)",
+                           file, line, expr.col)
+        k = eval_expr(_EMPTY_ASM, expr)
         if not (0 <= k <= 16):
-            raise AsmError(".align: shift count out of range", file, line, rest[0].col)
+            raise AsmError(".align: shift count out of range", file, line, expr.col)
         boundary = 1 << k
         cur = asm.cur_size(section)
         pad = (-cur) % boundary
@@ -694,13 +848,16 @@ def handle_directive(asm: Assembler, section: str, src: SourceLine,
         return section
 
     if n == ".skip":
-        if len(rest) != 1 or rest[0].kind != "num":
-            raise AsmError(".skip expects a numeric literal",
-                           file, line, rest[0].col if rest else 1)
-        nbytes = parse_int(rest[0].text, file, line, rest[0].col)
+        if not rest:
+            raise AsmError(".skip expects an integer", file, line, 1)
+        expr = parse_expression(rest, file, line)
+        if not expr_is_constant(expr):
+            raise AsmError(".skip argument must be constant (no symbols)",
+                           file, line, expr.col)
+        nbytes = eval_expr(_EMPTY_ASM, expr)
         if nbytes < 0:
             raise AsmError(".skip: count must be non-negative",
-                           file, line, rest[0].col)
+                           file, line, expr.col)
         if nbytes:
             emit_data(asm, section, file, line, 1, b"\x00" * nbytes)
         return section
@@ -717,12 +874,29 @@ def _need_one_token(g: list[Token], file: str, line: int, what: str) -> Token:
     return g[0]
 
 
+def parse_imm_expr(g: list[Token], file: str, line: int) -> Expr:
+    """Parse an operand as an expression (numeric literal, identifier, or
+    sum/difference thereof). The expression is resolved at pass 2."""
+    if not g:
+        raise AsmError("expected immediate expression", file, line, 1)
+    return parse_expression(g, file, line)
+
+
 def parse_imm_operand(g: list[Token], file: str, line: int) -> int:
-    t = _need_one_token(g, file, line, "immediate")
-    if t.kind not in ("num", "char"):
-        raise AsmError(f"expected numeric immediate, got {t.text!r}",
-                       file, line, t.col)
-    return parse_int(t.text, file, line, t.col)
+    """Parse an operand and eagerly evaluate it. Used at parse time when the
+    consuming code needs a number now (no symbol references allowed). For
+    operands that may reference labels or `.set` constants defined later in
+    the file, use `parse_imm_expr` instead and defer evaluation."""
+    expr = parse_imm_expr(g, file, line)
+    if not expr_is_constant(expr):
+        raise AsmError("symbol reference not allowed here (constant required)",
+                       file, line, expr.col)
+    return eval_expr(_EMPTY_ASM, expr)
+
+
+# An empty Assembler used to evaluate purely-numeric expressions without
+# threading the real assembler through every parse-time call site.
+_EMPTY_ASM = Assembler()
 
 
 def parse_imm_or_call_target(g: list[Token], file: str, line: int) -> int:
@@ -777,8 +951,8 @@ def handle_instruction(asm: Assembler, section: str, src: SourceLine,
             raise AsmError("li expects 2 operands", file, line, col)
         rd_t = _need_one_token(operands[0], file, line, "register")
         rd = parse_gpr(rd_t.text, file, line, rd_t.col)
-        imm = parse_imm_operand(operands[1], file, line)
-        emit_li(asm, section, file, line, col, rd, imm)
+        imm_expr = parse_imm_expr(operands[1], file, line)
+        emit_li_expr(asm, section, file, line, col, rd, imm_expr)
         return
 
     if name == "la":
@@ -1083,18 +1257,17 @@ def encode_arith_imm(asm: Assembler, section: str, src: SourceLine,
                    file, line, operands[0][0].col)
     rs = parse_gpr(_need_one_token(operands[1], file, line, "rs").text,
                    file, line, operands[1][0].col)
-    imm = parse_imm_operand(operands[2], file, line)
-    if signed:
-        # Accept either signed or unsigned 16-bit pattern.
-        imm16 = check_simm_or_uimm(imm, 16, file, line, operands[2][0].col,
+    imm_expr = parse_imm_expr(operands[2], file, line)
+    imm_col = operands[2][0].col
+
+    def enc(inst, asm):
+        imm = eval_expr(asm, imm_expr)
+        # Both signed and zero-extended forms accept the full 16-bit range.
+        imm16 = check_simm_or_uimm(imm, 16, file, line, imm_col,
                                    f"{name} immediate")
-    else:
-        # Bitwise ops: zero-extended; require 0..0xFFFF (or signed -32768..-1
-        # which we reinterpret as the same bit pattern).
-        imm16 = check_simm_or_uimm(imm, 16, file, line, operands[2][0].col,
-                                   f"{name} immediate")
-    word = encode_i(op, rs, rt, imm16)
-    emit_const(asm, section, file, line, 1, name, word)
+        return encode_i(op, rs, rt, imm16)
+
+    emit(asm, section, file, line, 1, name, [], enc)
 
 
 # ---- LUI ----
@@ -1106,10 +1279,15 @@ def encode_lui(asm: Assembler, section: str, src: SourceLine,
         raise AsmError("lui expects 2 operands", file, line, 1)
     rt = parse_gpr(_need_one_token(operands[0], file, line, "rt").text,
                    file, line, operands[0][0].col)
-    imm = parse_imm_operand(operands[1], file, line)
-    imm16 = check_simm_or_uimm(imm, 16, file, line, operands[1][0].col, "lui immediate")
-    word = encode_i(op, 0, rt, imm16)
-    emit_const(asm, section, file, line, 1, "lui", word)
+    imm_expr = parse_imm_expr(operands[1], file, line)
+    imm_col = operands[1][0].col
+
+    def enc(inst, asm):
+        imm = eval_expr(asm, imm_expr)
+        imm16 = check_simm_or_uimm(imm, 16, file, line, imm_col, "lui immediate")
+        return encode_i(op, 0, rt, imm16)
+
+    emit(asm, section, file, line, 1, "lui", [], enc)
 
 
 # ---- General loads/stores ----
@@ -1122,17 +1300,20 @@ def encode_load_store(asm: Assembler, section: str, src: SourceLine,
     rt = parse_gpr(_need_one_token(operands[0], file, line, "rt").text,
                    file, line, operands[0][0].col)
     offset_toks, base_tok = parse_mem_operand(operands[1], file, line)
-    if offset_toks:
-        if len(offset_toks) != 1 or offset_toks[0].kind not in ("num", "char"):
-            raise AsmError(f"{name}: offset must be a single integer literal",
-                           file, line, offset_toks[0].col)
-        off = parse_int(offset_toks[0].text, file, line, offset_toks[0].col)
-    else:
-        off = 0
     rs = parse_gpr(base_tok.text, file, line, base_tok.col)
-    off16 = check_simm_or_uimm(off, 16, file, line, base_tok.col, f"{name} offset")
-    word = encode_i(op, rs, rt, off16)
-    emit_const(asm, section, file, line, 1, name, word)
+    if offset_toks:
+        off_expr = parse_expression(offset_toks, file, line)
+        off_col = offset_toks[0].col
+    else:
+        off_expr = Expr(terms=[(1, "num", 0)], file=file, line=line, col=base_tok.col)
+        off_col = base_tok.col
+
+    def enc(inst, asm):
+        off = eval_expr(asm, off_expr)
+        off16 = check_simm_or_uimm(off, 16, file, line, off_col, f"{name} offset")
+        return encode_i(op, rs, rt, off16)
+
+    emit(asm, section, file, line, 1, name, [], enc)
 
 
 # ---- Object loads/stores ----
@@ -1145,17 +1326,20 @@ def encode_obj_ls(asm: Assembler, section: str, src: SourceLine,
     rt = parse_gpr(_need_one_token(operands[0], file, line, "rt").text,
                    file, line, operands[0][0].col)
     offset_toks, base_tok = parse_mem_operand(operands[1], file, line)
-    if offset_toks:
-        if len(offset_toks) != 1 or offset_toks[0].kind not in ("num", "char"):
-            raise AsmError(f"{name}: offset must be a single integer literal",
-                           file, line, offset_toks[0].col)
-        off = parse_int(offset_toks[0].text, file, line, offset_toks[0].col)
-    else:
-        off = 0
     os_ = parse_obj(base_tok.text, file, line, base_tok.col)
-    off16 = check_simm_or_uimm(off, 16, file, line, base_tok.col, f"{name} offset")
-    word = encode_o_ls(op, os_, rt, off16)
-    emit_const(asm, section, file, line, 1, name, word)
+    if offset_toks:
+        off_expr = parse_expression(offset_toks, file, line)
+        off_col = offset_toks[0].col
+    else:
+        off_expr = Expr(terms=[(1, "num", 0)], file=file, line=line, col=base_tok.col)
+        off_col = base_tok.col
+
+    def enc(inst, asm):
+        off = eval_expr(asm, off_expr)
+        off16 = check_simm_or_uimm(off, 16, file, line, off_col, f"{name} offset")
+        return encode_o_ls(op, os_, rt, off16)
+
+    emit(asm, section, file, line, 1, name, [], enc)
 
 
 # ---- OREFLD / OREFST (object-typed memory access) ----
@@ -1168,17 +1352,20 @@ def encode_obj_oref(asm: Assembler, section: str, src: SourceLine,
     od = parse_obj(_need_one_token(operands[0], file, line, "od").text,
                    file, line, operands[0][0].col)
     offset_toks, base_tok = parse_mem_operand(operands[1], file, line)
-    if offset_toks:
-        if len(offset_toks) != 1 or offset_toks[0].kind not in ("num", "char"):
-            raise AsmError(f"{name}: offset must be a single integer literal",
-                           file, line, offset_toks[0].col)
-        off = parse_int(offset_toks[0].text, file, line, offset_toks[0].col)
-    else:
-        off = 0
     os_ = parse_obj(base_tok.text, file, line, base_tok.col)
-    off16 = check_simm_or_uimm(off, 16, file, line, base_tok.col, f"{name} offset")
-    word = encode_oref(op, os_, od, off16)
-    emit_const(asm, section, file, line, 1, name, word)
+    if offset_toks:
+        off_expr = parse_expression(offset_toks, file, line)
+        off_col = offset_toks[0].col
+    else:
+        off_expr = Expr(terms=[(1, "num", 0)], file=file, line=line, col=base_tok.col)
+        off_col = base_tok.col
+
+    def enc(inst, asm):
+        off = eval_expr(asm, off_expr)
+        off16 = check_simm_or_uimm(off, 16, file, line, off_col, f"{name} offset")
+        return encode_oref(op, os_, od, off16)
+
+    emit(asm, section, file, line, 1, name, [], enc)
 
 
 # ---- O-type register-register (OBJECT funct codes) ----
@@ -1263,6 +1450,33 @@ def encode_call(asm: Assembler, section: str, src: SourceLine, operands) -> None
 
 
 # ---- li / la ----
+
+def emit_li_expr(asm: Assembler, section: str, file: str, line: int, col: int,
+                 rd: int, imm_expr: Expr) -> None:
+    """Materialize an Expr into rd. Constant expressions that fit in a
+    sign-extended 16-bit field collapse to a single ADDIU; everything
+    else emits the LUI+ORI pair (with deferred encoding for symbolic
+    values, so the layout is stable regardless of resolved value)."""
+    if expr_is_constant(imm_expr):
+        imm = eval_expr(_EMPTY_ASM, imm_expr)
+        if -(1 << 15) <= imm <= (1 << 15) - 1:
+            emit_li(asm, section, file, line, col, rd, imm)
+            return
+        emit_li(asm, section, file, line, col, rd, imm)
+        return
+
+    # Symbolic: always emit the 2-instruction LUI+ORI form for stable layout.
+    def enc_lui(inst, asm):
+        u = eval_expr(asm, imm_expr) & 0xFFFFFFFF
+        return encode_i(MAJOR["lui"], 0, rd, (u >> 16) & 0xFFFF)
+
+    def enc_ori(inst, asm):
+        u = eval_expr(asm, imm_expr) & 0xFFFFFFFF
+        return encode_i(MAJOR["ori"], rd, rd, u & 0xFFFF)
+
+    emit(asm, section, file, line, col, "li", [], enc_lui)
+    emit(asm, section, file, line, col, "li", [], enc_ori)
+
 
 def emit_li(asm: Assembler, section: str, file: str, line: int, col: int,
             rd: int, imm: int) -> None:
@@ -1370,6 +1584,31 @@ def lookup_label_in_text(asm: Assembler, name: str, file: str, line: int,
 # ---------------------------------------------------------------------------
 # Pass 2: encode all instructions and produce final byte stream.
 
+def _resolve_blob(asm: Assembler, blob: DataBlob) -> bytes:
+    """Apply any deferred fixups to a DataBlob and return the final bytes."""
+    if not blob.fixups:
+        return blob.data
+    out = bytearray(blob.data)
+    for off, w, expr, col in blob.fixups:
+        v = eval_expr(asm, expr)
+        if w == 1:
+            if not (-128 <= v <= 255):
+                raise AsmError(f".byte value {v} out of range",
+                               blob.file, blob.line, col)
+            out[off] = v & 0xFF
+        elif w == 2:
+            if not (-(1 << 15) <= v <= 0xFFFF):
+                raise AsmError(f".half value {v} out of range",
+                               blob.file, blob.line, col)
+            out[off:off+2] = struct.pack(">H", v & 0xFFFF)
+        elif w == 4:
+            if not (-(1 << 31) <= v <= 0xFFFF_FFFF):
+                raise AsmError(f".word value {v} out of range",
+                               blob.file, blob.line, col)
+            out[off:off+4] = struct.pack(">I", v & 0xFFFF_FFFF)
+    return bytes(out)
+
+
 def assemble(paths: list[Path]) -> bytes:
     lines = read_lines(paths)
     asm = pass1(lines)
@@ -1390,7 +1629,7 @@ def assemble(paths: list[Path]) -> bytes:
     for item in asm.text:
         if isinstance(item, DataBlob):
             # We don't allow .byte/.word in .text in this implementation.
-            text_bytes += item.data
+            text_bytes += _resolve_blob(asm, item)
             continue
         word = item.encoder(item, asm)
         item.encoded = word
@@ -1400,7 +1639,7 @@ def assemble(paths: list[Path]) -> bytes:
     data_bytes = bytearray()
     for item in asm.data:
         if isinstance(item, DataBlob):
-            data_bytes += item.data
+            data_bytes += _resolve_blob(asm, item)
         else:
             # Should not happen — .text directives never end up in .data.
             raise AsmError("instruction emitted in data section",
