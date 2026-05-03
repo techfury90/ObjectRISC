@@ -322,7 +322,16 @@ typedef long long OFFSZ;
 	{ -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 },
 
 #define GCLASS(x)	((x) < 32 ? CLASSA : (x) < 48 ? CLASSB : CLASSC)
-#define PCLASS(p)	(1 << gclass((p)->n_type))
+/*
+ * PCLASS: the register class a node should be allocated to. For
+ * Object RISC, an `__or`-qualified value (n_qual carries the OREF
+ * bit per mip/manifest.h) must live in the OR file (CLASSC) — that
+ * is the architectural commitment Volume III enforces. Everything
+ * else falls through to gclass on the basic type.
+ */
+#define PCLASS(p)	(ISOREF((p)->n_qual) \
+			    ? (1 << CLASSC) \
+			    : (1 << gclass((p)->n_type)))
 #define DECRA(x,y)	(((x) >> (y*6)) & 63)   /* decode encoded regs */
 #define ENCRA(x,y)	((x) << (6+y*6))        /* encode regs in int */
 #define ENCRD(x)	(x)			/* encode dest reg in n_reg */

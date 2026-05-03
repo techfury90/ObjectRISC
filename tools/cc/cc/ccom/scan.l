@@ -255,6 +255,7 @@ struct keywords {
 	{ "sizeof", C_SIZEOF, DEFKW },
 	{ "static", STATIC, C_CLASS },
 	{ "_Static_assert", C_STATICASSERT, DEFKW },
+	{ "__or", OREF, C_QUALIFIER },
 	{ "struct", STNAME, C_STRUCT },
 	{ "switch", C_SWITCH, DEFKW },
 	{ "_Thread_local", THLOCAL, C_CLASS },

@@ -95,6 +95,7 @@
 #define	ARY		0x60
 #define	CON		0x20
 #define	VOL		0x40
+#define	OREF		0x80	/* Object RISC: held in OR file (capability-bearing reference) */
 
 /*
  * Type packing constants
@@ -122,6 +123,7 @@
 #define ISARY(x)	(((x)&TMASK)==ARY)	/* is x an array type? */
 #define	ISCON(x)	(((x)&CON)==CON)	/* is x const? */
 #define	ISVOL(x)	(((x)&VOL)==VOL)	/* is x volatile? */
+#define	ISOREF(x)	(((x)&OREF)==OREF)	/* is x held in an OR? */
 #define INCREF(x)	((((x)&~BTMASK)<<TSHIFT)|PTR|((x)&BTMASK))
 #define INCQAL(x)	((((x)&~BTMASK)<<TSHIFT)|((x)&BTMASK))
 #define DECREF(x)	((((x)>>TSHIFT)&~BTMASK)|((x)&BTMASK))
