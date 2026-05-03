@@ -361,8 +361,11 @@ behaviour is identical in both cases — only the latency differs.
 There is no architectural ordering guarantee between an object-register
 access and an ordinary load or store directed at the same byte through
 a mapping installed by firmware. Code that requires such ordering must
-either interpose an explicit firmware call or use the fence instruction
-reserved at `OBJECT` function code `0x8` for a future revision.
+either interpose an explicit firmware call or use the `OFENCE`
+instruction (`OBJECT` function code `0x8`), which orders all
+preceding object-register accesses before all subsequent ones —
+including those reaching the same physical storage through a mapping
+installed by firmware.
 
 Object-register loads, like general-register loads, expose a one-cycle
 load-use delay to the compiler.
@@ -526,8 +529,9 @@ flow is correctly preserved.
 ## 14. Reserved Encodings
 
 This revision allocates thirty-three of the sixty-four major opcodes,
-twenty-two of the sixty-four `SPECIAL` function codes, and eight of the
-sixteen `OBJECT` function codes. Every unallocated encoding raises
+twenty-two of the sixty-four `SPECIAL` function codes, and nine of the
+sixteen `OBJECT` function codes (eight inspection/movement operations
+plus `OFENCE` at funct `0x8`). Every unallocated encoding raises
 `reserved-instruction` when executed.
 
 The following ranges are reserved for anticipated extensions; conforming
@@ -540,8 +544,6 @@ implementations shall not allocate them to local additions:
 - Major opcode `0x3F` — implementation-specific. Code using this
   opcode is not portable.
 - `SPECIAL` function codes `0x30`–`0x3F` — reserved.
-- `OBJECT` function code `0x8` — the explicit fence instruction
-  promised in Section 9.
 - `OBJECT` function codes `0x9`–`0xF` — reserved for further object-
   system primitives.
 

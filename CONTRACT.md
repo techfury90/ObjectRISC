@@ -224,7 +224,51 @@ Returns: `R2` = `OK`, `EPERM` (caps), `EREMOTE` (target lives
 elsewhere), `EINVAL` (handler offset not in any executable mapping
 of the handler code object on this CPU), `EFAULT`, or `ESTALE`.
 
-### 3.6 `0x320 ConsoleWrite`
+### 3.7 `0x203 ReceiveQueueAttach`
+
+Replace handler-dispatch on a target object with a per-object queue.
+Subsequent `SEND_DELIVER`s addressed to the object are appended to
+the queue rather than spawning a handler task; the queue is drained
+by `ReceiveQueuePoll` (Section 3.8). This is the *pull* alternative
+to handler dispatch, used for synchronous RPC reply patterns
+(Volume VII Section 4.3).
+
+Inputs:
+- `O1` = target object (must carry both `S` and `V`; home must be
+  the calling CPU).
+- `R4` = maximum queue depth (1..1024). Arrivals beyond this depth
+  are dropped on receipt.
+
+Returns: `R2` = `OK`, `EFAULT`, `EPERM`, `EREMOTE`, `ESTALE`, or
+`EINVAL`.
+
+### 3.8 `0x204 ReceiveQueuePoll`
+
+Dequeue the next message from a previously attached receive queue.
+Blocks the calling CPU at the `CALL` instruction until a message
+arrives, the timeout expires, or — with `timeout = 0` — returns
+`ETIMEOUT` immediately.
+
+Inputs:
+- `O1` = target object (must carry `V`; must have had
+  `ReceiveQueueAttach` called on it; home must be the calling CPU).
+- `R4` = timeout in scheduler ticks. `0` = no wait;
+  `0xFFFFFFFF` = wait forever; otherwise the queue is checked each
+  scheduler tick and the timeout is decremented.
+
+Returns:
+- `R2` = `OK` (message dequeued), `ETIMEOUT`, `EFAULT`, `EPERM`,
+  `EREMOTE`, `ESTALE`, or `EINVAL`.
+- On success, the dequeued message's wire payload is delivered
+  *verbatim* into registers (no `O1` self-override, unlike handler
+  dispatch — by exception to the usual return convention because the
+  caller already knows what queue it polled):
+  - `O1`–`O4` = the SEND's four wire OR payload references.
+  - `R3`–`R6` = the SEND's four wire integer payload words. Note
+    that `R3` carries the first integer payload word, *not* a return
+    value — the status occupies `R2` alone.
+
+### 3.9 `0x320 ConsoleWrite`
 
 Inputs:
 - `O1` = source object reference. Must be non-null and carry `R`. Must
@@ -391,6 +435,15 @@ section.
 | `0x5`  | OTAG     |
 | `0x6`  | OHOME    |
 | `0x7`  | OCAP     |
+| `0x8`  | OFENCE   |
+
+`OFENCE` takes no operands and is encoded with all zero `os`/`ot`/`rd`/
+`rs`/`rsv` fields. In an architecturally-strict simulator it serves as
+a memory ordering barrier between object-register access (`OL*`/`OS*`)
+and ordinary mapped-page access (`LW`/`SW` etc.) targeting the same
+underlying storage; in this single-threaded simulator there is no
+reordering and `OFENCE` retires as a no-op, but its presence makes
+ordering-sensitive programs portable across implementations.
 
 ### 5.5 R-Type Field Layout
 

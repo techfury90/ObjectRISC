@@ -303,10 +303,11 @@ REGIMM_RT = {
 
 # OBJECT funct codes (low 4 bits of funct field)
 OBJECT_FUNCT = {
-    "omov":  0x0, "onull": 0x1,
-    "oeq":   0x2, "oisn":  0x3,
-    "olen":  0x4, "otag":  0x5,
-    "ohome": 0x6, "ocap":  0x7,
+    "omov":   0x0, "onull":  0x1,
+    "oeq":    0x2, "oisn":   0x3,
+    "olen":   0x4, "otag":   0x5,
+    "ohome":  0x6, "ocap":   0x7,
+    "ofence": 0x8,
 }
 
 
@@ -1196,7 +1197,11 @@ def encode_object_rr(asm: Assembler, section: str, src: SourceLine,
         t = _need_one_token(g, file, line, "object register")
         return parse_obj(t.text, file, line, t.col)
 
-    if name == "omov":
+    if name == "ofence":
+        if len(operands) != 0:
+            raise AsmError("ofence takes no operands", file, line, 1)
+        word = encode_o_rr(op, 0, 0, 0, 0, funct)
+    elif name == "omov":
         if len(operands) != 2:
             raise AsmError("omov expects 2 operands", file, line, 1)
         od = obj0(operands[0])
@@ -1609,6 +1614,8 @@ def disasm_object_rr(word: int) -> str:
         return f"onull {obj_name(os_)}"
     if name == "oeq":
         return f"oeq {gpr_name(rd)}, {obj_name(os_)}, {obj_name(ot)}"
+    if name == "ofence":
+        return "ofence"
     # oisn, olen, otag, ohome, ocap
     return f"{name} {gpr_name(rd)}, {obj_name(os_)}"
 

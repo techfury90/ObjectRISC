@@ -131,6 +131,11 @@ class Descriptor:
     send_handler_off: int = 0
     send_handler_va:  int = 0   # populated by InstallHandler from object's mapping
     objstore: bool = False      # if True, storage is OR-typed (OREFLD/OREFST only)
+    # Receive-queue mode: when set by ReceiveQueueAttach, incoming SENDs are
+    # appended here instead of dispatching a handler task. queue_max_depth
+    # bounds the queue length; arrivals beyond it are dropped.
+    queue: Optional[List] = None
+    queue_max_depth: int = 0
 
 
 def make_ref(generation: int, home: int, index: int, caps: int) -> int:
@@ -172,6 +177,17 @@ class TaskExitSignal(Exception):
     """Raised by primitive_TaskExit; caught by the System scheduler."""
     def __init__(self, code: int):
         self.code = code
+
+
+class BlockedSignal(Exception):
+    """Raised by ReceiveQueuePoll when its target queue is empty and the
+    timeout is non-zero. The scheduler holds the CPU at the CALL until
+    the queue receives a message (or timeout expires); on resume it
+    populates registers per Volume VI Section 6 and advances PC."""
+    def __init__(self, descriptor_idx: int, timeout: int):
+        self.descriptor_idx = descriptor_idx
+        # timeout: -1 = infinite; otherwise number of scheduler ticks remaining
+        self.timeout = timeout
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +234,7 @@ class CPU:
         self.exit_code: Optional[int] = None # set by TaskExit
         self.inbox: List[PendingSend] = []   # SEND_DELIVERs awaiting dispatch
         self.boot_state: Optional[Dict] = None  # snapshot used to relaunch handler tasks
+        self.blocked_on: Optional[BlockedSignal] = None  # ReceiveQueuePoll wait state
 
         # Trace control.
         self.trace_enabled = False
@@ -437,11 +454,29 @@ class System:
                 print(f"  ; SEND dropped: recipient home {home} not configured",
                       file=sys.stderr)
             return
-        self.cpus[home].inbox.append(msg)
+        target_cpu = self.cpus[home]
+        idx = ref_index(msg.recipient_ref)
+        # If the recipient has a receive queue installed, deliver there
+        # (pull mode) and skip the per-CPU inbox/handler dispatch path.
+        if 0 < idx < len(target_cpu.descriptors) and \
+                target_cpu.descriptors[idx] is not None and \
+                target_cpu.descriptors[idx].queue is not None:
+            desc = target_cpu.descriptors[idx]
+            if len(desc.queue) >= desc.queue_max_depth:
+                if self.trace_enabled:
+                    print(f"  ; CPU{msg.src_pid} -> CPU{home}: SEND dropped "
+                          f"(receive queue full at idx={idx})", file=sys.stderr)
+                return
+            desc.queue.append(msg)
+            if self.trace_enabled:
+                print(f"  ; CPU{msg.src_pid} -> CPU{home}: SEND queued to "
+                      f"receive-queue idx={idx} (depth={len(desc.queue)})",
+                      file=sys.stderr)
+            return
+        target_cpu.inbox.append(msg)
         if self.trace_enabled:
             print(f"  ; CPU{msg.src_pid} -> CPU{home}: SEND queued "
-                  f"(recipient idx={ref_index(msg.recipient_ref)})",
-                  file=sys.stderr)
+                  f"(recipient idx={idx})", file=sys.stderr)
 
     # ---- handler dispatch --------------------------------------------------
 
@@ -502,6 +537,41 @@ class System:
                   file=sys.stderr)
         return True
 
+    # ---- blocked-CPU resume ------------------------------------------------
+
+    def _try_unblock(self, cpu: CPU) -> bool:
+        """If the CPU's blocked queue has a message, deliver it and
+        advance past the CALL. If the timeout has expired, return
+        ETIMEOUT and advance. Otherwise tick the timeout down (no-op
+        for infinite waits). Returns True if the CPU made progress."""
+        b = cpu.blocked_on
+        idx = b.descriptor_idx
+        # The descriptor must still be valid; if the program freed its
+        # queue object somehow, treat as ESTALE.
+        if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+            cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0)
+            cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.blocked_on = None
+            return True
+        desc = cpu.descriptors[idx]
+        if desc.queue and len(desc.queue) > 0:
+            _deliver_queue_msg(cpu, desc.queue.pop(0))
+            cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.blocked_on = None
+            return True
+        if b.timeout < 0:
+            return False    # infinite wait, nothing to do this tick
+        b.timeout -= 1
+        if b.timeout <= 0:
+            cpu.set_gpr(2, ERR_ETIMEOUT); cpu.set_gpr(3, 0)
+            cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.blocked_on = None
+            return True
+        return True   # made progress (decremented the timer)
+
     # ---- scheduler ---------------------------------------------------------
 
     def run(self, max_cycles: int) -> int:
@@ -512,6 +582,12 @@ class System:
         while ticks < max_cycles:
             any_progress = False
             for cpu in self.cpus:
+                # Blocked CPUs: see if their queue has a message (or timeout
+                # expired) and resume past the CALL accordingly.
+                if cpu.blocked_on is not None:
+                    if self._try_unblock(cpu):
+                        any_progress = True
+                    continue
                 if cpu.active:
                     try:
                         step(cpu)
@@ -784,6 +860,82 @@ def primitive_ObjDerive(cpu: CPU) -> None:
     cpu.set_opr(1, derived)
     cpu.set_gpr(2, ERR_OK)
 
+def primitive_ReceiveQueueAttach(cpu: CPU) -> None:
+    """Replace handler-dispatch behaviour on a target object with a
+    queue. Subsequent SENDs to the object are appended to the queue
+    instead of spawning a handler task."""
+    target = cpu.get_opr(1)
+    max_depth = cpu.get_gpr(4)
+
+    if target == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if (ref_caps(target) & (CAP_S | CAP_V)) != (CAP_S | CAP_V):
+        cpu.set_gpr(2, ERR_EPERM); return
+    if ref_home(target) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+    if max_depth <= 0 or max_depth > 1024:
+        cpu.set_gpr(2, ERR_EINVAL); return
+
+    idx = ref_index(target)
+    if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); return
+    desc = cpu.descriptors[idx]
+    if not desc.live or desc.generation != ref_generation(target):
+        cpu.set_gpr(2, ERR_ESTALE); return
+
+    desc.queue = []
+    desc.queue_max_depth = max_depth
+    cpu.set_gpr(2, ERR_OK)
+
+
+def _deliver_queue_msg(cpu: CPU, msg: PendingSend) -> None:
+    """Populate registers from a queue message per Volume VI Section 6:
+    R3..R6 receive the integer payload; O1..O4 receive the OR payload
+    verbatim (no self-override, unlike handler dispatch)."""
+    cpu.set_gpr(2, ERR_OK)
+    for i in range(4):
+        cpu.set_gpr(3 + i, msg.int_payload[i])
+    for i in range(4):
+        cpu.set_opr(1 + i, msg.or_payload[i])
+
+
+def primitive_ReceiveQueuePoll(cpu: CPU) -> None:
+    target = cpu.get_opr(1)
+    timeout = cpu.get_gpr(4)
+
+    if target == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if (ref_caps(target) & CAP_V) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return
+    if ref_home(target) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+
+    idx = ref_index(target)
+    if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); return
+    desc = cpu.descriptors[idx]
+    if not desc.live or desc.generation != ref_generation(target):
+        cpu.set_gpr(2, ERR_ESTALE); return
+    if desc.queue is None:
+        cpu.set_gpr(2, ERR_EINVAL); return
+
+    if desc.queue:
+        _deliver_queue_msg(cpu, desc.queue.pop(0))
+        return
+
+    if timeout == 0:
+        cpu.set_gpr(2, ERR_ETIMEOUT)
+        cpu.set_gpr(3, 0)
+        return
+
+    # Block. The scheduler holds the CPU at this CALL until the queue
+    # receives a message (delivered then) or the timeout expires.
+    raise BlockedSignal(
+        descriptor_idx=idx,
+        timeout=-1 if timeout == 0xFFFFFFFF else timeout,
+    )
+
+
 def primitive_InstallHandler(cpu: CPU) -> None:
     target = cpu.get_opr(1)
     handler = cpu.get_opr(2)
@@ -881,6 +1033,10 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_MapObject(cpu)
     elif prim == 0x200:
         primitive_InstallHandler(cpu)
+    elif prim == 0x203:
+        primitive_ReceiveQueueAttach(cpu)
+    elif prim == 0x204:
+        primitive_ReceiveQueuePoll(cpu)
     elif prim == 0x320:
         primitive_ConsoleWrite(cpu, faulting_pc)
     else:
@@ -952,10 +1108,12 @@ def fmt_instr(pc: int, word: int, cpu: CPU) -> str:
         ord_ = (word >> 13) & 0x1F
         ofn  = (word >>  4) & 0xF
         m = {0x0:"omov",0x1:"onull",0x2:"oeq",0x3:"oisn",
-             0x4:"olen",0x5:"otag",0x6:"ohome",0x7:"ocap"}.get(ofn, f"obj?fn={ofn:#x}")
+             0x4:"olen",0x5:"otag",0x6:"ohome",0x7:"ocap",
+             0x8:"ofence"}.get(ofn, f"obj?fn={ofn:#x}")
         if ofn == 0x0: return f"omov o{os_}, o{ot}"
         if ofn == 0x1: return f"onull o{os_}"
         if ofn == 0x2: return f"oeq r{ord_}, o{os_}, o{ot}"
+        if ofn == 0x8: return "ofence"
         return f"{m} r{ord_}, o{os_}"
     if op in (0x31,0x32,0x33,0x34,0x35,0x38,0x39,0x3B):
         os_ = (word >> 22) & 0xF
@@ -1170,6 +1328,8 @@ def step(cpu: CPU) -> None:
             elif ofn == 0x5: cpu.set_gpr(ord_, desc.type_tag & 0xFFFF)
             elif ofn == 0x6: cpu.set_gpr(ord_, home)
             elif ofn == 0x7: cpu.set_gpr(ord_, ref_caps(cpu.get_opr(os_)))
+        elif ofn == 0x8:  # OFENCE — no-op in this simulator (no reordering to fence)
+            pass
         else:
             raise Trap(CAUSE_RESERVED_INSTR, pc, f"OBJECT funct {ofn:#x}")
     elif op in (0x31,0x32,0x33,0x34,0x35,0x38,0x39,0x3B):
@@ -1258,7 +1418,15 @@ def step(cpu: CPU) -> None:
             pass
     elif op == 0x3D:  # CALL — no delay slot.
         prim = target26
-        dispatch_call(cpu, prim, pc)
+        try:
+            dispatch_call(cpu, prim, pc)
+        except BlockedSignal as b:
+            # Hold the CPU at this CALL; on resume the scheduler will
+            # populate registers, advance PC by 4, and clear blocked_on.
+            cpu.blocked_on = b
+            cpu.cycles += 1
+            emit_trace(cpu, pc, word, pre_gpr, pre_opr, pre_hi, pre_lo)
+            return
         cpu.pc = to_u32(pc + 4)
         cpu.next_pc = to_u32(cpu.pc + 4)
         cpu.cycles += 1
