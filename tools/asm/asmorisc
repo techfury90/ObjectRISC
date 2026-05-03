@@ -730,6 +730,9 @@ def handle_directive(asm: Assembler, section: str, src: SourceLine,
     n = name.lower()
     file, line = src.file, src.line
 
+    if n == ".file":
+        # cpp emits `.file "path"` as a debug marker; we ignore it.
+        return section
     if n == ".text":
         if rest:
             raise AsmError(".text takes no operands", file, line, rest[0].col)

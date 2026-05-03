@@ -98,6 +98,23 @@ wire-format crossbar in its own process:
 examples/run_hello_terminal.sh
 ```
 
+Hello, world! from C — compiled by our in-tree pcc port. Build pcc
+once (`cd tools/cc && ./configure --target=orisc-unknown-none && make`
+into a build dir of your choice — `/tmp/pcc-build` is the default),
+then:
+
+```sh
+examples/cc/run_hello_c.sh
+# Hello, world!
+```
+
+The C source is `examples/cc/hello.c`. It links against `crt0.s`
+(provides `.entry _start`, calls main, TaskExits with main's R2 as
+the exit code) and `console_io.s` (a small bridge to firmware
+ConsoleWrite — temporary until the C compiler grows the `__or`
+qualifier and OR-file patterns). Both live in
+`tools/cc/arch/orisc/`.
+
 Parallel π(N) across K+1 CPUs, results streamed live to the
 terminal. The coordinator partitions [2..N] into K+1 equal ranges,
 dispatches work to the workers via SEND with a derived reply cap,
