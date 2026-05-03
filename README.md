@@ -67,6 +67,7 @@ vendored pcc and needs `./configure && make` once (see
 | [`tools/sim/oriscbar`](tools/sim)            | Standalone wire-level crossbar daemon                |
 | [`tools/devices/oriscterm`](tools/devices)   | Tk-based terminal device that connects to `oriscbar` |
 | [`tools/devices/linkbootd`](tools/devices)   | Python-side link-boot server                         |
+| [`tools/devices/hostfsd`](tools/devices)     | Host-filesystem server (open/read/write/close, optional jail) |
 | [`tools/oriscrun`](tools/oriscrun)           | Launcher: spawns crossbar + devices + CPU processes  |
 | [`tools/cc`](tools/cc/arch/orisc)            | Vendored pcc with an Object RISC backend (`arch/orisc/`) |
 | [`tools/cc/lib`](tools/cc/lib)               | C library (liborisc.ora) — console I/O, string/memory primitives |
@@ -147,6 +148,13 @@ and graphics capabilities — each opens a Tk window:
 examples/cc/run_kbd_echo.sh    # echoes every keystroke (codepoint + mods)
 examples/cc/run_paint.sh       # arrow + letter keys → vector drawing on canvas
 examples/cc/run_mouse_paint.sh # mouse: click drops dot, drag draws stroke
+```
+
+A demo that reads an actual host file via `hostfsd` and prints
+it to the simulated console:
+
+```sh
+examples/cc/run_host_cat.sh    # cat README.md from inside an emulated CPU
 ```
 
 The `hello_or.c` and `print_or.c` variants use the `__or`

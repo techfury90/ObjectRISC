@@ -1320,6 +1320,110 @@ console, keyboard, grid, vector, pointer, and the (still
 deferred) raster — and the demos cover end-to-end interactive
 use of the first five.
 
+## Phase 18 — The first OS-shaped piece: hostfsd
+
+CPU programs could compute, talk to other CPUs, draw on a screen,
+and read a keyboard — but they couldn't read or write a file.
+The first proper "operating system" piece: a host-filesystem
+server that exposes the host's actual files as Object RISC
+resources, and a C library that wraps the wire protocol in
+familiar `open` / `read` / `write` / `close` shape.
+
+### Design choice
+
+Two reasonable shapes:
+
+1. **File-as-object.** `hf_open` returns an OR ref to a file
+   object hosted on `hostfsd`; CPU does `OLB` to read bytes.
+   Architecturally pure — files become first-class capability-
+   bearing objects. Bites on the same architectural friction
+   that bit linkboot (no register-indexed `OL`, no `MapObject`
+   on remote sources).
+
+2. **Fd-style with hostfsd-initiated transfers.** `hf_open`
+   returns an `int fd`; `hf_read(fd, buf, count)` SENDs to
+   hostfsd, which `OBJ_WRITE_REQ`s the bytes back into the
+   CPU's stack buffer (the lib derives the right OR ref from
+   the buffer's VA). No 32K cap, normal-shaped C API.
+
+Phase 18 ships #2. The file-as-object aesthetic is appealing but
+unworkable for v1 — too many architectural workarounds. With
+something concrete in tree, a v2 layer that exposes files as
+ORs becomes a sensible follow-up.
+
+### `tools/devices/hostfsd`
+
+A new Python device — third in the family alongside `oriscterm`
+and `linkbootd`. Single service object at index 1; CPUs SEND
+requests with the operation code in `R4`:
+
+| Op          | Code | Body                                                     |
+|-------------|------|----------------------------------------------------------|
+| `SUBSCRIBE` | 4    | O2 = subscriber's reply ref                              |
+| `OPEN`      | 0    | O2 = path buf, R5 = path off, R6 = path len, R7 = flags  |
+| `CLOSE`     | 1    | R5 = fd                                                  |
+| `READ`      | 2    | O2 = dst buf (W cap), R5 = fd, R6 = dst off, R7 = count  |
+| `WRITE`     | 3    | O2 = src buf, R5 = fd, R6 = src off, R7 = count          |
+
+All responses come back as SENDs to the per-CPU reply ref
+established by SUBSCRIBE. Errors negative (`-1` EBADF, `-3`
+ENOENT, `-4` EACCES, etc.).
+
+`READ` is the interesting case: hostfsd `read()`s from the host
+file, then issues `OBJ_WRITE_REQ` to land the bytes in the CPU's
+buffer. The wire's bidirectional `OBJ_*_REQ`/`RESP` traffic
+already supports device-to-CPU writes — `simorisc`'s "memory
+controller" tick handles them just like cross-CPU writes — so
+no new infrastructure was needed beyond hostfsd itself.
+
+### `--root` jailing
+
+Optional `--root DIR` chroots the service: paths resolve relative
+to `DIR` and any escape via `..` or absolute paths returns
+`EACCES`. Without `--root` the service is unjailed (full host FS
+access for the launching user). Useful default for the test suite
+(jail to a fixture dir); fine without for development.
+
+### `tools/cc/lib/host_io.c`
+
+Adds `hf_init`, `hf_open`, `hf_close`, `hf_read`, `hf_write` to
+the libc archive. The `hf_read` buffer must be on the stack
+(needs W cap; the boot data ref doesn't have it); `hf_write`
+buffers can be anywhere with R cap. Programs follow the OR-
+hygiene contract: park boot O2/O3/O4 in O11/O15/O14 once at
+startup, every helper restores them on the way out. hostfsd's
+service ref needs to be in O10 by the time `hf_init` runs (the
+runner's `--service` order is responsible).
+
+### Demo + test
+
+`examples/cc/host_cat.c` opens `README.md` and streams its
+contents to console — a `cat` from the simulated CPU through
+the wire-format crossbar to the host filesystem and back. The
+README arrives intact.
+
+`tools/devices/tests/test_hostfs.sh` is the headless variant:
+creates a fixture `test.txt` with known contents, jails hostfsd
+to its directory, asserts on the cpu's stdout (`FD=0`,
+`READ N=14`, `one`/`two`/`three`, `END`).
+
+### What's not yet done
+
+- **Seek / stat / readdir / unlink / mkdir.** Just the four
+  basic ops for now.
+- **File-as-object aesthetic.** Mentioned above; v2.
+- **Multi-process libc-using demos.** The OR-hygiene contract
+  is fragile and needs the runner to set `--service` order
+  exactly right. A higher-level launcher abstraction would
+  help.
+- **A shared Python library for device authors.** The user
+  flagged this — `oriscterm`, `linkbootd`, `hostfsd`, and
+  `fake_terminal.py` all duplicate the same wire helpers. A
+  base class with handshake + dispatch + storage primitives
+  would let the next device come together in maybe 50 lines.
+  Now that we have three real devices to learn from, the
+  abstraction lines should be visible.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
@@ -1350,9 +1454,15 @@ use of the first five.
   callee sides of the calling convention both wired). The C
   pipeline now goes through the linker — no more per-unit label
   mangling.
-- A small C library (`liborisc.ora`) covering console I/O and the
-  standard string/memory primitives, archived for selective
-  inclusion so programs only pay for what they call.
+- A small C library (`liborisc.ora`) covering console I/O, the
+  standard string/memory primitives, and host-filesystem access
+  via `hostfsd` (`hf_open` / `hf_read` / `hf_write` / `hf_close`).
+  Archived for selective inclusion so programs only pay for what
+  they call.
+- A host-filesystem device server (`hostfsd`) — first
+  OS-shaped piece, with optional `--root` jailing — that lets
+  CPU-side C programs read and write actual host files via the
+  wire-format crossbar.
 - A generic link-boot loader that lets you spin up extra CPUs whose
   code is decided at runtime — announce on the crossbar, receive a
   module by SEND, map and JR.

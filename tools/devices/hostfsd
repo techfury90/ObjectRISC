@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""hostfsd — Object RISC host filesystem server.
+
+A non-CPU participant on the crossbar that exposes the host
+filesystem to CPU-side C programs. Same wire-protocol shape as
+oriscterm and linkbootd: connect, handshake, exchange Vol IV §3
+packets. CPUs talk to a single "filesystem" service object (idx 1)
+to open/close files and to read/write through them; hostfsd
+performs the host-side I/O via OBJ_WRITE_REQ / OBJ_READ_REQ
+against the CPU's own buffer refs.
+
+Usage:
+    tools/devices/hostfsd --socket /tmp/oriscbar.sock --pid 17
+
+By default the host filesystem is exposed unrestricted (writes
+go anywhere the user can write). Pass `--root DIR` to chroot the
+service into a directory: paths are resolved relative to DIR and
+attempts to escape (via `..` or absolute paths) are rejected.
+
+Wire protocol (request: CPU SENDs to hostfsd at (pid, idx 1)):
+
+  R4 = op code, others depend on op:
+
+  OP_SUBSCRIBE = 4   O2 = reply ref to use for ALL future responses
+                     (first call from each CPU; no response sent)
+
+  OP_OPEN      = 0   O2 = path buffer ref (any byte-typed object)
+                     R5 = path offset within buffer
+                     R6 = path length (bytes)
+                     R7 = flags: bit 0 = read, bit 1 = write,
+                                  bit 2 = create, bit 3 = truncate
+                     → response: R3 = fd or negative errno
+                                 R4 = file length in bytes (at open)
+
+  OP_CLOSE     = 1   R5 = fd
+                     → response: R3 = 0 on success, negative errno
+
+  OP_READ      = 2   O2 = destination buffer ref (must have W cap)
+                     R5 = fd
+                     R6 = byte offset within destination buffer
+                     R7 = byte count to read
+                     → hostfsd OBJ_WRITE_REQs bytes into the buffer
+                     → response: R3 = bytes actually read (may be < count
+                                       at EOF, 0 means EOF reached)
+                                 negative on error
+
+  OP_WRITE     = 3   O2 = source buffer ref (must have R cap)
+                     R5 = fd
+                     R6 = byte offset within source buffer
+                     R7 = byte count to write
+                     → hostfsd OBJ_READ_REQs bytes from the buffer,
+                       writes them to the host file
+                     → response: R3 = bytes written, negative on error
+
+All responses are SEND_DELIVERs aimed at the subscribed reply ref;
+the operation result lands in the receiver's R3 (after queue
+dispatch overlay). R4 carries the secondary value where applicable
+(file length on open).
+
+Errors:  -1 = EBADF (bad fd / not subscribed)
+         -2 = EINVAL (bad args / unknown op)
+         -3 = ENOENT (file not found)
+         -4 = EACCES (path escapes --root jail; permission denied)
+         -5 = EIO    (host I/O error)
+         -6 = ENOMEM (per-CPU fd table full — limit is 64)
+"""
+
+import argparse
+import errno
+import os
+import selectors
+import signal
+import socket
+import struct
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# ---- Wire-format constants — must match simorisc / oriscbar / etc. --------
+
+HELLO_MAGIC      = 0xC0FFEEAA
+HELLO_OK         = 0x00000000
+
+PKT_OBJ_READ_REQ   = 0x10
+PKT_OBJ_READ_RESP  = 0x11
+PKT_OBJ_WRITE_REQ  = 0x12
+PKT_OBJ_WRITE_RESP = 0x13
+PKT_SEND_DELIVER   = 0x20
+
+RESP_OK     = 0x00
+RESP_STALE  = 0x01
+RESP_BOUNDS = 0x02
+RESP_CAP    = 0x03
+
+# ---- Capability bits (Vol III §2.2) --------------------------------------
+
+CAP_R = 0x01
+CAP_W = 0x02
+CAP_S = 0x08
+CAP_V = 0x10
+CAP_C = 0x40
+
+# ---- Service constants ---------------------------------------------------
+
+FS_SERVICE_INDEX = 1
+SERVICE_GENERATION = 1
+SERVICE_MAX_CAPS = 0x5B   # R|W|S|V|C — what the launcher will mint refs with
+
+# ---- Operation codes -----------------------------------------------------
+
+OP_OPEN       = 0
+OP_CLOSE      = 1
+OP_READ       = 2
+OP_WRITE      = 3
+OP_SUBSCRIBE  = 4
+
+# ---- Error codes (negative R3 in responses) ------------------------------
+
+E_BADF   = -1
+E_INVAL  = -2
+E_NOENT  = -3
+E_ACCES  = -4
+E_IO     = -5
+E_NOMEM  = -6
+
+MAX_FDS_PER_CPU = 64
+MAX_INFLIGHT_PER_CPU = 32
+
+
+# ---- Wire helpers (duplicated from oriscterm/linkbootd; the user has
+#      flagged that we should grow a shared library — that's a follow-up). --
+
+def make_ref(generation: int, home: int, index: int, caps: int) -> int:
+    return (((generation & 0xFFFF) << 48)
+            | ((home       & 0xFF)   << 40)
+            | ((index      & 0xFFFFFF) << 16)
+            | ((caps       & 0xFF)   << 8))
+
+
+def ref_home(r: int)       -> int: return (r >> 40) & 0xFF
+def ref_index(r: int)      -> int: return (r >> 16) & 0xFFFFFF
+def ref_generation(r: int) -> int: return (r >> 48) & 0xFFFF
+def ref_caps(r: int)       -> int: return (r >>  8) & 0xFF
+
+
+def pack_packet(src_pid: int, dst_pid: int, msg_type: int, flags: int,
+                trans_id: int, payload_words) -> bytes:
+    header = struct.pack(">BBBBHH",
+                         src_pid & 0xFF, dst_pid & 0xFF,
+                         msg_type & 0xFF, flags & 0xFF,
+                         trans_id & 0xFFFF, len(payload_words) & 0xFFFF)
+    payload = b''.join(struct.pack(">I", w & 0xFFFFFFFF)
+                       for w in payload_words)
+    h0, h1 = struct.unpack(">II", header)
+    chk = h0 ^ h1
+    for w in payload_words:
+        chk ^= w & 0xFFFFFFFF
+    return header + payload + struct.pack(">I", chk & 0xFFFFFFFF)
+
+
+def unpack_packet(data: bytes) -> Dict:
+    if len(data) < 12:
+        raise ValueError("packet too short")
+    src, dst, mtype, flags, trans_id, length_words = \
+        struct.unpack(">BBBBHH", data[:8])
+    payload_bytes = data[8:8 + length_words * 4]
+    words = list(struct.unpack(f">{length_words}I", payload_bytes)) \
+        if length_words else []
+    h0, h1 = struct.unpack(">II", data[:8])
+    chk = h0 ^ h1
+    for w in words:
+        chk ^= w
+    expected_chk = struct.unpack(">I", data[-4:])[0]
+    if chk != expected_chk:
+        raise ValueError("checksum mismatch")
+    return {"src_pid": src, "dst_pid": dst, "type": mtype,
+            "flags": flags, "trans_id": trans_id, "payload": words}
+
+
+def parse_send_deliver(pkt):
+    p = pkt["payload"]
+    if len(p) != 14:
+        raise ValueError(f"SEND_DELIVER payload must be 14 words, got {len(p)}")
+    recipient_ref = p[0] | (p[1] << 32)
+    int_payload = list(p[2:6])
+    or_payload = []
+    for i in range(4):
+        or_payload.append(p[6 + 2*i] | (p[7 + 2*i] << 32))
+    return recipient_ref, int_payload, or_payload
+
+
+def build_send_deliver(src_pid, dst_pid, trans_id, recipient_ref,
+                       int_payload, or_payload):
+    payload = [recipient_ref & 0xFFFFFFFF, (recipient_ref >> 32) & 0xFFFFFFFF]
+    for i in range(4):
+        payload.append(int_payload[i] & 0xFFFFFFFF if i < len(int_payload) else 0)
+    for i in range(4):
+        ref = or_payload[i] if i < len(or_payload) else 0
+        payload.append(ref & 0xFFFFFFFF)
+        payload.append((ref >> 32) & 0xFFFFFFFF)
+    return pack_packet(src_pid, dst_pid, PKT_SEND_DELIVER, 0, trans_id, payload)
+
+
+def build_obj_read_req(src_pid, dst_pid, trans_id, ref, offset, width):
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF,
+               offset & 0xFFFFFFFF, width & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_REQ, 0, trans_id, payload)
+
+
+def build_obj_write_req(src_pid, dst_pid, trans_id, ref, offset, width, data):
+    pad = (-len(data)) % 4
+    padded = data + bytes(pad)
+    data_words = list(struct.unpack(f">{len(padded)//4}I", padded)) \
+        if padded else []
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF,
+               offset & 0xFFFFFFFF, width & 0xFFFFFFFF]
+    payload.extend(data_words)
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_WRITE_REQ, 0, trans_id, payload)
+
+
+# ---- Per-CPU session state ----------------------------------------------
+
+@dataclass
+class Session:
+    """All hostfsd state tied to one subscriber (typically one CPU)."""
+    reply_ref: int
+    open_files: Dict[int, "OpenFile"] = field(default_factory=dict)
+    next_fd: int = 0
+
+
+@dataclass
+class OpenFile:
+    fd: int
+    host_fd: int
+    flags: int
+    path: str           # for diagnostics
+
+
+@dataclass
+class PendingRequest:
+    """An OPEN/READ/WRITE that's waiting on data from the CPU.
+
+    For OPEN: blocked on OBJ_READ_RESP for the path bytes.
+    For READ: the host-side read has happened; we're blocked on
+              OBJ_WRITE_RESP confirming the bytes landed in the
+              CPU's buffer.
+    For WRITE: blocked on OBJ_READ_RESP for the source bytes.
+    """
+    op: int
+    session: Session
+    fd: Optional[int] = None        # filled in for non-OPEN
+    flags: Optional[int] = None     # OPEN
+    bytes_remaining: int = 0        # how many more we expect to come
+    bytes_received: bytearray = field(default_factory=bytearray)
+    target_ref: int = 0             # for READ: the buffer to write to
+    target_offset: int = 0          # for READ: where in target_ref
+
+
+# ---- The server ----------------------------------------------------------
+
+class HostFSD:
+    def __init__(self, sock_path: str, my_pid: int,
+                 root: Optional[Path] = None, verbose: bool = False):
+        self.my_pid = my_pid
+        self.root = root.resolve() if root else None
+        self.verbose = verbose
+        self.next_trans_id = 0
+
+        # subscriber_ref → Session
+        self.sessions: Dict[int, Session] = {}
+        # outbound trans_id → PendingRequest
+        self.pending: Dict[int, PendingRequest] = {}
+
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.connect(sock_path)
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            raise SystemExit(f"hostfsd: connect to {sock_path}: {e}")
+        self.sock.sendall(struct.pack(">II", HELLO_MAGIC, my_pid))
+        reply = self._recv_exact(8)
+        magic, status = struct.unpack(">II", reply)
+        if magic != HELLO_MAGIC or status != HELLO_OK:
+            raise SystemExit(f"hostfsd: handshake failed "
+                             f"(magic={magic:#x}, status={status:#x})")
+        self.sock.setblocking(False)
+        self.recv_buf = bytearray()
+        self.shutdown_requested = False
+
+        self._log(f"online · pid={my_pid} · service idx={FS_SERVICE_INDEX}"
+                  + (f" · jailed to {self.root}" if self.root else " · UNJAILED"))
+
+    # ---- network ----------------------------------------------------------
+
+    def _recv_exact(self, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise SystemExit("hostfsd: crossbar closed during handshake")
+            out.extend(chunk)
+        return bytes(out)
+
+    def send_packet(self, packet: bytes) -> None:
+        try:
+            self.sock.sendall(struct.pack(">I", len(packet)) + packet)
+        except OSError as e:
+            self._log(f"send failed: {e}")
+            self.shutdown_requested = True
+
+    def _next_trans(self) -> int:
+        t = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        return t
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"hostfsd: {msg}", file=sys.stderr, flush=True)
+
+    # ---- main loop --------------------------------------------------------
+
+    def run(self) -> None:
+        print(f"hostfsd READY pid={self.my_pid}", flush=True)
+        sel = selectors.DefaultSelector()
+        sel.register(self.sock, selectors.EVENT_READ)
+        try:
+            while not self.shutdown_requested:
+                events = sel.select(timeout=0.25)
+                if not events:
+                    continue
+                if not self._drain():
+                    self._log("crossbar closed")
+                    break
+                while True:
+                    pkt = self._take_packet()
+                    if pkt is None:
+                        break
+                    self._handle_packet(pkt)
+        finally:
+            sel.close()
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    def _drain(self) -> bool:
+        try:
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    return False
+                self.recv_buf.extend(chunk)
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError as e:
+            if e.errno in (errno.ECONNRESET, errno.EPIPE):
+                return False
+            raise
+
+    def _take_packet(self) -> Optional[bytes]:
+        if len(self.recv_buf) < 4:
+            return None
+        (length,) = struct.unpack(">I", bytes(self.recv_buf[:4]))
+        if len(self.recv_buf) < 4 + length:
+            return None
+        pkt = bytes(self.recv_buf[4:4 + length])
+        del self.recv_buf[:4 + length]
+        return pkt
+
+    def _handle_packet(self, raw: bytes) -> None:
+        try:
+            pkt = unpack_packet(raw)
+        except ValueError as e:
+            self._log(f"malformed packet: {e}")
+            return
+        t = pkt["type"]
+        if t == PKT_SEND_DELIVER:
+            self._handle_send(pkt)
+        elif t == PKT_OBJ_READ_RESP:
+            self._handle_read_resp(pkt)
+        elif t == PKT_OBJ_WRITE_RESP:
+            self._handle_write_resp(pkt)
+        else:
+            self._log(f"unhandled packet type 0x{t:02x} from "
+                      f"pid={pkt['src_pid']}")
+
+    # ---- request dispatch -------------------------------------------------
+
+    def _handle_send(self, pkt) -> None:
+        try:
+            recipient_ref, int_payload, or_payload = parse_send_deliver(pkt)
+        except ValueError as e:
+            self._log(f"bad SEND_DELIVER: {e}")
+            return
+        if ref_index(recipient_ref) != FS_SERVICE_INDEX:
+            self._log(f"SEND to unknown obj idx={ref_index(recipient_ref)}")
+            return
+        op = int_payload[0]
+        # Find the session this request belongs to. For SUBSCRIBE we
+        # create one; for everything else we look it up by sender pid.
+        # That's a little loose (a CPU could subscribe under one pid
+        # and call from another), but in practice each simorisc process
+        # has one pid, so it works fine for v1.
+        sender_pid = pkt["src_pid"]
+        if op == OP_SUBSCRIBE:
+            self._do_subscribe(sender_pid, or_payload)
+            return
+        sess = self._session_for_sender(sender_pid)
+        if sess is None:
+            self._log(f"op {op} from pid={sender_pid} with no subscription; "
+                      f"dropping")
+            return
+        if op == OP_OPEN:
+            self._do_open(sess, int_payload, or_payload)
+        elif op == OP_CLOSE:
+            self._do_close(sess, int_payload)
+        elif op == OP_READ:
+            self._do_read(sess, int_payload, or_payload)
+        elif op == OP_WRITE:
+            self._do_write(sess, int_payload, or_payload)
+        else:
+            self._log(f"unknown op {op} from pid={sender_pid}")
+            self._reply(sess, E_INVAL, 0)
+
+    def _session_for_sender(self, sender_pid: int) -> Optional[Session]:
+        # Pick the session whose reply_ref's home matches the sender.
+        for sub_ref, sess in self.sessions.items():
+            if ref_home(sub_ref) == sender_pid:
+                return sess
+        return None
+
+    def _do_subscribe(self, sender_pid: int, or_payload) -> None:
+        sub_ref = or_payload[1]    # sender's O2 → wire slot 1
+        if sub_ref == 0:
+            # Null O2 = unsubscribe
+            removed = [r for r in self.sessions if ref_home(r) == sender_pid]
+            for r in removed:
+                sess = self.sessions.pop(r)
+                for of in sess.open_files.values():
+                    try: os.close(of.host_fd)
+                    except OSError: pass
+            self._log(f"unsubscribed pid={sender_pid} ({len(removed)} sess)")
+            return
+        # New session
+        sess = Session(reply_ref=sub_ref)
+        self.sessions[sub_ref] = sess
+        self._log(f"subscribed pid={sender_pid}, "
+                  f"reply_ref=0x{sub_ref:016x}")
+
+    # ---- OPEN -------------------------------------------------------------
+
+    def _do_open(self, sess: Session, int_payload, or_payload) -> None:
+        path_ref = or_payload[1]
+        path_off = int_payload[1]
+        path_len = int_payload[2]
+        flags    = int_payload[3]
+        if path_ref == 0 or path_len == 0:
+            return self._reply(sess, E_INVAL, 0)
+        if path_len > 4096:
+            return self._reply(sess, E_INVAL, 0)
+        if len(sess.open_files) >= MAX_FDS_PER_CPU:
+            return self._reply(sess, E_NOMEM, 0)
+        # Issue OBJ_READ_REQ to fetch the path bytes from the CPU.
+        trans = self._next_trans()
+        self.pending[trans] = PendingRequest(
+            op=OP_OPEN, session=sess, flags=flags,
+            bytes_remaining=path_len)
+        req = build_obj_read_req(self.my_pid, ref_home(path_ref), trans,
+                                 path_ref, path_off, path_len)
+        self.send_packet(req)
+
+    def _open_file(self, sess: Session, path_bytes: bytes, flags: int) -> None:
+        # Decode path; resolve against jail if any.
+        try:
+            path_str = path_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            return self._reply(sess, E_INVAL, 0)
+        path_obj = self._resolve_path(path_str)
+        if path_obj is None:
+            return self._reply(sess, E_ACCES, 0)
+        # Build os.open() flags.
+        rw_bits = flags & 3
+        if rw_bits == 0:        os_flags = os.O_RDONLY
+        elif rw_bits == 1:      os_flags = os.O_WRONLY
+        elif rw_bits == 2:      os_flags = os.O_RDWR
+        else:                   return self._reply(sess, E_INVAL, 0)
+        if flags & 4:           os_flags |= os.O_CREAT
+        if flags & 8:           os_flags |= os.O_TRUNC
+        try:
+            host_fd = os.open(str(path_obj), os_flags, 0o644)
+        except FileNotFoundError:
+            return self._reply(sess, E_NOENT, 0)
+        except PermissionError:
+            return self._reply(sess, E_ACCES, 0)
+        except OSError as e:
+            self._log(f"open({path_str!r}) failed: {e}")
+            return self._reply(sess, E_IO, 0)
+        try:
+            length = os.fstat(host_fd).st_size
+        except OSError:
+            length = 0
+        # Allocate a session-local fd.
+        fd = sess.next_fd
+        sess.next_fd += 1
+        sess.open_files[fd] = OpenFile(
+            fd=fd, host_fd=host_fd, flags=flags, path=path_str)
+        self._log(f"open fd={fd} → {path_str!r} (flags=0x{flags:x}, "
+                  f"size={length})")
+        self._reply(sess, fd, length)
+
+    def _resolve_path(self, path_str: str) -> Optional[Path]:
+        if self.root is None:
+            return Path(path_str)
+        # Resolve relative to root, reject any escape.
+        candidate = (self.root / path_str.lstrip('/')).resolve()
+        try:
+            candidate.relative_to(self.root)
+        except ValueError:
+            self._log(f"jail violation: {path_str!r} resolves outside "
+                      f"{self.root}")
+            return None
+        return candidate
+
+    # ---- CLOSE ------------------------------------------------------------
+
+    def _do_close(self, sess: Session, int_payload) -> None:
+        fd = int_payload[1]
+        of = sess.open_files.pop(fd, None)
+        if of is None:
+            return self._reply(sess, E_BADF, 0)
+        try:
+            os.close(of.host_fd)
+            status = 0
+        except OSError as e:
+            self._log(f"close(fd={fd}) failed: {e}")
+            status = E_IO
+        self._log(f"close fd={fd} → {of.path!r} (status={status})")
+        self._reply(sess, status, 0)
+
+    # ---- READ -------------------------------------------------------------
+
+    def _do_read(self, sess: Session, int_payload, or_payload) -> None:
+        dst_ref = or_payload[1]
+        fd      = int_payload[1]
+        dst_off = int_payload[2]
+        count   = int_payload[3]
+        of = sess.open_files.get(fd)
+        if of is None:
+            return self._reply(sess, E_BADF, 0)
+        if dst_ref == 0 or count == 0:
+            return self._reply(sess, E_INVAL, 0)
+        if (ref_caps(dst_ref) & CAP_W) == 0:
+            return self._reply(sess, E_ACCES, 0)
+        try:
+            data = os.read(of.host_fd, count)
+        except OSError as e:
+            self._log(f"read(fd={fd}, count={count}) failed: {e}")
+            return self._reply(sess, E_IO, 0)
+        if len(data) == 0:
+            # EOF; no need to OBJ_WRITE, just respond.
+            return self._reply(sess, 0, 0)
+        # Issue OBJ_WRITE_REQ to land bytes in the CPU's buffer.
+        trans = self._next_trans()
+        self.pending[trans] = PendingRequest(
+            op=OP_READ, session=sess, fd=fd,
+            bytes_remaining=len(data))
+        req = build_obj_write_req(self.my_pid, ref_home(dst_ref), trans,
+                                  dst_ref, dst_off, len(data), data)
+        self.send_packet(req)
+
+    # ---- WRITE ------------------------------------------------------------
+
+    def _do_write(self, sess: Session, int_payload, or_payload) -> None:
+        src_ref = or_payload[1]
+        fd      = int_payload[1]
+        src_off = int_payload[2]
+        count   = int_payload[3]
+        of = sess.open_files.get(fd)
+        if of is None:
+            return self._reply(sess, E_BADF, 0)
+        if src_ref == 0 or count == 0:
+            return self._reply(sess, E_INVAL, 0)
+        # Issue OBJ_READ_REQ to fetch source bytes from the CPU.
+        trans = self._next_trans()
+        self.pending[trans] = PendingRequest(
+            op=OP_WRITE, session=sess, fd=fd,
+            bytes_remaining=count)
+        req = build_obj_read_req(self.my_pid, ref_home(src_ref), trans,
+                                 src_ref, src_off, count)
+        self.send_packet(req)
+
+    # ---- response handlers ------------------------------------------------
+
+    def _handle_read_resp(self, pkt) -> None:
+        trans = pkt["trans_id"]
+        pr = self.pending.pop(trans, None)
+        if pr is None:
+            self._log(f"unexpected OBJ_READ_RESP trans={trans}")
+            return
+        flags = pkt["flags"] & 0x3F
+        if flags != 0:
+            self._reply(pr.session, E_IO, 0)
+            return
+        words = pkt["payload"]
+        raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in words)
+        data = raw[:pr.bytes_remaining]
+        if pr.op == OP_OPEN:
+            self._open_file(pr.session, data, pr.flags)
+        elif pr.op == OP_WRITE:
+            of = pr.session.open_files.get(pr.fd)
+            if of is None:
+                return self._reply(pr.session, E_BADF, 0)
+            try:
+                n = os.write(of.host_fd, data)
+            except OSError as e:
+                self._log(f"write(fd={pr.fd}, count={len(data)}) failed: {e}")
+                return self._reply(pr.session, E_IO, 0)
+            self._reply(pr.session, n, 0)
+
+    def _handle_write_resp(self, pkt) -> None:
+        trans = pkt["trans_id"]
+        pr = self.pending.pop(trans, None)
+        if pr is None:
+            self._log(f"unexpected OBJ_WRITE_RESP trans={trans}")
+            return
+        flags = pkt["flags"] & 0x3F
+        if pr.op == OP_READ:
+            if flags != 0:
+                self._reply(pr.session, E_IO, 0)
+            else:
+                self._reply(pr.session, pr.bytes_remaining, 0)
+
+    # ---- response back to the CPU ----------------------------------------
+
+    def _reply(self, sess: Session, primary: int, secondary: int) -> None:
+        # Pack negative ints as their two's-complement 32-bit form.
+        primary &= 0xFFFFFFFF
+        secondary &= 0xFFFFFFFF
+        trans = self._next_trans()
+        pkt = build_send_deliver(
+            src_pid=self.my_pid,
+            dst_pid=ref_home(sess.reply_ref),
+            trans_id=trans,
+            recipient_ref=sess.reply_ref,
+            int_payload=[primary, secondary, 0, 0],
+            or_payload=[sess.reply_ref, 0, 0, 0],
+        )
+        self.send_packet(pkt)
+
+
+# ---- CLI ----------------------------------------------------------------
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="hostfsd",
+        description="Object RISC host filesystem server")
+    ap.add_argument("--socket", required=True,
+                    help="path to oriscbar's UNIX domain socket")
+    ap.add_argument("--pid", type=int, required=True,
+                    help="processor identifier this server presents to "
+                         "the crossbar")
+    ap.add_argument("--root", type=Path, default=None,
+                    help="restrict file access to this directory "
+                         "(default: full host filesystem access)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.root and not args.root.is_dir():
+        sys.exit(f"hostfsd: --root {args.root}: not a directory")
+
+    server = HostFSD(args.socket, args.pid, root=args.root,
+                     verbose=args.verbose)
+
+    def _signal(_signo, _frame):
+        server.shutdown_requested = True
+    signal.signal(signal.SIGINT,  _signal)
+    signal.signal(signal.SIGTERM, _signal)
+
+    server.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -398,6 +398,84 @@ of every helper that polls or SENDs. See
 for the canonical pattern (each helper calls `restore_or_state()`
 on its way out, so the loop body never has to think about it).
 
+## hostfsd
+
+A Python-side host-filesystem server. Lets CPU-side C programs
+read and write the host's actual files via a small set of file
+ops dispatched as SENDs. The first piece of "OS-shaped" plumbing
+in the project — a long way from a real syscall layer, but
+enough to start writing programs that need to read configuration
+or persist state.
+
+Usage:
+
+    tools/devices/hostfsd --socket /tmp/oriscbar.sock --pid 17
+    tools/devices/hostfsd --socket /tmp/oriscbar.sock --pid 17 \
+                          --root /var/lib/orisc-fixtures
+
+`--root DIR` jails the service: paths are resolved relative to
+`DIR`, and any path that resolves outside (via `..` or absolute
+escapes) is rejected with `EACCES`. Without `--root` the service
+is unjailed and reads/writes anywhere the launching user has
+permission. The latter is fine for single-user development; the
+former is right for any shared environment.
+
+### Wire protocol
+
+A single service object at index `1`. CPUs SEND requests to it;
+all responses come back as SENDs to a per-CPU reply ref established
+by an explicit subscribe call. The dispatch by op code (R4):
+
+| `R4` | Op            | Request body                                          | Response (R3 / R4)               |
+|------|---------------|-------------------------------------------------------|----------------------------------|
+| `4`  | `SUBSCRIBE`   | O2 = subscriber's reply ref                           | (no response — establishes session) |
+| `0`  | `OPEN`        | O2 = path buf, R5 = path off, R6 = path len, R7 = flags | R3 = fd or `-errno`; R4 = file size |
+| `1`  | `CLOSE`       | R5 = fd                                               | R3 = 0 or `-errno`               |
+| `2`  | `READ`        | O2 = dst buf (W cap), R5 = fd, R6 = dst off, R7 = count | R3 = bytes read or `-errno`      |
+| `3`  | `WRITE`       | O2 = src buf, R5 = fd, R6 = src off, R7 = count       | R3 = bytes written or `-errno`   |
+
+Flags for `OPEN`:
+
+| Bit    | Meaning            |
+|--------|--------------------|
+| `0x01` | Read               |
+| `0x02` | Write              |
+| `0x04` | Create if missing  |
+| `0x08` | Truncate on open   |
+
+`READ` is implemented as: hostfsd reads from the host file, then
+issues an `OBJ_WRITE_REQ` to land the bytes in the CPU's buffer.
+This means the buffer ref handed to hostfsd needs `W` cap — which
+the boot stack ref has, but the boot data ref doesn't. Callers
+must use stack-allocated buffers for `hf_read`. (`WRITE` is the
+reverse: hostfsd `OBJ_READ_REQ`s the source, then writes to the
+host file. Source bufs can live anywhere with `R` cap.)
+
+### Errors (negative `R3`)
+
+| Code | Name      | Meaning                                                   |
+|------|-----------|-----------------------------------------------------------|
+| `-1` | `EBADF`   | bad fd, or no subscription                                |
+| `-2` | `EINVAL`  | bad arguments / unknown op / oversized path               |
+| `-3` | `ENOENT`  | file does not exist                                       |
+| `-4` | `EACCES`  | permission denied, or path escapes `--root` jail          |
+| `-5` | `EIO`     | host I/O error                                            |
+| `-6` | `ENOMEM`  | per-CPU fd table full (limit 64)                          |
+
+### C library
+
+[`tools/cc/lib/host_io.c`](../cc/lib/host_io.c) wraps the protocol
+in the obvious shape — `hf_init`, `hf_open`, `hf_close`, `hf_read`,
+`hf_write`. Programs need to follow the OR-hygiene contract
+documented at the top of that file: park the boot O2 (stack), O3
+(data), and O4 (self-svc) in O11/O15/O14 once at startup, and
+hostfsd's service ref needs to be in O10 at boot (the runner's
+job, via `--service`). See
+[`examples/cc/host_cat.c`](../../examples/cc/host_cat.c) for
+the canonical use, and
+[`examples/cc/run_host_cat.sh`](../../examples/cc/run_host_cat.sh)
+for the launcher wiring.
+
 ## linkbootd
 
 A Python-side link-boot server. Connects to the crossbar like any
