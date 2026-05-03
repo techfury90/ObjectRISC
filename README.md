@@ -104,9 +104,9 @@ computes its own range, and prints each worker's count and elapsed
 cycles as the reply arrives:
 
 ```sh
-examples/run_parallel_primes                  # defaults: N=2000, w=3
-examples/run_parallel_primes -N 5000 -w 5
-examples/run_parallel_primes -N 10000 -w 8
+examples/run_parallel_primes.sh               # defaults: N=2000, w=3
+examples/run_parallel_primes.sh -N 5000 -w 5
+examples/run_parallel_primes.sh -N 10000 -w 8
 
 # Parallel pi(10000) across 9 CPUs:
 # CPU 0: 186 primes in 41270 cycles
