@@ -778,6 +778,20 @@ struct optab table[] = {
 
 { UMUL,    DF(UMUL),    },
 { ASSIGN,  DF(ASSIGN),  },
+
+/* Struct assignment — `*dst = *src;` for an aggregate. Lowered to
+ * a memcpy call. Modeled on the MIPS64 STASG entry: dest is a
+ * memory operand (OREG = base+offset) or named global (SNAME);
+ * source is a pointer in a GPR. NSPECIAL pins R4/R5/R6 to the
+ * memcpy ABI and zzzcode 'Q' (local2.c::stasg) emits the call. */
+{ STASG, INAREG|FOREFF,
+        SOREG|SNAME,	TANY,
+        SAREG,		TPTRTO|TANY,
+                NSPECIAL,	RDEST,
+                "ZQ", },
+
+/* Fallback rewrite if the above doesn't match — keeps the matcher
+ * happy for funny shapes (mostly defensive). */
 { STASG,   DF(STASG),   },
 { FLD,     DF(FLD),     },
 { OPLEAF,  DF(NAME),    },

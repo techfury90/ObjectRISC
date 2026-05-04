@@ -272,18 +272,35 @@ extdec(struct symtab *q)
  * Define a zero-initialized variable. Asmorisc has no .comm or .lcomm
  * directive — we lower BSS-style variables to a `.skip N` in the
  * data section after a label.
+ *
+ * Emit a leading `.align` based on the symbol's type alignment.
+ * pcc's uninitialized-global path (pftn.c::nidcl2) doesn't go
+ * through locctr — it calls defzero directly without first calling
+ * defalign — so two consecutive globals of mismatched alignment
+ * (e.g. `char Ch_Glob;` followed by `int Arr_Glob[50];`) would
+ * leave the int array on an odd offset and word loads would trap.
+ * Initialized globals get their alignment from the locctr → defalign
+ * path inside init.c.
  */
 void
 defzero(struct symtab *sp)
 {
 	int off;
 	char *name;
+	int al, bytes, k;
 
 	name = getexname(sp);
 	off = tsize(sp->stype, sp->sdf, sp->sap);
 	off = (off + SZCHAR - 1) / SZCHAR;
 
 	printf("\t.data\n");
+	al = talign(sp->stype, sp->sap);   /* in bits */
+	if (al > SZCHAR) {
+		bytes = al / SZCHAR;
+		k = ispow2(bytes);
+		if (k > 0)
+			printf("\t.align %d\n", k);
+	}
 	if (sp->slevel == 0)
 		printf("%s:\n", name);
 	else

@@ -13,13 +13,10 @@
  *   - register keyword dropped — pcc's orisc backend doesn't
  *     gain anything from it given the current allocator state,
  *     and removing it keeps the source uniform.
- *   - struct assignments (`*Ptr_Val_Par->Ptr_Comp = *Ptr_Glob;`)
- *     replaced with explicit memcpy — pcc's orisc backend doesn't
- *     yet generate code for STASG. The cycle cost is similar
- *     (memcpy is in liborisc, called via the standard ABI; the
- *     unrolled struct copy would have been inline) but not
- *     identical. Flagged here so a purist can re-port once the
- *     backend grows STASG.
+ *   (Earlier ports of this file substituted memcpy for struct
+ *   assignments and reordered globals to dodge a missing-.align
+ *   bug — both have been fixed in the pcc orisc backend, so the
+ *   source here matches the canonical Dhrystone shape.)
  *
  * Algorithm and instruction mix are unchanged. The result lines
  * report:
@@ -82,20 +79,13 @@ typedef struct record {
  * Ptr_Glob / Next_Ptr_Glob at them at startup. Same memory shape,
  * same access patterns. */
 
-/* Order matters: pcc's orisc backend doesn't currently emit
- * .align directives between globals of different alignment
- * requirements, so int arrays placed after char globals would
- * land on odd byte offsets and word loads would trap with
- * "address-misaligned-d". Putting all int-aligned globals first
- * sidesteps that — the trailing chars get whatever stragglers'
- * misalignment is harmless (they're loaded as bytes anyway). */
 Rec_Type Rec_1, Rec_2;
 Rec_Pointer Ptr_Glob, Next_Ptr_Glob;
 int         Int_Glob;
 Boolean     Bool_Glob;
+char        Ch_1_Glob, Ch_2_Glob;
 int         Arr_1_Glob[50];
 int         Arr_2_Glob[50][50];
-char        Ch_1_Glob, Ch_2_Glob;
 
 /* --- forward decls --------------------------------------------- */
 
@@ -139,7 +129,7 @@ Proc_1 (Rec_Pointer Ptr_Val_Par)
 {
 	Rec_Pointer Next_Record = Ptr_Val_Par->Ptr_Comp;
 
-	memcpy (Ptr_Val_Par->Ptr_Comp, Ptr_Glob, sizeof (Rec_Type));
+	*Ptr_Val_Par->Ptr_Comp = *Ptr_Glob;
 	Ptr_Val_Par->variant.var_1.Int_Comp = 5;
 	Next_Record->variant.var_1.Int_Comp =
 		Ptr_Val_Par->variant.var_1.Int_Comp;
@@ -153,7 +143,7 @@ Proc_1 (Rec_Pointer Ptr_Val_Par)
 		Proc_7 (Next_Record->variant.var_1.Int_Comp, 10,
 		        &Next_Record->variant.var_1.Int_Comp);
 	} else {
-		memcpy (Ptr_Val_Par, Ptr_Val_Par->Ptr_Comp, sizeof (Rec_Type));
+		*Ptr_Val_Par = *Ptr_Val_Par->Ptr_Comp;
 	}
 }
 

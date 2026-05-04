@@ -245,10 +245,48 @@ starg(NODE *p)
 	comperr("starg not implemented for orisc");
 }
 
+/*
+ * Struct assignment — `*dst = *src;` for a struct, where both sides
+ * may be lvalues or pointer-derefs. Modeled on the MIPS64 backend
+ * (tools/cc/arch/mips64/local2.c::stasg): pcc's rewriter drops the
+ * source pointer into R5 (= A1) before reaching us, leaving us to
+ *
+ *   1. set R6 (= A2) to the byte size,
+ *   2. compute the dest address into R4 (= A0) — either base+offset
+ *      from a register (OREG) or the address of a named global (NAME),
+ *   3. reserve the standard 16-byte outgoing-arg spill area,
+ *   4. JAL memcpy + nop delay slot,
+ *   5. unwind the spill area.
+ *
+ * The struct size is stashed in the node's ATTR_P2STRUCT attribute
+ * by the framework. Caller-saved scratch registers and the source
+ * pointer are spilled / preserved by pcc's standard call-clobber
+ * machinery — we just emit the call.
+ */
 void
 stasg(NODE *p)
 {
-	comperr("stasg not implemented for orisc");
+	int sz = attr_find(p->n_ap, ATTR_P2STRUCT)->iarg(0);
+
+	assert(p->n_right->n_rval == R5);
+
+	printf("\tli r6, %d\t; struct size\n", sz);
+
+	if (p->n_left->n_op == OREG) {
+		printf("\taddiu r4, %s, " CONFMT "\t; dest addr\n",
+		    rnames[p->n_left->n_rval], getlval(p->n_left));
+	} else if (p->n_left->n_op == NAME) {
+		printf("\tla r4, ");
+		adrput(stdout, p->n_left);
+		printf("\n");
+	} else {
+		comperr("stasg: unhandled n_left op %d", p->n_left->n_op);
+	}
+
+	printf("\taddiu sp, sp, -16\n");
+	printf("\tjal %s\t; struct copy via memcpy\n", exname("memcpy"));
+	printf("\tnop\n");
+	printf("\taddiu sp, sp, 16\n");
 }
 
 int
@@ -278,6 +316,14 @@ zzzcode(NODE *p, int c)
 		 * amount. */
 		sz = p->n_qual > 16 ? p->n_qual : 16;
 		printf("\taddiu sp, sp, %d\n", sz);
+		break;
+	case 'Q':
+		/* Struct assignment — emit a memcpy call. The matched
+		 * STASG node has the source pointer in R5 (forced by the
+		 * NSPECIAL entry in order.c::nspecial), the dest is in
+		 * p->n_left (OREG or NAME), and the byte size is in the
+		 * ATTR_P2STRUCT attribute. local2.c::stasg does the rest. */
+		stasg(p);
 		break;
 	default:
 		comperr("zzzcode '%c' not implemented for orisc", c);

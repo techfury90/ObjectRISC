@@ -90,6 +90,23 @@ setuni(NODE *p, int cookie)
 struct rspecial *
 nspecial(struct optab *q)
 {
+	switch (q->op) {
+	case STASG: {
+		/* Struct assignment lowers to a memcpy call:
+		 *   R4 = dest (we set it in stasg())
+		 *   R5 = src  (pcc loads it here per NRIGHT)
+		 *   R6 = size (we set it in stasg())
+		 * NEVER means the allocator must not put any unrelated
+		 * value in that register across this op. */
+		static struct rspecial s[] = {
+			{ NEVER,  R4 },
+			{ NRIGHT, R5 },
+			{ NEVER,  R6 },
+			{ 0 }
+		};
+		return s;
+	}
+	}
 	comperr("unknown nspecial %d: %s", q - table, q->cstring);
 	return 0;
 }
