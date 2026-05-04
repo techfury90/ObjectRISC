@@ -171,12 +171,15 @@ examples/cc/run_host_cat.sh    # cat README.md from inside an emulated CPU
 ```
 
 The MVP shell — `help` / `cat` / `more` / `ls` / `cd` / `pwd` /
-`echo` / `run` / `cycles` / `exit`, with a build-date banner
-shifted back 40 years. Paths resolve against the shell's own cwd;
+`echo` / `run` / `cycles` / `time` / `exit`, with a build-date
+banner shifted back 40 years, command history (up/down arrow
+recall), backspace with visual undo, and a `--More--` paginator
+on `more` and `help`. Paths resolve against the shell's own cwd;
 the prompt mirrors it (`/sub>`). The `run` command spawns another
 `.orx` onto a pool of four spare CPUs (each running a chunked-boot
 loader) via the `linkbootd` server; the spare CPU is reset on the
-guest's TaskExit and re-announces, so the slot is reusable:
+guest's TaskExit and re-announces, so the slot is reusable. The
+`[exited N]` line surfaces the guest's actual exit code.
 
 ```sh
 examples/cc/run_shell.sh       # opens a Tk terminal on the shell
@@ -188,6 +191,18 @@ examples/cc/run_shell.sh       # opens a Tk terminal on the shell
 # hello from guest
 # [exited 0]
 # /> exit
+```
+
+Dhrystone v2.1 — the canonical 1984 benchmark, ported to the
+Object RISC C runtime. Reports cycle count + dhry/s + DMIPS at
+the OR-1000's nominal 16/20 MHz clock rates from Vol I §3
+(VAX 11/780 = 1.0 DMIPS reference):
+
+```sh
+examples/cc/dhrystone/run.sh
+# Cycles per iteration: 4067
+# 16 MHz: ~3936 dhry/s   = ~2.2 DMIPS
+# 20 MHz: ~4920 dhry/s   = ~2.7 DMIPS
 ```
 
 The `hello_or.c` and `print_or.c` variants use the `__or`

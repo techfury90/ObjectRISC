@@ -1804,6 +1804,251 @@ plus "saw a stanza ≥090" — same test of "stream ran end-to-end",
 but doesn't flake on simulator load. The right fix (double-buffering
 or a synchronous flush) is flagged in the test comment.
 
+## Phase 22 — Tightening the libc, finishing the shell
+
+A run of "the shell exists; now make it not annoying" — every
+loose end the previous phase had marked as future work, knocked
+out one at a time.
+
+### Visual backspace
+
+The Tk text widget had been append-only: typing "exi" + BACKSPACE +
+"it" would commit "exit" to the line buffer (correct) but leave
+the rendered text reading "exiit". oriscterm's `_append` now
+interprets a 0x08 byte as "delete the character immediately
+before it"; the shell's `read_line` echoes a literal `\b` when
+the buffer was non-empty. Stack: standard terminal-style
+semantics, no cursor-positioning escape grammar required, no-op
+when nothing's there to erase. fake_terminal got matching `\b`
+handling so test transcripts stay readable.
+
+### Per-service receive queue for hostfsd
+
+`hf_init` had been attaching its queue to O4 — the boot
+self-svc — alongside `term_init`'s keyboard queue on the same
+descriptor. A long `cat` then raced: a keystroke could land
+between `hf_read` and the blocking poll, and the shell would
+dequeue the keystroke as if it were a hostfsd reply, mis-decoding
+R3 as the read count. Dhrystone numbers go very strange when
+that happens. `hf_init` now ObjAllocs its own 16-byte mailbox,
+attaches a depth-16 queue, derives an R+S sub-ref to subscribe
+with, and parks the full ref in O8. All `hf_*` polls hit O8;
+keyboard events stay on O4. Same shape as `lb_init`'s mailbox
+in linkboot.c.
+
+### `term_print_n_sync` — closing the SEND/READ race
+
+`cmd_cat` had been double-buffering its READ_BUF (fill buf_a,
+SEND, fill buf_b, SEND, alternating) to give the receiver a
+window before the next `hf_read` overwrote things. That cut the
+race down but didn't kill it. The proper fix used oriscterm's
+existing reply_cap protocol: `term_print_n_sync(buf, count)`
+sends a console SEND with `O3` set to a reply mailbox, then
+blocks until the receiver acks. After the call the bytes have
+been pulled — safe to reuse the source. The reply mailbox
+reuses O8 (the hf one), since `cmd_cat` strictly alternates
+hf_read with term_print_n_sync, so the queue holds at most one
+outstanding message at any moment. fake_terminal grew matching
+ack support; oriscterm already had the reply_cap path.
+
+The largecat assertion went from "≥50 stanzas + saw a stanza in
+the 90s" to "exactly 100 stanzas." Five runs in a row report
+100/100.
+
+### Real exit codes from spawned guests
+
+The `[exited N]` line that `cmd_run` prints had been hardcoded
+to 0. The chain was: guest TaskExit(N) → simorisc captured
+`cpu.exit_code` → `reset_cpu` wiped it before the loader's fresh
+announce reached linkbootd. Now: simorisc preserves the previous
+exit code across reset by priming R6 with it just after re-init.
+chunkboot.s reads R6 at boot, saves it across the chunk loop,
+and forwards it in the announce SEND's int payload slot 2.
+linkbootd parses int_payload[2] on the post-reset "ready"
+announce and uses it as the exit code in the spawn-result
+message. `cmd_run` prints `[exited N]` with the real `N` now.
+
+Headless test: a 4-instruction guest that returns 42, run from
+the shell, asserts the rendered output contains `[exited 42`.
+
+### `cd` / `pwd` / `echo` / `cycles` / `time`
+
+All Phase 21's polish-tier shell commands landed in the same
+arc:
+
+- `cd <path>` / `pwd` — the shell maintains an absolute,
+  normalized cwd on main()'s stack (the data segment is mapped
+  R-only, so a global `cwd[]` would fault on the assignment in
+  `cmd_cd`). cat / ls / run prepend cwd to relative args and
+  collapse `.` / `..` components in place before sending the
+  resolved path over the wire. The prompt mirrors cwd
+  (`/sub>`).
+- `echo <text>` — one printf.
+- `cycles` and `time` — wrap the existing `ReadCycles` (#0x301)
+  and the newly-implemented `TimeNow` (#0x400) firmware
+  primitives. simorisc's `System` captures `boot_time =
+  time.time()` at construction; `TimeNow` returns microseconds
+  since that moment in the low 32 bits of R3 (the spec puts the
+  high 32 bits in the side-channel buffer of Vol VI §11, which
+  this firmware doesn't yet implement; the low 32 bits wrap at
+  ~71 minutes). `ClockResolution` (#0x410) returns 1_000_000.
+
+linkbootd's path resolution also got matched semantics — absolute
+paths from the shell are now treated as root-relative (same as
+hostfsd's jail) so `cat /foo` and `run /foo` mean the same
+file.
+
+### Shell command history
+
+A 16-entry circular buffer of past commands lives on main()'s
+stack alongside cwd / line / prompt (~4 KB extra). `read_line`
+saves each non-empty line on RET, and TK_UP / TK_DOWN cycle
+through history entries — UP walks back, DOWN walks forward
+toward the current empty line. The on-screen line is swapped
+via the `\b` backspace-erase mechanic the visual-undo fix
+introduced, then echoed character by character. Standard
+limitations to flag: arrow keys other than UP/DOWN are still
+ignored; typing-then-UP loses what you'd typed (bash-like, not
+zsh-like); no `!!` / Ctrl-R search yet; no persistence across
+shell exits.
+
+### Verbose opt-in for spawned devices
+
+oriscrun was hardcoding `-v` on every spawned device and
+oriscterm's `_append` unconditionally emitted a `RENDER:` line
+per console insert. Together those flooded the launcher's
+combined log when the shell did anything substantial. Now the
+`RENDER:` line is gated on `verbose`, and the `--terminal` /
+`--hostfsd` / `--linkbootd` specs grow an opt-in `verbose`
+field. Without it the device runs quiet; only its READY line and
+warnings/errors come out.
+
+### pcc orisc — all ORs caller-saved
+
+The pcc backend marked O9..O12 as `SCREG|PERMREG` to mirror Vol
+VII's "callee-preserved" convention, but pcc's spill machinery
+for CLASSC (OR) registers can only land an old value in
+*another* CLASSC slot — ORs can't live in integer memory. When
+user code did `register __or T p __asm__("o11"); p = boot_stack;`,
+pcc emitted a prologue that stashed the old O11 into O10,
+clobbering whatever ref the runner had placed there. The libc
+worked around it everywhere with raw inline asm. Real fix is
+OBJSTORE-backed OR spill via OREFLD/OREFST (Vol VII §2.4 specs
+this); for now PERMREG → TEMPREG so no spill is emitted. Spec
+deviation is documented in macdefs.h and the orisc backend TODO.
+
+### What's not yet done
+
+- **OBJSTORE-based OR spill in pcc.** The PERMREG → TEMPREG
+  change is a workaround. The real fix is teaching the backend
+  to spill ORs into an `ObjAllocStore`'d OR-typed object via
+  `OREFLD`/`OREFST`. Re-enables Vol VII's callee-preserved
+  promise.
+- **`Unmap` (0x111) / `Protect` (0x112)** spec'd, unimplemented.
+  Small closeout each.
+- **Side-channel mechanism (Vol VI §11)** — needed for `TimeNow`
+  high bits, `Stat`, `ObjQuery` overflow returns. Touches the
+  per-task control block.
+- **Capability passing in SEND.** Still wants a use case (piping
+  is the obvious one).
+- **Shell file mutation (mkdir / rm / mv / touch).** Each is one
+  hostfsd op + libc wrapper + shell command.
+- **Migrate kbd_echo / paint / mouse_paint onto term lib.** Still
+  inline asm.
+- **Shared Python device library.** oriscterm / linkbootd /
+  hostfsd / fake_terminal still duplicate wire-format helpers.
+
+## Phase 23 — Object RISC Dhrystone
+
+Once the shell felt usable end-to-end, the natural next question
+was "how would this thing have benchmarked." Dhrystone v2.1
+(Reinhold Weicker, 1984; Andrew C. Lowry's 1985 update) is the
+canonical 1984/1985 era yardstick — period-perfect for an
+alternate-history 1986 architecture.
+
+### What it took to get the source compiling
+
+Three toolchain pieces were needed before Dhrystone would build
+unmodified through the pipeline.
+
+**Writable .data.** Dhrystone leans on globals — `Int_Glob`,
+`Bool_Glob`, `Arr_1_Glob[50]`, `Arr_2_Glob[50][50]` — and our
+`.data` was mapped R-only. Same wall the shell's `cwd[]` had
+hit. Fix is split: the data REF stays R|C (per CONTRACT §3 — the
+OCAP and direct-OSB-through-O3 validation tests still see the
+historical caps), but the MAPPING is now R|W so VA-based stores
+to globals work. The intentional split between ref caps and
+mapping prot in OR makes this fully consistent.
+
+**`lw rd, LABEL[+OFFSET]` synthetic in asmorisc.** pcc emits
+`lw r2, counter` for direct-to-global access and
+`sw r4, Arr_2_Glob+1628` for array-with-constant-index. Both
+expanded to `lui $at, %hi(eff); ori $at, $at, %lo(eff); INST
+rd, 0($at)` — three words, but the lui-ori pair uses unsigned
+imm semantics so no HI16 sign-extension correction is needed on
+the linker side. `$at` is R1, reserved by the pcc backend's
+RSTATUS so the assembler's expansions never collide with caller
+state.
+
+**Reloc addends in the .oro / orld format.** The 2 bytes of
+historical reloc-record padding now hold a signed 16-bit addend;
+old .oro files have zeros there so the change is backward-
+compatible at the binary level. Used by the LABEL+OFFSET form
+above, also available to other patterns that want to bake a
+constant offset into a symbol-relative relocation.
+
+### What it took to get Dhrystone running
+
+Two further pcc backend gaps surfaced once compilation worked.
+
+**STASG (struct assignment).** Dhrystone has `*p = *q;` between
+struct values. local2.c::stasg used to comperr; now it lowers to
+a memcpy call modeled on the MIPS64 backend — table.c gets a
+real STASG entry pinning R4/R5/R6 to the memcpy ABI via NSPECIAL,
+order.c::nspecial returns the rspecial, local2.c::stasg sets
+R6=size and R4=dest then JAL memcpy with the standard 16-byte
+spill area, zzzcode 'Q' dispatches.
+
+**`.align` in defzero.** pcc's uninitialized-global path
+(pftn.c::nidcl2) calls defzero directly without first calling
+defalign. Two consecutive globals of mismatched alignment
+(`char Ch_Glob;` then `int Arr_Glob[50];`) would land the int
+array at an odd offset and word loads would trap. defzero now
+emits its own leading `.align K` based on the symbol's
+talign(). Initialized globals already got aligned via the
+locctr → defalign path inside init.c.
+
+### The benchmark itself
+
+[`examples/cc/dhrystone/dhry.c`](examples/cc/dhrystone/dhry.c)
+is a faithful port: algorithm and instruction mix unchanged,
+adapted only at the I/O boundaries (printf → print_str /
+print_int; malloc → two static `Rec_Type` instances; clock() /
+time() → `read_cycles` / `time_now_us`; hardcoded
+`DHRY_RUNS` instead of a scanf prompt).
+
+Result on the OR-1000's nominal 16/20 MHz clock rates from
+Vol I §3:
+
+```
+  Cycles per iteration: 4067
+  16 MHz: ~3936 dhry/s = ~2.2 DMIPS
+  20 MHz: ~4920 dhry/s = ~2.7 DMIPS
+```
+
+Plausible for a single-issue, naively-allocated 1986-class
+RISC. For period context: VAX 11/780 = 1.0 DMIPS, MIPS R2000
+(16.7 MHz) ≈ 8 DMIPS, SPARC v7 (16.7 MHz) ≈ 8, 80386
+(20 MHz) ≈ 6. Most of the gap to the canonical RISCs is the
+toolchain — pcc's orisc backend is a faithful port of the MIPS
+template but hasn't been tuned, so each Dhrystone iteration
+costs ~4000 cycles instead of the ~500-cycle figure the
+contemporaries reported. Register allocator improvements,
+peephole over the lw/sw-label 3-instruction expansion, and
+inline struct copy would close most of that gap. Dhrystone-as-
+shipped is the regression baseline to measure that work
+against.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
@@ -1859,12 +2104,25 @@ or a synchronous flush) is flagged in the test comment.
   loader, which re-announces to linkbootd as "ready for the next
   job".
 - An MVP shell that's actually pleasant to use: `cd` / `pwd` /
-  `echo` / `cycles` alongside `cat` / `more` / `ls` / `run` /
-  `help` / `exit`, paths normalized against a shell-side cwd, the
-  prompt mirroring the cwd, and a `more <path>` paginator with a
-  `--More-- (space/RET, q to quit)` prompt. The Tk terminal's text
-  pane is now 24×80 (was 10×60) so help and casual cat output fit
-  without scrolling off.
+  `echo` / `cycles` / `time` alongside `cat` / `more` / `ls` /
+  `run` / `help` / `exit`, paths normalized against a shell-side
+  cwd, the prompt mirroring the cwd, command history with up/down
+  arrow recall (16-entry circular buffer), visual undo on
+  backspace, and a `more <path>` paginator with a `--More--` /
+  q-to-quit prompt. The Tk terminal's text pane is 24×80 so help
+  and casual cat output fit without scrolling off; `cmd_run`
+  surfaces the guest's actual exit code in the `[exited N]`
+  line.
+- A `Dhrystone v2.1` port that runs end-to-end through pcc →
+  asmorisc → orld → simorisc, reporting cycle counts the
+  benchmark would have produced on actual silicon at the
+  OR-1000's claimed 16/20 MHz nominal rates. Current numbers:
+  ~4067 cycles/iter, 2.2 / 2.7 DMIPS, plausible for a single-
+  issue, naively-allocated 1986 RISC.
+- Wall-clock primitives: `TimeNow` (#0x400) and
+  `ClockResolution` (#0x410) implemented in firmware with μs
+  resolution; the spec's side-channel high bits are the only
+  remaining gap.
 
 The two open consequences from the initial commit are both closed:
 
