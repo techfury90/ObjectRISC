@@ -267,7 +267,10 @@ finalize:
     nop
     omov  o13, o1
 
-    ; If data exists, ObjDerive data → R|C (drop W).
+    ; If data exists, ObjDerive data → R|C (drop W from the ref
+    ; itself). Match init_cpu's contract: the data REF is R|C, but
+    ; InstallProgram's R|W mapping makes VA-based stores to globals
+    ; work just like for a freshly-init'd program. OCAP sees R|C.
     beq   r22, r0, install
     nop
     omov  o1, o14

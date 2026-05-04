@@ -216,7 +216,10 @@ typedef long long OFFSZ;
  */
 #define RSTATUS \
 	0,				/* R0 — hardwired zero */	\
-	SAREG|TEMPREG,			/* R1 — at */			\
+	0,				/* R1 — at: reserved for the */	\
+					/* assembler's lw/sw-with-label */\
+					/* synthetic and other pseudo-ops*/\
+					/* that need a clobberable temp */\
 	SAREG|TEMPREG, SAREG|TEMPREG,	/* R2..R3 — return values */	\
 	SAREG|TEMPREG, SAREG|TEMPREG,	/* R4..R5 — args */		\
 	SAREG|TEMPREG, SAREG|TEMPREG,	/* R6..R7 — args (R7 = PROCID) */ \

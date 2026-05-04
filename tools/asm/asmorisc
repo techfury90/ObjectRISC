@@ -943,16 +943,19 @@ def handle_directive(asm: Assembler, section: str, src: SourceLine,
             emit_data(asm, section, file, line, 1, b"\x00" * pad)
         return section
 
-    if n == ".skip":
+    if n in (".skip", ".space"):
+        # `.space N` is the GAS synonym for `.skip N` — both
+        # reserve N zero bytes. pcc emits `.space` for `char x[N]`
+        # without an initializer; we accept either.
         if not rest:
-            raise AsmError(".skip expects an integer", file, line, 1)
+            raise AsmError(f"{n} expects an integer", file, line, 1)
         expr = parse_expression(rest, file, line)
         if not expr_is_constant(expr):
-            raise AsmError(".skip argument must be constant (no symbols)",
+            raise AsmError(f"{n} argument must be constant (no symbols)",
                            file, line, expr.col)
         nbytes = eval_expr(_EMPTY_ASM, expr)
         if nbytes < 0:
-            raise AsmError(".skip: count must be non-negative",
+            raise AsmError(f"{n}: count must be non-negative",
                            file, line, expr.col)
         if nbytes:
             emit_data(asm, section, file, line, 1, b"\x00" * nbytes)
@@ -1074,6 +1077,35 @@ def handle_instruction(asm: Assembler, section: str, src: SourceLine,
                            file, line, lab_t.col)
         emit_la(asm, section, file, line, col, rd, lab_t.text)
         return
+
+    # MIPS-style synthetic for `lw rd, LABEL` / `sw rd, LABEL` etc.
+    # — load/store from a globally-visible address. Expanded to
+    # `lui $at, %hi(LABEL); inst rd, %lo(LABEL)($at)`, where $at
+    # is R1 (reserved for the assembler — see pcc backend's
+    # macdefs.h RSTATUS marking R1 unallocatable). Both halves get
+    # HI16/LO16 relocs so the linker can patch the final address.
+    if name in ("lw", "sw", "sb", "sh", "lh", "lb", "lbu", "lhu") \
+            and len(operands) == 2:
+        second = operands[1]
+        # Distinguish `lw r1, LABEL` (synthetic) from `lw r1, 4(r2)`
+        # (real instruction) — the real form has '(' in its
+        # operand. Bare-symbol second operand → synthetic.
+        if len(second) == 1 and second[0].kind == "sym" \
+                and second[0].text not in ("r0", "r1", "r2", "r3", "r4",
+                                           "r5", "r6", "r7", "r8", "r9",
+                                           "r10", "r11", "r12", "r13",
+                                           "r14", "r15", "r16", "r17",
+                                           "r18", "r19", "r20", "r21",
+                                           "r22", "r23", "r24", "r25",
+                                           "r26", "r27", "r28", "r29",
+                                           "r30", "r31", "sp", "fp",
+                                           "ra", "gp", "at"):
+            rt_t = _need_one_token(operands[0], file, line, "register")
+            rt = parse_gpr(rt_t.text, file, line, rt_t.col)
+            lab = second[0].text
+            emit_load_store_label(asm, section, file, line, col,
+                                  name, rt, lab)
+            return
 
     # MIPS-style assembler synthetic: `add/addu/sub/subu rd, rs, IMM`
     # accepts a constant third operand and rewrites to the matching
@@ -1659,6 +1691,46 @@ def emit_li(asm: Assembler, section: str, file: str, line: int, col: int,
                pretty=f"lui r{rd}, 0x{hi:04X}")
     emit_const(asm, section, file, line, col, "li", ori_w,
                pretty=f"ori r{rd}, r{rd}, 0x{lo:04X}")
+
+
+def emit_load_store_label(asm: Assembler, section: str, file: str,
+                          line: int, col: int, name: str, rt: int,
+                          label: str) -> None:
+    """Expand `INST rt, LABEL` (where INST ∈ {lw, sw, sb, sh, lh, lb,
+    lbu, lhu}) into a two-word LUI-then-INST sequence using R1 as the
+    address temporary. R1 is reserved for the assembler (pcc never
+    allocates it), so the expansion never collides with caller
+    state. HI16 / LO16 relocs let the linker patch in the final
+    address."""
+    AT = 1   # $at — assembler temp; pcc backend marks R1 unallocatable
+    if asm.relocatable:
+        def enc1(inst: Inst, asm: Assembler) -> int:
+            return encode_i(MAJOR["lui"], 0, AT, 0)         # placeholder hi
+        def enc2(inst: Inst, asm: Assembler) -> int:
+            return encode_i(MAJOR[name], AT, rt, 0)         # placeholder lo
+        i1 = emit(asm, section, file, line, col, "lui", [], enc1)
+        i1.label_target = label
+        asm.relocations.append(Reloc(section=section, offset=i1.offset,
+                                     rtype=R_ORISC_HI16, symbol=label))
+        i2 = emit(asm, section, file, line, col, name, [], enc2)
+        asm.relocations.append(Reloc(section=section, offset=i2.offset,
+                                     rtype=R_ORISC_LO16, symbol=label))
+        return
+    state = {}
+    def enc1(inst: Inst, asm: Assembler) -> int:
+        sec, off = lookup_label(asm, label, inst.file, inst.line, col)
+        addr = (section_base(sec) + off) & 0xFFFF_FFFF
+        state["addr"] = addr
+        hi = (addr >> 16) & 0xFFFF
+        if (addr & 0x8000):    # adjust for sign-extension of lo
+            hi = (hi + 1) & 0xFFFF
+        return encode_i(MAJOR["lui"], 0, AT, hi)
+    def enc2(inst: Inst, asm: Assembler) -> int:
+        addr = state["addr"]
+        lo = addr & 0xFFFF
+        return encode_i(MAJOR[name], AT, rt, lo)
+    emit(asm, section, file, line, col, "lui", [], enc1)
+    emit(asm, section, file, line, col, name, [], enc2)
 
 
 def emit_la(asm: Assembler, section: str, file: str, line: int, col: int,

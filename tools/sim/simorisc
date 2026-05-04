@@ -1383,6 +1383,15 @@ def init_cpu(cpu: CPU, text_bytes: bytes, data_bytes: bytes,
     stack_ref = cpu.alloc_object(stack_size, type_tag=TAG_STACK,
                                  max_caps=CAP_R|CAP_W|CAP_C)
     if data_size > 0:
+        # Data REF stays R|C (CONTRACT §3) — OCAP and direct
+        # OSB-through-O3 see the historical caps. But the MAPPING
+        # gets R|W so VA-based stores to global variables work,
+        # which C programs need (Dhrystone, the shell's cwd[],
+        # anything with mutable file-scope data). The split is
+        # intentional in OR: refs carry max-allowed caps, mappings
+        # carry actually-exposed caps. UB programs that mutate
+        # string literals via VA writes will silently succeed —
+        # the MVP toolchain doesn't separate .rodata from .data.
         data_ref = cpu.alloc_object(data_size, type_tag=TAG_DATA,
                                     max_caps=CAP_R|CAP_C,
                                     init_bytes=data_bytes)
@@ -1395,7 +1404,7 @@ def init_cpu(cpu: CPU, text_bytes: bytes, data_bytes: bytes,
                    length=stack_size, prot=CAP_R|CAP_W)
     if data_size > 0:
         cpu.map_object(data_ref, va=DATA_VA, offset=0,
-                       length=data_size, prot=CAP_R)
+                       length=data_size, prot=CAP_R|CAP_W)
 
     cpu.set_opr(1, code_ref)
     cpu.set_opr(2, stack_ref)
@@ -1817,8 +1826,10 @@ def primitive_InstallProgram(cpu: CPU) -> None:
     cpu.map_object(code_ref, va=CODE_VA, offset=0, length=code_size,
                    prot=CAP_R | CAP_X)
     if data_size > 0:
+        # Match init_cpu: data is R+W so guests can mutate globals.
+        # (Caller is responsible for the data ref carrying CAP_W.)
         cpu.map_object(data_ref, va=DATA_VA, offset=0, length=data_size,
-                       prot=CAP_R)
+                       prot=CAP_R | CAP_W)
 
     # Match init_cpu's GPR state — minus R0 (always zero), and with
     # PROCID restored to cpu.pid (some loaders may have shuffled R7).
