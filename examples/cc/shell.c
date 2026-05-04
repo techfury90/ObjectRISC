@@ -278,17 +278,7 @@ static void
 cmd_cat(const char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
-	/* Double-buffer the read/print loop. term_print_n SENDs
-	 * asynchronously: the receiver issues an OBJ_READ_REQ for the
-	 * bytes some time later, and if our next hf_read has already
-	 * overwritten the buffer by then it reads garbage. With two
-	 * buffers we alternate, so the most recent SEND always points
-	 * at a buffer the *other* iteration is filling, leaving the
-	 * receiver a full hf_read worth of time to drain. */
-	char buf_a[READ_BUF];
-	char buf_b[READ_BUF];
-	char *buf;
-	int turn = 0;
+	char buf[READ_BUF];
 	resolve_path(cwd, arg, path);
 	int fd = hf_open(path, HF_O_RDONLY);
 	int n;
@@ -298,12 +288,13 @@ cmd_cat(const char *cwd, const char *arg)
 		term_print("'\n");
 		return;
 	}
-	while (1) {
-		buf = turn ? buf_b : buf_a;
-		n = hf_read(fd, buf, READ_BUF);
-		if (n <= 0) break;
-		term_print_n(buf, n);
-		turn = 1 - turn;
+	/* term_print_n_sync blocks until the receiver has pulled the
+	 * bytes — safe to reuse `buf` immediately after. With the
+	 * async term_print_n we needed double-buffering to give the
+	 * receiver a window before our next hf_read overwrote things;
+	 * the sync variant closes that race entirely. */
+	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
+		term_print_n_sync(buf, n);
 	}
 	hf_close(fd);
 }
@@ -312,10 +303,7 @@ static void
 cmd_more(const char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
-	char buf_a[READ_BUF];   /* see cmd_cat for why two buffers */
-	char buf_b[READ_BUF];
-	char *buf;
-	int turn = 0;
+	char buf[READ_BUF];
 	int line_count = 0;
 	resolve_path(cwd, arg, path);
 	int fd = hf_open(path, HF_O_RDONLY);
@@ -326,17 +314,17 @@ cmd_more(const char *cwd, const char *arg)
 		term_print("'\n");
 		return;
 	}
-	while (1) {
-		buf = turn ? buf_b : buf_a;
-		n = hf_read(fd, buf, READ_BUF);
-		if (n <= 0) break;
+	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
 		/* Print the chunk in newline-bounded slices so we can
-		 * paginate at line boundaries without splitting bytes. */
+		 * paginate at line boundaries without splitting bytes.
+		 * Each slice goes through term_print_n_sync so the
+		 * receiver drains before we overwrite the buffer on the
+		 * next hf_read. */
 		int seg_start = 0;
 		int i;
 		for (i = 0; i < n; i++) {
 			if (buf[i] == '\n') {
-				term_print_n(buf + seg_start, i - seg_start + 1);
+				term_print_n_sync(buf + seg_start, i - seg_start + 1);
 				seg_start = i + 1;
 				line_count++;
 				if (line_count >= PAGE_LINES) {
@@ -348,8 +336,7 @@ cmd_more(const char *cwd, const char *arg)
 				}
 			}
 		}
-		if (i > seg_start) term_print_n(buf + seg_start, i - seg_start);
-		turn = 1 - turn;
+		if (i > seg_start) term_print_n_sync(buf + seg_start, i - seg_start);
 	}
 	hf_close(fd);
 }
@@ -358,10 +345,7 @@ static void
 cmd_ls(const char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
-	char buf_a[READ_BUF];   /* see cmd_cat for why two buffers */
-	char buf_b[READ_BUF];
-	char *buf;
-	int turn = 0;
+	char buf[READ_BUF];
 	resolve_path(cwd, arg, path);
 	int fd = hf_opendir(path);
 	int n;
@@ -371,12 +355,8 @@ cmd_ls(const char *cwd, const char *arg)
 		term_print("'\n");
 		return;
 	}
-	while (1) {
-		buf = turn ? buf_b : buf_a;
-		n = hf_read(fd, buf, READ_BUF);
-		if (n <= 0) break;
-		term_print_n(buf, n);
-		turn = 1 - turn;
+	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
+		term_print_n_sync(buf, n);
 	}
 	hf_close(fd);
 }

@@ -224,6 +224,95 @@ term_print_n(const char *buf, int count)
 	}
 }
 
+/* Synchronous variant of term_print_n: SENDs to the console with
+ * O3 = a reply_cap pointing at the hf mailbox (O8), then blocks
+ * until the receiver acks. After the ack the bytes have been
+ * pulled — the caller may now reuse the source buffer.
+ *
+ * This relies on hf having its own private mailbox in O8 (set up
+ * by hf_init), and on the caller serializing hf_read with
+ * term_print_n_sync so the mailbox queue holds at most one
+ * outstanding message at any time (either an hf reply or a term
+ * ack, never both). cmd_cat / cmd_ls / cmd_more in shell.c match
+ * that pattern.
+ *
+ * Why reuse the hf mailbox instead of allocating a third one:
+ * O-slot pressure. A dedicated term-sync mailbox would need its
+ * own slot for the full ref, and we're already at the wall
+ * (O5..O15 fully claimed). Sharing with hf is safe because of the
+ * strict serialization. */
+void
+term_print_n_sync(const char *buf, int count)
+{
+	unsigned int va = (unsigned int)buf;
+	int from_stack;
+	int offset;
+	if (count <= 0) return;
+	if (va >= STACK_BOTTOM) {
+		from_stack = 1;
+		offset = (int)(va - STACK_BOTTOM);
+	} else {
+		from_stack = 0;
+		offset = (int)(va - DATA_VA);
+	}
+
+	/* Derive an R|S sub-ref of the hf mailbox into O9 — the SEND
+	 * payload's O3 slot. The receiver only needs to be able to
+	 * SEND back; R|S is the minimum. */
+	asm volatile(
+		"omov  o1, o8\n"
+		"addiu r4, r0, 9\n"             /* R|S */
+		"call  #0x103\n"                /* ObjDerive */
+		"nop\n"
+		"omov  o9, o1"                  /* o9 = mailbox R|S */
+		:
+		:
+		: "r1", "r2", "r4"
+	);
+
+	if (from_stack) {
+		asm volatile(
+			"omov  o1, o5\n"            /* console */
+			"omov  o2, o11\n"           /* stack source */
+			"omov  o3, o9\n"            /* reply_cap */
+			"addu  r4, %0, r0\n"
+			"addu  r5, %1, r0\n"
+			"addiu r6, r0, 0\n"
+			"addiu r7, r0, 0\n"
+			"send  o1"
+			:
+			: "r"(offset), "r"(count)
+			: "r1", "r4", "r5", "r6", "r7"
+		);
+	} else {
+		asm volatile(
+			"omov  o1, o5\n"
+			"omov  o2, o15\n"           /* data source */
+			"omov  o3, o9\n"
+			"addu  r4, %0, r0\n"
+			"addu  r5, %1, r0\n"
+			"addiu r6, r0, 0\n"
+			"addiu r7, r0, 0\n"
+			"send  o1"
+			:
+			: "r"(offset), "r"(count)
+			: "r1", "r4", "r5", "r6", "r7"
+		);
+	}
+
+	/* Block on the hf mailbox for the empty-payload ack. */
+	asm volatile(
+		"omov  o1, o8\n"
+		"addiu r4, r0, -1\n"
+		"call  #0x204\n"               /* ReceiveQueuePoll */
+		"nop"
+		:
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	_term_restore_or();
+}
+
 void
 term_print_char(char c)
 {

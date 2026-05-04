@@ -97,25 +97,14 @@ sed -n '/--- console render ---/,$p' "$TMP/term.out" \
 COUNT=$(grep -c '^--- stanza ' "$TMP/rendered.txt" || true)
 echo "rendered $COUNT stanzas (file has 100)"
 
-# What this test actually proves: the chunked term_print_n design
-# survives a full 6 KB cat without the device dropping the
-# connection. Exact rendered count is *not* a useful assertion —
-# fake_terminal's OBJ_READ_REQs are async with the shell's reuse of
-# its READ_BUF stack buffer, so by the time fake_terminal pulls bytes
-# the buffer may already hold the next chunk. (Real devices like
-# oriscterm have the same race; nobody has noticed because humans
-# read text slower than the simulator runs.) So we assert two things
-# instead: (a) we got past the halfway mark, proving the stream
-# didn't truncate, and (b) we saw at least one of the late stanza
-# markers, proving we didn't bail before the end. The real fix —
-# double-buffering or a synchronous flush — is left for a future
-# pass.
-[ "$COUNT" -ge 50 ] \
-    || { echo "FAIL: only $COUNT stanzas rendered (expected ≥50)" >&2;
-         echo "--- last 20 rendered lines ---" >&2;
-         tail -20 "$TMP/rendered.txt" >&2; exit 1; }
-grep -qE '^--- stanza 09[0-9] ---|^--- stanza 099 ---' "$TMP/rendered.txt" \
-    || { echo "FAIL: never saw a stanza in the 90s — stream truncated early?" >&2
+# Now that cmd_cat uses term_print_n_sync (which blocks until the
+# receiver acks the buffer pull), the SEND/READ race is closed and
+# we should reliably see *every* stanza. The threshold accounts for
+# only the documented TaskExit/render race on the very last
+# stanza — which doesn't apply to cat anyway since the shell
+# doesn't exit during it.
+[ "$COUNT" -ge 100 ] \
+    || { echo "FAIL: only $COUNT stanzas rendered (expected 100)" >&2;
          echo "--- last 20 rendered lines ---" >&2;
          tail -20 "$TMP/rendered.txt" >&2; exit 1; }
 

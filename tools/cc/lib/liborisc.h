@@ -73,7 +73,11 @@ int hf_write(int fd, const char *buf, int count);   /* buf may be stack or data 
 
 void term_init(void);
 void term_print(const char *s);
-void term_print_n(const char *buf, int count);   /* explicit length */
+void term_print_n(const char *buf, int count);     /* explicit length, async */
+void term_print_n_sync(const char *buf, int count);/* sync — blocks until the
+                                                    * receiver acks; safe to
+                                                    * reuse the buffer after
+                                                    * return. See term.c. */
 void term_print_char(char c);
 void term_print_int(int n);
 void term_print_hex(unsigned int n);

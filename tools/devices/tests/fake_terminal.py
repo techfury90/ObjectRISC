@@ -145,25 +145,49 @@ class FakeTerminal:
         elif idx == CONSOLE_INDEX:
             # CPU sent us a console-write request — same shape as
             # oriscterm's idx-1 service: O2 = source ref, R4 = offset,
-            # R5 = byte count. The OR payload starts at word 6; OR
-            # slot 1 (sender's O2) is words [8..10].
+            # R5 = byte count. OR slot 2 (sender's O3) optionally
+            # carries a reply_cap — when present we send back an
+            # empty SEND_DELIVER aimed at it after the OBJ_READ_RESP
+            # is processed. That's what term_print_n_sync uses to
+            # know "the bytes have been pulled, my buffer can be
+            # reused now". Mirrors oriscterm's reply_cap path.
             source_ref = p[8] | (p[9] << 32)
+            reply_cap  = p[10] | (p[11] << 32)
             offset = p[2]
             length = p[3]
             if source_ref and length:
                 trans = self._next_trans()
-                self.console_reads[trans] = length
+                self.console_reads[trans] = {
+                    "len": length, "reply_cap": reply_cap,
+                }
                 pkt_out = build_obj_read_req(
                     self.pid, ref_home(source_ref), trans,
                     source_ref, offset, length)
                 self.sock.sendall(struct.pack(">I", len(pkt_out)) + pkt_out)
 
+    def _send_ack(self, recipient_ref):
+        """Empty SEND_DELIVER aimed at recipient_ref — used as the
+        reply for a console SEND that carried a reply_cap."""
+        trans = self._next_trans()
+        # build_send_deliver from this file (defined elsewhere in the
+        # module); 14-word payload, all int + or slots zero.
+        pkt = build_send_deliver(
+            self.pid, ref_home(recipient_ref), trans,
+            recipient_ref, [0, 0, 0, 0], [0, 0, 0, 0])
+        self.sock.sendall(struct.pack(">I", len(pkt)) + pkt)
+
     def _handle_read_resp(self, pkt):
-        n = self.console_reads.pop(pkt["trans"], None)
-        if n is None:
+        info = self.console_reads.pop(pkt["trans"], None)
+        if info is None:
             return
+        n = info["len"]
+        reply_cap = info.get("reply_cap", 0)
         if pkt["flags"] & 0x3F:
-            return    # fault; ignore
+            # Fault — still send the ack so the sender doesn't block
+            # forever waiting on a reply that will never come.
+            if reply_cap:
+                self._send_ack(reply_cap)
+            return
         words = pkt["payload"]
         raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in words)
         # Mirror oriscterm's \b handling: byte 0x08 deletes the
@@ -176,6 +200,8 @@ class FakeTerminal:
                     del self.console_render[-1]
             else:
                 self.console_render.append(b)
+        if reply_cap:
+            self._send_ack(reply_cap)
 
     def wait_for(self, want_kbd, want_ptr, timeout=10.0):
         deadline = time.time() + timeout
