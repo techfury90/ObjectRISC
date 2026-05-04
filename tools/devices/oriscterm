@@ -257,13 +257,19 @@ class Terminal:
         self.root.after(150, lambda: self.root.attributes('-topmost', False))
 
         font = tkfont.Font(family="Menlo", size=14)
-        self.text = tk.Text(self.root, width=60, height=10,
+        # Text pane is sized for an interactive shell session — 24
+        # rows is the legacy terminal default. Below it the graphics
+        # canvas still gets a fixed 16-row strip for grid / vector /
+        # raster / pointer demos; programs that don't touch graphics
+        # (the shell, kbd_echo, host-cat) just see a tall text area
+        # with an empty canvas band underneath.
+        self.text = tk.Text(self.root, width=80, height=24,
                             bg="#0a0a14", fg="#d8d8d8",
                             insertbackground="#d8d8d8",
                             font=font, padx=12, pady=12,
                             wrap="word", borderwidth=0,
                             highlightthickness=0)
-        self.text.pack(side="top", fill="x")
+        self.text.pack(side="top", fill="both", expand=True)
         self.text.insert("end",
             f"oriscterm online · pid={my_pid}\n"
             f"  console  idx={CONSOLE_INDEX}    keyboard idx={KEYBOARD_INDEX}\n"
@@ -278,8 +284,8 @@ class Terminal:
         # match what the text pane shows.
         self.cell_w = font.measure("M")
         self.cell_h = font.metrics("linespace")
-        self.canvas_cols = 60
-        self.canvas_rows = 24
+        self.canvas_cols = 80
+        self.canvas_rows = 16
         self.canvas_w = self.cell_w * self.canvas_cols
         self.canvas_h = self.cell_h * self.canvas_rows
         self.canvas = tk.Canvas(self.root,

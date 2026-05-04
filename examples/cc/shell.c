@@ -5,6 +5,7 @@
  * Built-ins:
  *     help        — short list of commands
  *     cat <path>  — print the contents of a host file
+ *     more <path> — like cat, but paginated (space/RET to advance, q to quit)
  *     ls [path]   — list a host directory (default: cwd)
  *     cd [path]   — change working directory (no arg → "/")
  *     pwd         — print the current working directory
@@ -43,12 +44,17 @@
 #define READ_BUF 128
 #define PATH_MAX 256
 
+/* Lines per page for `more` and the paginated `help`. The terminal
+ * is 24 rows; we leave ~4 for the page-prompt + room to breathe. */
+#define PAGE_LINES 20
+
 const char banner[]  = BUILD_BANNER;
 const char hello1[]  = "\nType 'help' for commands. End with 'exit'.\n";
 const char help_msg[] =
     "Commands:\n"
     "  help            — this message\n"
     "  cat <path>      — print the contents of a host file\n"
+    "  more <path>     — like cat, but paginated (space/RET to advance, q to quit)\n"
     "  ls [<path>]     — list a host directory (default: cwd)\n"
     "  cd [<path>]     — change working directory (no arg → '/')\n"
     "  pwd             — print the current working directory\n"
@@ -62,6 +68,7 @@ const char help_msg[] =
 
 const char run_done_pre[] = "[exited ";
 const char run_done_post[] = "]\n";
+const char more_prompt[] = "--More-- (space/RET, q to quit)";
 
 /* The shell maintains an absolute, normalized cwd ("/", "/foo",
  * "/a/b" etc.) and threads a pointer to it through every command
@@ -210,10 +217,55 @@ print_prompt(const char *cwd, char *prompt_buf)
 
 /* --- commands --------------------------------------------------------- */
 
+/* Print the "--More-- " prompt, block on the keyboard, return 1 if
+ * the user wants to abort (q/Q), 0 if they want to continue
+ * (space/RET, or anything else we treat as "go"). The display is
+ * append-only — we just newline past the prompt instead of erasing
+ * it. */
+static int
+pause_for_key(void)
+{
+	int mods;
+	int c;
+	term_print(more_prompt);
+	while (1) {
+		c = term_getkey(&mods);
+		if (c == 'q' || c == 'Q') { term_print("\n"); return 1; }
+		if (c == ' ' || c == TK_RETURN) {
+			term_print("\n");
+			return 0;
+		}
+	}
+}
+
+/* Print a NUL-terminated string with pagination — pauses every
+ * PAGE_LINES newlines until the user presses space/RET. Used by
+ * `help` and could trivially be reused for any other long text. */
+static void
+print_paginated(const char *s)
+{
+	int line_count = 0;
+	int seg_start = 0;
+	int i = 0;
+	while (s[i]) {
+		if (s[i] == '\n') {
+			term_print_n(s + seg_start, i - seg_start + 1);
+			seg_start = i + 1;
+			line_count++;
+			if (line_count >= PAGE_LINES) {
+				if (pause_for_key()) return;
+				line_count = 0;
+			}
+		}
+		i++;
+	}
+	if (i > seg_start) term_print_n(s + seg_start, i - seg_start);
+}
+
 static void
 cmd_help(void)
 {
-	term_print(help_msg);
+	print_paginated(help_msg);
 }
 
 static void
@@ -236,6 +288,45 @@ cmd_cat(const char *cwd, const char *arg)
 	 * receive socket on any non-trivial file. */
 	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
 		term_print_n(buf, n);
+	}
+	hf_close(fd);
+}
+
+static void
+cmd_more(const char *cwd, const char *arg)
+{
+	char path[PATH_MAX];
+	char buf[READ_BUF];
+	int line_count = 0;
+	resolve_path(cwd, arg, path);
+	int fd = hf_open(path, HF_O_RDONLY);
+	int n;
+	if (fd < 0) {
+		term_print("more: cannot open '");
+		term_print(arg);
+		term_print("'\n");
+		return;
+	}
+	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
+		/* Print the chunk in newline-bounded slices so we can
+		 * paginate at line boundaries without splitting bytes. */
+		int seg_start = 0;
+		int i;
+		for (i = 0; i < n; i++) {
+			if (buf[i] == '\n') {
+				term_print_n(buf + seg_start, i - seg_start + 1);
+				seg_start = i + 1;
+				line_count++;
+				if (line_count >= PAGE_LINES) {
+					if (pause_for_key()) {
+						hf_close(fd);
+						return;
+					}
+					line_count = 0;
+				}
+			}
+		}
+		if (i > seg_start) term_print_n(buf + seg_start, i - seg_start);
 	}
 	hf_close(fd);
 }
@@ -362,6 +453,9 @@ main(void)
 		} else if (strcmp(line, "cat") == 0) {
 			if (*arg == 0) term_print("usage: cat <path>\n");
 			else cmd_cat(cwd, arg);
+		} else if (strcmp(line, "more") == 0) {
+			if (*arg == 0) term_print("usage: more <path>\n");
+			else cmd_more(cwd, arg);
 		} else if (strcmp(line, "ls") == 0) {
 			cmd_ls(cwd, *arg ? arg : ".");
 		} else if (strcmp(line, "cd") == 0) {
