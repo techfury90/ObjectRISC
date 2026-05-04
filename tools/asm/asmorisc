@@ -561,11 +561,16 @@ ORO_BIND_GLOBAL = 1
 
 @dataclass
 class Reloc:
-    """One pending relocation against `symbol` in a .oro file."""
+    """One pending relocation against `symbol` in a .oro file. The
+    optional addend is added to the symbol's resolved address before
+    the linker patches the site — used for `lw rd, LABEL+CONST`-
+    style synthetics where pcc bakes a constant offset into the
+    operand expression."""
     section: str   # 'text' or 'data'
     offset: int    # byte offset within the section
     rtype: int     # R_ORISC_*
     symbol: str    # name; resolved to symbol-table index when writing
+    addend: int = 0  # signed 16-bit; encoded into the .oro reloc rec
 
 
 def is_local_label(name: str) -> bool:
@@ -1078,34 +1083,32 @@ def handle_instruction(asm: Assembler, section: str, src: SourceLine,
         emit_la(asm, section, file, line, col, rd, lab_t.text)
         return
 
-    # MIPS-style synthetic for `lw rd, LABEL` / `sw rd, LABEL` etc.
-    # — load/store from a globally-visible address. Expanded to
-    # `lui $at, %hi(LABEL); inst rd, %lo(LABEL)($at)`, where $at
-    # is R1 (reserved for the assembler — see pcc backend's
-    # macdefs.h RSTATUS marking R1 unallocatable). Both halves get
-    # HI16/LO16 relocs so the linker can patch the final address.
+    # MIPS-style synthetic for `lw rd, LABEL[+OFFSET]` /
+    # `sw rd, LABEL[+OFFSET]` etc. — load/store from a globally-
+    # visible address with an optional constant offset (pcc emits
+    # `Arr_2_Glob+1628` for indexed access into a flat global). We
+    # expand to `lui $at, %hi(eff); ori $at, $at, %lo(eff); inst
+    # rd, 0($at)` — three words, but uses ori (unsigned imm) so we
+    # don't need any HI16 sign-extension correction on the linker
+    # side. $at is R1 (reserved for the assembler — see pcc
+    # backend's macdefs.h RSTATUS marking R1 unallocatable).
     if name in ("lw", "sw", "sb", "sh", "lh", "lb", "lbu", "lhu") \
             and len(operands) == 2:
         second = operands[1]
-        # Distinguish `lw r1, LABEL` (synthetic) from `lw r1, 4(r2)`
-        # (real instruction) — the real form has '(' in its
-        # operand. Bare-symbol second operand → synthetic.
-        if len(second) == 1 and second[0].kind == "sym" \
-                and second[0].text not in ("r0", "r1", "r2", "r3", "r4",
-                                           "r5", "r6", "r7", "r8", "r9",
-                                           "r10", "r11", "r12", "r13",
-                                           "r14", "r15", "r16", "r17",
-                                           "r18", "r19", "r20", "r21",
-                                           "r22", "r23", "r24", "r25",
-                                           "r26", "r27", "r28", "r29",
-                                           "r30", "r31", "sp", "fp",
-                                           "ra", "gp", "at"):
-            rt_t = _need_one_token(operands[0], file, line, "register")
-            rt = parse_gpr(rt_t.text, file, line, rt_t.col)
-            lab = second[0].text
-            emit_load_store_label(asm, section, file, line, col,
-                                  name, rt, lab)
-            return
+        # The real form has '(' in its operand; the synthetic form
+        # doesn't. Distinguish on that.
+        has_paren = any(t.kind == "punct" and t.text == "("
+                        for t in second)
+        if not has_paren and second:
+            # Try to parse as `LABEL` or `LABEL+CONST`.
+            lab_addend = _split_label_addend(second)
+            if lab_addend is not None:
+                lab, addend = lab_addend
+                rt_t = _need_one_token(operands[0], file, line, "register")
+                rt = parse_gpr(rt_t.text, file, line, rt_t.col)
+                emit_load_store_label(asm, section, file, line, col,
+                                      name, rt, lab, addend)
+                return
 
     # MIPS-style assembler synthetic: `add/addu/sub/subu rd, rs, IMM`
     # accepts a constant third operand and rewrites to the matching
@@ -1693,44 +1696,79 @@ def emit_li(asm: Assembler, section: str, file: str, line: int, col: int,
                pretty=f"ori r{rd}, r{rd}, 0x{lo:04X}")
 
 
+_REG_NAMES_FOR_LABEL_PARSE = (
+    {"r%d" % i for i in range(32)} | {"sp", "fp", "ra", "gp", "at"}
+)
+
+def _split_label_addend(toks):
+    """Return (label_name, signed_addend) if `toks` parses as a bare
+    label or LABEL ± CONST, else None. Used by the lw/sw label
+    synthetic to extract pcc's `Arr_Glob+1628`-style operands."""
+    if not toks:
+        return None
+    if len(toks) == 1 and toks[0].kind == "sym" \
+            and toks[0].text not in _REG_NAMES_FOR_LABEL_PARSE:
+        return (toks[0].text, 0)
+    if len(toks) == 3 and toks[0].kind == "sym" \
+            and toks[0].text not in _REG_NAMES_FOR_LABEL_PARSE \
+            and toks[1].kind == "punct" and toks[1].text in ("+", "-") \
+            and toks[2].kind in ("num", "char"):
+        try:
+            v = parse_int(toks[2].text, "<expr>", 0, 0)
+        except AsmError:
+            return None
+        if toks[1].text == "-":
+            v = -v
+        return (toks[0].text, v)
+    return None
+
+
 def emit_load_store_label(asm: Assembler, section: str, file: str,
                           line: int, col: int, name: str, rt: int,
-                          label: str) -> None:
-    """Expand `INST rt, LABEL` (where INST ∈ {lw, sw, sb, sh, lh, lb,
-    lbu, lhu}) into a two-word LUI-then-INST sequence using R1 as the
-    address temporary. R1 is reserved for the assembler (pcc never
-    allocates it), so the expansion never collides with caller
-    state. HI16 / LO16 relocs let the linker patch in the final
-    address."""
-    AT = 1   # $at — assembler temp; pcc backend marks R1 unallocatable
+                          label: str, addend: int = 0) -> None:
+    """Expand `INST rt, LABEL[+ADDEND]` (where INST ∈ {lw, sw, sb,
+    sh, lh, lb, lbu, lhu}) into a three-word sequence using R1 as
+    the address temporary:
+        lui  $at, %hi(LABEL+ADDEND)
+        ori  $at, $at, %lo(LABEL+ADDEND)
+        INST rt, 0($at)
+    Three words instead of two, but the lui-ori pair uses unsigned
+    immediate semantics so the linker doesn't need any HI16
+    sign-extension correction (the same mechanic emit_la uses).
+    R1 is reserved for the assembler — pcc backend's macdefs.h
+    marks it unallocatable. HI16/LO16 relocs carry the addend."""
+    AT = 1
     if asm.relocatable:
         def enc1(inst: Inst, asm: Assembler) -> int:
-            return encode_i(MAJOR["lui"], 0, AT, 0)         # placeholder hi
+            return encode_i(MAJOR["lui"], 0, AT, 0)
         def enc2(inst: Inst, asm: Assembler) -> int:
-            return encode_i(MAJOR[name], AT, rt, 0)         # placeholder lo
+            return encode_i(MAJOR["ori"], AT, AT, 0)
+        def enc3(inst: Inst, asm: Assembler) -> int:
+            return encode_i(MAJOR[name], AT, rt, 0)
         i1 = emit(asm, section, file, line, col, "lui", [], enc1)
         i1.label_target = label
         asm.relocations.append(Reloc(section=section, offset=i1.offset,
-                                     rtype=R_ORISC_HI16, symbol=label))
-        i2 = emit(asm, section, file, line, col, name, [], enc2)
+                                     rtype=R_ORISC_HI16, symbol=label,
+                                     addend=addend))
+        i2 = emit(asm, section, file, line, col, "ori", [], enc2)
         asm.relocations.append(Reloc(section=section, offset=i2.offset,
-                                     rtype=R_ORISC_LO16, symbol=label))
+                                     rtype=R_ORISC_LO16, symbol=label,
+                                     addend=addend))
+        emit(asm, section, file, line, col, name, [], enc3)
         return
     state = {}
     def enc1(inst: Inst, asm: Assembler) -> int:
         sec, off = lookup_label(asm, label, inst.file, inst.line, col)
-        addr = (section_base(sec) + off) & 0xFFFF_FFFF
+        addr = (section_base(sec) + off + addend) & 0xFFFF_FFFF
         state["addr"] = addr
-        hi = (addr >> 16) & 0xFFFF
-        if (addr & 0x8000):    # adjust for sign-extension of lo
-            hi = (hi + 1) & 0xFFFF
-        return encode_i(MAJOR["lui"], 0, AT, hi)
+        return encode_i(MAJOR["lui"], 0, AT, (addr >> 16) & 0xFFFF)
     def enc2(inst: Inst, asm: Assembler) -> int:
-        addr = state["addr"]
-        lo = addr & 0xFFFF
-        return encode_i(MAJOR[name], AT, rt, lo)
+        return encode_i(MAJOR["ori"], AT, AT, state["addr"] & 0xFFFF)
+    def enc3(inst: Inst, asm: Assembler) -> int:
+        return encode_i(MAJOR[name], AT, rt, 0)
     emit(asm, section, file, line, col, "lui", [], enc1)
-    emit(asm, section, file, line, col, name, [], enc2)
+    emit(asm, section, file, line, col, "ori", [], enc2)
+    emit(asm, section, file, line, col, name, [], enc3)
 
 
 def emit_la(asm: Assembler, section: str, file: str, line: int, col: int,
@@ -1888,14 +1926,22 @@ def assemble_oro(paths: list[Path]) -> bytes:
         sym_buf += struct.pack(">BBB5x", sec_code, binding, 0)
     assert len(sym_buf) == len(symbols) * ORO_SYMBOL_SIZE
 
-    # Pack the relocation table.
+    # Pack the relocation table. Layout `>IBBhI` reuses the 2 bytes
+    # of historical padding for a signed 16-bit addend; old .oro
+    # files read those bytes as zero, so addend defaults to 0 and
+    # the change is backward compatible at the binary level.
     reloc_buf = bytearray()
     for r in asm.relocations:
         sym_idx = name_to_index[r.symbol]
         sec_code = ORO_SEC_TEXT if r.section == "text" else ORO_SEC_DATA
-        reloc_buf += struct.pack(">IBB2xI",
+        addend = r.addend
+        if not (-(1 << 15) <= addend <= (1 << 15) - 1):
+            raise SystemExit(f"asmorisc: reloc addend {addend} for "
+                             f"symbol {r.symbol!r} out of signed-16 range")
+        reloc_buf += struct.pack(">IBBhI",
                                  r.offset & 0xFFFF_FFFF,
                                  sec_code, r.rtype,
+                                 addend,
                                  sym_idx & 0xFFFF_FFFF)
     assert len(reloc_buf) == len(asm.relocations) * ORO_RELOC_SIZE
 

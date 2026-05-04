@@ -80,6 +80,11 @@ class Reloc:
     section: int        # 1=text, 2=data
     rtype: int
     sym_index: int
+    addend: int = 0     # signed 16-bit; added to symbol's resolved
+                        # address before patching. Read from the
+                        # 2 bytes that older .oro files used as
+                        # padding — those zero out cleanly so old
+                        # files default to addend=0.
 
 
 @dataclass(eq=False)
@@ -132,14 +137,17 @@ def _parse_oro(path: Path, blob: bytes) -> ObjectFile:
         symbols.append(Symbol(name=name, value=value,
                               section=section, binding=binding))
 
-    # Relocations.
+    # Relocations. The 2 historical-padding bytes now hold a signed
+    # 16-bit addend; old .oro files have zeros there, so addend=0
+    # for backward-compat reads.
     relocs: List[Reloc] = []
     for i in range(rel_count):
         off = i * ORO_RELOC_SIZE
-        roff, sec, rtype, sym_idx = struct.unpack_from(
-            ">IBB2xI", rel_bytes, off)
+        roff, sec, rtype, addend, sym_idx = struct.unpack_from(
+            ">IBBhI", rel_bytes, off)
         relocs.append(Reloc(offset=roff, section=sec,
-                            rtype=rtype, sym_index=sym_idx))
+                            rtype=rtype, sym_index=sym_idx,
+                            addend=addend))
 
     return ObjectFile(path=path, text=text, data=data,
                       symbols=symbols, relocs=relocs)
@@ -384,16 +392,22 @@ def _apply_reloc(buf: bytearray, reloc: Reloc, target_va: int,
     if reloc.rtype == R_ORISC_NONE:
         return
 
+    # Effective target = symbol address + addend. Used by all
+    # symbol-relative relocs (ABS32, HI16/LO16) for the
+    # `lw rd, LABEL+CONST` pattern pcc emits when accessing array
+    # elements with a constant index.
+    eff = (target_va + reloc.addend) & 0xFFFFFFFF
+
     if reloc.rtype == R_ORISC_ABS32:
-        buf[o:o + 4] = struct.pack(">I", target_va & 0xFFFFFFFF)
+        buf[o:o + 4] = struct.pack(">I", eff)
         return
 
     if reloc.rtype in (R_ORISC_HI16, R_ORISC_LO16):
         word = struct.unpack(">I", bytes(buf[o:o + 4]))[0]
         if reloc.rtype == R_ORISC_HI16:
-            patch = (target_va >> 16) & 0xFFFF
+            patch = (eff >> 16) & 0xFFFF
         else:
-            patch = target_va & 0xFFFF
+            patch = eff & 0xFFFF
         word = (word & 0xFFFF0000) | patch
         buf[o:o + 4] = struct.pack(">I", word)
         return
