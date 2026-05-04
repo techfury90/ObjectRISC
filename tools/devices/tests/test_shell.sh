@@ -91,7 +91,7 @@ cat "$TMP/hf.out"
 # Assertions: ls "note.txt" entry, cat output, prompt re-appears, exits.
 grep -q "Object RISC Shell" "$TMP/term.out" \
     || { echo "FAIL: missing banner" >&2; exit 1; }
-grep -q "orisc>" "$TMP/term.out" \
+grep -q "/>" "$TMP/term.out" \
     || { echo "FAIL: missing prompt" >&2; exit 1; }
 grep -q "note.txt" "$TMP/term.out" \
     || { echo "FAIL: ls didn't list note.txt" >&2; exit 1; }

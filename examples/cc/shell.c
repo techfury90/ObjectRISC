@@ -5,9 +5,18 @@
  * Built-ins:
  *     help        — short list of commands
  *     cat <path>  — print the contents of a host file
- *     ls [path]   — list a host directory (default: ".")
+ *     ls [path]   — list a host directory (default: cwd)
+ *     cd [path]   — change working directory (no arg → "/")
+ *     pwd         — print the current working directory
+ *     echo <text> — print the rest of the line
  *     run <path>  — load and run another .orx via linkbootd
+ *     cycles      — print the CPU's cycle counter
  *     exit / quit — end the session
+ *
+ * Path handling: the shell maintains its own cwd (absolute, relative
+ * to hostfsd's --root jail). cat / ls / run resolve relative args by
+ * joining cwd + arg + collapsing "." / ".." components, then send
+ * the result to the hostfsd / linkbootd as an absolute path.
  *
  * The runner script (run_shell.sh) computes a build-date banner
  * and passes it through -DBUILD_BANNER so a fresh build always
@@ -32,16 +41,20 @@
 
 #define LINE_MAX 256
 #define READ_BUF 128
+#define PATH_MAX 256
 
 const char banner[]  = BUILD_BANNER;
-const char prompt[]  = "orisc> ";
 const char hello1[]  = "\nType 'help' for commands. End with 'exit'.\n";
 const char help_msg[] =
     "Commands:\n"
     "  help            — this message\n"
     "  cat <path>      — print the contents of a host file\n"
-    "  ls [<path>]     — list a host directory (default: '.')\n"
+    "  ls [<path>]     — list a host directory (default: cwd)\n"
+    "  cd [<path>]     — change working directory (no arg → '/')\n"
+    "  pwd             — print the current working directory\n"
+    "  echo <text>     — print the rest of the line\n"
     "  run <path>      — load and run another .orx via linkbootd\n"
+    "  cycles          — print the CPU's cycle counter\n"
     "  exit | quit     — leave the shell\n"
     "\n"
     "Backspace edits the line buffer but the terminal display is\n"
@@ -49,6 +62,13 @@ const char help_msg[] =
 
 const char run_done_pre[] = "[exited ";
 const char run_done_post[] = "]\n";
+
+/* The shell maintains an absolute, normalized cwd ("/", "/foo",
+ * "/a/b" etc.) and threads a pointer to it through every command
+ * that touches it. We can't put it in a global because Object RISC's
+ * data segment is mapped R-only by init_cpu — `cmd_cd` would fault
+ * on the assignment. So cwd lives on main()'s stack along with a
+ * scratch buffer for building the prompt string. */
 
 /* --- input helpers ---------------------------------------------------- */
 
@@ -94,6 +114,100 @@ split_arg(char *buf)
 	return p;
 }
 
+/* --- path resolution -------------------------------------------------- */
+
+/* Build `out` from cwd and arg, then collapse "." / ".." components
+ * in place. Result is absolute, normalized, never has trailing '/'
+ * (except at root). On overflow `out` is truncated to PATH_MAX-1
+ * and the result may be invalid; callers don't bother checking
+ * because PATH_MAX is generous for the shell's needs. */
+static void
+resolve_path(const char *cwd, const char *arg, char *out)
+{
+	int n = 0;
+
+	/* Step 1: build the unnormalized join into `out`. */
+	if (arg[0] == '/') {
+		while (arg[n] && n < PATH_MAX - 1) {
+			out[n] = arg[n];
+			n++;
+		}
+		out[n] = 0;
+	} else {
+		int i = 0;
+		while (cwd[i] && n < PATH_MAX - 1) out[n++] = cwd[i++];
+		if (n > 0 && out[n-1] != '/' && n < PATH_MAX - 1)
+			out[n++] = '/';
+		i = 0;
+		while (arg[i] && n < PATH_MAX - 1) out[n++] = arg[i++];
+		out[n] = 0;
+	}
+
+	/* Step 2: collapse to a normalized form in tmp, then copy back.
+	 * Walk components, skipping "." / empty, popping last on "..". */
+	char tmp[PATH_MAX];
+	int t = 0;
+	tmp[t++] = '/';
+
+	int i = (out[0] == '/') ? 1 : 0;
+	while (out[i]) {
+		/* Find next component. */
+		int seg_start = i;
+		while (out[i] && out[i] != '/') i++;
+		int seg_len = i - seg_start;
+		if (out[i] == '/') i++;
+
+		if (seg_len == 0) continue;             /* "//" */
+		if (seg_len == 1 && out[seg_start] == '.') continue;
+		if (seg_len == 2
+		    && out[seg_start] == '.'
+		    && out[seg_start + 1] == '.') {
+			/* Pop the last component (and its trailing '/'). */
+			if (t > 1) {
+				t--;                /* drop trailing '/' if any */
+				while (t > 0 && tmp[t-1] != '/') t--;
+				if (t == 0) tmp[t++] = '/';
+			}
+			continue;
+		}
+		/* Append component, ensuring exactly one '/' between. */
+		if (t == 0 || tmp[t-1] != '/') {
+			if (t < PATH_MAX - 1) tmp[t++] = '/';
+		}
+		int k;
+		for (k = 0; k < seg_len && t < PATH_MAX - 1; k++)
+			tmp[t++] = out[seg_start + k];
+		/* Add trailing '/' for the next iteration's join. */
+		if (t < PATH_MAX - 1) tmp[t++] = '/';
+	}
+	/* Strip trailing '/' unless we're at root. */
+	if (t > 1 && tmp[t-1] == '/') t--;
+	if (t == 0) tmp[t++] = '/';
+	tmp[t] = 0;
+
+	/* Copy tmp back into out. */
+	int j;
+	for (j = 0; j <= t && j < PATH_MAX; j++) out[j] = tmp[j];
+}
+
+/* --- prompt ----------------------------------------------------------- */
+
+/* Build "$cwd> " into the caller's prompt_buf, then term_print it.
+ * Called fresh before each line so cd updates show up immediately. */
+static void
+print_prompt(const char *cwd, char *prompt_buf)
+{
+	int i = 0;
+	while (cwd[i] && i < PATH_MAX) {
+		prompt_buf[i] = cwd[i];
+		i++;
+	}
+	prompt_buf[i++] = '>';
+	prompt_buf[i++] = ' ';
+	prompt_buf[i] = 0;
+	term_print(prompt_buf);
+}
+
 /* --- commands --------------------------------------------------------- */
 
 static void
@@ -103,14 +217,16 @@ cmd_help(void)
 }
 
 static void
-cmd_cat(const char *path)
+cmd_cat(const char *cwd, const char *arg)
 {
+	char path[PATH_MAX];
 	char buf[READ_BUF];
+	resolve_path(cwd, arg, path);
 	int fd = hf_open(path, HF_O_RDONLY);
 	int n;
 	if (fd < 0) {
 		term_print("cat: cannot open '");
-		term_print(path);
+		term_print(arg);
 		term_print("'\n");
 		return;
 	}
@@ -125,14 +241,16 @@ cmd_cat(const char *path)
 }
 
 static void
-cmd_ls(const char *path)
+cmd_ls(const char *cwd, const char *arg)
 {
+	char path[PATH_MAX];
 	char buf[READ_BUF];
+	resolve_path(cwd, arg, path);
 	int fd = hf_opendir(path);
 	int n;
 	if (fd < 0) {
 		term_print("ls: cannot open '");
-		term_print(path);
+		term_print(arg);
 		term_print("'\n");
 		return;
 	}
@@ -143,12 +261,68 @@ cmd_ls(const char *path)
 }
 
 static void
-cmd_run(const char *path)
+cmd_cd(char *cwd, const char *arg)
 {
+	char path[PATH_MAX];
+	resolve_path(cwd, arg, path);
+	/* Verify the new directory exists by opening + closing it.
+	 * Avoids the trap of cd'ing into a non-existent path and only
+	 * finding out on the next ls / cat. */
+	int fd = hf_opendir(path);
+	if (fd < 0) {
+		term_print("cd: cannot enter '");
+		term_print(arg);
+		term_print("'\n");
+		return;
+	}
+	hf_close(fd);
+	int i = 0;
+	while (path[i] && i < PATH_MAX - 1) {
+		cwd[i] = path[i];
+		i++;
+	}
+	cwd[i] = 0;
+}
+
+static void
+cmd_pwd(const char *cwd)
+{
+	term_print(cwd);
+	term_print("\n");
+}
+
+static void
+cmd_echo(const char *arg)
+{
+	term_print(arg);
+	term_print("\n");
+}
+
+static void
+cmd_run(const char *cwd, const char *arg)
+{
+	char path[PATH_MAX];
+	resolve_path(cwd, arg, path);
 	int code = lb_spawn(path);
 	term_print(run_done_pre);
 	term_print_int(code);
 	term_print(run_done_post);
+}
+
+static void
+cmd_cycles(void)
+{
+	int n;
+	asm volatile(
+		"call  #0x301\n"               /* ReadCycles → R3 */
+		"nop\n"
+		"addu  %0, r3, r0"
+		: "=r"(n)
+		:
+		: "r2", "r3"
+	);
+	term_print_int(n);
+	term_print("\n");
 }
 
 /* --- main ------------------------------------------------------------- */
@@ -157,6 +331,11 @@ int
 main(void)
 {
 	char line[LINE_MAX];
+	char cwd[PATH_MAX];
+	char prompt_buf[PATH_MAX + 16];
+
+	cwd[0] = '/';
+	cwd[1] = 0;
 
 	/* term_init parks boot O2/O3/O4 into O11/O14/O15; we don't need
 	 * to touch them ourselves here. (See term.c on why we avoid
@@ -172,7 +351,7 @@ main(void)
 		int len;
 		char *arg;
 
-		term_print(prompt);
+		print_prompt(cwd, prompt_buf);
 		len = read_line(line, sizeof(line));
 		if (len == 0) continue;
 
@@ -182,12 +361,20 @@ main(void)
 			cmd_help();
 		} else if (strcmp(line, "cat") == 0) {
 			if (*arg == 0) term_print("usage: cat <path>\n");
-			else cmd_cat(arg);
+			else cmd_cat(cwd, arg);
 		} else if (strcmp(line, "ls") == 0) {
-			cmd_ls(*arg ? arg : ".");
+			cmd_ls(cwd, *arg ? arg : ".");
+		} else if (strcmp(line, "cd") == 0) {
+			cmd_cd(cwd, *arg ? arg : "/");
+		} else if (strcmp(line, "pwd") == 0) {
+			cmd_pwd(cwd);
+		} else if (strcmp(line, "echo") == 0) {
+			cmd_echo(arg);
 		} else if (strcmp(line, "run") == 0) {
 			if (*arg == 0) term_print("usage: run <path>\n");
-			else cmd_run(arg);
+			else cmd_run(cwd, arg);
+		} else if (strcmp(line, "cycles") == 0) {
+			cmd_cycles();
 		} else if (strcmp(line, "exit") == 0
 		           || strcmp(line, "quit") == 0) {
 			term_print("bye!\n");

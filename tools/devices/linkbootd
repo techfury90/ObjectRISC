@@ -539,12 +539,14 @@ class LinkBootD:
             self._notify_failure(info["requester_ref"],
                                  "path is not valid UTF-8")
             return
-        # Resolve relative paths against our --root, if configured.
-        # Reject paths that try to escape via "..".
+        # When --root is configured, treat the requested path as
+        # relative to that root regardless of leading "/" — matches
+        # hostfsd's jail semantics so `cat /foo` and `run /foo` from
+        # the shell mean the same thing.
         candidate = Path(path)
-        if self.root is not None and not candidate.is_absolute():
+        if self.root is not None:
             try:
-                resolved = (self.root / candidate).resolve()
+                resolved = (self.root / path.lstrip("/")).resolve()
                 resolved.relative_to(self.root)
             except (ValueError, OSError) as e:
                 self._notify_failure(info["requester_ref"],
