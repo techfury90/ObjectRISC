@@ -3,20 +3,33 @@
  *
  * Wraps the wire protocol documented in tools/devices/hostfsd. Each
  * function SENDs a request to the hostfsd service object (passed in
- * O10 by convention — see hf_init below) and blocks on the calling
- * task's receive queue for the response.
+ * O10 by convention — see hf_init below) and blocks on a private
+ * receive queue for the response.
+ *
+ * The per-service mailbox
+ * -----------------------
+ * hf_init() ObjAllocs its own 16-byte mailbox, attaches a depth-16
+ * queue, derives an R|S sub-ref to hand to hostfsd as the
+ * subscription target, and parks the full ref in O8. All hostfsd
+ * responses land on that mailbox's queue; hf_wait() polls it.
+ *
+ * Why a private mailbox: term_init's queue on O4 (boot self-svc) is
+ * shared by keyboard events, so a long-running cat would otherwise
+ * dequeue a keystroke instead of a hostfsd reply and mis-decode the
+ * R3 field. Same shape as lb_init's mailbox in linkboot.c.
  *
  * OR-hygiene convention REQUIRED of callers
  * -----------------------------------------
  * These functions assume the program has parked the boot-time refs
  * in known slots:
  *
- *     O11 = boot stack ref  (for hf_read destination buffers)
- *     O14 = boot self-svc   (for queue polling)
- *     O15 = boot data ref   (for hf_write source buffers + libc
- *                            console output)
+ *     O8  = hf mailbox full ref (parked by hf_init)
+ *     O11 = boot stack ref      (for hf_read destination buffers)
+ *     O14 = boot self-svc       (restored on every helper exit)
+ *     O15 = boot data ref       (for hf_write source buffers + libc
+ *                                console output)
  *
- * Each helper restores O2/O3/O4 from O13/O14/O15 on the way out
+ * Each helper restores O2/O3/O4 from O11/O15/O14 on the way out
  * (matching the discipline mouse_paint.c established), so callers'
  * print_str etc. keep working after every hf_* call.
  *
@@ -45,9 +58,10 @@
 #define STACK_BOTTOM 0x001f0000
 
 /* Reserved OR slots for hostfsd-using programs (see top-of-file). */
+/*   O8  — hf mailbox full ref (parked by hf_init; poll target) */
 /*   O10 — hostfsd service ref (caller arranges via --service order) */
 /*   O11 — boot stack ref (writable; for hf_read destinations) */
-/*   O14 — boot self-svc (queue target) */
+/*   O14 — boot self-svc (restored on exit) */
 /*   O15 — boot data ref (read-only; for hf_write sources) */
 
 /* --- helpers shared by all ops ----------------------------------------- */
@@ -62,7 +76,7 @@ hf_restore_or(void)
 	asm volatile("omov o4, o14");
 }
 
-/* Block on the receive queue for one response from hostfsd. The
+/* Block on the hf mailbox for one response from hostfsd. The
  * response carries (primary in R3, secondary in R4) — see the
  * protocol table in tools/devices/hostfsd. Caller's primary value
  * is what the user-facing function returns; secondary is used by
@@ -72,7 +86,7 @@ hf_wait(int *out_secondary)
 {
 	int status, primary, secondary;
 	asm volatile(
-		"omov  o1, o4\n"
+		"omov  o1, o8\n"            /* hf mailbox (private queue) */
 		"addiu r4, r0, -1\n"
 		"call  #0x204\n"            /* ReceiveQueuePoll */
 		"nop\n"
@@ -92,41 +106,70 @@ hf_wait(int *out_secondary)
 	return primary;
 }
 
-/* --- hf_init — subscribe to hostfsd ------------------------------------ */
+/* --- hf_init — allocate mailbox + subscribe to hostfsd ----------------- *
+ *
+ * ObjAllocs a private 16-byte mailbox (TAG_SERVICE-typed),
+ * attaches a depth-16 queue, derives an R|S sub-ref to hand
+ * hostfsd, and parks the full ref in O8 for later polls. Without
+ * the private mailbox, hostfsd responses would land on the boot
+ * self-svc queue alongside keyboard events — a long cat then
+ * dequeues a keystroke as if it were a read reply and mis-decodes
+ * the count. */
 
 int
 hf_init(void)
 {
 	int status;
 
-	/* Attach a queue on our self-service so hostfsd's responses land
-	 * in something we can poll. */
+	/* ObjAlloc(16, TAG_SERVICE, R|W|S|V|C). */
 	asm volatile(
-		"omov  o1, o4\n"
 		"addiu r4, r0, 16\n"
-		"call  #0x203\n"
+		"addiu r5, r0, 0x4103\n"     /* TAG_SERVICE */
+		"addiu r6, r0, 0x5b\n"        /* R|W|S|V|C */
+		"addiu r7, r0, 0\n"
+		"call  #0x100\n"              /* ObjAlloc → O1 */
 		"nop\n"
-		"addu  %0, r2, r0"
+		"addu  %0, r2, r0\n"
+		"omov  o8, o1"                /* o8 = mailbox full ref */
 		: "=r"(status)
 		:
-		: "r1", "r2", "r3", "r4"
+		: "r1", "r2", "r4", "r5", "r6", "r7"
 	);
 	if (status != 0) {
 		hf_restore_or();
 		return -1;
 	}
 
-	/* Derive an R|S self-ref into O9 (no `register __or __asm__`
-	 * declarations — see term.c::term_init for why). */
+	/* Attach a queue to the mailbox. */
 	asm volatile(
-		"omov  o1, o4\n"
-		"addiu r4, r0, 9\n"
-		"call  #0x103\n"
+		"omov  o1, o8\n"
+		"addiu r4, r0, 16\n"
+		"call  #0x203\n"              /* ReceiveQueueAttach */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r1", "r2", "r4"
+	);
+	if (status != 0) {
+		hf_restore_or();
+		return -1;
+	}
+
+	/* Derive an R|S sub-ref into O9 to hand to hostfsd. (No
+	 * `register __or __asm__` declarations — see term.c::term_init
+	 * for why.) O9 is scratch — the keyboard subscribe ref already
+	 * lived there briefly during term_init and is no longer
+	 * needed. */
+	asm volatile(
+		"omov  o1, o8\n"
+		"addiu r4, r0, 9\n"           /* R|S */
+		"call  #0x103\n"              /* ObjDerive */
 		"nop\n"
 		"omov  o9, o1"
 	);
 
-	/* Send OP_SUBSCRIBE to hostfsd (in O10). */
+	/* Send OP_SUBSCRIBE to hostfsd (in O10) with the mailbox R|S. */
 	asm volatile(
 		"omov  o1, o10\n"
 		"omov  o2, o9\n"

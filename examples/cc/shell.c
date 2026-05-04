@@ -278,7 +278,17 @@ static void
 cmd_cat(const char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
-	char buf[READ_BUF];
+	/* Double-buffer the read/print loop. term_print_n SENDs
+	 * asynchronously: the receiver issues an OBJ_READ_REQ for the
+	 * bytes some time later, and if our next hf_read has already
+	 * overwritten the buffer by then it reads garbage. With two
+	 * buffers we alternate, so the most recent SEND always points
+	 * at a buffer the *other* iteration is filling, leaving the
+	 * receiver a full hf_read worth of time to drain. */
+	char buf_a[READ_BUF];
+	char buf_b[READ_BUF];
+	char *buf;
+	int turn = 0;
 	resolve_path(cwd, arg, path);
 	int fd = hf_open(path, HF_O_RDONLY);
 	int n;
@@ -288,12 +298,12 @@ cmd_cat(const char *cwd, const char *arg)
 		term_print("'\n");
 		return;
 	}
-	/* One SEND per chunk (term_print_n), not per byte. The
-	 * single-byte path through term_print_char issues a SEND +
-	 * OBJ_READ round-trip per byte and overruns oriscterm's
-	 * receive socket on any non-trivial file. */
-	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
+	while (1) {
+		buf = turn ? buf_b : buf_a;
+		n = hf_read(fd, buf, READ_BUF);
+		if (n <= 0) break;
 		term_print_n(buf, n);
+		turn = 1 - turn;
 	}
 	hf_close(fd);
 }
@@ -302,7 +312,10 @@ static void
 cmd_more(const char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
-	char buf[READ_BUF];
+	char buf_a[READ_BUF];   /* see cmd_cat for why two buffers */
+	char buf_b[READ_BUF];
+	char *buf;
+	int turn = 0;
 	int line_count = 0;
 	resolve_path(cwd, arg, path);
 	int fd = hf_open(path, HF_O_RDONLY);
@@ -313,7 +326,10 @@ cmd_more(const char *cwd, const char *arg)
 		term_print("'\n");
 		return;
 	}
-	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
+	while (1) {
+		buf = turn ? buf_b : buf_a;
+		n = hf_read(fd, buf, READ_BUF);
+		if (n <= 0) break;
 		/* Print the chunk in newline-bounded slices so we can
 		 * paginate at line boundaries without splitting bytes. */
 		int seg_start = 0;
@@ -333,6 +349,7 @@ cmd_more(const char *cwd, const char *arg)
 			}
 		}
 		if (i > seg_start) term_print_n(buf + seg_start, i - seg_start);
+		turn = 1 - turn;
 	}
 	hf_close(fd);
 }
@@ -341,7 +358,10 @@ static void
 cmd_ls(const char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
-	char buf[READ_BUF];
+	char buf_a[READ_BUF];   /* see cmd_cat for why two buffers */
+	char buf_b[READ_BUF];
+	char *buf;
+	int turn = 0;
 	resolve_path(cwd, arg, path);
 	int fd = hf_opendir(path);
 	int n;
@@ -351,8 +371,12 @@ cmd_ls(const char *cwd, const char *arg)
 		term_print("'\n");
 		return;
 	}
-	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
+	while (1) {
+		buf = turn ? buf_b : buf_a;
+		n = hf_read(fd, buf, READ_BUF);
+		if (n <= 0) break;
 		term_print_n(buf, n);
+		turn = 1 - turn;
 	}
 	hf_close(fd);
 }
