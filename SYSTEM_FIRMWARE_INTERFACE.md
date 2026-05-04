@@ -218,6 +218,51 @@ calling task or returns `ENOSYS` per its policy.
 > Returns: `R2`: status. `R3`: packed state word (state in low 8 bits,
 > processor in next 8, exit code in upper 16).
 
+**`0x009  InstallProgram`** — *Non-restartable.*
+
+> Replace the calling task's running program with a new one and
+> transfer control to its entry point. Used by chunked-boot loaders
+> that have just finished assembling a guest program in two freshly
+> allocated objects (one code, one data) and now need to map that
+> guest at the standard `CODE_VA` / `DATA_VA` and jump in.
+>
+> Effects:
+> 1. Every existing mapping in the calling task whose backing
+>    descriptor is not of type `STACK` is dropped. The stack
+>    mapping is preserved so the new program inherits a usable
+>    stack.
+> 2. The code reference is mapped at the platform's standard
+>    `CODE_VA` (Vol I §5.4) with protection `R|X`. If a non-null
+>    data reference is provided, it is mapped at the standard
+>    `DATA_VA` with protection `R`.
+> 3. All general registers are zeroed except `R7` (set to PROCID),
+>    `R29` (set to `STACK_TOP - 16`), `R30` (set to 0), and `R31`
+>    (set to 0) — the same initial state firmware would set for a
+>    freshly loaded program. `O1` is set to the new code reference,
+>    `O2` to the inherited stack reference, `O3` to the new data
+>    reference (or null). `O4..O15` are *not* cleared; the loader
+>    is expected to have arranged the service-reference layout the
+>    new program expects before calling.
+> 4. PC is set to `CODE_VA + R4` and the next instruction fetched
+>    is the new program's entry point. The primitive does not
+>    return to its caller in any meaningful sense — by the time it
+>    completes, the caller's code is no longer mapped.
+>
+> Args:
+> - `O1`: code reference (must have effective `R|X` capabilities;
+>   home must be the calling processor).
+> - `O3`: data reference (must have `R`; null permitted), or zero.
+> - `R4`: entry offset within the new code (typically zero).
+>
+> Returns (visible only if a fault occurred before the jump): `R2`:
+> status. On success there is no observable return because the next
+> retired instruction is in the new program.
+>
+> Errors: `EREMOTE` (code or data home is not the calling
+> processor), `EPERM` (insufficient capabilities on the supplied
+> references), `ESTALE` (descriptor freed or generation mismatched),
+> `EINVAL` (entry offset out of range, or code reference null).
+
 ### 4.2 Synchronization
 
 **`0x010  SemAlloc`** — *Restartable.*
