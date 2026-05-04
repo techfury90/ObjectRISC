@@ -49,6 +49,17 @@
  * is 24 rows; we leave ~4 for the page-prompt + room to breathe. */
 #define PAGE_LINES 20
 
+/* Command history. Sized for ~10 KB of stack — fits comfortably in
+ * the default 64 KB stack alongside cwd / line / prompt. Bumping
+ * either dimension is free until you start eating into it. */
+#define HISTORY_SIZE 16
+
+struct history {
+	char buf[HISTORY_SIZE][LINE_MAX];
+	int  head;    /* index of the next slot to write */
+	int  count;   /* number of valid entries (≤ HISTORY_SIZE) */
+};
+
 const char banner[]  = BUILD_BANNER;
 const char hello1[]  = "\nType 'help' for commands. End with 'exit'.\n";
 const char help_msg[] =
@@ -78,21 +89,50 @@ const char more_prompt[] = "--More-- (space/RET, q to quit)";
 
 /* --- input helpers ---------------------------------------------------- */
 
-/* Read a line from the keyboard. Echoes printable chars to the
- * terminal as they come in. Backspace adjusts the buffer (no visual
- * undo). Enter (TK_RETURN) terminates the line; we print a newline
- * and NUL-terminate the buffer. Returns line length. */
+/* Replace the on-screen line + buffer contents with `src`. Erases
+ * the current `*n` chars via backspace echoes (oriscterm interprets
+ * `\b` as delete-prev-char), then copies `src` into `buf` and
+ * echoes it. Used by the up/down arrow handlers in read_line. */
+static void
+replace_line(char *buf, int *n, const char *src, int max)
+{
+	int i;
+	while (*n > 0) {
+		(*n)--;
+		term_print_char('\b');
+	}
+	for (i = 0; src[i] && i < max - 1; i++) {
+		buf[i] = src[i];
+		term_print_char(src[i]);
+	}
+	*n = i;
+}
+
+/* Read a line from the keyboard. Echoes printable chars as they
+ * arrive. Backspace deletes the previous char (visually too — see
+ * oriscterm's `\b` handling). Up / Down arrows cycle through
+ * history. Enter (TK_RETURN) terminates the line, saves it into
+ * history if non-empty, and returns its length. */
 static int
-read_line(char *buf, int max)
+read_line(char *buf, int max, struct history *h)
 {
 	int n = 0;
+	int pos = 0;     /* 0 = current/empty; k = k entries back */
 	while (1) {
 		int mods;
 		int c = term_getkey(&mods);
 		if (c < 0) { buf[0] = 0; return 0; }
 		if (c == TK_RETURN) {
+			int i;
 			term_print("\n");
 			buf[n] = 0;
+			if (n > 0) {
+				/* Save into the circular history. */
+				for (i = 0; i <= n && i < LINE_MAX; i++)
+					h->buf[h->head][i] = buf[i];
+				h->head = (h->head + 1) % HISTORY_SIZE;
+				if (h->count < HISTORY_SIZE) h->count++;
+			}
 			return n;
 		}
 		if (c == TK_BACKSPACE) {
@@ -105,6 +145,28 @@ read_line(char *buf, int max)
 				 * non-empty so a backspace at column 0
 				 * doesn't chew into the prompt. */
 				term_print_char('\b');
+			}
+			continue;
+		}
+		if (c == TK_UP) {
+			if (pos < h->count) {
+				int idx;
+				pos++;
+				idx = (h->head - pos + HISTORY_SIZE) % HISTORY_SIZE;
+				replace_line(buf, &n, h->buf[idx], max);
+			}
+			continue;
+		}
+		if (c == TK_DOWN) {
+			if (pos > 0) {
+				pos--;
+				if (pos == 0) {
+					replace_line(buf, &n, "", max);
+				} else {
+					int idx = (h->head - pos + HISTORY_SIZE)
+					          % HISTORY_SIZE;
+					replace_line(buf, &n, h->buf[idx], max);
+				}
 			}
 			continue;
 		}
@@ -438,9 +500,12 @@ main(void)
 	char line[LINE_MAX];
 	char cwd[PATH_MAX];
 	char prompt_buf[PATH_MAX + 16];
+	struct history h;
 
 	cwd[0] = '/';
 	cwd[1] = 0;
+	h.head = 0;
+	h.count = 0;
 
 	/* term_init parks boot O2/O3/O4 into O11/O14/O15; we don't need
 	 * to touch them ourselves here. (See term.c on why we avoid
@@ -457,7 +522,7 @@ main(void)
 		char *arg;
 
 		print_prompt(cwd, prompt_buf);
-		len = read_line(line, sizeof(line));
+		len = read_line(line, sizeof(line), &h);
 		if (len == 0) continue;
 
 		arg = split_arg(line);
