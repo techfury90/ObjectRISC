@@ -82,11 +82,14 @@ CPU=$!
 
 wait $TERM_PID 2>/dev/null || true
 sleep 0.5
+# After fake_terminal exits, the shell may still be alive — under
+# load some 'exit' keystrokes get dropped (the shared self-svc queue
+# in libc interleaves keys with hostfsd responses; see term.c). Just
+# kill it so the test can move on to its assertion.
+kill -KILL $CPU 2>/dev/null || true
 wait $CPU 2>/dev/null || true
-kill -TERM $HF 2>/dev/null || true
-wait $HF 2>/dev/null || true
-kill -TERM $BAR 2>/dev/null || true
-wait $BAR 2>/dev/null || true
+kill -KILL $HF $BAR 2>/dev/null || true
+wait $HF $BAR 2>/dev/null || true
 
 # Extract the rendered text and count occurrences of stanza markers.
 sed -n '/--- console render ---/,$p' "$TMP/term.out" \

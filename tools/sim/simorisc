@@ -685,6 +685,9 @@ class CPU(Port):
         self.boot_state: Optional[Dict] = None  # snapshot used to relaunch handler tasks
         self.blocked_on: Optional[BlockedSignal] = None  # poll/response wait state
         self.next_trans_id = 0               # per-CPU SEND/OL/OS transaction id counter
+        # Set to True by primitive_InstallProgram to tell the CALL
+        # dispatch site "I already moved PC, don't advance it".
+        self._installed_program = False
 
         # Trace control.
         self.trace_enabled = False
@@ -1050,10 +1053,14 @@ class System:
             return None, RESP_CAP
         if offset < 0 or offset + width > desc.length or width <= 0:
             return None, RESP_BOUNDS
-        if width in (2, 4, 8) and (offset & (width - 1)):
-            # No dedicated misalignment fault code in Vol IV §4.1; reuse
-            # BUS_ERROR for now.
-            return None, RESP_BUS_ERROR
+        # Don't enforce offset/width alignment here: this validator is
+        # called from _handle_obj_read_req / _handle_obj_write_req, which
+        # serve arbitrary byte-stream device reads (e.g. oriscterm
+        # fetching a 2-byte console-write payload at an odd offset).
+        # CPU-side OL/OS instructions enforce VA alignment in
+        # lookup_va, before they even issue an OBJ_READ_REQ, so adding
+        # an alignment check here would only break legitimate device
+        # traffic.
         return desc, RESP_OK
 
     def _handle_obj_read_req(self, cpu: CPU, pkt: Dict) -> None:
@@ -1207,6 +1214,24 @@ class System:
                         any_progress = True
                         continue
                     except TaskExitSignal as e:
+                        if getattr(cpu, "reset_on_exit", False):
+                            # MVP "tiny OS": this CPU is a reusable
+                            # program slot. The guest just TaskExited;
+                            # we'll wipe state and re-run the loader.
+                            # But: if the guest's last act was a
+                            # term_print SEND, the receiver may still
+                            # be issuing OBJ_READ_REQs against the
+                            # guest's data descriptor — wiping
+                            # immediately would lose those bytes.
+                            # Defer the actual reset until a wall-
+                            # clock deadline; meanwhile
+                            # _process_requests answers in-flight
+                            # reads against the still-valid descriptor
+                            # table.
+                            cpu.active = False
+                            cpu.reset_at_time = time.time() + RESET_DRAIN_SECONDS
+                            any_progress = True
+                            continue
                         cpu.active = False
                         cpu.exit_code = e.code & 0xFF
                         # Snapshot state at TaskExit so any handlers that
@@ -1227,18 +1252,36 @@ class System:
                         return 3
                     any_progress = True
                 else:
-                    if self.dispatch_handler(cpu):
+                    # Inactive CPU: either it's draining toward a
+                    # deferred reset (the wall-clock deadline gates
+                    # this; while waiting, _process_requests above
+                    # still answers in-flight reads), or it has
+                    # handler dispatch work to do.
+                    if getattr(cpu, "reset_at_time", 0) > 0:
+                        if time.time() >= cpu.reset_at_time:
+                            cpu.reset_at_time = 0
+                            reset_cpu(cpu)
+                            any_progress = True
+                        # else: don't set any_progress — let the run
+                        # loop's idle-sleep give us 1ms ticks while
+                        # we wait for the deadline.
+                    elif self.dispatch_handler(cpu):
                         any_progress = True
             if not any_progress:
-                # Stay alive if either: (a) the user asked us to serve
-                # forever via --serve, or (b) we're in socket mode and
-                # at least one CPU is blocked waiting on something
-                # the socket might deliver. In either case, exit only
-                # when the socket has EOF'd.
+                # Stay alive if any of: (a) the user asked us to serve
+                # forever via --serve, (b) we're in socket mode and at
+                # least one CPU is blocked waiting on something the
+                # socket might deliver, or (c) a CPU is draining
+                # toward a deferred reset and may yet receive
+                # in-flight OBJ_READ_REQs. In all cases, exit when
+                # the socket has EOF'd.
                 in_socket_mode = hasattr(self.crossbar, 'connected')
                 waiting_blocked = any(
                     cpu.blocked_on is not None for cpu in self.cpus)
-                if self.serve_mode or (in_socket_mode and waiting_blocked):
+                draining = any(
+                    getattr(cpu, "reset_at_time", 0) > 0 for cpu in self.cpus)
+                if self.serve_mode or (in_socket_mode and waiting_blocked) \
+                        or (in_socket_mode and draining):
                     if in_socket_mode and not self.crossbar.connected:
                         break
                     time.sleep(0.001)
@@ -1278,6 +1321,14 @@ def to_u32(v: int) -> int:
 # ---------------------------------------------------------------------------
 
 DEFAULT_STACK_SIZE = 0x10000
+
+# Wall-clock seconds a --reset-on-exit CPU spends in a "drain" phase
+# between TaskExit and the actual reset. During this window the CPU
+# doesn't fetch instructions, but _process_requests still answers any
+# in-flight OBJ_READ_REQs from receivers (e.g., oriscterm fetching
+# the bytes of the guest's last term_print). Sized for a few-process
+# Tk-mediated SEND→OBJ_READ_REQ round trip with some slack.
+RESET_DRAIN_SECONDS = 0.5
 
 def load_orx_file(path: str) -> Tuple[bytes, bytes, int, int]:
     """Parse an .orx file and return (text_bytes, data_bytes, entry_offset,
@@ -1389,6 +1440,39 @@ def snapshot_boot_state(cpu: CPU) -> None:
         "opr": list(cpu.opr),
         "code_va_base": CODE_VA,
     }
+
+
+def reset_cpu(cpu: CPU) -> None:
+    """Wipe `cpu` back to fresh boot state and re-run init from the saved
+    boot args. Used by --reset-on-exit: when a non-leader CPU running the
+    chunkboot loader hits TaskExit, we don't terminate the process; we
+    re-init so the loader runs again and can boot the next program.
+
+    Crossbar connection, PID, and trace settings persist across reset."""
+    args = cpu.reset_args   # set by main() once at startup
+    cpu.gpr            = [0] * 32
+    cpu.opr            = [0] * 16
+    cpu.hi             = 0
+    cpu.lo             = 0
+    cpu.pc             = 0
+    cpu.next_pc        = 0
+    cpu.descriptors    = [None]
+    cpu.next_obj_idx   = 1
+    cpu.free_indices   = []
+    cpu.mappings       = []
+    cpu.active         = False
+    cpu.exit_code      = None
+    cpu.inbox          = []
+    cpu.requests       = []
+    cpu.responses      = []
+    cpu.boot_state     = None
+    cpu.blocked_on     = None
+    cpu.next_trans_id  = 0
+    cpu.reset_at_time  = 0
+    init_cpu(cpu, args["text"], args["data"], args["entry"], args["stack_size"])
+    populate_self_service(cpu)
+    install_external_services(cpu, args["services"])
+    snapshot_boot_state(cpu)
 
 
 # ---------------------------------------------------------------------------
@@ -1611,6 +1695,117 @@ def primitive_InstallHandler(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK)
 
 
+def primitive_InstallProgram(cpu: CPU) -> None:
+    """Atomically replace the running program with one loaded into a
+    fresh code/(optional) data object pair, and jump to its entry.
+
+    Used by chunkboot.s after fetching all chunks of a guest .orx:
+    the loader hands control to the guest at CODE_VA + entry_offset,
+    with the guest seeing the same VA layout as a standalone simorisc
+    boot would have produced.
+
+    Args:
+        O1 = code reference (must have R+X effective caps)
+        O3 = data reference (must have R; null for code-only programs)
+        R4 = entry offset within the new code
+
+    Effects:
+        - Drops all mappings whose descriptors aren't TAG_STACK; the
+          stack mapping (whatever VA range it lives in) is preserved
+          so the guest can keep using the inherited stack.
+        - Maps code at CODE_VA with prot=R+X.
+        - Maps data at DATA_VA with prot=R (only if O3 != 0).
+        - Resets all GPRs except R7 (PROCID), R29 (SP=STACK_TOP-16),
+          R30 (FP=0), R31 (RA=0).
+        - Sets PC = CODE_VA + R4 and next_PC = PC + 4.
+        - Sets cpu._installed_program=True so the dispatch_call site
+          knows to skip the post-call PC advance.
+
+    The CPU's OR slots are NOT cleared (the guest inherits whatever
+    O5..O15 the loader has arranged, e.g. terminal/keyboard/hostfsd
+    refs after the loader's pre-jump shift). O1 is set to the new
+    code ref; O3 is set to the new data ref or zero."""
+    code_ref = cpu.get_opr(1)
+    data_ref = cpu.get_opr(3)
+    entry    = cpu.get_gpr(4) & 0xFFFFFFFF
+    if entry & 0x80000000:
+        entry -= 0x100000000
+
+    if code_ref == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if ref_home(code_ref) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+    if (ref_caps(code_ref) & (CAP_R | CAP_X)) != (CAP_R | CAP_X):
+        cpu.set_gpr(2, ERR_EPERM); return
+    code_idx = ref_index(code_ref)
+    if code_idx >= len(cpu.descriptors) or cpu.descriptors[code_idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); return
+    code_desc = cpu.descriptors[code_idx]
+    if not code_desc.live or code_desc.generation != ref_generation(code_ref):
+        cpu.set_gpr(2, ERR_ESTALE); return
+    code_size = code_desc.length
+    if entry < 0 or entry >= code_size:
+        cpu.set_gpr(2, ERR_EINVAL); return
+
+    data_size = 0
+    if data_ref != 0:
+        if ref_home(data_ref) != cpu.pid:
+            cpu.set_gpr(2, ERR_EREMOTE); return
+        if (ref_caps(data_ref) & CAP_R) != CAP_R:
+            cpu.set_gpr(2, ERR_EPERM); return
+        data_idx = ref_index(data_ref)
+        if data_idx >= len(cpu.descriptors) or cpu.descriptors[data_idx] is None:
+            cpu.set_gpr(2, ERR_ESTALE); return
+        data_desc = cpu.descriptors[data_idx]
+        if not data_desc.live or data_desc.generation != ref_generation(data_ref):
+            cpu.set_gpr(2, ERR_ESTALE); return
+        data_size = data_desc.length
+
+    # Keep only stack mappings; toss everything else (loader's own
+    # code/data, any temp R+W mappings the loader created during the
+    # chunk copy, etc.). The stack VA range is inherited.
+    stack_idx = None
+    new_mappings = []
+    for m in cpu.mappings:
+        d = cpu.descriptors[m[2]]
+        if d is not None and d.type_tag == TAG_STACK:
+            new_mappings.append(m)
+            stack_idx = m[2]
+    cpu.mappings = new_mappings
+
+    cpu.map_object(code_ref, va=CODE_VA, offset=0, length=code_size,
+                   prot=CAP_R | CAP_X)
+    if data_size > 0:
+        cpu.map_object(data_ref, va=DATA_VA, offset=0, length=data_size,
+                       prot=CAP_R)
+
+    # Match init_cpu's GPR state — minus R0 (always zero), and with
+    # PROCID restored to cpu.pid (some loaders may have shuffled R7).
+    for i in range(32):
+        cpu.gpr[i] = 0
+    cpu.set_gpr(7, cpu.pid)
+    cpu.set_gpr(29, STACK_TOP - 16)
+    cpu.set_gpr(30, 0)
+    cpu.set_gpr(31, 0)
+
+    cpu.set_opr(1, code_ref)
+    cpu.set_opr(3, data_ref)
+    # O2 = stack ref so term_init's `omov o11, o2` lands the right
+    # thing. Reconstruct from the surviving stack descriptor (its
+    # index is fixed by init_cpu, but we look it up to be tolerant of
+    # future layout changes).
+    if stack_idx is not None:
+        sd = cpu.descriptors[stack_idx]
+        stack_ref = make_ref(generation=sd.generation, home=cpu.pid,
+                             index=stack_idx, caps=sd.max_caps)
+        cpu.set_opr(2, stack_ref)
+
+    cpu.pc      = (CODE_VA + entry) & 0xFFFFFFFF
+    cpu.next_pc = (cpu.pc + 4)      & 0xFFFFFFFF
+    cpu._installed_program = True
+    cpu.set_gpr(2, ERR_OK)
+
+
 def primitive_MapObject(cpu: CPU) -> None:
     target  = cpu.get_opr(1)
     va_hint = cpu.get_gpr(4)
@@ -1655,6 +1850,8 @@ def primitive_MapObject(cpu: CPU) -> None:
 def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
     if prim == 0x001:
         primitive_TaskExit(cpu)
+    elif prim == 0x009:
+        primitive_InstallProgram(cpu)
     elif prim == 0x100:
         primitive_ObjAlloc(cpu)
     elif prim == 0x101:
@@ -2089,6 +2286,7 @@ def step(cpu: CPU) -> None:
             cpu.system.queue_send(msg)
     elif op == 0x3D:  # CALL — no delay slot.
         prim = target26
+        cpu._installed_program = False
         try:
             dispatch_call(cpu, prim, pc)
         except BlockedSignal as b:
@@ -2098,8 +2296,11 @@ def step(cpu: CPU) -> None:
             cpu.cycles += 1
             emit_trace(cpu, pc, word, pre_gpr, pre_opr, pre_hi, pre_lo)
             return
-        cpu.pc = to_u32(pc + 4)
-        cpu.next_pc = to_u32(cpu.pc + 4)
+        if not cpu._installed_program:
+            cpu.pc = to_u32(pc + 4)
+            cpu.next_pc = to_u32(cpu.pc + 4)
+        # Else: primitive_InstallProgram already set PC to the new
+        # entry point — don't advance past it.
         cpu.cycles += 1
         emit_trace(cpu, pc, word, pre_gpr, pre_opr, pre_hi, pre_lo)
         return
@@ -2203,6 +2404,14 @@ def main(argv: List[str]) -> int:
                          "incoming SENDs and handler dispatches until "
                          "the socket closes or a signal arrives. Use this "
                          "for server-style CPUs.")
+    ap.add_argument("--reset-on-exit", action="store_true",
+                    help="in --connect mode: when the running task hits "
+                         "TaskExit, don't terminate the process — wipe all "
+                         "state and re-run init from the loaded .orx. "
+                         "Used for MVP program-spawning: pre-spawned spare "
+                         "CPUs run the chunkboot loader, run a guest "
+                         "program, exit, reset, re-announce — making the "
+                         "CPU a reusable boot target.")
     ap.add_argument("--trace", action="store_true",
                     help="print each retired instruction with register effects")
     ap.add_argument("--max-cycles", type=int, default=10_000_000,
@@ -2231,6 +2440,17 @@ def main(argv: List[str]) -> int:
         system.serve_mode = args.serve
         socket_xbar.attach_port(args.pid, cpu)
         cpu.trace_enabled = args.trace
+        # Stash the boot inputs so reset_cpu can re-init verbatim on
+        # TaskExit. --reset-on-exit only meaningful in --connect mode
+        # (otherwise there's no socket to keep alive).
+        cpu.reset_args = {
+            "text":       text_bytes,
+            "data":       data_bytes,
+            "entry":      entry,
+            "stack_size": stack_size,
+            "services":   args.service,
+        }
+        cpu.reset_on_exit = args.reset_on_exit
         init_cpu(cpu, text_bytes, data_bytes, entry, stack_size)
         populate_self_service(cpu)
         install_external_services(cpu, args.service)

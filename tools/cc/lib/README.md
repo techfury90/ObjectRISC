@@ -43,6 +43,21 @@ Documented in [`tools/devices/README.md`](../../devices/README.md)
 under "hostfsd". Adds `hf_init / hf_open / hf_opendir / hf_close /
 hf_read / hf_write` to the libc.
 
+### `linkboot.c` — spawn programs via `linkbootd`
+
+| Function | Effect |
+|----------|--------|
+| `int lb_init(void)` | ObjAlloc a private mailbox, attach a queue, derive an R+S sub-ref. Call once at startup, after `term_init`. |
+| `int lb_spawn(const char *path)` | SEND a spawn request to `linkbootd` (in `O7` by convention) carrying `path` and the mailbox ref. Block until the guest exits; return its exit code (always 0 for MVP), 255 on a load failure, or -1 on a poll failure. |
+
+The mailbox is a separate object from the boot self-svc on purpose:
+the standard self-svc queue holds keyboard events and hostfsd
+responses, and `lb_spawn` would otherwise interleave with them when
+a long-running spawn lets traffic pile up. The boot ABI gets one
+new slot for shells using these helpers:
+
+    O7 = linkbootd  (--service order)
+
 ### `string.c` — string and memory primitives
 
 | Function | Effect |
@@ -89,7 +104,10 @@ delete the `.ora`) to refresh.
 | File             | Role                                              |
 |------------------|---------------------------------------------------|
 | `liborisc.h`     | C-side declarations for everything in the archive |
-| `io.c`           | Console-output functions                          |
+| `io.c`           | Console-output functions (host stdout via the legacy bridge) |
+| `term.c`         | oriscterm: console SENDs, keyboard subscription, queue helpers |
+| `host_io.c`      | hostfsd client: open/read/write/close/opendir over the wire |
+| `linkboot.c`     | linkbootd client: `lb_init` / `lb_spawn`         |
 | `string.c`       | String + memory primitives                        |
 | `build.sh`       | Compile every `.c` and bundle into `liborisc.ora` |
 | `liborisc.ora`   | The archive (regenerated; not source-controlled)  |

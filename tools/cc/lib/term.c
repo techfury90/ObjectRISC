@@ -146,8 +146,15 @@ term_init(void)
 	asm volatile("omov o14, o4");
 	asm volatile("omov o15, o3");
 
-	/* Attach a receive queue (shared across keyboard events and any
-	 * other SENDs to our self-svc — depth 16 is generous). */
+	/* Attach a receive queue (depth 16). This queue is shared:
+	 * keyboard events AND hostfsd responses both land here. The
+	 * shared-queue design has a known limitation — a long-running
+	 * hf_read loop interleaved with keystrokes can mis-decode
+	 * messages. The right fix is separate per-service queues; for
+	 * now we keep the depth small so excess keystrokes during long
+	 * cmd_cat / cmd_ls runs are dropped at the door rather than
+	 * silently corrupting the response stream. lb_spawn sidesteps
+	 * the issue by attaching its own mailbox queue (linkboot.c). */
 	asm volatile(
 		"omov  o1, o4\n"
 		"addiu r4, r0, 16\n"

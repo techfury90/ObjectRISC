@@ -6,6 +6,7 @@
  *     help        — short list of commands
  *     cat <path>  — print the contents of a host file
  *     ls [path]   — list a host directory (default: ".")
+ *     run <path>  — load and run another .orx via linkbootd
  *     exit / quit — end the session
  *
  * The runner script (run_shell.sh) computes a build-date banner
@@ -16,6 +17,7 @@
  * Boot ABI (set up by run_shell.sh via --service order):
  *     O5  = oriscterm console  (idx 1)
  *     O6  = oriscterm keyboard (idx 2)
+ *     O7  = linkbootd          (pid 18, idx 1)
  *     O10 = hostfsd            (pid 17, idx 1)
  *     O11 = boot stack ref     (parked by term_init)
  *     O14 = boot self-svc      (parked by term_init)
@@ -39,10 +41,14 @@ const char help_msg[] =
     "  help            — this message\n"
     "  cat <path>      — print the contents of a host file\n"
     "  ls [<path>]     — list a host directory (default: '.')\n"
+    "  run <path>      — load and run another .orx via linkbootd\n"
     "  exit | quit     — leave the shell\n"
     "\n"
     "Backspace edits the line buffer but the terminal display is\n"
     "append-only, so corrections aren't visually undone yet.\n";
+
+const char run_done_pre[] = "[exited ";
+const char run_done_post[] = "]\n";
 
 /* --- input helpers ---------------------------------------------------- */
 
@@ -136,6 +142,15 @@ cmd_ls(const char *path)
 	hf_close(fd);
 }
 
+static void
+cmd_run(const char *path)
+{
+	int code = lb_spawn(path);
+	term_print(run_done_pre);
+	term_print_int(code);
+	term_print(run_done_post);
+}
+
 /* --- main ------------------------------------------------------------- */
 
 int
@@ -148,6 +163,7 @@ main(void)
 	 * `register __or __asm__("oN")` declarations for the saves.) */
 	term_init();
 	hf_init();
+	lb_init();
 
 	term_print(banner);
 	term_print(hello1);
@@ -169,6 +185,9 @@ main(void)
 			else cmd_cat(arg);
 		} else if (strcmp(line, "ls") == 0) {
 			cmd_ls(*arg ? arg : ".");
+		} else if (strcmp(line, "run") == 0) {
+			if (*arg == 0) term_print("usage: run <path>\n");
+			else cmd_run(arg);
 		} else if (strcmp(line, "exit") == 0
 		           || strcmp(line, "quit") == 0) {
 			term_print("bye!\n");

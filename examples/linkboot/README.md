@@ -1,31 +1,45 @@
-# Generic link-boot loader
+# Generic link-boot loaders
 
-A small `.orx` that any extra Object RISC CPU can be booted with —
-the loader announces itself to a "boot master" service on the
-crossbar, waits for the master to SEND it a code reference, copies
-the code into a fresh local code object, maps it executable, and
-JRs into the loaded module. The loader's own `.orx` carries no
-application code; the actual program is decided at runtime.
+Two flavors of self-contained `.orx` that any extra Object RISC CPU
+can be booted with. Both announce to a "boot master" service on the
+crossbar and load the actual program at runtime; the loader's own
+`.orx` carries no application code.
 
-Useful for spinning up dynamic worker pools, demand-loaded service
-handlers, or anything where a CPU's role isn't fixed when the
-system is launched.
+- **`linkboot.s`** — single-shot. The master replies with one SEND
+  carrying a code reference; the loader OLW-copies it (up to 256 B
+  via an unrolled per-word loop with early exit), maps it
+  executable, and JRs in. Compact, but the 256 B image cap means
+  it can only boot tiny hand-encoded modules.
+- **`chunkboot.s`** — chunked. The master serves the program 256 B
+  at a time over a request/reply protocol; the loader splits text
+  and data into separate objects and hands off via the
+  `InstallProgram` firmware primitive (call #0x009). Handles
+  arbitrarily large pcc-built programs and is what the MVP
+  shell's `run` command uses to spawn guests onto its pool of
+  spare CPUs.
+
+Both are useful for spinning up dynamic worker pools, demand-loaded
+service handlers, or anything where a CPU's role isn't fixed when
+the system is launched.
 
 ## Files
 
 | File                   | Role                                                                                |
 |------------------------|-------------------------------------------------------------------------------------|
-| `gen_linkboot.py`      | Generator. Run this to produce the four files below.                                |
-| `linkboot.s`           | Standalone loader `.orx` source.                                                    |
-| `master.s`             | Standalone asm master `.orx` source. Drives one loader, sends an 8-instruction module. |
-| `demo.s`               | Combined master + loader for `simorisc --processors 2`. Branches on PROCID.         |
-| `run.sh`               | Multi-process runner with the asm master, under `oriscrun`.                         |
-| `run_python_master.sh` | Multi-process runner with [`tools/devices/linkbootd`](../../tools/devices/linkbootd) (Python boot server) standing in for the asm master. Scales to N loader CPUs (`NCPUS=N`). |
+| `gen_linkboot.py`      | Generator for the single-shot loader/master/demo. Edit this, not its outputs.       |
+| `linkboot.s`           | Single-shot loader `.orx` source. Generated.                                        |
+| `master.s`             | Standalone asm master `.orx` source. Drives one loader, sends an 8-instruction module. Generated. |
+| `demo.s`               | Combined master + loader for `simorisc --processors 2`. Branches on PROCID. Generated. |
+| `run.sh`               | Multi-process runner with the asm master, under `oriscrun`. Uses `linkboot.s`.      |
+| `gen_chunkboot.py`     | Generator for the chunked-protocol loader. Edit this, not its output.               |
+| `chunkboot.s`          | Chunked-protocol loader `.orx` source. Generated.                                   |
+| `run_python_master.sh` | Multi-process runner with [`tools/devices/linkbootd`](../../tools/devices/linkbootd) (Python boot server) standing in for the asm master. Uses `chunkboot.s`; scales to N loader CPUs (`NCPUS=N`). |
 
 `linkboot.s`, `master.s`, `demo.s`, and the validation test at
 [`tools/sim/tests/validation/11_multicpu/13_linkboot_loader.s`](../../tools/sim/tests/validation/11_multicpu/13_linkboot_loader.s)
-are all regenerated from `gen_linkboot.py`. Edit the generator, not
-the outputs.
+are all regenerated from `gen_linkboot.py`. `chunkboot.s` is
+regenerated from `gen_chunkboot.py`. Edit the generators, not the
+outputs.
 
 ## Try it
 

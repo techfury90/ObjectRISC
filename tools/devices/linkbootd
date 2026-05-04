@@ -1,44 +1,84 @@
 #!/usr/bin/env python3
 """linkbootd — Python-side link-boot server for the Object RISC crossbar.
 
-A non-CPU participant that connects to oriscbar like any other port,
-hosts a boot image (extracted from a `.orx` file or read raw), and
-answers link-boot requests from CPUs running examples/linkboot/
-linkboot.s. For each loader CPU that announces, linkbootd replies
-with a SEND_DELIVER carrying:
+A non-CPU participant that connects to oriscbar like any other port.
+Two roles:
 
-    O2 = synthesized reference to our hosted boot image
-    R4 = byte length of the image
-    R5 = entry offset within the image (default 0)
+1. **Boot master for a pool of "spare" CPUs.** Each spare runs the
+   chunkboot loader (examples/linkboot/chunkboot.s); when a guest
+   program is queued, linkbootd serves it to the next-announcing
+   loader 256 bytes at a time, then waits for the loader to reset
+   (simorisc --reset-on-exit) and re-announce, which doubles as the
+   "previous run finished" signal.
 
-When the loader subsequently OLW's words from that reference, the
-crossbar routes the OBJ_READ_REQ packets to us; we answer with
-OBJ_READ_RESP carrying the bytes from the hosted image.
+2. **Control endpoint for the shell.** A "shell" CPU SENDs a spawn
+   request with a path; linkbootd OBJ_READs the path bytes from the
+   shell, loads the .orx, queues it, and notifies the shell when the
+   guest exits.
 
-Same shape as oriscterm — both are external programs that present
-themselves to the crossbar as Volume IV §3 ports. The difference is
-just what they do with the SENDs they receive.
+Protocols
+---------
+
+Spawn request (shell → linkbootd):
+    O1 = our service ref           (recipient, by SEND convention)
+    O2 = path source ref           (any byte object linkbootd can OL)
+    O3 = shell's R+S self-ref      (where to send the result)
+    R4 = path_offset_in_source
+    R5 = path_byte_length          (≤ MAX_PATH_LEN)
+    R6 = op = 1 (spawn)
+
+Spawn result (linkbootd → shell):
+    O1 = shell's R+S self-ref      (recipient)
+    O2 = null
+    R4 = magic = LB_RESULT_MAGIC
+    R5 = op = 1 (spawn-done)
+    R6 = exit_code                 (always 0 for MVP — we don't yet
+                                   capture the guest's TaskExit code)
+
+Loader announce/ack (loader → linkbootd):
+    O1 = our service ref           (recipient)
+    O2 = loader's R+S self-ref
+    R4 = PROCID                    (informational)
+    R5 = next_offset               (0 = "ready / done with previous";
+                                   else "send me the chunk starting
+                                   here")
+
+Chunk delivery (linkbootd → loader):
+    O1 = loader's R+S self-ref     (recipient)
+    O2 = chunk source ref          (R-only, ≤256 B window we synthesize
+                                   per-chunk; loader OLW's offsets
+                                   0..chunk_byte_length-1)
+    R4 = chunk_offset_in_image
+    R5 = chunk_byte_length
+    R6 = total_image_size
+    R7 = entry_offset
+
+Backward-compat
+---------------
+
+`--image PATH` preloads an image at startup for systems that don't
+have a shell driving spawns (the run_python_master.sh demo). The image
+is served once to the first announcing loader, with no result
+notification (requester_ref = 0).
 
 Usage:
-    tools/devices/linkbootd --socket /tmp/oriscbar.sock --pid 0 \\
-                            --image path/to/module.orx [--entry OFFSET]
-
-If the image is a `.orx` file (magic = "ORISC\\0\\0\\0"), the text
-section is extracted automatically. Otherwise the file is treated as
-raw bytes — useful for testing with hand-encoded module images that
-don't go through asmorisc.
+    tools/devices/linkbootd --socket /tmp/oriscbar.sock --pid 18 \\
+        --shell-pids 0 --loader-pids 32,33,34,35 [--image path.orx]
 """
 
 import argparse
 import errno
 import os
+import select
 import selectors
 import signal
 import socket
 import struct
 import sys
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 # Wire-format constants — must agree with oriscbar / simorisc / oriscterm.
 HELLO_MAGIC      = 0xC0FFEEAA
@@ -59,14 +99,26 @@ CAP_S = 0x08
 CAP_V = 0x10
 CAP_C = 0x40
 
-# Synthetic descriptor index for the hosted boot image. Picked to be
-# distinct from anything a real CPU would assign (init_cpu starts at 1
-# and a few are taken by code/stack/data/service).
-IMAGE_DESC_INDEX = 0x100
-IMAGE_DESC_GEN   = 1
+# Our service descriptor — what shells / loaders address us as. Spec'd
+# by callers via --service N=SERVICE_INDEX@9 and --pid N.
+SERVICE_INDEX = 1
+SERVICE_GEN   = 1
 
-# `.orx` magic; if the input file starts with this we extract the text
-# section, otherwise treat it as raw bytes.
+# Chunked boot constants. Loader's unrolled OLW table covers 256 bytes;
+# each chunk delivery synthesizes a fresh descriptor at a unique index.
+CHUNK_BYTES         = 256
+CHUNK_DESC_BASE     = 0x200      # avoid collision with SERVICE_INDEX (1)
+                                 # and the legacy IMAGE_DESC_INDEX (0x100).
+CHUNK_DESC_GEN      = 1
+
+# Spawn protocol opcodes.
+OP_SPAWN          = 1
+LB_RESULT_MAGIC   = 0x4C42_5251   # "LBRQ" — picked to be unmistakable
+                                  # in a queue receive vs. a keyboard event.
+
+MAX_PATH_LEN = 4096
+
+# `.orx` magic.
 ORX_MAGIC = b"ORISC\x00\x00\x00"
 
 
@@ -150,6 +202,13 @@ def build_send_deliver(src_pid: int, dst_pid: int, trans_id: int,
     return pack_packet(src_pid, dst_pid, PKT_SEND_DELIVER, 0, trans_id, payload)
 
 
+def build_obj_read_req(src_pid: int, dst_pid: int, trans_id: int,
+                       ref: int, offset: int, width: int) -> bytes:
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF,
+               offset & 0xFFFFFFFF, width & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_REQ, 0, trans_id, payload)
+
+
 def build_obj_read_resp(src_pid: int, dst_pid: int, trans_id: int,
                         flags: int, data: bytes) -> bytes:
     if flags == RESP_OK:
@@ -167,21 +226,62 @@ def build_obj_read_resp(src_pid: int, dst_pid: int, trans_id: int,
 # Image loading
 # ---------------------------------------------------------------------------
 
-def load_image(path: Path) -> bytes:
-    """Return the raw module bytes from `path`. If the file is a .orx
-    (starts with the ORISC magic), extract just the text section;
-    otherwise treat the file contents as raw bytes."""
+def load_image(path: Path) -> Tuple[bytes, bytes, int]:
+    """Return (text_bytes, data_bytes, entry_offset). For .orx files,
+    parse the header and split sections; for raw files, treat the
+    whole file as text with no data and entry=0."""
     blob = path.read_bytes()
     if blob[:8] == ORX_MAGIC:
         if len(blob) < 0x20:
-            raise SystemExit(f"linkbootd: {path}: .orx too short for header")
-        version, _flags, _entry, text_size, _data_size, _stack = \
+            raise ValueError(f".orx too short for header")
+        version, _flags, entry, text_size, data_size, _stack = \
             struct.unpack(">IIIIII", blob[0x08:0x20])
         if version != 1:
-            raise SystemExit(f"linkbootd: {path}: unsupported .orx version "
-                             f"{version}")
-        return blob[0x20:0x20 + text_size]
-    return blob
+            raise ValueError(f"unsupported .orx version {version}")
+        text  = blob[0x20:0x20 + text_size]
+        data  = blob[0x20 + text_size:0x20 + text_size + data_size]
+        return text, data, entry
+    return blob, b'', 0
+
+
+# ---------------------------------------------------------------------------
+# Per-loader and per-spawn state
+# ---------------------------------------------------------------------------
+
+# Loader states.
+L_IDLE         = "idle"        # not assigned to anything; waiting in pool
+L_ASSIGNED     = "assigned"    # serving chunks; loader is mid-copy
+L_WAITING_DONE = "waiting"     # last chunk sent; guest running; await reset
+
+
+@dataclass
+class LoaderInfo:
+    pid: int
+    state: str = L_IDLE
+    self_ref: int = 0          # most recent R+S self-ref this loader sent
+    # Active assignment fields:
+    text: bytes = b''
+    data: bytes = b''
+    entry: int = 0
+    position: int = 0          # bytes served so far in concat'd image
+    requester_ref: int = 0     # who to notify on completion (0 = none)
+
+    @property
+    def total_size(self) -> int:
+        return len(self.text) + len(self.data)
+
+
+@dataclass
+class PendingSpawn:
+    text: bytes
+    data: bytes
+    entry: int
+    requester_ref: int          # 0 = preloaded, no notification
+    sticky: bool = False        # True = re-queue after each serve so
+                                # multiple loaders all get the same
+                                # image (used by --image preload to
+                                # match the legacy single-shot demo's
+                                # NCPUS>1 behaviour)
 
 
 # ---------------------------------------------------------------------------
@@ -189,21 +289,46 @@ def load_image(path: Path) -> bytes:
 # ---------------------------------------------------------------------------
 
 class LinkBootD:
-    def __init__(self, sock_path: str, my_pid: int, image: bytes,
-                 entry: int, verbose: bool = False):
+    def __init__(self, sock_path: str, my_pid: int,
+                 shell_pids: List[int], loader_pids: List[int],
+                 root: Optional[Path] = None,
+                 preload: Optional[Tuple[bytes, bytes, int]] = None,
+                 verbose: bool = False):
         self.my_pid = my_pid
-        self.image = image
-        self.entry = entry
+        self.shell_pids = set(shell_pids)
+        self.loader_pids = set(loader_pids)
+        self.root = root.resolve() if root is not None else None
         self.verbose = verbose
-        self.next_trans_id = 0
 
-        # Synthesize one descriptor for the boot image. CPUs see this as
-        # a foreign reference whose home is our pid; their OLW's land here
-        # and we answer with bytes.
-        self.image_ref = make_ref(generation=IMAGE_DESC_GEN,
-                                  home=my_pid,
-                                  index=IMAGE_DESC_INDEX,
-                                  caps=CAP_R | CAP_S | CAP_V | CAP_C)
+        self.next_trans_id = 0
+        self.next_chunk_index = CHUNK_DESC_BASE
+
+        # Per-loader state (keyed by PID — loaders never change PID).
+        self.loaders: Dict[int, LoaderInfo] = {
+            pid: LoaderInfo(pid=pid) for pid in loader_pids
+        }
+
+        # FIFO of spawns waiting for a free loader.
+        self.pending_spawns: Deque[PendingSpawn] = deque()
+
+        # Outstanding OBJ_READ_REQs we issued (to fetch shell paths).
+        # Maps trans_id → {"action": "load_path", "requester_ref": ...,
+        #                  "len": int, "buffer": bytearray}.
+        self.pending_reads: Dict[int, Dict] = {}
+
+        # Synthesized chunk descriptors (idx → (image_bytes, base_offset,
+        # length)). One per chunk we send; loader OLW's into these.
+        self.chunk_descriptors: Dict[int, Tuple[bytes, int, int]] = {}
+
+        # Optional preload: queue immediately so the first announcing
+        # loader picks it up (used by run_python_master.sh). sticky=True
+        # so the spawn re-queues itself after each serve, giving every
+        # loader in an NCPUS>1 demo the same image.
+        if preload is not None:
+            text, data, entry = preload
+            self.pending_spawns.append(PendingSpawn(
+                text=text, data=data, entry=entry, requester_ref=0,
+                sticky=True))
 
         # Connect + handshake.
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -222,8 +347,9 @@ class LinkBootD:
         self.recv_buf = bytearray()
         self.shutdown_requested = False
 
-        self._log(f"online · pid={my_pid} · image_idx={IMAGE_DESC_INDEX} · "
-                  f"image_size={len(image)} · entry={entry}")
+        self._log(f"online · pid={my_pid} · shells={sorted(self.shell_pids)} "
+                  f"· loaders={sorted(self.loader_pids)} "
+                  f"· preload={'yes' if preload else 'no'}")
 
     # ---- network ----------------------------------------------------------
 
@@ -240,7 +366,6 @@ class LinkBootD:
         # Backpressure-aware send: socket is non-blocking, so a busy
         # receiver eventually fills the kernel buffer and sendall
         # raises BlockingIOError. Block via select until writable.
-        import select
         data = struct.pack(">I", len(packet)) + packet
         sent = 0
         while sent < len(data):
@@ -264,6 +389,11 @@ class LinkBootD:
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"linkbootd: {msg}", file=sys.stderr, flush=True)
+
+    def _alloc_trans(self) -> int:
+        t = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        return t
 
     # ---- main loop --------------------------------------------------------
 
@@ -324,94 +454,336 @@ class LinkBootD:
         except ValueError as e:
             self._log(f"malformed packet: {e}")
             return
-        if pkt["type"] == PKT_SEND_DELIVER:
+        t = pkt["type"]
+        if t == PKT_SEND_DELIVER:
             self._handle_send_deliver(pkt)
-        elif pkt["type"] == PKT_OBJ_READ_REQ:
+        elif t == PKT_OBJ_READ_REQ:
             self._handle_obj_read_req(pkt)
+        elif t == PKT_OBJ_READ_RESP:
+            self._handle_obj_read_resp(pkt)
         else:
-            self._log(f"unhandled packet type 0x{pkt['type']:02x} "
-                      f"from pid={pkt['src_pid']}")
+            self._log(f"unhandled packet type 0x{t:02x} from pid={pkt['src_pid']}")
 
     # ---- handlers ---------------------------------------------------------
 
     def _handle_send_deliver(self, pkt: Dict) -> None:
-        """Treat any SEND_DELIVER landing on us as a boot announce. The
-        sender's PROCID is in R4 (per the announce protocol); the
-        sender's R|S self-ref (the recipient for our boot reply) is in
-        OR slot 1 of the payload."""
+        src = pkt["src_pid"]
         try:
             recipient_ref, int_payload, or_payload = parse_send_deliver(pkt)
         except ValueError as e:
-            self._log(f"bad SEND_DELIVER: {e}")
+            self._log(f"bad SEND_DELIVER from pid={src}: {e}")
             return
-        loader_self_ref = or_payload[1]
-        loader_pid = int_payload[0]
-        if loader_self_ref == 0:
-            self._log(f"announce from pid={pkt['src_pid']} carries null "
-                      f"loader-self-ref; dropping")
-            return
-        self._log(f"announce: pid={loader_pid} (sender pid={pkt['src_pid']}); "
-                  f"replying with image (len={len(self.image)} entry="
-                  f"{self.entry})")
+        if src in self.shell_pids:
+            self._handle_spawn_request(src, int_payload, or_payload)
+        elif src in self.loader_pids:
+            self._handle_loader_msg(src, int_payload, or_payload)
+        else:
+            self._log(f"SEND from unknown pid={src}; ignoring")
 
-        # Build the boot SEND. Per linkboot.s:
-        #   sender O2 → handler/queue O2 → loader's "code ref" → our image_ref
-        #   sender R4 → R3 (queue) / R4 (handler) → length
-        #   sender R5 → R4 (queue) / R5 (handler) → entry offset
-        # (Queue dispatch lands ints in R3..R6; the loader knows that.)
-        trans = self.next_trans_id & 0xFFFF
-        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
-        boot = build_send_deliver(
+    # ---- spawn request from shell ----------------------------------------
+
+    def _handle_spawn_request(self, src_pid: int,
+                              int_payload, or_payload) -> None:
+        path_source = or_payload[1]      # sender's O2
+        requester   = or_payload[2]      # sender's O3
+        path_off    = int_payload[0]     # sender's R4
+        path_len    = int_payload[1]     # sender's R5
+        op          = int_payload[2]     # sender's R6
+        if op != OP_SPAWN:
+            self._log(f"shell pid={src_pid} sent unknown op={op}; ignoring")
+            return
+        if path_source == 0 or requester == 0:
+            self._log(f"spawn from pid={src_pid} missing path source or "
+                      f"requester ref; ignoring")
+            return
+        if path_len <= 0 or path_len > MAX_PATH_LEN:
+            self._notify_failure(requester,
+                                 f"bad path length {path_len}")
+            return
+        # Issue OBJ_READ_REQ to fetch the path bytes from the shell's
+        # source object. The response handler will load the .orx and
+        # queue it.
+        trans = self._alloc_trans()
+        self.pending_reads[trans] = {
+            "action": "load_path",
+            "requester_ref": requester,
+            "len": path_len,
+        }
+        req = build_obj_read_req(self.my_pid, ref_home(path_source),
+                                 trans, path_source, path_off, path_len)
+        self._log(f"spawn from pid={src_pid}: fetching path "
+                  f"({path_len} bytes) via trans={trans}")
+        self.send_packet(req)
+
+    def _handle_obj_read_resp(self, pkt: Dict) -> None:
+        trans = pkt["trans_id"]
+        info = self.pending_reads.pop(trans, None)
+        if info is None:
+            self._log(f"unexpected OBJ_READ_RESP trans={trans}")
+            return
+        if info["action"] != "load_path":
+            self._log(f"unknown pending action {info['action']!r}")
+            return
+        flags = pkt["flags"] & 0x3F
+        if flags != RESP_OK:
+            self._notify_failure(info["requester_ref"],
+                                 f"path read failed flags=0x{flags:02x}")
+            return
+        # Reassemble path bytes from the response's word payload.
+        words = pkt["payload"]
+        raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in words)
+        path_bytes = raw[:info["len"]]
+        try:
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            self._notify_failure(info["requester_ref"],
+                                 "path is not valid UTF-8")
+            return
+        # Resolve relative paths against our --root, if configured.
+        # Reject paths that try to escape via "..".
+        candidate = Path(path)
+        if self.root is not None and not candidate.is_absolute():
+            try:
+                resolved = (self.root / candidate).resolve()
+                resolved.relative_to(self.root)
+            except (ValueError, OSError) as e:
+                self._notify_failure(info["requester_ref"],
+                                     f"path {path!r} escapes root: {e}")
+                return
+            candidate = resolved
+        try:
+            text, data, entry = load_image(candidate)
+        except (FileNotFoundError, IsADirectoryError, ValueError, OSError) as e:
+            self._notify_failure(info["requester_ref"],
+                                 f"cannot load {path!r}: {e}")
+            return
+        if not text:
+            self._notify_failure(info["requester_ref"],
+                                 f"empty text section in {path!r}")
+            return
+        # Pad each section to a 4-byte boundary — the loader's copy
+        # loop is word-granular.
+        if len(text) % 4 != 0:
+            text = text + bytes((-len(text)) % 4)
+        if len(data) % 4 != 0:
+            data = data + bytes((-len(data)) % 4)
+        self._log(f"queued spawn: path={path!r} text={len(text)} "
+                  f"data={len(data)} entry={entry}")
+        self.pending_spawns.append(PendingSpawn(
+            text=text, data=data, entry=entry,
+            requester_ref=info["requester_ref"]))
+        self._dispatch_pending()
+
+    # ---- loader-side messages --------------------------------------------
+
+    def _handle_loader_msg(self, src_pid: int,
+                           int_payload, or_payload) -> None:
+        loader = self.loaders.get(src_pid)
+        if loader is None:
+            self._log(f"got SEND from non-pool pid={src_pid}; ignoring")
+            return
+        loader_self_ref = or_payload[1]      # sender's O2
+        next_offset     = int_payload[1]     # sender's R5
+        if loader_self_ref == 0:
+            self._log(f"loader pid={src_pid} sent null self-ref; ignoring")
+            return
+        loader.self_ref = loader_self_ref
+
+        if next_offset == 0:
+            # "Ready" / "done with previous run" announce.
+            if loader.state == L_WAITING_DONE:
+                # Previous guest just finished. Notify requester (if any).
+                if loader.requester_ref:
+                    self._notify_done(loader.requester_ref, exit_code=0)
+                self._log(f"loader pid={src_pid} done; back to idle")
+                loader.state = L_IDLE
+                loader.image = b''
+                loader.entry = 0
+                loader.position = 0
+                loader.requester_ref = 0
+            elif loader.state == L_IDLE:
+                pass    # benign — initial announce
+            else:
+                self._log(f"loader pid={src_pid} announced (R5=0) while in "
+                          f"state {loader.state!r}; resetting to idle")
+                loader.state = L_IDLE
+            self._dispatch_pending()
+            return
+
+        # next_offset > 0 → ack for the previous chunk; serve the next.
+        if loader.state != L_ASSIGNED:
+            self._log(f"loader pid={src_pid} acked offset={next_offset} but "
+                      f"state is {loader.state!r}; ignoring")
+            return
+        if next_offset != loader.position:
+            self._log(f"loader pid={src_pid} acked offset={next_offset} "
+                      f"but expected {loader.position}; ignoring")
+            return
+        self._serve_next_chunk(loader)
+
+    # ---- dispatch / serve -------------------------------------------------
+
+    def _dispatch_pending(self) -> None:
+        """If there's a queued spawn and an idle loader, assign one and
+        send its first chunk. Sticky spawns (preloaded --image) get
+        re-queued so subsequent loaders in NCPUS>1 demos boot from the
+        same image."""
+        while self.pending_spawns:
+            idle = next((l for l in self.loaders.values()
+                         if l.state == L_IDLE and l.self_ref != 0), None)
+            if idle is None:
+                return
+            spawn = self.pending_spawns.popleft()
+            if spawn.sticky:
+                self.pending_spawns.append(spawn)
+            idle.state         = L_ASSIGNED
+            idle.text          = spawn.text
+            idle.data          = spawn.data
+            idle.entry         = spawn.entry
+            idle.position      = 0
+            idle.requester_ref = spawn.requester_ref
+            self._log(f"assigned spawn (text={len(spawn.text)} "
+                      f"data={len(spawn.data)} entry={spawn.entry}) "
+                      f"to loader pid={idle.pid}")
+            self._serve_next_chunk(idle)
+
+    def _serve_next_chunk(self, loader: LoaderInfo) -> None:
+        """Concatenate text + data into a single byte stream and serve
+        it 256 bytes at a time. We intentionally never let a chunk
+        straddle the text/data boundary, so the loader can switch
+        destination objects per-chunk without splitting bytes."""
+        text_size = len(loader.text)
+        total = loader.total_size
+        remaining = total - loader.position
+        if remaining <= 0:
+            loader.state = L_WAITING_DONE
+            return
+        if loader.position < text_size:
+            chunk_len = min(CHUNK_BYTES, text_size - loader.position)
+            window = loader.text[loader.position : loader.position + chunk_len]
+        else:
+            data_off = loader.position - text_size
+            chunk_len = min(CHUNK_BYTES, len(loader.data) - data_off)
+            window = loader.data[data_off : data_off + chunk_len]
+        # Synthesize a fresh chunk descriptor for this 256 B window.
+        chunk_idx = self.next_chunk_index
+        self.next_chunk_index += 1
+        if self.next_chunk_index >= (1 << 24):
+            self.next_chunk_index = CHUNK_DESC_BASE
+        # Store the window standalone so OBJ_READ_REQ at offset N reads
+        # window[N], not the original section's byte at N.
+        self.chunk_descriptors[chunk_idx] = (window, 0, chunk_len)
+        chunk_ref = make_ref(generation=CHUNK_DESC_GEN,
+                             home=self.my_pid,
+                             index=chunk_idx,
+                             caps=CAP_R | CAP_S | CAP_V | CAP_C)
+        trans = self._alloc_trans()
+        # Per-chunk payload (sender's R4..R7 → loader's R3..R6):
+        #   R3 = position in concatenated image
+        #   R4 = chunk byte length
+        #   R5 = text size      (so loader can route past the boundary)
+        #   R6 = data size      (so loader can ObjAlloc a data obj)
+        # entry_offset is omitted from the per-chunk payload — the
+        # loader just JRs to text_obj_va + 0 for now (we only spawn
+        # standard pcc-built .orx programs whose entry is offset 0).
+        msg = build_send_deliver(
             src_pid=self.my_pid,
-            dst_pid=ref_home(loader_self_ref),
+            dst_pid=loader.pid,
             trans_id=trans,
-            recipient_ref=loader_self_ref,
-            int_payload=[len(self.image), self.entry, 0, 0],
-            or_payload=[loader_self_ref, self.image_ref, 0, 0],
+            recipient_ref=loader.self_ref,
+            int_payload=[loader.position, chunk_len, text_size,
+                         len(loader.data)],
+            or_payload=[loader.self_ref, chunk_ref, 0, 0],
         )
-        self.send_packet(boot)
+        self._log(f"  → loader pid={loader.pid}: "
+                  f"chunk pos={loader.position} len={chunk_len} "
+                  f"(text={text_size} data={len(loader.data)})")
+        self.send_packet(msg)
+        loader.position += chunk_len
+        if loader.position >= total:
+            loader.state = L_WAITING_DONE
+            self._log(f"  loader pid={loader.pid} fully served; awaiting reset")
 
     def _handle_obj_read_req(self, pkt: Dict) -> None:
-        """A loader is OLW-ing words from our hosted boot image."""
+        """A loader is OLW-ing words from a chunk we synthesized."""
         p = pkt["payload"]
         if len(p) < 4:
             self._log(f"OBJ_READ_REQ from pid={pkt['src_pid']} payload too "
                       f"short ({len(p)} words)")
             return
         ref = p[0] | (p[1] << 32)
-        # offset is unsigned in the packet but signed semantically; treat
-        # high bit as negative for the bounds check.
         offset = p[2] if p[2] < 0x80000000 else p[2] - 0x100000000
         width = p[3]
         issuer = pkt["src_pid"]
 
         # Validate at home (us). Volume IV §4.1.
-        if ref_home(ref) != self.my_pid \
-                or ref_index(ref) != IMAGE_DESC_INDEX \
-                or ref_generation(ref) != IMAGE_DESC_GEN:
+        idx = ref_index(ref)
+        chunk = self.chunk_descriptors.get(idx)
+        if ref_home(ref) != self.my_pid or chunk is None \
+                or ref_generation(ref) != CHUNK_DESC_GEN:
             fault = RESP_STALE
+            data = b''
         elif (ref_caps(ref) & CAP_R) != CAP_R:
             fault = RESP_CAP
-        elif offset < 0 or width <= 0 or offset + width > len(self.image):
-            fault = RESP_BOUNDS
+            data = b''
         else:
-            fault = RESP_OK
-
-        if fault == RESP_OK:
-            data = self.image[offset:offset + width]
-            response = build_obj_read_resp(self.my_pid, issuer,
-                                           pkt["trans_id"], RESP_OK, data)
-        else:
-            response = build_obj_read_resp(self.my_pid, issuer,
-                                           pkt["trans_id"], fault, b'')
-            self._log(f"OBJ_READ_REQ from pid={issuer} faulted: "
-                      f"flags={fault:#x} (off={offset} width={width})")
+            image, base, length = chunk
+            if offset < 0 or width <= 0 or offset + width > length:
+                fault = RESP_BOUNDS
+                data = b''
+            else:
+                fault = RESP_OK
+                data = image[base + offset : base + offset + width]
+        response = build_obj_read_resp(self.my_pid, issuer,
+                                       pkt["trans_id"], fault, data)
+        if fault != RESP_OK:
+            self._log(f"OBJ_READ_REQ from pid={issuer} idx={idx} "
+                      f"off={offset} width={width} faulted: "
+                      f"flags={fault:#x}")
         self.send_packet(response)
+
+    # ---- shell notifications ---------------------------------------------
+
+    def _notify_done(self, requester_ref: int, exit_code: int) -> None:
+        trans = self._alloc_trans()
+        msg = build_send_deliver(
+            src_pid=self.my_pid,
+            dst_pid=ref_home(requester_ref),
+            trans_id=trans,
+            recipient_ref=requester_ref,
+            int_payload=[LB_RESULT_MAGIC, OP_SPAWN, exit_code, 0],
+            or_payload=[requester_ref, 0, 0, 0],
+        )
+        self.send_packet(msg)
+
+    def _notify_failure(self, requester_ref: int, reason: str) -> None:
+        # MVP: just log + notify-done with exit code 255. The shell
+        # currently doesn't surface error reasons; this gives us a
+        # distinct exit code we can read in the [exited] line.
+        self._log(f"spawn failed: {reason}")
+        if requester_ref:
+            self._notify_done(requester_ref, exit_code=255)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def parse_pid_list(s: str) -> List[int]:
+    out = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part, 0)
+        except ValueError:
+            raise SystemExit(f"linkbootd: bad pid in list: {part!r}")
+        if v < 0 or v > 255:
+            raise SystemExit(f"linkbootd: pid out of range: {v}")
+        out.append(v)
+    return out
+
 
 def main(argv) -> int:
     ap = argparse.ArgumentParser(prog="linkbootd",
@@ -421,24 +793,55 @@ def main(argv) -> int:
                     help="path to oriscbar's UNIX domain socket")
     ap.add_argument("--pid", type=int, required=True,
                     help="processor identifier this server presents to "
-                         "the crossbar (typically 0; loaders by convention "
-                         "announce to whatever lives in their O5)")
-    ap.add_argument("--image", required=True, type=Path,
-                    help="boot image: either a .orx file (text section "
-                         "extracted automatically) or a raw byte file")
-    ap.add_argument("--entry", type=int, default=0,
-                    help="entry offset within the image (default 0)")
+                         "the crossbar")
+    ap.add_argument("--shell-pids", default="",
+                    help="comma-separated list of PIDs that may issue "
+                         "spawn requests (typically just '0')")
+    ap.add_argument("--loader-pids", default="",
+                    help="comma-separated list of PIDs in the chunkboot "
+                         "loader pool")
+    ap.add_argument("--image", type=Path, default=None,
+                    help="optional preload image. If given, queued at "
+                         "startup as if a shell had spawned it (with no "
+                         "completion notification). Used by the legacy "
+                         "run_python_master.sh demo.")
+    ap.add_argument("--root", type=Path, default=None,
+                    help="resolve relative paths from spawn requests "
+                         "under this root, and reject paths that try "
+                         "to escape it via '..'. Mirrors hostfsd's "
+                         "--root: typically point both at the same dir "
+                         "so 'run foo.orx' from the shell finds the "
+                         "same file 'cat foo.orx' would.")
+    ap.add_argument("--entry", type=int, default=None,
+                    help="entry offset for --image (overrides .orx header)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
-    image = load_image(args.image)
-    if not image:
-        sys.exit(f"linkbootd: {args.image}: empty image")
-    if args.entry < 0 or args.entry >= len(image):
-        sys.exit(f"linkbootd: --entry {args.entry} out of range "
-                 f"[0, {len(image)})")
+    shell_pids  = parse_pid_list(args.shell_pids)
+    loader_pids = parse_pid_list(args.loader_pids)
 
-    server = LinkBootD(args.socket, args.pid, image, args.entry,
+    preload = None
+    if args.image is not None:
+        try:
+            text, data, entry = load_image(args.image)
+        except (FileNotFoundError, ValueError, OSError) as e:
+            sys.exit(f"linkbootd: --image {args.image}: {e}")
+        if not text:
+            sys.exit(f"linkbootd: --image {args.image}: empty text section")
+        if args.entry is not None:
+            entry = args.entry
+        if entry < 0 or entry >= len(text):
+            sys.exit(f"linkbootd: --entry {entry} out of range "
+                     f"[0, {len(text)})")
+        if len(text) % 4 != 0:
+            text = text + bytes((-len(text)) % 4)
+        if len(data) % 4 != 0:
+            data = data + bytes((-len(data)) % 4)
+        preload = (text, data, entry)
+
+    server = LinkBootD(args.socket, args.pid,
+                       shell_pids=shell_pids, loader_pids=loader_pids,
+                       root=args.root, preload=preload,
                        verbose=args.verbose)
 
     def _signal(_signo, _frame):

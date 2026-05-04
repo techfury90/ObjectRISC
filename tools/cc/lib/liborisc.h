@@ -101,4 +101,26 @@ int  term_getkey(int *out_mods);
 #define TK_MOD_ALT   0x04
 #define TK_MOD_META  0x08
 
+/* ---- linkboot.c — spawn programs via linkbootd ----------------- *
+ *
+ * Boot ABI for shells using these helpers (caller arranges via
+ * --service order):
+ *
+ *     O7  = linkbootd service ref  (--service N=1@9 in slot 3)
+ *     O11 = boot stack ref         (parked by term_init)
+ *     O14 = boot self-svc          (parked by term_init)
+ *     O15 = boot data ref          (parked by term_init)
+ *
+ * lb_init() must be called once at startup, after term_init. It
+ * allocates an internal mailbox object and attaches a queue, used
+ * to receive spawn-result messages without conflicting with the
+ * keyboard/hostfsd queue. */
+
+int lb_init(void);
+
+/* Ask linkbootd to load and run `path`. Blocks until the guest
+ * exits (or fails to load). Returns the guest's exit code on
+ * success, 255 on a load failure, or -1 on a poll failure. */
+int lb_spawn(const char *path);
+
 #endif /* LIBORISC_H */
