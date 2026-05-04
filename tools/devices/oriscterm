@@ -775,8 +775,28 @@ class Terminal:
     # ---- UI helpers --------------------------------------------------------
 
     def _append(self, s: str) -> None:
+        """Insert s at end of the text widget, with one piece of
+        terminal-style processing: a `\\b` byte (0x08) deletes the
+        character immediately before it. Programs (the shell's
+        read_line in particular) lean on this for backspace-to-erase
+        without us needing a full cursor-positioning escape grammar.
+        \\b at the start of an empty widget is a no-op (the inserted
+        prompt is the floor)."""
         self.text.configure(state="normal")
-        self.text.insert("end", s)
+        i = 0
+        while i < len(s):
+            if s[i] == '\b':
+                # "end-1c" is the trailing implicit newline; "end-2c"
+                # is the last visible character. Delete that char if
+                # any character precedes the implicit newline.
+                if self.text.index("end-2c") != self.text.index("1.0"):
+                    self.text.delete("end-2c", "end-1c")
+                i += 1
+            else:
+                seg_start = i
+                while i < len(s) and s[i] != '\b':
+                    i += 1
+                self.text.insert("end", s[seg_start:i])
         self.text.see("end")
         self.text.configure(state="disabled")
         # Also surface rendered text on stderr so the launcher / tests

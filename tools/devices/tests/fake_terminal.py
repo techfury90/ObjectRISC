@@ -166,7 +166,16 @@ class FakeTerminal:
             return    # fault; ignore
         words = pkt["payload"]
         raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in words)
-        self.console_render.extend(raw[:n])
+        # Mirror oriscterm's \b handling: byte 0x08 deletes the
+        # previous byte from the rendered stream, no-op at start.
+        # Without this the shell's backspace echo shows up as raw
+        # \x08 bytes in test transcripts.
+        for b in raw[:n]:
+            if b == 0x08:
+                if self.console_render:
+                    del self.console_render[-1]
+            else:
+                self.console_render.append(b)
 
     def wait_for(self, want_kbd, want_ptr, timeout=10.0):
         deadline = time.time() + timeout

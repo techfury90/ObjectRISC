@@ -61,10 +61,7 @@ const char help_msg[] =
     "  echo <text>     — print the rest of the line\n"
     "  run <path>      — load and run another .orx via linkbootd\n"
     "  cycles          — print the CPU's cycle counter\n"
-    "  exit | quit     — leave the shell\n"
-    "\n"
-    "Backspace edits the line buffer but the terminal display is\n"
-    "append-only, so corrections aren't visually undone yet.\n";
+    "  exit | quit     — leave the shell\n";
 
 const char run_done_pre[] = "[exited ";
 const char run_done_post[] = "]\n";
@@ -97,7 +94,16 @@ read_line(char *buf, int max)
 			return n;
 		}
 		if (c == TK_BACKSPACE) {
-			if (n > 0) n--;
+			if (n > 0) {
+				n--;
+				/* Echo a literal '\b' (0x08) — oriscterm's
+				 * _append interprets it as "delete the
+				 * previous character", giving us visual
+				 * undo. We only send when the buffer was
+				 * non-empty so a backspace at column 0
+				 * doesn't chew into the prompt. */
+				term_print_char('\b');
+			}
 			continue;
 		}
 		if (c >= 32 && c < 127 && n < max - 1) {
