@@ -12,6 +12,7 @@
  *     echo <text> — print the rest of the line
  *     run <path>  — load and run another .orx via linkbootd
  *     cycles      — print the CPU's cycle counter
+ *     time        — print microseconds since boot (wall clock, 32-bit)
  *     exit / quit — end the session
  *
  * Path handling: the shell maintains its own cwd (absolute, relative
@@ -61,6 +62,7 @@ const char help_msg[] =
     "  echo <text>     — print the rest of the line\n"
     "  run <path>      — load and run another .orx via linkbootd\n"
     "  cycles          — print the CPU's cycle counter\n"
+    "  time            — print microseconds since boot (wall clock)\n"
     "  exit | quit     — leave the shell\n";
 
 const char run_done_pre[] = "[exited ";
@@ -413,17 +415,19 @@ cmd_run(const char *cwd, const char *arg)
 static void
 cmd_cycles(void)
 {
-	int n;
-	asm volatile(
-		"call  #0x301\n"               /* ReadCycles → R3 */
-		"nop\n"
-		"addu  %0, r3, r0"
-		: "=r"(n)
-		:
-		: "r2", "r3"
-	);
-	term_print_int(n);
+	term_print_int((int)read_cycles());
 	term_print("\n");
+}
+
+static void
+cmd_time(void)
+{
+	/* Microseconds since boot (32-bit, wraps at ~71 min). Useful
+	 * mostly as a wall-clock companion to `cycles`: cycles tells
+	 * you how much CPU work happened; time tells you how much
+	 * wall-clock time elapsed. */
+	term_print_int((int)time_now_us());
+	term_print(" us\n");
 }
 
 /* --- main ------------------------------------------------------------- */
@@ -479,6 +483,8 @@ main(void)
 			else cmd_run(cwd, arg);
 		} else if (strcmp(line, "cycles") == 0) {
 			cmd_cycles();
+		} else if (strcmp(line, "time") == 0) {
+			cmd_time();
 		} else if (strcmp(line, "exit") == 0
 		           || strcmp(line, "quit") == 0) {
 			term_print("bye!\n");

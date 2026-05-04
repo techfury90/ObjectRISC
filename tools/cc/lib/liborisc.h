@@ -20,6 +20,16 @@ void print_char(char c);
 void print_int(int n);
 void print_hex(unsigned int n);
 
+/* ---- clock.c — system clock primitives (Vol VI §8) ------------ */
+
+unsigned int read_cycles(void);        /* CPU cycle counter (#0x301) */
+unsigned int time_now_us(void);        /* μs since boot, low 32 bits
+                                        * (#0x400 — high 32 bits live
+                                        * in the side-channel which
+                                        * isn't implemented yet) */
+unsigned int clock_resolution(void);   /* ticks/sec of time_now_us
+                                        * (#0x410); always 1_000_000 */
+
 /* ---- string.c — string and memory primitives ------------------- */
 
 unsigned int strlen(const char *s);

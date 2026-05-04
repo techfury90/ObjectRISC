@@ -934,6 +934,12 @@ class System:
         self.crossbar: Crossbar = InProcessCrossbar()
         for cpu in self.cpus:
             self.crossbar.attach_port(cpu.pid, cpu)
+        # Wall-clock zero-point for the TimeNow firmware primitive
+        # (Vol VI #0x400). TimeNow returns microseconds since this
+        # moment, so the simulator's sense of time matches the
+        # outside world rather than a fictional clock. Captured here
+        # so all CPUs in a multi-CPU System see the same epoch.
+        self.boot_time = time.time()
 
     # ---- inter-CPU SEND queue ----------------------------------------------
 
@@ -1496,6 +1502,32 @@ def primitive_ReadCycles(cpu: CPU) -> None:
     cpu.set_gpr(2, 0)
     cpu.set_gpr(3, cpu.cycles & 0xFFFFFFFF)
 
+def primitive_TimeNow(cpu: CPU) -> None:
+    """Vol VI #0x400. Returns microseconds elapsed since the System's
+    boot_time, low 32 bits in R3. The spec puts the high 32 bits in
+    the side-channel buffer (Vol VI §11), but this firmware doesn't
+    yet implement the side-channel; programs that need a 64-bit span
+    will have to track epoch wraps themselves. 32-bit microseconds
+    wrap at ~71.6 minutes — fine for benchmarks and typical
+    interactive use."""
+    if cpu.system is None:
+        cpu.set_gpr(2, ERR_OK)
+        cpu.set_gpr(3, 0)
+        return
+    elapsed = time.time() - cpu.system.boot_time
+    micros = int(elapsed * 1_000_000) & 0xFFFFFFFFFFFFFFFF
+    cpu.set_gpr(2, ERR_OK)
+    cpu.set_gpr(3, micros & 0xFFFFFFFF)
+    # High 32 bits would go to the side-channel; not implemented.
+
+def primitive_ClockResolution(cpu: CPU) -> None:
+    """Vol VI #0x410. Returns ticks per second of the clock TimeNow
+    counts. Picked to be 1_000_000 (microseconds) — a 1980s-Unix-
+    typical value, comfortably finer than anything Dhrystone or a
+    cmd-line shell needs to measure."""
+    cpu.set_gpr(2, ERR_OK)
+    cpu.set_gpr(3, 1_000_000)
+
 def primitive_ConsoleWrite(cpu: CPU, faulting_pc: int) -> None:
     o1   = cpu.get_opr(1)
     off  = cpu.get_gpr(4)
@@ -1881,6 +1913,10 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ReadCycles(cpu)
     elif prim == 0x320:
         primitive_ConsoleWrite(cpu, faulting_pc)
+    elif prim == 0x400:
+        primitive_TimeNow(cpu)
+    elif prim == 0x410:
+        primitive_ClockResolution(cpu)
     else:
         cpu.set_gpr(2, ERR_ENOSYS)
         cpu.set_gpr(3, 0)
