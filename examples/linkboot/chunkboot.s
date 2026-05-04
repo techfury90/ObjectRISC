@@ -18,6 +18,13 @@ main:
     ; Save PROCID (R7) so we can include it in announce/ack SENDs.
     addu  r16, r7, r0
 
+    ; Save R6 — simorisc's reset_cpu primes it with the *previous*
+    ; guest's TaskExit code so we can include it in our first
+    ; "ready" announce. Linkbootd uses that to surface the real
+    ; exit code to the shell instead of always reporting 0. On the
+    ; very first boot R6 is just the default 0 (no prior run).
+    addu  r27, r6, r0                  ; r27 = previous exit code
+
     ; Save the V-cap-bearing self-svc into O15 — every queue poll
     ; overwrites O1..O4 with the sender's OR payload, so we'd lose
     ; the full ref otherwise.
@@ -60,7 +67,9 @@ req_loop:
     onull o4
     addu  r4, r16, r0                  ; PROCID
     addu  r5, r17, r0                  ; next_offset
-    addiu r6, r0, 0
+    addu  r6, r27, r0                  ; previous exit code (initial
+                                       ; announce only — meaningful
+                                       ; when next_offset == 0)
     addiu r7, r0, 0
     send  o1
 

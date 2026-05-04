@@ -586,6 +586,12 @@ class LinkBootD:
             return
         loader_self_ref = or_payload[1]      # sender's O2
         next_offset     = int_payload[1]     # sender's R5
+        # int_payload[2] (sender's R6) carries the previous guest's
+        # TaskExit code on the post-reset "ready" announce. simorisc
+        # primes R6 in reset_cpu before re-running the loader, and
+        # the loader passes it through here. Only meaningful when
+        # next_offset == 0.
+        prev_exit_code  = int_payload[2] & 0xFF
         if loader_self_ref == 0:
             self._log(f"loader pid={src_pid} sent null self-ref; ignoring")
             return
@@ -596,8 +602,10 @@ class LinkBootD:
             if loader.state == L_WAITING_DONE:
                 # Previous guest just finished. Notify requester (if any).
                 if loader.requester_ref:
-                    self._notify_done(loader.requester_ref, exit_code=0)
-                self._log(f"loader pid={src_pid} done; back to idle")
+                    self._notify_done(loader.requester_ref,
+                                      exit_code=prev_exit_code)
+                self._log(f"loader pid={src_pid} done (exit={prev_exit_code});"
+                          f" back to idle")
                 loader.state = L_IDLE
                 loader.image = b''
                 loader.entry = 0

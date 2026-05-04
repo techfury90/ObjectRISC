@@ -1229,6 +1229,7 @@ class System:
                             # reads against the still-valid descriptor
                             # table.
                             cpu.active = False
+                            cpu.exit_code = e.code & 0xFF
                             cpu.reset_at_time = time.time() + RESET_DRAIN_SECONDS
                             any_progress = True
                             continue
@@ -1448,8 +1449,15 @@ def reset_cpu(cpu: CPU) -> None:
     chunkboot loader hits TaskExit, we don't terminate the process; we
     re-init so the loader runs again and can boot the next program.
 
-    Crossbar connection, PID, and trace settings persist across reset."""
+    Crossbar connection, PID, and trace settings persist across reset.
+
+    The previous run's exit code (the byte the guest passed to
+    TaskExit) is smuggled into the new R6 so the chunkboot loader
+    can include it in its next "ready" announce — that's how
+    linkbootd surfaces guest exit codes to the shell. R6 defaults
+    to 0 on the very first boot (no prior run)."""
     args = cpu.reset_args   # set by main() once at startup
+    prev_exit_code = cpu.exit_code if cpu.exit_code is not None else 0
     cpu.gpr            = [0] * 32
     cpu.opr            = [0] * 16
     cpu.hi             = 0
@@ -1473,6 +1481,7 @@ def reset_cpu(cpu: CPU) -> None:
     populate_self_service(cpu)
     install_external_services(cpu, args["services"])
     snapshot_boot_state(cpu)
+    cpu.set_gpr(6, prev_exit_code & 0xFF)
 
 
 # ---------------------------------------------------------------------------
