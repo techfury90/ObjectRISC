@@ -16,8 +16,10 @@
  *     exposed to C as a third register class (CLASSC) holding
  *     `__or`-qualified pointer-shaped values.
  *   - O0 is hardwired null, O1..O4 are object arguments / first OR
- *     return, O5..O8 caller-saved, O9..O12 callee-preserved,
- *     O13..O15 caller-saved (Volume VII §2.1).
+ *     return. Volume VII §2.1 specifies O9..O12 as callee-preserved
+ *     and O5..O8 / O13..O15 as caller-saved, but this backend
+ *     currently treats *all* of O1..O15 as caller-saved — see the
+ *     RSTATUS comment below for the spill-path reason.
  *   - Four integer arguments (R4..R7), not eight; matches MIPS O32.
  *   - No floating-point unit yet (Volume I deferred); CLASSC slots
  *     formerly used for FP regs in the MIPS port are repurposed
@@ -247,14 +249,26 @@ typedef long long OFFSZ;
 	SBREG|TEMPREG, SBREG|TEMPREG,	/* R24R25, R26R27 */		\
 	0, 0,				/* R28R29, R30R31 — reserved */	\
 									\
-	/* CLASSC: O0 hardwired null, O1..O4 arg/return, O9..O12 saved */ \
+	/* CLASSC: O0 hardwired null, O1..O4 arg/return, O5..O15 callee
+	 * uses freely. Volume VII §2.4 specifies O9..O12 as
+	 * callee-preserved by convention, with the spill backed by an
+	 * ObjAllocStore'd OR-typed object plus OREFLD/OREFST. The pcc
+	 * backend doesn't yet emit that spill sequence — and a naive
+	 * PERMREG marking made pcc try to spill an OR's old value into
+	 * an *adjacent* OR (because that's the only place a CLASSC
+	 * temporary is allowed to live), clobbering O10 / O14 / etc.
+	 * For now we mark all ORs caller-saved (TEMPREG) so the spill
+	 * never gets emitted; programs that want a value to survive a
+	 * call do the save/restore explicitly via inline asm. The
+	 * convention should be revisited once the OBJSTORE spill path
+	 * is wired in. */ \
 	0,				/* O0 — hardwired null */	\
 	SCREG|TEMPREG, SCREG|TEMPREG,	/* O1..O2 — args/returns */	\
 	SCREG|TEMPREG, SCREG|TEMPREG,	/* O3..O4 */			\
 	SCREG|TEMPREG, SCREG|TEMPREG,	/* O5..O6 — caller-saved */	\
 	SCREG|TEMPREG, SCREG|TEMPREG,	/* O7..O8 */			\
-	SCREG|PERMREG, SCREG|PERMREG,	/* O9..O10 — callee-preserved */ \
-	SCREG|PERMREG, SCREG|PERMREG,	/* O11..O12 */			\
+	SCREG|TEMPREG, SCREG|TEMPREG,	/* O9..O10 — caller-saved (was */\
+	SCREG|TEMPREG, SCREG|TEMPREG,	/* O11..O12  PERMREG; bug above) */\
 	SCREG|TEMPREG, SCREG|TEMPREG, SCREG|TEMPREG,	/* O13..O15 */
 
 /*

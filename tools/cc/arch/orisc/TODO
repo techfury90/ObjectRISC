@@ -64,6 +64,21 @@ Done
   optimizer learns to elide dead saves, or when we have programs
   that genuinely benefit from the wider allocation pool.
 
+- Codegen correctness: O9..O12 were marked SCREG|PERMREG to honor
+  Volume VII's "callee-preserved" convention, but pcc's spill code
+  for CLASSC values can only land in *another* CLASSC slot (because
+  ORs cannot live in integer storage). When user code did `register
+  __or T p __asm__("o11"); p = boot_stack;`, pcc emitted a prologue
+  that stashed the old O11 into O10 and an epilogue that restored
+  — clobbering whatever ref the runner had placed in O10. The libc
+  worked around it by using raw `asm volatile("omov o11, o2")`
+  declarations everywhere, which pcc doesn't track. The proper fix
+  is to teach the backend to spill ORs into an ObjAllocStore'd
+  OR-typed object via OREFLD/OREFST (Vol VII §2.4 spec'd this); for
+  now we mark all of O5..O15 as SCREG|TEMPREG (caller-saved). User
+  code that wants a value to survive a call still needs the inline
+  asm pattern, but adjacent ORs are no longer corrupted.
+
 - `__or` qualifier — Phase 1 (parse-only). Added `OREF = 0x80` to
   mip/manifest.h's qualifier-bit set (alongside CON and VOL),
   added the matching `ISOREF()` macro, and registered `__or` as a
