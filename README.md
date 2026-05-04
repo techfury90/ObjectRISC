@@ -170,20 +170,24 @@ it to the simulated console:
 examples/cc/run_host_cat.sh    # cat README.md from inside an emulated CPU
 ```
 
-The MVP shell — `help` / `cat <path>` / `ls [<path>]` /
-`run <path>` / `exit`, with a build-date banner shifted back 40
-years. The `run` command spawns another `.orx` onto a pool of four
-spare CPUs (each running a chunked-boot loader) via the
-`linkbootd` server; the spare CPU is reset on the guest's TaskExit
-and re-announces, so the slot is reusable:
+The MVP shell — `help` / `cat` / `more` / `ls` / `cd` / `pwd` /
+`echo` / `run` / `cycles` / `exit`, with a build-date banner
+shifted back 40 years. Paths resolve against the shell's own cwd;
+the prompt mirrors it (`/sub>`). The `run` command spawns another
+`.orx` onto a pool of four spare CPUs (each running a chunked-boot
+loader) via the `linkbootd` server; the spare CPU is reset on the
+guest's TaskExit and re-announces, so the slot is reusable:
 
 ```sh
 examples/cc/run_shell.sh       # opens a Tk terminal on the shell
-# orisc> ls
-# orisc> run hello.orx
+# /> ls
+# /> cd src
+# /src> cat hello.c
+# /src> cd ..
+# /> run hello.orx
 # hello from guest
 # [exited 0]
-# orisc> exit
+# /> exit
 ```
 
 The `hello_or.c` and `print_or.c` variants use the `__or`
