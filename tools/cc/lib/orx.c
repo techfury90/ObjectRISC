@@ -190,6 +190,35 @@ orx_free_slot(int slot)
 	return status;
 }
 
+/* Like orx_free_slot but uses ObjFreeDeferred (#0x107) with the
+ * given drain delay (ms). The descriptor stays live during the
+ * window so any in-flight OBJ_READ_REQs from oriscterm/hostfsd
+ * against the soon-to-be-freed object can still be answered.
+ *
+ * Used at the end of orx_spawn for code/data/stack: the guest may
+ * have buffered async SENDs whose receivers haven't issued reads
+ * yet at the moment of TaskExit. */
+static int
+orx_freedef_slot(int slot, unsigned int delay_ms)
+{
+	int status;
+	switch (slot) {
+	case SLOT_CODE:  asm volatile("orefld o1, 0(o7)");  break;
+	case SLOT_DATA:  asm volatile("orefld o1, 8(o7)");  break;
+	case SLOT_STACK: asm volatile("orefld o1, 16(o7)"); break;
+	}
+	asm volatile(
+		"addu  r4, %1, r0\n"
+		"call  #0x107\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "r"(delay_ms)
+		: "r2", "r3", "r4"
+	);
+	return status;
+}
+
 /* Load slot ref into O1, then MapObject(O1, va, 0, R+W, length). */
 static int
 orx_map_slot(int slot, unsigned int va, unsigned int length)
@@ -422,13 +451,21 @@ orx_spawn(const char *path)
 		orx_scratch_free(); return -5;
 	}
 
-	/* Done — drop the orx scratch (we no longer need it; the task
-	 * ref now lives in the libc table). The loaded code/data/stack
-	 * objects are intentionally NOT freed here; freeing them would
-	 * race the guest's last async SEND being read by oriscterm. The
-	 * chunkboot path solved this with simorisc's RESET_DRAIN_SECONDS
-	 * window; orx_spawn needs an analogous drain primitive (or a
-	 * timed-free libc helper). For now, each spawn leaks ~80 KiB. */
+	/* Schedule deferred frees of the loaded code/data/stack with a
+	 * generous drain window. The descriptors stay live until the
+	 * deadline elapses, which gives the guest plenty of run-time and
+	 * the receiver(s) of any async SENDs (oriscterm, hostfsd) time to
+	 * read the bytes before the storage disappears. The 30-second
+	 * window is the practical upper bound on how long an interactive
+	 * guest is expected to run; longer-lived guests would have their
+	 * data pulled out from under them and would need a different
+	 * model (an explicit unload primitive that runs after task_wait).
+	 * The trailing scratch object isn't shared with anyone — drop
+	 * immediately. */
+	orx_freedef_slot(SLOT_CODE, 30000);
+	if (has_data)
+		orx_freedef_slot(SLOT_DATA, 30000);
+	orx_freedef_slot(SLOT_STACK, 30000);
 	orx_scratch_free();
 	return t;
 }
