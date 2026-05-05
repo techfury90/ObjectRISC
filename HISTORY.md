@@ -3400,6 +3400,110 @@ support it.)
   handler explicitly re-sets IE before ERETing rather than the
   saved-IE bit riding back automatically. Cosmetic.
 
+## Phase 36 — Timer in the shell, blocked-task preemption (Ouroboros, day 13)
+
+Phase 35 made preemption *architecturally* possible — a timer
+handler can call `TaskYield` and ERET will honor it on the way
+out. Phase 36 cashes that in: the shell installs the timer at
+boot, and the scheduler stops getting stuck on a blocked
+`current_task` when other tasks are runnable. Together, those are
+the two pieces a real interactive supervisor needs to stay alive
+under load.
+
+### Wiring the timer into the shell
+
+Three small additions:
+
+1. **`tools/cc/lib/preempt_handler.s`** — generic timer-interrupt
+   handler. Re-arms `COMPARE = COUNT + 5000`, re-enables `STATUS.IE`
+   (cleared by `deliver_trap` for cause `0x01`), calls `TaskYield`
+   (which Phase 35 turns into `yield_pending` from a trap context),
+   and `ERET`s. The ERET path notices the flag and switches to the
+   next runnable task before resuming user mode.
+2. **`task_install_preempt_timer(quantum)`** — libc helper that
+   `InstallTrapHandler`s the above for cause `0x01`, arms
+   `COMPARE = COUNT + quantum`, and sets `STATUS.IE`. Caller must be
+   in supervisor mode. The shell calls this once at boot with a 5000-
+   cycle quantum.
+3. **`tools/cc/lib/build.sh`** now also sweeps `*.s` files in
+   `tools/cc/lib/`, so the assembler-only handler ends up in
+   `liborisc.ora` alongside the C-compiled members and the linker
+   pulls it in only when something references the symbol.
+
+### Trap-handler address-space fix
+
+Wiring the timer surfaced a subtle issue. The shell's preempt
+handler lives at a VA mapped in the *shell's* address space, but
+when the timer fires while a guest task is running, the CPU is
+using the guest's mappings — the handler's VA isn't there, so the
+first instruction of the handler took a `tlb-miss-i`.
+
+The fix: `primitive_InstallTrapHandler` snapshots
+`cpu.mappings` into a per-cause `cpu.trap_handler_mappings[cause]`
+at install time. `deliver_trap`, when it routes to an installed
+supervisor handler, swaps that snapshot in for the duration of the
+handler. ERET's `load_task_to_cpu` then restores the trapping
+task's mappings as part of its normal job.
+
+This is the simulator's stand-in for what real hardware would do
+with an MMU + privilege boundary: the handler runs in its own
+address-space view, and the user task's view is restored on return.
+
+### Blocked-task preemption
+
+The other half of "preemption" is what happens when the *current*
+task can't make progress — say the shell calls `term_getkey`, which
+parks it on the kbd queue waiting for a SEND. Before this phase, a
+single-CPU configuration would just sit on that `CALL`, and any
+runnable peer (e.g., a backgrounded CPU-bound task) wouldn't run
+until the queue got something.
+
+Now: when `_try_unblock` can't satisfy `cpu.blocked_on` and there's
+another runnable task on this CPU, `save_cpu_to_task` checkpoints
+the blocked task (its `blocked_on` rides along into the Task struct
+via Phase 36's `Task.blocked_on` field) and `load_task_to_cpu`
+swaps in the next runnable. When the original condition eventually
+becomes satisfiable, `_wake_blocked_tasks` finds the BLOCKED task,
+promotes it back to RUNNABLE, and the scheduler picks it up; on
+its next dispatch the saved `blocked_on` is reinstated and
+`_try_unblock` delivers the response.
+
+The split between "wake the blocked task" (queue/response check)
+and "deliver the unblock side effects" (R2/R3 writes, PC advance)
+falls out naturally: the latter only happens when the task is
+actually scheduled, so it can't race the saved CPU state.
+
+### Tests
+
+- **`14_tasks/10_blocked_task_yields_cpu`** (sim validation) —
+  single CPU, two tasks. Main allocates a service object, attaches
+  a queue, parks itself on `ReceiveQueuePoll` with infinite
+  timeout. Without blocked-task preemption that's a deadlock —
+  child can't run, queue stays empty forever. With it, the
+  scheduler switches to child, child SENDs `0x55` to the queue,
+  child exits, scheduler reschedules main, `_wake_blocked_tasks`
+  promotes it, `_try_unblock` delivers the message, main exits with
+  `0x55`. 137 sim validation tests.
+- **`tools/devices/tests/test_shell_preempt.sh`** (integration) —
+  end-to-end proof that the shell stays responsive under a CPU-
+  bound bg task. The test spawns `spinner.orx &` (a 5,000,000-
+  iteration tight loop, much longer than the test's wall-clock
+  budget), then types `pwd`. The rendered terminal is asserted to
+  contain `/` on a line by itself — meaning the shell got the CPU
+  back from the spinner, processed the keystrokes, and printed
+  `cwd`. Without the timer, the spinner would hold the CPU and
+  `pwd` would never reach the prompt.
+
+### What's not yet done
+
+- **Saved-IE rides ERET.** Still cosmetic — the handler explicitly
+  re-sets `STATUS.IE` rather than the saved-IE bit auto-restoring.
+  Phase 27 caveat carries forward.
+- **Quantum is a magic number.** 5000 cycles is hard-coded in
+  `preempt_handler.s` and at the shell's call site. A small
+  follow-up would either thread it through the handler or make it
+  a libc configuration knob.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

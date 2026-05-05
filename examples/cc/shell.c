@@ -655,6 +655,12 @@ main(void)
 	term_init();
 	hf_init();
 
+	/* Wire the preemption timer. From here on, a CPU-bound bg task
+	 * spawned via `run cmd &` can't starve the shell — the handler
+	 * fires every 5000 cycles, calls TaskYield (deferred), and ERET
+	 * picks the next runnable. Phase 36. */
+	task_install_preempt_timer(5000);
+
 	term_print(banner);
 	term_print(hello1);
 

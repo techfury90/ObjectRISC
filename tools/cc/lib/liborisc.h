@@ -210,6 +210,12 @@ struct task_info {
 int          task_query(task_t t, struct task_info *out);
 unsigned int task_active_mask(void);               /* in-use slot bitmap */
 
+/* Install a generic timer-interrupt handler that yields to the
+ * next runnable task every `quantum` cycles. Lets the caller stay
+ * responsive even when a child task is CPU-bound. Caller must be
+ * supervisor-mode (uses InstallTrapHandler #0x520). */
+void task_install_preempt_timer(unsigned int quantum);
+
 /* ---- orx.c — load and run a .orx executable as a child task ----- *
  *
  * The supervisor escape from "spawn programs only via linkbootd on a

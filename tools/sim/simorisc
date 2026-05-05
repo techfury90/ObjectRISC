@@ -270,6 +270,14 @@ class Task:
     # cleared (waiters can't double-collect).
     waiters: List['Task'] = field(default_factory=list)
 
+    # IPC blocked_on saved with this task. When the current task hits
+    # a blocking primitive (ReceiveQueuePoll on an empty queue, remote
+    # OL/OS waiting on a response) and there's another runnable task
+    # we'd like to schedule, save the BlockedSignal here so the
+    # scheduler can switch in the runnable task and process this
+    # task's unblock condition asynchronously. Phase 36.
+    blocked_on: Optional['BlockedSignal'] = None
+
 
 # ---------------------------------------------------------------------------
 # Trap exception
@@ -855,9 +863,14 @@ class CPU(Port):
         # Supervisor-installable trap handlers (Volume VI primitive
         # #0x520, InstallTrapHandler). Per-CPU map cause → handler VA;
         # consulted by deliver_trap before falling back to VECBASE.
-        # Handlers run in supervisor mode in the trapping task's
-        # address space.
+        # Handlers run in supervisor mode. The handler VA may not be
+        # mapped in the trapping task's address space (e.g., a shell
+        # registers a handler in its own code; a guest task it spawned
+        # later traps), so deliver_trap swaps in the mappings the
+        # supervisor had at install time, then load_task_to_cpu on
+        # ERET restores the trapping task's mappings.
         self.trap_handlers: Dict[int, int] = {}
+        self.trap_handler_mappings: Dict[int, List[Tuple[int,int,int,int,int]]] = {}
 
         # Timer interrupt state (Volume V Section 2.10 — COMPARE).
         # `compare_reg` is the cycle-counter target; when cycles >=
@@ -1325,6 +1338,51 @@ class System:
 
     # ---- blocked-CPU resume ------------------------------------------------
 
+    def _wake_blocked_tasks(self, cpu: 'CPU') -> None:
+        """Scan tasks that are BLOCKED-but-not-current; if their
+        IPC condition is now satisfied (matching response in
+        cpu.responses, or non-empty queue), promote them to
+        RUNNABLE and queue them up for the scheduler. The actual
+        unblock (writing the result registers, advancing PC) happens
+        in the existing _try_unblock path once the task is
+        scheduled back and cpu.blocked_on holds its signal again.
+
+        Read-only against cpu state — no responses consumed, no
+        descriptor queues popped. Phase 36."""
+        for task in cpu.tasks.values():
+            if task.state != TASK_STATE_BLOCKED:
+                continue
+            if task is cpu.current_task:
+                continue   # current_task's blocked_on lives on the CPU
+            b = task.blocked_on
+            if b is None:
+                continue
+            ready = False
+            if isinstance(b, BlockedOnResponse):
+                for packet in cpu.responses:
+                    try:
+                        pkt = unpack_packet(packet)
+                    except ValueError:
+                        continue
+                    if pkt['trans_id'] == b.trans_id:
+                        ready = True
+                        break
+            elif isinstance(b, BlockedOnQueue):
+                idx = b.descriptor_idx
+                if 0 < idx < len(cpu.descriptors) \
+                        and cpu.descriptors[idx] is not None \
+                        and cpu.descriptors[idx].queue \
+                        and len(cpu.descriptors[idx].queue) > 0:
+                    ready = True
+                # Skip the timeout-decrement path — non-current
+                # tasks don't tick down. Practical for the shell
+                # case where the blocking call is term_getkey
+                # (infinite timeout); user code that needs strict
+                # timeout semantics should stay current.
+            if ready:
+                task.state = TASK_STATE_RUNNABLE
+                cpu.runnable.append(task)
+
     def _try_unblock(self, cpu: CPU) -> bool:
         """Resume a blocked CPU if its wait condition is now satisfied.
         Returns True if the CPU made progress (delivered a message,
@@ -1439,6 +1497,13 @@ class System:
                             survivors.append((deadline, idx))
                     cpu.deferred_frees = survivors
             for cpu in self.cpus:
+                # Wake any non-current BLOCKED tasks whose unblock
+                # condition is now satisfied (the response landed,
+                # the queue got a SEND); they go back to RUNNABLE for
+                # the scheduler to pick. The actual unblock work
+                # (writing R2/R3, advancing PC) happens when the task
+                # is next scheduled and cpu.blocked_on is processed.
+                self._wake_blocked_tasks(cpu)
                 # Blocked CPUs: see if their queue/response is now ready
                 # and resume past the CALL or OL/OS accordingly.
                 if cpu.blocked_on is not None:
@@ -1451,6 +1516,22 @@ class System:
                             continue
                         report_trap(cpu, t)
                         return 3
+                    # Still blocked? If there's another runnable task on
+                    # this CPU, switch to it — the blocked task's
+                    # blocked_on is preserved in its Task struct via
+                    # save_cpu_to_task and will be reinstated when it's
+                    # scheduled back. (Phase 36 — blocked-task preemption.)
+                    if cpu.blocked_on is not None and cpu.runnable:
+                        cur = cpu.current_task
+                        nxt = pick_next_runnable(cpu)
+                        if nxt is not None and nxt is not cur:
+                            if cur is not None:
+                                cur.state = TASK_STATE_BLOCKED
+                                save_cpu_to_task(cpu, cur)
+                            load_task_to_cpu(cpu, nxt)
+                            nxt.state = TASK_STATE_RUNNING
+                            cpu.current_task = nxt
+                            any_progress = True
                     continue
                 if cpu.active:
                     try:
@@ -1807,6 +1888,7 @@ def save_cpu_to_task(cpu: CPU, task: 'Task') -> None:
     task.cause_reg    = cpu.cause_reg
     task.badvaddr_reg = cpu.badvaddr_reg
     task.mappings     = list(cpu.mappings)
+    task.blocked_on   = cpu.blocked_on
 
 
 def load_task_to_cpu(cpu: CPU, task: 'Task') -> None:
@@ -1824,6 +1906,7 @@ def load_task_to_cpu(cpu: CPU, task: 'Task') -> None:
     cpu.cause_reg    = task.cause_reg
     cpu.badvaddr_reg = task.badvaddr_reg
     cpu.mappings     = list(task.mappings)
+    cpu.blocked_on   = task.blocked_on
 
 
 def context_switch(cpu: CPU, next_task: 'Task') -> None:
@@ -2420,6 +2503,13 @@ def primitive_InstallTrapHandler(cpu: CPU) -> None:
     if cause not in CAUSE_VECTOR_OFFSET:
         cpu.set_gpr(2, ERR_EINVAL); return
     cpu.trap_handlers[cause] = va
+    # Snapshot the supervisor's mappings at install time. When the trap
+    # eventually fires from a child task whose own address space doesn't
+    # cover this handler VA (e.g. an orx_run-spawned guest faults under
+    # a shell that registered the handler), deliver_trap swaps these
+    # mappings in for the duration of the handler. ERET then restores
+    # the trapping task's mappings via load_task_to_cpu.
+    cpu.trap_handler_mappings[cause] = list(cpu.mappings)
     cpu.set_gpr(2, ERR_OK)
 
 
@@ -3351,6 +3441,13 @@ def deliver_trap(cpu: CPU, t: Trap) -> bool:
     cpu.pc            = target_pc
     cpu.next_pc       = (cpu.pc + 4) & 0xFFFFFFFF
     cpu.in_trap_handler = True
+    # If we're delivering to an installed supervisor handler, swap in
+    # the mappings the supervisor had at install time. The handler VA
+    # may not be reachable in the trapping task's address space, but
+    # save_cpu_to_task above already captured the trapping task's
+    # mappings; ERET via load_task_to_cpu restores them.
+    if handler_va is not None and t.cause in cpu.trap_handler_mappings:
+        cpu.mappings = list(cpu.trap_handler_mappings[t.cause])
     if t.cause == CAUSE_EXTERNAL_INTERRUPT:
         cpu.status_ie = False
     # If we trapped while parked at a CALL waiting on a primitive (or at
