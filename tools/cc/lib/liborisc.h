@@ -139,26 +139,49 @@ int lb_spawn(const char *path);
 
 /* ---- task.c — task management (Vol VI §4) ----------------------- *
  *
- * MVP single-child API: each call operates on the task ref parked
- * in O12 by task_spawn. Multi-child programs need to omov refs
- * elsewhere themselves until the libc grows a real task table.
+ * Multi-child API: each call takes a `task_t` handle that names a
+ * slot in a libc-managed OREF storage table holding up to
+ * TASK_MAX_CONCURRENT child task refs at once.
+ *
+ *     task_t kid_a = task_spawn(child_a, 7);
+ *     task_t kid_b = task_spawn(child_b, 11);
+ *     int    code_a = task_wait(kid_a);
+ *     int    code_b = task_wait(kid_b);
+ *     task_free(kid_a);
+ *     task_free(kid_b);
  *
  * Boot ABI for task-using programs:
  *
- *     O12 = current child task ref   (set by task_spawn)
- *     O13 = parent's boot code ref   (parked by task_init)
+ *     O11 = boot stack ref            (parked by task_init)
+ *     O12 = task table (objstore ref) (allocated by task_init)
+ *     O13 = parent's boot code ref    (parked by task_init)
+ *     O15 = boot data ref             (parked by task_init)
  *
  * task_init() must be called once at program start, BEFORE main
  * clobbers O1. Children inherit the parent's OPRs verbatim, so
- * service refs (O5..O10), boot saves (O11/O14/O15), etc. are all
+ * service refs (O5..O10), boot saves (O11/O15), etc. are all
  * visible to the child without redoing the init dances.
+ *
+ * Returns:
+ *   task_spawn:  >= 0 = slot handle on success;
+ *                -1   = table full;
+ *                -EERR (negative firmware errno) on primitive failure.
+ *   task_wait:   >= 0 = child's exit code (0..255);
+ *                -EERR on failure.
+ *   task_free:   0    = OK;
+ *                -1   = bad handle;
+ *                EERR (positive firmware errno) on primitive failure.
  */
 
-void task_init(void);                              /* park O1 → O13 */
-int  task_spawn(void (*entry)(int), int arg);     /* fork → O12; return status */
-int  task_wait(void);                              /* block on O12 → return exit code */
-int  task_free(void);                              /* ObjFree(O12) → return status */
-void task_yield(void);                             /* surrender quantum */
-void task_exit(int code);                          /* terminate caller (no return) */
+#define TASK_MAX_CONCURRENT 16
+
+typedef int task_t;
+
+void   task_init(void);                            /* allocate the task table */
+task_t task_spawn(void (*entry)(int), int arg);    /* fork; return slot handle */
+int    task_wait(task_t t);                        /* block on t; return exit code */
+int    task_free(task_t t);                        /* reap exited child */
+void   task_yield(void);                           /* surrender quantum */
+void   task_exit(int code);                        /* terminate caller (no return) */
 
 #endif /* LIBORISC_H */

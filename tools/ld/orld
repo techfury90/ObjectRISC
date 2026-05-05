@@ -287,6 +287,15 @@ def link(objs: List[ObjectFile], entry_name: str
 
     # Step 1 — section layout. Each .oro contributes its text and data to
     # the unified output at a per-file base offset.
+    #
+    # .text is always 4-byte aligned (instructions are 4 bytes; the
+    # assembler asserts this within an object). .data is padded to 4
+    # bytes between objects so that an object whose first datum is
+    # `.align 2; foo: .skip 4` lands at a 4-aligned position even when
+    # the previous object's .data ended on an odd byte (e.g., a
+    # null-terminated 7-byte string). 4 covers every alignment the
+    # current toolchain emits; coarser per-symbol alignments would
+    # need section-alignment metadata in the .oro format.
     text_offsets: Dict[ObjectFile, int] = {}
     data_offsets: Dict[ObjectFile, int] = {}
     text_cursor = 0
@@ -296,6 +305,7 @@ def link(objs: List[ObjectFile], entry_name: str
         text_cursor += len(obj.text)
         data_offsets[obj] = data_cursor
         data_cursor += len(obj.data)
+        data_cursor = (data_cursor + 3) & ~3
 
     # Step 2 — resolve globals. Walk each .oro's symbol table; defined
     # globals enter the merged table (duplicate detection); local symbols
@@ -337,12 +347,15 @@ def link(objs: List[ObjectFile], entry_name: str
             site_va = sec_base_va + obj_base + reloc.offset
             _apply_reloc(buf, reloc, target_va, site_va, obj)
 
-    # Step 4 — assemble final text and data.
+    # Step 4 — assemble final text and data. Pad .data between objects
+    # to match the offsets step 1 reserved (see comment there).
     text_bytes = bytearray()
     for obj in objs:
         text_bytes += obj.text
     data_bytes = bytearray()
     for obj in objs:
+        if len(data_bytes) < data_offsets[obj]:
+            data_bytes += b"\x00" * (data_offsets[obj] - len(data_bytes))
         data_bytes += obj.data
 
     if len(text_bytes) % 4:

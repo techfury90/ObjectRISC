@@ -2680,6 +2680,120 @@ contract isn't fully captured by the type system yet.
   or a shim that does the LCTRL/SCTRL/ERET dance) would let
   Ouroboros catch faulting tasks gracefully.
 
+## Phase 29 — Multi-child task API (Ouroboros, day 6)
+
+Phase 28 left the obvious gap: the `O12`-as-task-handle convention
+worked for one child at a time, which made `task_spawn` look more
+like `posix_spawn-then-wait` than `fork`. Phase 29 grows it into a
+real handle API where the user can hold N children at once and
+wait on them in any order.
+
+### A `task_t` handle backed by an OREF table
+
+`task_init` now `ObjAllocStore`s a 128-byte OR-typed storage
+object (`TASK_MAX_CONCURRENT * 8` bytes — one OR ref per slot)
+and parks it in `O12`. `task_t` is a small int that names a slot
+in the table. Slot allocation: a `static unsigned int task_slots_in_use`
+bitmap in regular memory, scanned linearly to find a free bit.
+The OREF table itself never has to be searched — the bitmap is the
+authoritative "in use" record.
+
+```c
+task_t kid_a = task_spawn(child_a, 7);
+task_t kid_b = task_spawn(child_b, 11);
+int    code_a = task_wait(kid_a);
+int    code_b = task_wait(kid_b);
+task_free(kid_a);
+task_free(kid_b);
+```
+
+Up to 16 concurrent children. Bumping that just needs a bigger
+table (and one more line in the bitmap-bit-count macro).
+
+### OREFLD / OREFST switch dispatch
+
+The architectural wart: `OREFLD`/`OREFST` take a 16-bit constant
+offset, not a register. Slot index → offset would need a runtime
+multiplication, but the offset has to be baked into the
+instruction word. So `task_load_to_o1(slot)` and
+`task_store_from_o1(slot)` are 16-case switches with one inline-asm
+arm per slot. Verbose but mechanical, and pcc lowers them to a
+chain of compare-branches that disappears under the cost of the
+TaskCreate / TaskWait calls themselves.
+
+### A linker bug found en route
+
+First run of the new demo trapped `address-misaligned-d` at VA
+`0x40007`. Cause: `orld` concatenated `.data` sections from
+multiple `.oro` objects without padding between them, so the
+`task.c` object's 4-byte-aligned `task_slots_in_use` global landed
+at offset 7 in the combined section (right after a 7-byte
+`"hello\n\0"` literal from another object). The `.align 2`
+directive in `task.c`'s assembly aligned within its own object —
+which doesn't help if the object itself starts unaligned in the
+combined section.
+
+Fix in `tools/ld/orld`: pad `data_cursor` to 4 bytes between
+objects in step 1 (layout), and pad `data_bytes` to match in
+step 4 (concatenation). 4 covers everything the current toolchain
+emits; coarser per-symbol alignments would need section-alignment
+metadata in the `.oro` format.
+
+This is the kind of bug that's been lurking — earlier programs
+had data layouts where the offset-7 collision didn't happen to
+matter (or no cross-object globals at all). The new task table
+forced it into the open.
+
+### Concurrent demo
+
+`examples/cc/multitask/concurrent.c`: parent allocates a 32-byte
+shared scratch object, parks it in `O7` *before* spawning, then
+spawns five children all at once. Each child reads its slot index
+from the packed `R4` argument, stamps a value into
+`scratch[slot]` via `OSB`, and exits. Parent waits on each in
+turn, OLBUs the scratch byte back, prints. Without the OPR-
+inheritance behaviour of `TaskCreate` (Phase 26), the children
+wouldn't see `O7` at all — the demo doubles as a regression test
+for that.
+
+```
+spawned 5 children
+scratch[0] = 7
+scratch[1] = 11
+scratch[2] = 13
+scratch[3] = 17
+scratch[4] = 19
+all done
+```
+
+### Validation
+
+- Existing `multitask.c` (sequential) updated to the handle API;
+  still passes its `test_multitask.sh`.
+- New `examples/cc/multitask/concurrent.c` + `run-concurrent.sh`
+  + `tools/devices/tests/test_concurrent.sh` — 12 device/shell
+  tests now (was 11).
+- 132 sim validation + 7 asm + 5 wire-format + multiprocess +
+  hello all still green.
+
+### What's not yet done
+
+- **`task_wait_any` / `task_wait_first`.** The current loop
+  pattern is `for each kid: task_wait(kid)`, which works (the
+  earliest exit is collected first by short-circuit when its
+  `TaskWait` finds the task already EXITED) but doesn't return
+  control as eagerly as a real reaper would. A `wait_any`
+  variant would scan the table, hand out the first EXITED
+  child, and only block if none are ready.
+- **Configurable stack size per task_spawn.** Hard-coded 4 KiB
+  per child today.
+- **Slot reuse across `task_free`.** Already works (the bitmap
+  bit clears, next `task_spawn` picks the same slot), but the
+  invariant — "the OREF slot reads as null after `task_free`" —
+  is enforced by overwriting with `O0` rather than tracked
+  separately. Fine but worth documenting if anyone ever pokes
+  at the table directly.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

@@ -48,11 +48,12 @@ main(void)
 	args[2] = 21;
 
 	for (i = 0; i < 3; i++) {
-		if (task_spawn(double_and_exit, args[i]) != 0) {
+		task_t kid = task_spawn(double_and_exit, args[i]);
+		if (kid < 0) {
 			print_str("task_spawn failed\n");
 			return 1;
 		}
-		result = task_wait();
+		result = task_wait(kid);
 		if (result < 0) {
 			print_str("task_wait failed\n");
 			return 1;
@@ -62,7 +63,7 @@ main(void)
 		print_str(") -> ");
 		print_int(result);
 		print_str("\n");
-		task_free();
+		task_free(kid);
 	}
 
 	print_str("parent done\n");
