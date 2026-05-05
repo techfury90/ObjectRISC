@@ -2,10 +2,23 @@
  * task.c — Object RISC libc: task management.
  *
  * Wraps Vol VI §4 task primitives plus the matching ObjFree-of-task
- * reaping path. The MVP is single-child: each task_* call operates
- * on the task ref currently parked in O12. Multi-child programs
- * need to omov refs between O12 and other slots themselves until
- * the libc grows a real task table.
+ * reaping path. Multi-child API: each call takes a `task_t` handle
+ * that names a slot in a libc-managed OREF storage table holding
+ * up to TASK_MAX_CONCURRENT child task refs at once.
+ *
+ *     task_t kid_a = task_spawn(child_a, 7);
+ *     task_t kid_b = task_spawn(child_b, 11);
+ *     int exit_a = task_wait(kid_a);
+ *     int exit_b = task_wait(kid_b);
+ *     task_free(kid_a);
+ *     task_free(kid_b);
+ *
+ * The table itself is an OR-typed storage object (ObjAllocStore'd
+ * by task_init), parked in O12 with R+W caps. Slot index → byte
+ * offset is `slot * 8` (each OR ref is 64 bits). A separate in-use
+ * bitmap (regular int memory) tracks which slots hold live refs so
+ * task_spawn can find a free slot in O(MAX) without scanning the
+ * OREF table itself.
  *
  * Boot-ABI required of callers
  * ----------------------------
@@ -16,7 +29,7 @@
  * print_str, etc. read string data through O2/O3).
  *
  *     O11 = boot stack ref               (parked by task_init)
- *     O12 = current child task ref       (set by task_spawn)
+ *     O12 = task table (objstore ref)    (allocated by task_init)
  *     O13 = parent's boot code ref       (parked by task_init)
  *     O15 = boot data ref                (parked by task_init)
  *
@@ -35,15 +48,23 @@
 
 #include "liborisc.h"
 
-#define CODE_VA 0x00010000
+#define CODE_VA            0x00010000
+#define TAG_DATA           0x4102
+#define TAG_STACK          0x4101
+#define CAP_R              0x01
+#define CAP_W              0x02
+#define CAP_C              0x40
+#define DEFAULT_STACK_SIZE 0x1000   /* 4 KiB — fine for leaf children */
 
-#define TAG_STACK    0x4101
-#define CAP_R 0x01
-#define CAP_W 0x02
-#define CAP_C 0x40
-#define DEFAULT_STACK_SIZE  0x1000   /* 4 KiB — fine for leaf children */
+/* TASK_MAX_CONCURRENT is defined in liborisc.h so callers can size
+ * arrays of task_t against it. Keep them in sync. */
+#define TABLE_BYTES (TASK_MAX_CONCURRENT * 8)
 
-/* --- task_init: park boot O1/O2/O3 into O13/O11/O15 ------------- */
+/* Bit set when the corresponding table slot holds a live ref. Lives
+ * in regular int memory; pcc treats it as a normal global. */
+static unsigned int task_slots_in_use;
+
+/* --- task_init: park boot ORs + ObjAllocStore the table --------- */
 
 void
 task_init(void)
@@ -51,8 +72,73 @@ task_init(void)
 	asm volatile(
 		"omov o13, o1\n"     /* boot code ref */
 		"omov o11, o2\n"     /* boot stack ref */
-		"omov o15, o3"       /* boot data ref */
+		"omov o15, o3\n"     /* boot data ref */
+
+		/* ObjAllocStore(R4=size, R5=tag, R6=caps) → O1 = table ref. */
+		"addiu r4, r0, %0\n"
+		"addiu r5, r0, %1\n"
+		"addiu r6, r0, %2\n"
+		"call  #0x106\n"
+		"nop\n"
+		"omov  o12, o1"
+		:
+		: "i"(TABLE_BYTES), "i"(TAG_DATA), "i"(CAP_R | CAP_W)
+		: "r2", "r3", "r4", "r5", "r6"
 	);
+	task_slots_in_use = 0;
+}
+
+/* --- internal: OREFLD slot → O1 / OREFST O1 → slot ---------------
+ *
+ * OREFLD/OREFST take a constant 16-bit signed offset; we can't
+ * compute the slot offset at runtime in a single instruction. The
+ * switches below are mechanical — pcc lowers them to a chain of
+ * compare-branches, which is fine at TASK_MAX_CONCURRENT = 16. */
+
+static void
+task_load_to_o1(int slot)
+{
+	switch (slot) {
+	case  0: asm volatile("orefld o1, 0(o12)");   break;
+	case  1: asm volatile("orefld o1, 8(o12)");   break;
+	case  2: asm volatile("orefld o1, 16(o12)");  break;
+	case  3: asm volatile("orefld o1, 24(o12)");  break;
+	case  4: asm volatile("orefld o1, 32(o12)");  break;
+	case  5: asm volatile("orefld o1, 40(o12)");  break;
+	case  6: asm volatile("orefld o1, 48(o12)");  break;
+	case  7: asm volatile("orefld o1, 56(o12)");  break;
+	case  8: asm volatile("orefld o1, 64(o12)");  break;
+	case  9: asm volatile("orefld o1, 72(o12)");  break;
+	case 10: asm volatile("orefld o1, 80(o12)");  break;
+	case 11: asm volatile("orefld o1, 88(o12)");  break;
+	case 12: asm volatile("orefld o1, 96(o12)");  break;
+	case 13: asm volatile("orefld o1, 104(o12)"); break;
+	case 14: asm volatile("orefld o1, 112(o12)"); break;
+	case 15: asm volatile("orefld o1, 120(o12)"); break;
+	}
+}
+
+static void
+task_store_from_o1(int slot)
+{
+	switch (slot) {
+	case  0: asm volatile("orefst o1, 0(o12)");   break;
+	case  1: asm volatile("orefst o1, 8(o12)");   break;
+	case  2: asm volatile("orefst o1, 16(o12)");  break;
+	case  3: asm volatile("orefst o1, 24(o12)");  break;
+	case  4: asm volatile("orefst o1, 32(o12)");  break;
+	case  5: asm volatile("orefst o1, 40(o12)");  break;
+	case  6: asm volatile("orefst o1, 48(o12)");  break;
+	case  7: asm volatile("orefst o1, 56(o12)");  break;
+	case  8: asm volatile("orefst o1, 64(o12)");  break;
+	case  9: asm volatile("orefst o1, 72(o12)");  break;
+	case 10: asm volatile("orefst o1, 80(o12)");  break;
+	case 11: asm volatile("orefst o1, 88(o12)");  break;
+	case 12: asm volatile("orefst o1, 96(o12)");  break;
+	case 13: asm volatile("orefst o1, 104(o12)"); break;
+	case 14: asm volatile("orefst o1, 112(o12)"); break;
+	case 15: asm volatile("orefst o1, 120(o12)"); break;
+	}
 }
 
 /* --- task_yield: surrender the rest of the quantum -------------- */
@@ -88,23 +174,29 @@ task_exit(int code)
  *
  * Allocates a fresh stack via ObjAlloc, calls TaskCreate with the
  * parent's code ref (parked in O13 by task_init) and the supplied
- * entry offset, then TaskResume. The new task's ref is left in O12
- * for subsequent task_wait / task_free.
+ * entry offset, OREFSTs the new ref into the next free table slot,
+ * then TaskResumes. Restores O2/O3 from O11/O15 on the way out so
+ * the caller's subsequent print_str / print_int keep working.
  *
- * `entry` is a function pointer; we convert it to the byte offset
- * within the code object by subtracting CODE_VA (the standard
- * mapping VA per CONTRACT.md §2). `arg` is placed in the child's
- * R4 so the entry function can read it as its first integer arg.
- *
- * Returns 0 on success, or the error code from a failed primitive.
+ * Returns the slot index (>= 0) on success; -firmware_errno on a
+ * primitive failure; -1 if the table is full.
  */
-int
+task_t
 task_spawn(void (*entry)(int), int arg)
 {
 	unsigned int entry_off = (unsigned int)entry - CODE_VA;
+	int slot;
 	int status;
 
-	/* ObjAlloc(R4=size, R5=tag, R6=caps) → O1 = stack ref. */
+	/* Find a free slot. */
+	for (slot = 0; slot < TASK_MAX_CONCURRENT; slot++) {
+		if (!(task_slots_in_use & (1 << slot)))
+			break;
+	}
+	if (slot >= TASK_MAX_CONCURRENT)
+		return -1;
+
+	/* ObjAlloc(R4=size, R5=TAG_STACK, R6=R|W|C) → O1 = stack ref. */
 	asm volatile(
 		"addiu r4, r0, %1\n"
 		"addiu r5, r0, %2\n"
@@ -117,12 +209,9 @@ task_spawn(void (*entry)(int), int arg)
 		: "r2", "r3", "r4", "r5", "r6"
 	);
 	if (status != 0)
-		return status;
+		return -status;
 
-	/* TaskCreate(O1=code, O2=stack, R4=entry_off, R5=arg) → O1 = task.
-	 * Restore O2/O3 from O11/O15 afterwards — TaskCreate clobbered O2
-	 * (we set it to the child's stack) and console_write / print_str
-	 * use O2 (stack data) and O3 (segment data) to find string memory. */
+	/* TaskCreate(O1=code, O2=stack, R4=entry_off, R5=arg) → O1 = task. */
 	asm volatile(
 		"omov  o2, o1\n"           /* O2 = stack ref (just from ObjAlloc) */
 		"omov  o1, o13\n"          /* O1 = parent's code ref */
@@ -130,20 +219,24 @@ task_spawn(void (*entry)(int), int arg)
 		"addu  r5, %2, r0\n"
 		"call  #0x000\n"
 		"nop\n"
-		"omov  o12, o1\n"          /* park child task ref in O12 */
-		"omov  o2, o11\n"          /* restore parent's stack ref */
-		"omov  o3, o15\n"          /* restore parent's data ref */
 		"addu  %0, r2, r0"
 		: "=r"(status)
 		: "r"(entry_off), "r"(arg)
 		: "r2", "r3", "r4", "r5"
 	);
-	if (status != 0)
-		return status;
+	if (status != 0) {
+		/* Restore O2/O3 before bailing — caller's prints depend on them. */
+		asm volatile("omov o2, o11");
+		asm volatile("omov o3, o15");
+		return -status;
+	}
 
-	/* TaskResume(O1=task). */
+	/* O1 now holds the new task ref. Park it in the table at `slot`. */
+	task_store_from_o1(slot);
+	task_slots_in_use |= (1 << slot);
+
+	/* TaskResume(O1=task) — O1 still holds the ref from TaskCreate. */
 	asm volatile(
-		"omov  o1, o12\n"
 		"call  #0x002\n"
 		"nop\n"
 		"addu  %0, r2, r0"
@@ -151,24 +244,34 @@ task_spawn(void (*entry)(int), int arg)
 		:
 		: "r2"
 	);
-	return status;
+
+	/* Restore O2/O3 for the caller. */
+	asm volatile("omov o2, o11");
+	asm volatile("omov o3, o15");
+
+	if (status != 0)
+		return -status;
+	return slot;
 }
 
-/* --- task_wait: block until the child exits, return its code ----
+/* --- task_wait: block until the named child exits, return its code
  *
- * The child task is taken from O12 (where task_spawn parked it).
- * On wakeup, the firmware places R3 = exit code; we surface that as
- * the return value. Errors return negative (R2 negated to keep the
- * happy-path 0..255 range usable).
+ * Loads the child's ref from the table into O1, calls TaskWait. On
+ * wakeup the firmware places R3 = exit code; we surface that as the
+ * return value. Errors return negative (firmware error code negated
+ * to keep the happy-path 0..255 range usable).
  */
 int
-task_wait(void)
+task_wait(task_t t)
 {
-	int code;
-	int status;
+	int status, code;
 
+	if (t < 0 || t >= TASK_MAX_CONCURRENT
+			|| !(task_slots_in_use & (1 << t)))
+		return -1;
+
+	task_load_to_o1(t);
 	asm volatile(
-		"omov  o1, o12\n"
 		"call  #0x007\n"
 		"nop\n"
 		"addu  %0, r2, r0\n"
@@ -182,14 +285,19 @@ task_wait(void)
 	return code;
 }
 
-/* --- task_free: reap the child's descriptor --------------------- */
+/* --- task_free: reap the child's descriptor and free its slot --- */
 
 int
-task_free(void)
+task_free(task_t t)
 {
 	int status;
+
+	if (t < 0 || t >= TASK_MAX_CONCURRENT
+			|| !(task_slots_in_use & (1 << t)))
+		return -1;
+
+	task_load_to_o1(t);
 	asm volatile(
-		"omov  o1, o12\n"
 		"call  #0x101\n"
 		"nop\n"
 		"addu  %0, r2, r0"
@@ -197,5 +305,13 @@ task_free(void)
 		:
 		: "r2"
 	);
+	if (status == 0) {
+		/* Clear the slot — overwrite with the null ref so any stale
+		 * reuse via task_load_to_o1 reads back as null, and free up
+		 * the bit for the next task_spawn. */
+		asm volatile("omov o1, o0");
+		task_store_from_o1(t);
+		task_slots_in_use &= ~(1 << t);
+	}
 	return status;
 }
