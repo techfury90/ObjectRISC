@@ -3114,6 +3114,101 @@ real free path (was leak-and-let-the-OS-clean-up).
   someone else's task. Long-term it might want to be capability-
   gated (require a specific cap on the ref).
 
+## Phase 33 — `orx_unload`: post-exit cleanup (Ouroboros, day 10)
+
+Phase 32's drain primitive worked, but the timer started at
+spawn time with a generous 30 s window — long enough for typical
+interactive guests but not principled. A guest running >30 s
+would have its data segment pulled out from under it. Phase 33
+fixes this by deferring the timer to **after** the guest exits.
+
+### Per-task manifest in the persistent state
+
+`orx.c` no longer ObjAllocStores a fresh scratch on each spawn
+and frees it on return. Instead:
+
+- `orx_state_init()` — lazy, idempotent. ObjAllocStores a
+  408-byte OR-typed object on first call, parks in `O7`, sets
+  the static `orx_state_initialized = 1`. Subsequent calls noop.
+- Layout of the state object:
+  - bytes `0..23`: scratch slots (`SLOT_CODE`/`SLOT_DATA`/`SLOT_STACK`)
+    used during the load — overwritten on each spawn.
+  - bytes `24..407`: per-task **manifest** — 16 entries × 24
+    bytes each, indexed by the libc `task_t` handle. Each entry
+    holds the loaded code/data/stack refs at offsets +0/+8/+16.
+
+`orx_spawn` ends by OREFLDing the three scratch refs into
+`O1`/`O2`/`O3` and OREFSTing them into `manifest[t]` via a single
+`manifest_save(t)` switch. No deferred-frees scheduled at spawn —
+the loaded objects live as long as the task does.
+
+### `orx_unload(task_t t)`
+
+```c
+int orx_unload(task_t t) {
+    int code = task_wait(t);            /* block until guest EXITED */
+    if (code < 0) return code;
+    manifest_load(t);                   /* OREFLD m[t] → O1/O2/O3 */
+    freedef_o1();                       /* ObjFreeDeferred(O1=code, 1500ms) */
+    asm("omov o1, o2"); freedef_o1();   /* O1 = data,  ObjFreeDeferred */
+    asm("omov o1, o3"); freedef_o1();   /* O1 = stack, ObjFreeDeferred */
+    manifest_clear(t);                  /* OREFST O0 (null) → m[t] */
+    task_free(t);
+    return code;
+}
+```
+
+Drain delay shrinks from 30 s (start of spawn) to **1.5 s**
+(post-`task_wait`), which is plenty for any in-flight `OBJ_READ_REQ`
+to drain — `task_wait` already proved the guest finished sending.
+Long-lived guests are no longer at risk.
+
+### Manifest helpers (mechanical 16-case switches)
+
+`OREFLD`/`OREFST` take literal 16-bit offsets so a runtime `task_t`
+has to dispatch through a switch. Three helpers — `manifest_save`,
+`manifest_load`, `manifest_clear` — each with one case per task
+slot. Each case is a single asm block doing all three OREFs at
+once for that slot. Verbose-but-tidy: 48 cases total, each one line.
+
+### `orx_run` collapses to two calls
+
+```c
+int orx_run(const char *path) {
+    task_t t = orx_spawn(path);
+    if (t < 0) return t;
+    return orx_unload(t);
+}
+```
+
+The shell's `cmd_wait` swapped its `task_wait` + `task_free` pair
+for `orx_unload`. Safe on tasks that weren't orx-spawned (manifest
+entries are null → `ObjFreeDeferred(null)` returns `EFAULT`,
+which we swallow silently). Means user can `wait <N>` on any task
+without knowing whether it was `orx_spawn`'d.
+
+### Validation
+
+134 sim validation + 7 asm + 13 device/shell + others all still
+green. `test_shell_run` and `test_shell_bg` now exercise the
+post-exit cleanup path through `orx_unload`. No new tests — the
+existing flow covers it end-to-end.
+
+### What's not yet done
+
+- **State object on `--reset-on-exit`.** A reset CPU wipes its
+  descriptor table; `orx_state_initialized` (in C memory) stays
+  truthy but the state object is gone, so subsequent
+  `orx_spawn`s would crash on first `OREFST`. Not a real issue
+  for the current use case (the shell never resets), but worth
+  noting.
+- **Manifest size = `TASK_MAX_CONCURRENT`.** Hardcoded to 16.
+  If the task table ever grows, the orx manifest needs to grow
+  too (and the switch tables need more cases).
+- **Backgrounded shell `wait` doesn't auto-yield.** Same caveat
+  as Phase 31 — CPU-bound bg tasks freeze the shell. Real
+  preemption is still gated.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

@@ -212,5 +212,6 @@ int    task_resume(task_t t);                      /* OREFLD slot, call TaskResu
 
 int    orx_run(const char *path);
 task_t orx_spawn(const char *path);                /* async — caller waits/frees */
+int    orx_unload(task_t t);                       /* wait + deferred-free + reap */
 
 #endif /* LIBORISC_H */
