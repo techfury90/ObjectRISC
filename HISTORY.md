@@ -2440,6 +2440,132 @@ wire-format + 10 device/shell tests all still green.
   context — fine while there's one supervisor managing all
   tasks, but the architecture admits per-task handlers.
 
+## Phase 27 — Wait, reap, supervisor handlers, timer (Ouroboros, day 4)
+
+Phase 26 left four obvious gaps. Phase 27 closes them in a single
+pass: the synchronization primitive a parent needs to harvest a
+child (`TaskWait`), the storage-management primitive that lets
+EXITED tasks not leak (`ObjFree` on `TAG_TASK`), the supervisor
+escape hatch from firmware-only `VECBASE` (`InstallTrapHandler`),
+and the asynchronous-trap path that timer-driven preemption rides
+on top of (`STATUS.IE` + `COMPARE` + `external-interrupt`).
+
+### `TaskWait` (#0x007)
+
+`Task` gained a `waiters: List[Task]` field. `TaskWait`:
+
+1. Validates `O1` as a task ref (no V cap required — Vol VI §4.1).
+2. If the target is already `EXITED`, returns immediately with `R3
+   = exit_code`.
+3. Otherwise marks the caller `BLOCKED`, appends it to
+   `target.waiters`, bumps PC past the CALL, and context-switches
+   to the next runnable task. If nothing else is runnable, returns
+   `EBUSY` instead — waiting would deadlock the CPU.
+
+`TaskExit` gained a `_wake_waiters` pre-step that walks the
+exiting task's waiters list, sets each waiter's `R2 = OK` and
+`R3 = exit_code` directly in their saved Task struct (so the
+values are visible after the next context-switch back), and
+moves them `BLOCKED → RUNNABLE`. Then the regular `pick_next_runnable`
+runs, possibly picking a just-woken waiter.
+
+### Reaping via `ObjFree`
+
+`ObjFree` is now type-aware for `TAG_TASK`: freeing a task
+descriptor evicts the Python `Task` struct from `cpu.tasks`
+alongside the descriptor itself. A live task can't be freed
+(returns `EBUSY`) — that would silently strand the running
+context or leave a dangling pointer in the runnable queue.
+
+Means an Ouroboros pattern of `TaskCreate → TaskResume →
+TaskWait → ObjFree` works as a clean reap primitive without
+adding a new `TaskReap` syscall.
+
+### `InstallTrapHandler` (#0x520)
+
+Per-CPU `cpu.trap_handlers: Dict[cause, va]`. `deliver_trap`
+consults this map *before* falling back to `VECBASE + offset`:
+when a per-cause handler is installed, the trap delivers to that
+VA in supervisor mode (firmware mode for the VECBASE fallback).
+The handler runs in the trapping task's address space, can read
+the architectural trap state via `LCTRL`, and returns by `ERET`.
+
+Slot is `#0x520` rather than `#0x500` — the latter was already
+spec-allocated to `GuestCreate`. Vol VI §9 picks up the new
+primitive next to `SystemReset` / `SystemHalt`; the
+"hypervisor and system management" range is the right home for
+trap-routing primitives.
+
+### Timer interrupt + `STATUS.IE`
+
+`STATUS` got the bit-layout pinned down in Vol V §2.10:
+
+| Bits      | Field        | Meaning                                       |
+|-----------|--------------|-----------------------------------------------|
+| `[1:0]`   | `MODE`       | Current privilege mode                        |
+| `[3:2]`   | `SAVED_MODE` | Mode to restore on `ERET`                     |
+| `[4]`     | `IE`         | Interrupt enable (gates `external-interrupt`) |
+
+`COMPARE` (control register 6) is now actually backed.
+`step()` checks at the top of each instruction: if `IE` is set
+and `cycles >= compare > 0`, raise `Trap(CAUSE_EXTERNAL_INTERRUPT)`
+which `deliver_trap` routes through whatever path is installed.
+On delivery of `external-interrupt`, `IE` is auto-cleared so the
+handler runs without immediately re-firing. The handler is
+expected to re-arm `COMPARE` and re-enable `IE` before `ERET`ing.
+
+The check is suppressed when the CPU is in a branch delay slot —
+firing there would lose the branch's effect on control flow
+because the simulator doesn't yet track the BD bit. We just defer
+one instruction and fire on the branch target.
+
+### Validation
+
+Four new tests:
+
+- **`14_tasks/05_taskwait_returns_exit_code`** — Bootstrap
+  creates a child with `init_r4 = 0x37`, `TaskWait`s on it; child
+  exits with `R4 = 0x37`; bootstrap wakes with `R3 = 0x37` and
+  exits with that.
+- **`14_tasks/06_objfree_reaps_exited_task`** — Premature
+  `ObjFree` returns `EBUSY`; after `TaskWait`, `ObjFree` returns
+  `OK`; a second `ObjFree` returns `ESTALE` (descriptor really
+  freed).
+- **`08_traps/15_supervisor_trap_handler`** — Bootstrap installs
+  a handler for arithmetic-overflow at a code label, triggers
+  the trap, handler reads STATUS to confirm supervisor mode
+  (not firmware), reads CAUSE, exits with the cause code.
+- **`14_tasks/07_timer_preemption`** — Bootstrap arms the timer,
+  enables IE, drops into a tight loop reading a counter; the
+  handler increments the counter, re-arms COMPARE, re-enables
+  IE, ERETs back. After 5 fires the loop exits. Without the
+  timer, the loop would never advance.
+
+128 → 132 sim validation tests passing. All other suites green.
+
+### What's not yet done
+
+- **Yield from inside a trap handler.** A handler that does a
+  voluntary `TaskYield` clobbers the trap's saved state (the
+  context switch saves the handler's mid-execution PC into the
+  task struct, which the next `ERET` will then misinterpret).
+  Real preemptive scheduling — where the timer handler hands the
+  CPU to another task — needs either (a) a deferred-yield
+  mechanism (handler sets a flag, ERETs back, the next
+  user-mode instruction yields), or (b) a "task-switch" variant
+  of `ERET` that fully resolves the saved state. Today the
+  timer can only do work that fits in the handler itself.
+- **`TaskBindProcessor` and `TaskQuery`.** `TaskQuery` is small;
+  `TaskBindProcessor` waits for cross-CPU scheduling.
+- **BD bit / delay-slot trap handling.** Sync traps inside delay
+  slots currently lose the branch effect on resume. Timer
+  interrupts dodge this by deferring one instruction; sync traps
+  don't have that luxury and need real BD machinery.
+- **`saved-IE` rides ERET.** Real architectures save the IE bit
+  alongside saved-mode and restore on ERET. Today the handler
+  must explicitly re-set IE before ERETing, which works but is
+  one more thing for the OS author to remember.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
