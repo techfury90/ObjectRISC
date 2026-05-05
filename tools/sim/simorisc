@@ -2177,6 +2177,42 @@ def primitive_TaskExit(cpu: CPU) -> None:
     context_switch(cpu, nxt)
 
 
+def primitive_TaskKill(cpu: CPU) -> None:
+    """Volume VI §4.1 #0x00A. Externally terminate the named task. The
+    target moves to EXITED with the supplied exit code, drops out of the
+    runnable queue, releases any pending IPC wait, and wakes anyone
+    blocked in TaskWait on it. The caller (a different task on the same
+    CPU) continues normally — no context switch.
+
+    Killing the calling task itself is rejected with EINVAL — that's
+    what TaskExit is for. Killing an already-EXITED task is a no-op
+    (idempotent, so a shell can `kill` a task that just finished racing
+    a `wait` without erroring)."""
+    target = _resolve_task_arg(cpu)
+    if target is None:
+        return
+    if target is cpu.current_task:
+        cpu.set_gpr(2, ERR_EINVAL); return
+    if target.state == TASK_STATE_EXITED:
+        cpu.set_gpr(2, ERR_OK); return
+    code = cpu.get_gpr(4) & 0xFF
+    # Drop the target from anywhere it might be parked. RUNNABLE tasks
+    # live in cpu.runnable; BLOCKED tasks have a blocked_on saved in
+    # their Task struct (Phase 36) — clearing it ensures a stale
+    # _try_unblock attempt can't fire on a corpse if the queue/response
+    # ever gets satisfied later.
+    if target.state == TASK_STATE_RUNNABLE:
+        try:
+            cpu.runnable.remove(target)
+        except ValueError:
+            pass
+    target.blocked_on = None
+    target.state      = TASK_STATE_EXITED
+    target.exit_code  = code
+    _wake_waiters(cpu, target)
+    cpu.set_gpr(2, ERR_OK)
+
+
 def primitive_TaskQuery(cpu: CPU) -> None:
     """Volume VI §4.2 #0x008. Return summary information about a task:
     its state, the processor it lives on, and its exit code if it
@@ -2746,6 +2782,7 @@ PRIMITIVE_MIN_MODE = {
     0x008: MODE_USER,        # TaskQuery
     0x007: MODE_USER,        # TaskWait
     0x009: MODE_SUPERVISOR,  # InstallProgram   — replaces task image
+    0x00A: MODE_USER,        # TaskKill         — external termination by ref
     0x100: MODE_USER,        # ObjAlloc
     0x101: MODE_USER,        # ObjFree
     0x107: MODE_USER,        # ObjFreeDeferred — drain-window wrapper
@@ -2792,6 +2829,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_TaskQuery(cpu)
     elif prim == 0x009:
         primitive_InstallProgram(cpu)
+    elif prim == 0x00A:
+        primitive_TaskKill(cpu)
     elif prim == 0x100:
         primitive_ObjAlloc(cpu)
     elif prim == 0x101:
