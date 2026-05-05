@@ -26,3 +26,6 @@ build/
 
 # autoconf cache (regenerated on `autoconf`)
 tools/cc/autom4te.cache/
+
+# Sample-program builds (run_shell.sh rebuilds on demand)
+examples/cc/programs/*.orx

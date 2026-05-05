@@ -1,6 +1,8 @@
 /*
  * shell.c — minimal interactive shell for the Object RISC graphical
- * terminal. MVP: prompt, line input, a handful of built-ins.
+ * terminal. The MVP supervisor: cmd_run loads a .orx from the host
+ * filesystem and TaskCreates a child task on the same CPU
+ * (Phase 30) — no spare-CPU pool, no linkbootd round-trip.
  *
  * Built-ins:
  *     help        — short list of commands
@@ -10,7 +12,7 @@
  *     cd [path]   — change working directory (no arg → "/")
  *     pwd         — print the current working directory
  *     echo <text> — print the rest of the line
- *     run <path>  — load and run another .orx via linkbootd
+ *     run <path>  — load and run another .orx as a child task
  *     cycles      — print the CPU's cycle counter
  *     time        — print microseconds since boot (wall clock, 32-bit)
  *     exit / quit — end the session
@@ -18,7 +20,7 @@
  * Path handling: the shell maintains its own cwd (absolute, relative
  * to hostfsd's --root jail). cat / ls / run resolve relative args by
  * joining cwd + arg + collapsing "." / ".." components, then send
- * the result to the hostfsd / linkbootd as an absolute path.
+ * the result to the hostfsd / orx_run as an absolute path.
  *
  * The runner script (run_shell.sh) computes a build-date banner
  * and passes it through -DBUILD_BANNER so a fresh build always
@@ -28,7 +30,6 @@
  * Boot ABI (set up by run_shell.sh via --service order):
  *     O5  = oriscterm console  (idx 1)
  *     O6  = oriscterm keyboard (idx 2)
- *     O7  = linkbootd          (pid 18, idx 1)
  *     O10 = hostfsd            (pid 17, idx 1)
  *     O11 = boot stack ref     (parked by term_init)
  *     O14 = boot self-svc      (parked by term_init)
@@ -71,7 +72,7 @@ const char help_msg[] =
     "  cd [<path>]     — change working directory (no arg → '/')\n"
     "  pwd             — print the current working directory\n"
     "  echo <text>     — print the rest of the line\n"
-    "  run <path>      — load and run another .orx via linkbootd\n"
+    "  run <path>      — load and run another .orx as a child task\n"
     "  cycles          — print the CPU's cycle counter\n"
     "  time            — print microseconds since boot (wall clock)\n"
     "  exit | quit     — leave the shell\n";
@@ -513,10 +514,11 @@ main(void)
 
 	/* term_init parks boot O2/O3/O4 into O11/O14/O15; we don't need
 	 * to touch them ourselves here. (See term.c on why we avoid
-	 * `register __or __asm__("oN")` declarations for the saves.) */
+	 * `register __or __asm__("oN")` declarations for the saves.)
+	 * orx_run (used by cmd_run) doesn't need its own init — it
+	 * allocates a private OREF scratch in O7 on each call. */
 	term_init();
 	hf_init();
-	lb_init();
 
 	term_print(banner);
 	term_print(hello1);
