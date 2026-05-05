@@ -2049,6 +2049,20 @@ inline struct copy would close most of that gap. Dhrystone-as-
 shipped is the regression baseline to measure that work
 against.
 
+## Phase 24 onward — Ouroboros
+
+The OS layer being built on top of Object RISC firmware is named
+**Ouroboros**. The name evolved from OROS (Object RISC OS) and the
+snake-eating-its-tail symbolism is fitting in several ways: the OS
+runs on the architecture whose toolchain self-hosts; traps return
+to where they came from via `ERET`; and the VM/CMS analogy that
+motivated the architectural split (CP = firmware, CMS = Ouroboros)
+is itself a recursive shape.
+
+Phases 24+ are the build-up: enforce privilege (Phase 24), wire
+trap delivery (Phase 25), then per-task address spaces and the
+supervisor scheduler that turn one CPU into a multitasking system.
+
 ## Phase 24 — Privilege modes start working
 
 Vol II Section 13 has named the three privilege modes — user,
@@ -2186,6 +2200,106 @@ questions (in roughly the order the user articulated them):
   `Cause` / `BADVADDR` populated, and `ERET` actually unwinding
   back. The control-register slots are present and `ERET`
   decodes; the wiring isn't.
+
+## Phase 25 — Trap delivery (Ouroboros, day 2)
+
+Phase 24 made privileged instructions trap. They had nowhere to
+go: a `privileged-instruction` trap killed the process the same
+way a bus error did, with the simulator's Python exception
+bubbling up to `report_trap`. For Ouroboros to actually mediate
+between user tasks and the hardware it runs on, traps had to
+*deliver* — populate the architectural state, switch mode, and
+hand control to a vector that firmware code controls.
+
+### `deliver_trap` and the vector table
+
+Volume II Appendix B has had the vector layout since the 0.1
+revision: each cause has a fixed 64-byte slot at a defined offset
+from `VECBASE`. The simulator now implements that. On a trap:
+
+1. `EPC` ← faulting PC (also `cpu.saved_pc` for `ERET`)
+2. `Cause` ← cause code
+3. `BadVAddr` ← faulting VA (memory traps only; 0 otherwise)
+4. `Status` saved-mode bits ← current mode
+5. Mode → firmware
+6. PC → `VECBASE + offset[cause]`
+
+`Status` gained a bit-layout: bits [1:0] carry the current mode
+(this is what supervisor SCTRLs to demote itself); bits [3:2]
+carry the saved mode (`ERET` pops these into the current). The
+spec leaves `Status`'s detailed layout to Volume V — this is the
+reference choice. `SCTRL $0, Rx` accepts both halves at once,
+which is how supervisor will eventually drop a child to user
+mode: pre-load EPC with the user entry, write `Status` with
+saved=user/current=supervisor, ERET.
+
+`ERET` was decoded in Phase 24 as a no-op placeholder; it's now
+wired: pops saved mode → current, jumps to EPC. The handler
+adjusts EPC by 4 first if it wants to skip the trapping
+instruction (most causes — TLB miss, future page faults — want
+re-execute on resume, which is the default).
+
+### Vector base and control register coverage
+
+`VECBASE` (control register 8) is now writable from firmware via
+`SCTRL` and read back via `LCTRL`. `Cause` (1), `EPC` (2),
+`BadVAddr` (3) are similarly backed; `Status` (0), `Count` (5),
+`ProcID` (7) were already covered. A `LCTRL` of `VECBASE` from
+supervisor mode still traps — firmware-only, per Volume V.
+
+`Trap` exceptions gained an optional `bad_vaddr` field. None of
+the existing trap sites populate it yet (the memory-trap raise
+sites don't carry the EA), but the wire is in place; the next
+pass over deref/load/store will fill it in once we have a real
+fault scenario that needs it.
+
+### Vol II §14.1
+
+Vol II §14 listed exception causes but didn't describe the
+actual delivery sequence. §14.1 now spells out the six-step
+trap-delivery contract, the `ERET` reverse path, and the
+`VECBASE = 0` fallback (implementation-defined; we halt and
+report).
+
+### Validation
+
+Three new tests in `08_traps`:
+
+- `12_trap_delivered_to_vector` — arithmetic-overflow delivers
+  to a handler that reads `Cause` and exits with code 9.
+- `13_trap_handler_eret_resumes` — handler advances `EPC` by 4
+  and `ERET`s; main resumes at the next instruction and exits
+  with 42.
+- `14_trap_promotes_user_to_firmware` — main demotes to user
+  via `SCTRL Status; ERET`, the user-mode `LCTRL` traps with
+  cause `0x0b`, the firmware handler executes `TLBWR` (proving
+  it's in firmware mode) and reads `Status` bits [3:2] to
+  recover the saved mode (expects USER = 0).
+
+Trick the tests share: bias `VECBASE` so the relevant cause's
+vector slot lands directly on `handler` (`VECBASE = handler -
+offset`). Avoids laying out a full 16-vector trampoline table
+for a single-cause test. Real firmware will lay out the full
+table.
+
+121 → 124 sim validation tests. All other suites green.
+
+### What's not yet done
+
+- **Trap from supervisor of an in-flight CALL.** When a primitive
+  raises `Trap`, the CPU is parked on the CALL with `blocked_on`
+  set. `deliver_trap` clears `blocked_on` so the handler runs
+  cleanly, but the architectural model isn't pinned down yet:
+  on `ERET`, do we re-issue the CALL or proceed past it? Right
+  now `EPC` points at the CALL so re-issue happens by default.
+- **Supervisor-installable handlers.** `VECBASE` is firmware-
+  only, which means a supervisor program can't install handlers
+  directly. The Vol II §14 prose mentions registering "with
+  firmware through the appropriate primitive" — that primitive
+  doesn't exist yet. Next phase, alongside the task scheduler.
+- **`bad_vaddr` population at memory-trap sites.** The field
+  exists; the `raise Trap(CAUSE_BUS_ERROR_D, ...)` callsites
+  still pass faulting_pc but not the EA.
 
 ## Where things stand now
 

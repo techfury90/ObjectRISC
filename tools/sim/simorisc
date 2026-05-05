@@ -128,7 +128,37 @@ CTRL_CONTEXT  = 4
 CTRL_COUNT    = 5
 CTRL_COMPARE  = 6
 CTRL_PROCID   = 7
+CTRL_VECBASE  = 8
 CTRL_SV_MAX   = 7   # any ctrl > this requires firmware mode
+
+# Trap-vector offsets per Volume II Appendix B. The vector base lives in
+# the VECBASE control register; on a trap delivery the CPU jumps to
+# `VECBASE + CAUSE_VECTOR_OFFSET[cause]`. Each vector is 64 bytes
+# (16 instructions) — enough for a short trampoline that branches out to
+# a longer handler. Causes not listed here can't be delivered to a
+# vector and fall back to the fatal-trap path (current behaviour).
+CAUSE_VECTOR_OFFSET = {
+    0x00: 0x000,  # reset (synthetic; never raised at runtime)
+    0x01: 0x040,  # external-interrupt
+    0x02: 0x080,  # bus-error-i
+    0x03: 0x0C0,  # bus-error-d
+    0x04: 0x100,  # address-misaligned-i
+    0x05: 0x140,  # address-misaligned-d
+    0x06: 0x180,  # tlb-miss-i
+    0x07: 0x1C0,  # tlb-miss-d
+    0x08: 0x200,  # page-permission
+    0x09: 0x240,  # arithmetic-overflow
+    0x0A: 0x280,  # reserved-instruction
+    0x0B: 0x2C0,  # privileged-instruction
+    0x0C: 0x300,  # breakpoint
+    0x10: 0x400,  # null-dereference
+    0x11: 0x440,  # stale-reference
+    0x12: 0x480,  # bounds-violation
+    0x13: 0x4C0,  # capability-violation
+    0x14: 0x500,  # send-buffer-overflow
+    0x20: 0x800,  # firmware-call (CALL)
+    0x21: 0x840,  # reserved-call
+}
 
 # ---------------------------------------------------------------------------
 # Object descriptor and reference layout
@@ -187,9 +217,11 @@ def ref_caps(ref: int)       -> int:  return (ref >>  8) & 0xFF
 # ---------------------------------------------------------------------------
 
 class Trap(Exception):
-    def __init__(self, cause: int, faulting_pc: int, detail: str = ""):
+    def __init__(self, cause: int, faulting_pc: int, detail: str = "",
+                 bad_vaddr: int = 0):
         self.cause = cause
         self.faulting_pc = faulting_pc
+        self.bad_vaddr = bad_vaddr & 0xFFFFFFFF
         self.detail = detail
         super().__init__(f"trap {CAUSE_NAMES.get(cause, hex(cause))} @ "
                          f"0x{faulting_pc:08x}: {detail}")
@@ -716,13 +748,19 @@ class CPU(Port):
         # boots as supervisor and keeps working. main() honours --mode to
         # override per-program (and per-CPU on reset).
         self.mode = MODE_SUPERVISOR
-        # ERET destination, written when an exception or CALL would
-        # promote mode in a real implementation. The simulator runs
-        # primitives directly in Python rather than re-entering firmware
-        # code, so saved_mode is updated only by an explicit trap-handling
-        # path (not yet wired) and consumed by ERET.
+        # ERET destination, written by trap delivery (deliver_trap) and
+        # consumed by ERET. saved_pc is also exposed as the EPC control
+        # register; saved_mode lives in STATUS bits [3:2] when read out.
         self.saved_mode = MODE_SUPERVISOR
         self.saved_pc   = 0
+
+        # Architecturally visible control registers populated by trap
+        # delivery (Volume II Section 14). VECBASE is supplied by
+        # firmware via SCTRL; CAUSE / BADVADDR are written when a trap
+        # is delivered to a vector and read by the handler via LCTRL.
+        self.vecbase     = 0
+        self.cause_reg   = 0
+        self.badvaddr_reg = 0
 
         # Trace control.
         self.trace_enabled = False
@@ -784,28 +822,39 @@ class CPU(Port):
     def ctrl_read(self, idx: int) -> int:
         """LCTRL fetch. The simulator backs the architecturally visible
         subset; firmware-only registers controlling the (absent) TLB,
-        object table, and crossbar route are read-as-zero."""
-        if   idx == CTRL_STATUS:   return self.mode & 0x3
-        elif idx == CTRL_CAUSE:    return 0  # no exception model yet
+        object table, and crossbar route are read-as-zero.
+
+        STATUS layout (simulator-defined; spec leaves bit assignment to
+        Volume V): bits [1:0] = current mode, bits [3:2] = saved mode."""
+        if   idx == CTRL_STATUS:
+            return (self.mode & 0x3) | ((self.saved_mode & 0x3) << 2)
+        elif idx == CTRL_CAUSE:    return self.cause_reg & 0xFFFFFFFF
         elif idx == CTRL_EPC:      return self.saved_pc & 0xFFFFFFFF
-        elif idx == CTRL_BADVADDR: return 0
+        elif idx == CTRL_BADVADDR: return self.badvaddr_reg & 0xFFFFFFFF
         elif idx == CTRL_CONTEXT:  return 0
         elif idx == CTRL_COUNT:    return self.cycles & 0xFFFFFFFF
         elif idx == CTRL_COMPARE:  return 0
         elif idx == CTRL_PROCID:   return self.pid & 0xFFFFFFFF
+        elif idx == CTRL_VECBASE:  return self.vecbase & 0xFFFFFFFF
         return 0
 
     def ctrl_write(self, idx: int, val: int) -> None:
         """SCTRL store. PROCID is read-only (writes silently ignored, per
-        Volume V); STATUS writes update the current mode bits, which is
-        how supervisor code drops a child task to user mode after
-        installing it. The remaining writable slots are stubbed for now."""
+        Volume V). STATUS writes update both the current mode bits
+        (immediate effect — how supervisor code self-demotes) and the
+        saved-mode bits (consumed by the next ERET — how supervisor
+        sets up an ERET-into-user-mode hand-off after preparing EPC)."""
         v = val & 0xFFFFFFFF
-        if   idx == CTRL_STATUS:   self.mode = v & 0x3
+        if   idx == CTRL_STATUS:
+            self.mode = v & 0x3
+            self.saved_mode = (v >> 2) & 0x3
+        elif idx == CTRL_CAUSE:    self.cause_reg = v
         elif idx == CTRL_EPC:      self.saved_pc = v
-        # CAUSE / BADVADDR / CONTEXT / COUNT / COMPARE: writable in spec
-        # but no architectural effect in this simulator yet.
-        # PROCID and the firmware-only registers (>= 8): ignore.
+        elif idx == CTRL_BADVADDR: self.badvaddr_reg = v
+        elif idx == CTRL_VECBASE:  self.vecbase = v
+        # CONTEXT / COUNT / COMPARE: writable in spec but no
+        # architectural effect in this simulator yet. PROCID and the
+        # remaining firmware-only registers: ignore.
 
     # ---- object table -------------------------------------------------------
 
@@ -1268,6 +1317,9 @@ class System:
                         if self._try_unblock(cpu):
                             any_progress = True
                     except Trap as t:
+                        if deliver_trap(cpu, t):
+                            any_progress = True
+                            continue
                         report_trap(cpu, t)
                         return 3
                     continue
@@ -1318,6 +1370,9 @@ class System:
                             "code_va_base": cpu.boot_state["code_va_base"],
                         }
                     except Trap as t:
+                        if deliver_trap(cpu, t):
+                            any_progress = True
+                            continue
                         report_trap(cpu, t)
                         return 3
                     any_progress = True
@@ -2524,6 +2579,40 @@ def step(cpu: CPU) -> None:
 # ---------------------------------------------------------------------------
 # Trap reporter
 # ---------------------------------------------------------------------------
+
+def deliver_trap(cpu: CPU, t: Trap) -> bool:
+    """Vector-driven trap delivery (Volume II Section 14 + Appendix B).
+
+    Populates EPC/CAUSE/BADVADDR, saves the current mode, switches to
+    firmware mode, and jumps to `VECBASE + offset[cause]`. Returns True
+    when delivered; False when no vector is installed (VECBASE = 0) or
+    the cause has no vector slot, in which case the caller should fall
+    back to the fatal-trap report.
+
+    The handler returns by `ERET`, which restores `saved_mode` from
+    STATUS and resumes at `EPC`. To skip the trapping instruction, the
+    handler must add 4 to EPC before issuing ERET — re-execute is the
+    default since most causes (TLB miss, future page faults) want it."""
+    if cpu.vecbase == 0:
+        return False
+    offset = CAUSE_VECTOR_OFFSET.get(t.cause)
+    if offset is None:
+        return False
+
+    cpu.saved_mode    = cpu.mode
+    cpu.saved_pc      = t.faulting_pc & 0xFFFFFFFF
+    cpu.cause_reg     = t.cause & 0xFFFFFFFF
+    cpu.badvaddr_reg  = t.bad_vaddr & 0xFFFFFFFF
+    cpu.mode          = MODE_FIRMWARE
+    cpu.pc            = (cpu.vecbase + offset) & 0xFFFFFFFF
+    cpu.next_pc       = (cpu.pc + 4) & 0xFFFFFFFF
+    # If we trapped while parked at a CALL waiting on a primitive (or at
+    # a remote OL/OS waiting on a response), the handler is taking over.
+    # Drop the wait state — ERET will return us to the trapping
+    # instruction, which can re-issue the CALL/load if it needs to.
+    cpu.blocked_on    = None
+    return True
+
 
 def report_trap(cpu: CPU, t: Trap) -> None:
     prefix = f"CPU{cpu.pid} " if (cpu.system and cpu.system.n_cpus > 1) else ""
