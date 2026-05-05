@@ -47,6 +47,7 @@ CAP_M = 1 << 5
 CAP_C = 1 << 6
 
 # Trap cause codes (Volume II Section 13).
+CAUSE_EXTERNAL_INTERRUPT= 0x01
 CAUSE_BUS_ERROR_I       = 0x02
 CAUSE_BUS_ERROR_D       = 0x03
 CAUSE_ADDR_MISALIGN_I   = 0x04
@@ -67,6 +68,7 @@ CAUSE_FIRMWARE_CALL     = 0x20
 CAUSE_RESERVED_CALL     = 0x21
 
 CAUSE_NAMES = {
+    CAUSE_EXTERNAL_INTERRUPT: "external-interrupt",
     CAUSE_BUS_ERROR_I:    "bus-error-i",
     CAUSE_BUS_ERROR_D:    "bus-error-d",
     CAUSE_ADDR_MISALIGN_I:"address-misaligned-i",
@@ -261,6 +263,12 @@ class Task:
     # Address space. Each task carries its own virtual-address layout;
     # the CPU's `mappings` list IS the running task's layout.
     mappings: List[Tuple[int,int,int,int,int]] = field(default_factory=list)
+
+    # Tasks parked in TaskWait on this one. When this task transitions to
+    # EXITED, every entry's R3 is filled with the exit code, R2 with OK,
+    # and the waiter is moved BLOCKED → RUNNABLE. The list is then
+    # cleared (waiters can't double-collect).
+    waiters: List['Task'] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +831,22 @@ class CPU(Port):
         self.cause_reg   = 0
         self.badvaddr_reg = 0
 
+        # Supervisor-installable trap handlers (Volume VI primitive
+        # #0x520, InstallTrapHandler). Per-CPU map cause → handler VA;
+        # consulted by deliver_trap before falling back to VECBASE.
+        # Handlers run in supervisor mode in the trapping task's
+        # address space.
+        self.trap_handlers: Dict[int, int] = {}
+
+        # Timer interrupt state (Volume V Section 2.10 — COMPARE).
+        # `compare_reg` is the cycle-counter target; when cycles >=
+        # compare and STATUS.IE is set, the simulator raises an
+        # external-interrupt trap once and clears IE so the handler
+        # runs without immediately re-firing. Setting compare_reg=0
+        # disables the timer (the default).
+        self.compare_reg = 0
+        self.status_ie   = False    # bit 4 of STATUS
+
         # Trace control.
         self.trace_enabled = False
 
@@ -886,15 +910,18 @@ class CPU(Port):
         object table, and crossbar route are read-as-zero.
 
         STATUS layout (simulator-defined; spec leaves bit assignment to
-        Volume V): bits [1:0] = current mode, bits [3:2] = saved mode."""
+        Volume V): bits [1:0] = current mode, bits [3:2] = saved mode,
+        bit 4 = IE (interrupt enable, gates the timer-interrupt path)."""
         if   idx == CTRL_STATUS:
-            return (self.mode & 0x3) | ((self.saved_mode & 0x3) << 2)
+            return ((self.mode & 0x3) |
+                    ((self.saved_mode & 0x3) << 2) |
+                    ((1 if self.status_ie else 0) << 4))
         elif idx == CTRL_CAUSE:    return self.cause_reg & 0xFFFFFFFF
         elif idx == CTRL_EPC:      return self.saved_pc & 0xFFFFFFFF
         elif idx == CTRL_BADVADDR: return self.badvaddr_reg & 0xFFFFFFFF
         elif idx == CTRL_CONTEXT:  return 0
         elif idx == CTRL_COUNT:    return self.cycles & 0xFFFFFFFF
-        elif idx == CTRL_COMPARE:  return 0
+        elif idx == CTRL_COMPARE:  return self.compare_reg & 0xFFFFFFFF
         elif idx == CTRL_PROCID:   return self.pid & 0xFFFFFFFF
         elif idx == CTRL_VECBASE:  return self.vecbase & 0xFFFFFFFF
         return 0
@@ -909,13 +936,15 @@ class CPU(Port):
         if   idx == CTRL_STATUS:
             self.mode = v & 0x3
             self.saved_mode = (v >> 2) & 0x3
+            self.status_ie = bool((v >> 4) & 0x1)
         elif idx == CTRL_CAUSE:    self.cause_reg = v
         elif idx == CTRL_EPC:      self.saved_pc = v
         elif idx == CTRL_BADVADDR: self.badvaddr_reg = v
+        elif idx == CTRL_COMPARE:  self.compare_reg = v
         elif idx == CTRL_VECBASE:  self.vecbase = v
-        # CONTEXT / COUNT / COMPARE: writable in spec but no
-        # architectural effect in this simulator yet. PROCID and the
-        # remaining firmware-only registers: ignore.
+        # CONTEXT / COUNT: writable in spec but no architectural effect
+        # in this simulator yet. PROCID and the remaining firmware-only
+        # registers: ignore.
 
     # ---- object table -------------------------------------------------------
 
@@ -1858,14 +1887,16 @@ def primitive_TaskCreate(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK)
 
 
-def _resolve_task_arg(cpu: CPU) -> Optional['Task']:
-    """Validate O1 as a task ref, return its Task or None (with R2 set)."""
+def _resolve_task_arg(cpu: CPU, require_v: bool = True) -> Optional['Task']:
+    """Validate O1 as a task ref, return its Task or None (with R2 set).
+    `require_v=False` skips the V-capability check — TaskWait/TaskQuery
+    take a task ref of any caps per Volume VI §4.1."""
     ref = cpu.get_opr(1)
     if ref == 0:
         cpu.set_gpr(2, ERR_EFAULT); return None
     if ref_home(ref) != cpu.pid:
         cpu.set_gpr(2, ERR_EREMOTE); return None
-    if (ref_caps(ref) & CAP_V) == 0:
+    if require_v and (ref_caps(ref) & CAP_V) == 0:
         cpu.set_gpr(2, ERR_EPERM); return None
     idx = ref_index(ref)
     desc = cpu.descriptors[idx] if 0 < idx < len(cpu.descriptors) else None
@@ -1946,24 +1977,64 @@ def primitive_TaskCurrent(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK)
 
 
+def _wake_waiters(cpu: CPU, exiting: 'Task') -> None:
+    """Move every task parked on `exiting` from BLOCKED to RUNNABLE,
+    seeding its R2/R3 (visible after context-switch back) with the
+    TaskWait return values. Called from primitive_TaskExit before
+    pick_next_runnable so wakeups are first-class scheduler citizens."""
+    for w in exiting.waiters:
+        if w.state != TASK_STATE_BLOCKED:
+            continue
+        w.gpr[2] = ERR_OK
+        w.gpr[3] = exiting.exit_code & 0xFF
+        w.state  = TASK_STATE_RUNNABLE
+        cpu.runnable.append(w)
+    exiting.waiters = []
+
+
 def primitive_TaskExit(cpu: CPU) -> None:
-    """Terminate the calling task. If another task is runnable, context-
-    switch to it; otherwise raise TaskExitSignal so the run loop tears
-    down the CPU as it always has."""
+    """Terminate the calling task. Wake any tasks waiting on it, then
+    context-switch to the next runnable. If nothing is runnable
+    (including waiters we just promoted), bubble up TaskExitSignal so
+    the run loop tears down the CPU as it always has."""
     code = cpu.get_gpr(4) & 0xFF
     cur = cpu.current_task
     if cur is not None:
         cur.state = TASK_STATE_EXITED
         cur.exit_code = code
+        _wake_waiters(cpu, cur)
     nxt = pick_next_runnable(cpu)
     if nxt is None:
-        # Last task on the CPU. Behave the way single-task code always
-        # has: bubble up the exit signal so the run loop captures the
-        # exit code and (for --reset-on-exit) reschedules the loader.
         raise TaskExitSignal(code)
-    # Hand the CPU to the next runnable. The exited task is dropped on
-    # the floor — its descriptor stays live so TaskWait/TaskQuery can
-    # see the exit code; storage is empty so there's nothing to free.
+    context_switch(cpu, nxt)
+
+
+def primitive_TaskWait(cpu: CPU, faulting_pc: int) -> None:
+    """Block the calling task until O1 has terminated. The exit code is
+    returned in R3 (Volume VI §4.1). If O1 is already EXITED the call
+    returns immediately."""
+    target = _resolve_task_arg(cpu, require_v=False)
+    if target is None:
+        return
+    if target.state == TASK_STATE_EXITED:
+        cpu.set_gpr(2, ERR_OK)
+        cpu.set_gpr(3, target.exit_code & 0xFF)
+        return
+    cur = cpu.current_task
+    if cur is None or cur is target:
+        cpu.set_gpr(2, ERR_EINVAL); return
+    nxt = pick_next_runnable(cpu)
+    if nxt is None:
+        # Nothing else can run — waiting would deadlock the CPU.
+        cpu.set_gpr(2, ERR_EBUSY); return
+    # The waiter resumes at the instruction after the CALL. R2/R3 will
+    # be overwritten by _wake_waiters when the target exits, so we don't
+    # set them here. Bump PC before save so that's where it lands on
+    # resume.
+    cpu.pc      = (faulting_pc + 4) & 0xFFFFFFFF
+    cpu.next_pc = (cpu.pc + 4)      & 0xFFFFFFFF
+    cur.state = TASK_STATE_BLOCKED
+    target.waiters.append(cur)
     context_switch(cpu, nxt)
 
 def primitive_ReadCycles(cpu: CPU) -> None:
@@ -2068,6 +2139,17 @@ def primitive_ObjFree(cpu: CPU) -> None:
     desc = cpu.descriptors[idx]
     if not desc.live or desc.generation != ref_generation(o1):
         cpu.set_gpr(2, ERR_ESTALE); return
+    # Reaping a TAG_TASK descriptor: only legal once the task has
+    # exited, and we evict the Python Task struct alongside the
+    # descriptor so cpu.tasks doesn't accumulate dead entries. A live
+    # task can't be freed — that would silently strand the running
+    # context (or the runnable queue would hold a dangling pointer).
+    if desc.type_tag == TAG_TASK:
+        task = cpu.tasks.get(idx)
+        if task is not None:
+            if task.state != TASK_STATE_EXITED:
+                cpu.set_gpr(2, ERR_EBUSY); return
+            cpu.tasks.pop(idx, None)
     cpu.free_object(idx)
     cpu.set_gpr(2, ERR_OK)
 
@@ -2161,6 +2243,27 @@ def primitive_ReceiveQueuePoll(cpu: CPU) -> None:
         descriptor_idx=idx,
         timeout=-1 if timeout == 0xFFFFFFFF else timeout,
     )
+
+
+def primitive_InstallTrapHandler(cpu: CPU) -> None:
+    """Volume VI #0x520. Install a supervisor-mode trap handler for the
+    given cause code. Subsequent traps with that cause are delivered to
+    `R5` (a virtual address mapped in the trapping task's address space)
+    in supervisor mode, instead of going through the firmware-only
+    VECBASE table.
+
+    Args:
+      R4: cause code (0x01..0x21 — must appear in CAUSE_VECTOR_OFFSET).
+      R5: handler virtual address.
+
+    Returns: R2 = OK on success, EINVAL if cause is not a recognised
+    architectural exception."""
+    cause = cpu.get_gpr(4) & 0xFF
+    va    = cpu.get_gpr(5) & 0xFFFFFFFF
+    if cause not in CAUSE_VECTOR_OFFSET:
+        cpu.set_gpr(2, ERR_EINVAL); return
+    cpu.trap_handlers[cause] = va
+    cpu.set_gpr(2, ERR_OK)
 
 
 def primitive_InstallHandler(cpu: CPU) -> None:
@@ -2369,6 +2472,7 @@ PRIMITIVE_MIN_MODE = {
     0x003: MODE_SUPERVISOR,  # TaskSuspend
     0x004: MODE_USER,        # TaskYield
     0x005: MODE_USER,        # TaskCurrent
+    0x007: MODE_USER,        # TaskWait
     0x009: MODE_SUPERVISOR,  # InstallProgram   — replaces task image
     0x100: MODE_USER,        # ObjAlloc
     0x101: MODE_USER,        # ObjFree
@@ -2382,6 +2486,7 @@ PRIMITIVE_MIN_MODE = {
     0x320: MODE_USER,        # ConsoleWrite     — debug primitive, will move
     0x400: MODE_USER,        # TimeNow
     0x410: MODE_USER,        # ClockResolution
+    0x520: MODE_SUPERVISOR,  # InstallTrapHandler — registers per-cause vector
 }
 
 def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
@@ -2407,6 +2512,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_TaskYield(cpu, faulting_pc)
     elif prim == 0x005:
         primitive_TaskCurrent(cpu)
+    elif prim == 0x007:
+        primitive_TaskWait(cpu, faulting_pc)
     elif prim == 0x009:
         primitive_InstallProgram(cpu)
     elif prim == 0x100:
@@ -2433,6 +2540,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_TimeNow(cpu)
     elif prim == 0x410:
         primitive_ClockResolution(cpu)
+    elif prim == 0x520:
+        primitive_InstallTrapHandler(cpu)
 
 
 # ---------------------------------------------------------------------------
@@ -2567,6 +2676,20 @@ def step(cpu: CPU) -> None:
     pc = cpu.pc
     if pc == 0:
         raise Trap(CAUSE_BUS_ERROR_I, pc, "main returned without TaskExit")
+    # Timer interrupt: fire before fetching the next instruction so EPC
+    # ends up pointing at the would-be-next instruction (which is what
+    # ERET will resume). compare_reg = 0 disables the timer (default).
+    # Defer firing while the CPU is in a branch delay slot — Vol II §14
+    # would have us record the branch's address in EPC with the BD bit
+    # set; the simulator doesn't track BD yet, so we just wait one
+    # instruction and fire on the branch target instead. (Sync traps
+    # inside delay slots have the same architectural concern; they're
+    # rare in current programs and will be fixed when BD is wired in.)
+    in_delay_slot = (cpu.next_pc != to_u32(cpu.pc + 4))
+    if (not in_delay_slot
+            and cpu.status_ie and cpu.compare_reg != 0
+            and cpu.cycles >= cpu.compare_reg):
+        raise Trap(CAUSE_EXTERNAL_INTERRUPT, pc, "timer")
     word = cpu.fetch_instr(pc)
     op = (word >> 26) & 0x3F
 
@@ -2936,29 +3059,51 @@ def step(cpu: CPU) -> None:
 def deliver_trap(cpu: CPU, t: Trap) -> bool:
     """Vector-driven trap delivery (Volume II Section 14 + Appendix B).
 
-    Populates EPC/CAUSE/BADVADDR, saves the current mode, switches to
-    firmware mode, and jumps to `VECBASE + offset[cause]`. Returns True
-    when delivered; False when no vector is installed (VECBASE = 0) or
-    the cause has no vector slot, in which case the caller should fall
-    back to the fatal-trap report.
+    Populates EPC/CAUSE/BADVADDR, saves the current mode, and either:
+
+    1. Jumps to a supervisor-installed handler for this cause (mode
+       switches to supervisor — installed via Volume VI primitive
+       #0x520 InstallTrapHandler). Per-CPU map; the handler runs in
+       the trapping task's address space.
+    2. Falls back to `VECBASE + offset[cause]` (mode switches to
+       firmware) when no per-cause handler is registered.
+
+    Returns True when delivered; False when neither path applies, in
+    which case the caller should fall back to the fatal-trap report.
+
+    External-interrupt delivery (cause 0x01) auto-clears `STATUS.IE`
+    so the handler runs without immediately re-firing on the same
+    instruction; the handler re-enables IE on ERET (typically by
+    SCTRL-ing STATUS or letting the saved-IE bit ride back via ERET
+    — the latter not yet wired, today the handler must explicitly
+    re-set IE).
 
     The handler returns by `ERET`, which restores `saved_mode` from
     STATUS and resumes at `EPC`. To skip the trapping instruction, the
     handler must add 4 to EPC before issuing ERET — re-execute is the
     default since most causes (TLB miss, future page faults) want it."""
-    if cpu.vecbase == 0:
+    handler_va = cpu.trap_handlers.get(t.cause)
+    if handler_va is None and cpu.vecbase == 0:
         return False
-    offset = CAUSE_VECTOR_OFFSET.get(t.cause)
-    if offset is None:
-        return False
+    if handler_va is None:
+        offset = CAUSE_VECTOR_OFFSET.get(t.cause)
+        if offset is None:
+            return False
+        target_pc   = (cpu.vecbase + offset) & 0xFFFFFFFF
+        target_mode = MODE_FIRMWARE
+    else:
+        target_pc   = handler_va & 0xFFFFFFFF
+        target_mode = MODE_SUPERVISOR
 
     cpu.saved_mode    = cpu.mode
     cpu.saved_pc      = t.faulting_pc & 0xFFFFFFFF
     cpu.cause_reg     = t.cause & 0xFFFFFFFF
     cpu.badvaddr_reg  = t.bad_vaddr & 0xFFFFFFFF
-    cpu.mode          = MODE_FIRMWARE
-    cpu.pc            = (cpu.vecbase + offset) & 0xFFFFFFFF
+    cpu.mode          = target_mode
+    cpu.pc            = target_pc
     cpu.next_pc       = (cpu.pc + 4) & 0xFFFFFFFF
+    if t.cause == CAUSE_EXTERNAL_INTERRUPT:
+        cpu.status_ie = False
     # If we trapped while parked at a CALL waiting on a primitive (or at
     # a remote OL/OS waiting on a response), the handler is taking over.
     # Drop the wait state — ERET will return us to the trapping

@@ -792,6 +792,31 @@ diagnostic primitive `Stat` (Section 11).
 >
 > No arguments. Does not return.
 
+**`0x520  InstallTrapHandler`** — *Restartable.*
+
+> Register a supervisor-mode handler for an architectural exception
+> cause. Subsequent traps with that cause are delivered to the
+> supplied virtual address in supervisor mode, in the trapping task's
+> address space, instead of being routed to firmware via `VECBASE`
+> (Volume II Section 14). This is the primitive Volume II §14
+> alludes to as "registering with firmware through the appropriate
+> primitive" — it lets a supervisor (e.g., a guest OS) install
+> handlers without firmware-mode access to the vector base register.
+>
+> Args:
+> - `R4`: cause code (must be a recognised architectural exception
+>   per Volume II §14; raises `EINVAL` otherwise).
+> - `R5`: handler virtual address.
+>
+> Returns: `R2`: status. Errors: `EINVAL`, `EPERM`.
+>
+> The handler runs at the configured VA with the architectural trap
+> state (`EPC`, `Cause`, `BadVAddr`) populated as Volume II §14.1
+> describes. Handlers return by `ERET`. The trap-delivery path
+> auto-clears `STATUS.IE` for `external-interrupt` (cause `0x01`)
+> so the handler is not immediately re-entered; the handler must
+> re-arm `IE` (and `COMPARE` for the timer) before returning.
+
 ## 10. Diagnostic Primitives
 
 **`0x700  Stat`** — *Restartable.*

@@ -267,6 +267,28 @@ trap-handling and cycle-accounting needs of an operating system; the
 firmware-only subset (registers 8 and above) controls the TLB, the
 object table, the crossbar routing, and the descriptor cache.
 
+The `STATUS` register is laid out as follows:
+
+| Bits      | Field        | Meaning                                       |
+|-----------|--------------|-----------------------------------------------|
+| `[1:0]`   | `MODE`       | Current privilege mode (0=user, 1=sv, 2=fw)   |
+| `[3:2]`   | `SAVED_MODE` | Mode to restore on `ERET`                     |
+| `[4]`     | `IE`         | Interrupt enable (gates `external-interrupt`) |
+| `[31:5]`  | reserved     | Read as zero; writes ignored                  |
+
+A trap delivery copies `MODE` into `SAVED_MODE` and changes `MODE`
+to firmware (or to supervisor when a per-cause supervisor handler is
+installed via `InstallTrapHandler`, Volume VI §9). `ERET` reverses
+this, and supervisor code that wants to enter user mode by `ERET`
+prepares `STATUS` with `MODE=supervisor`, `SAVED_MODE=user`, then
+issues `ERET` after writing the user entry to `EPC`.
+
+The `IE` bit is auto-cleared on delivery of an `external-interrupt`
+trap so handlers run without immediate re-entry; firmware (or a
+supervisor handler) restores it before returning. `IE` does not
+affect synchronous traps such as `arithmetic-overflow` or
+`privileged-instruction`, which are precise and unconditional.
+
 ## 3. The OR-XBAR-1 Crossbar
 
 ### 3.1 Specifications
