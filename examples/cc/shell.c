@@ -530,12 +530,14 @@ static void
 cmd_wait(const char *arg)
 {
 	int t = atoi(arg);
-	int code = task_wait((task_t)t);
+	/* orx_unload = task_wait + ObjFreeDeferred(code/data/stack) +
+	 * task_free. Safe on tasks that weren't orx-spawned (manifest is
+	 * empty → the deferred-frees noop). */
+	int code = orx_unload((task_t)t);
 	if (code < 0) {
 		term_print("wait: bad task or task_wait error\n");
 		return;
 	}
-	task_free((task_t)t);
 	term_print("[task ");
 	term_print_int(t);
 	term_print(" exited ");
