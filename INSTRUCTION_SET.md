@@ -612,6 +612,32 @@ register. `ERET` resuming from such a trap re-executes the branch,
 which is the only way to ensure that the branch's effect on control
 flow is correctly preserved.
 
+### 14.1 Trap Delivery
+
+When the processor takes a trap, it performs the following sequence
+atomically before executing the next instruction:
+
+1. The faulting instruction's address is written to `EPC`.
+2. The cause is written to `Cause`; the `BD` bit is set if the
+   instruction was in a branch delay slot.
+3. For memory-related causes, the faulting virtual address is
+   written to `BadVAddr`.
+4. The current privilege mode is recorded in the saved-mode field
+   of `Status` (so `ERET` can restore it).
+5. The mode is changed to firmware.
+6. The program counter is set to `VECBASE + offset`, where `offset`
+   is determined by the cause according to Appendix B.
+
+`ERET` reverses steps 4–6: it pops the saved mode from `Status` into
+the current mode and resumes execution at `EPC`. The handler must
+adjust `EPC` (typically by adding 4) before issuing `ERET` if the
+trapping instruction should not be re-executed; the architecture
+defaults to re-execution because that is what TLB-miss and other
+restart-on-resolve causes require.
+
+A trap taken with `VECBASE` unset (zero) is implementation-defined;
+typical implementations halt the processor and signal the host.
+
 ## 15. Reserved Encodings
 
 This revision allocates thirty-six of the sixty-four major opcodes
