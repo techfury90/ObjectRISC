@@ -106,6 +106,16 @@ TAG_CODE    = 0x4100
 TAG_STACK   = 0x4101
 TAG_DATA    = 0x4102
 TAG_SERVICE = 0x4103
+TAG_TASK    = 0x4104   # task object (Volume VI Section 4)
+
+# Task lifecycle states (Volume VI Section 4.2). Internal numbering;
+# returned by TaskQuery in the low 8 bits of the packed state word.
+TASK_STATE_NEW       = 0
+TASK_STATE_RUNNABLE  = 1
+TASK_STATE_RUNNING   = 2
+TASK_STATE_SUSPENDED = 3
+TASK_STATE_BLOCKED   = 4   # parked on IPC; not yet used
+TASK_STATE_EXITED    = 5
 
 # Service object layout: 64 bytes, present on every CPU in multi-CPU mode.
 SERVICE_OBJ_SIZE = 64
@@ -210,6 +220,47 @@ def ref_generation(ref: int) -> int:  return (ref >> 48) & 0xFFFF
 def ref_home(ref: int)       -> int:  return (ref >> 40) & 0xFF
 def ref_index(ref: int)      -> int:  return (ref >> 16) & 0xFFFFFF
 def ref_caps(ref: int)       -> int:  return (ref >>  8) & 0xFF
+
+
+# ---------------------------------------------------------------------------
+# Tasks (Volume VI Section 4)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Task:
+    """A swappable execution context. The CPU's per-task fields
+    (general/object registers, PC, mode, the supervisor-visible control
+    registers, and the address-space mappings) are mirrored here so the
+    scheduler can save out the running task and load another in.
+
+    Per-CPU state (descriptor table, inbox, request/response queues,
+    cycle counter, VECBASE) lives on the CPU, not the task. VECBASE
+    is firmware-installed once per CPU and shared by every task."""
+    descriptor_idx: int             # index in cpu.descriptors for the task ref
+    code_ref:  int = 0              # original code object (kept for restart/debug)
+    stack_ref: int = 0              # original stack object
+    state:     int = TASK_STATE_NEW
+    exit_code: Optional[int] = None
+
+    # Saved register file. CPU's gpr/opr/etc. become these on context-in.
+    gpr: List[int] = field(default_factory=lambda: [0]*32)
+    opr: List[int] = field(default_factory=lambda: [0]*16)
+    hi:  int = 0
+    lo:  int = 0
+    pc:  int = 0
+    next_pc: int = 0
+
+    # Privilege state — current mode and whatever ERET / trap delivery
+    # has stashed so far. Each task's traps are private to it.
+    mode:        int = MODE_SUPERVISOR
+    saved_mode:  int = MODE_SUPERVISOR
+    saved_pc:    int = 0
+    cause_reg:   int = 0
+    badvaddr_reg: int = 0
+
+    # Address space. Each task carries its own virtual-address layout;
+    # the CPU's `mappings` list IS the running task's layout.
+    mappings: List[Tuple[int,int,int,int,int]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -737,9 +788,19 @@ class CPU(Port):
         self.boot_state: Optional[Dict] = None  # snapshot used to relaunch handler tasks
         self.blocked_on: Optional[BlockedSignal] = None  # poll/response wait state
         self.next_trans_id = 0               # per-CPU SEND/OL/OS transaction id counter
-        # Set to True by primitive_InstallProgram to tell the CALL
-        # dispatch site "I already moved PC, don't advance it".
-        self._installed_program = False
+        # Set to True by primitives that have already moved PC into the
+        # right place (InstallProgram, TaskYield, TaskExit-with-successor)
+        # so the CALL dispatch site won't bump it past the redirect.
+        self._call_redirected_pc = False
+
+        # Task scheduling state. `current_task` is what's running on this
+        # CPU right now; `tasks` is every Task ever created here keyed by
+        # its descriptor index; `runnable` is the round-robin queue of
+        # ready-to-run tasks not currently running. Populated by
+        # init_cpu (bootstrap task) and TaskCreate.
+        self.current_task: Optional['Task'] = None
+        self.tasks:    Dict[int, 'Task'] = {}
+        self.runnable: List['Task'] = []
 
         # Privilege state (Volume II Section 13). Mode defaults to
         # supervisor — this preserves the pre-privilege-modes behaviour
@@ -1536,6 +1597,13 @@ def init_cpu(cpu: CPU, text_bytes: bytes, data_bytes: bytes,
     cpu.next_pc = cpu.pc + 4
     cpu.active = True
 
+    # Wrap the just-primed CPU state into a bootstrap Task struct so the
+    # scheduler has a current_task to swap out when (if) the program
+    # ever creates a child task and yields. Single-task programs never
+    # touch this Task — they TaskExit, run loop sees no successor, and
+    # tears the CPU down via TaskExitSignal as it always has.
+    make_bootstrap_task(cpu, code_ref, stack_ref)
+
 
 def populate_service_objects(system: System) -> None:
     """Allocate one service object per CPU (in multi-CPU mode), then hand
@@ -1610,6 +1678,9 @@ def reset_cpu(cpu: CPU) -> None:
     cpu.blocked_on     = None
     cpu.next_trans_id  = 0
     cpu.reset_at_time  = 0
+    cpu.current_task   = None
+    cpu.tasks          = {}
+    cpu.runnable       = []
     init_cpu(cpu, args["text"], args["data"], args["entry"], args["stack_size"])
     populate_self_service(cpu)
     install_external_services(cpu, args["services"])
@@ -1621,12 +1692,279 @@ def reset_cpu(cpu: CPU) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Task scheduling (Volume VI Section 4)
+# ---------------------------------------------------------------------------
+
+def alloc_task_descriptor(cpu: CPU) -> int:
+    """Reserve an object-table slot for a Task ref. The Task struct is
+    stored separately in cpu.tasks; the descriptor exists so SEND, OREFLD,
+    and other ref-bearing operations have something to identify the task
+    by. Storage is empty (length 0) — the task lives in Python state."""
+    ref = cpu.alloc_object(0, type_tag=TAG_TASK,
+                           max_caps=CAP_R | CAP_V | CAP_C)
+    return ref_index(ref)
+
+
+def task_ref_for(cpu: CPU, task: 'Task', caps: int = CAP_R | CAP_V | CAP_C) -> int:
+    """Manufacture a ref to `task` with the requested caps."""
+    desc = cpu.descriptors[task.descriptor_idx]
+    return make_ref(generation=desc.generation, home=cpu.pid,
+                    index=task.descriptor_idx, caps=caps)
+
+
+def save_cpu_to_task(cpu: CPU, task: 'Task') -> None:
+    """Copy the running task's CPU-resident state out to its Task struct
+    in preparation for a context switch. Called on the *outgoing* task
+    just before load_task_to_cpu paints in the incoming one."""
+    task.gpr          = cpu.gpr.copy()
+    task.opr          = cpu.opr.copy()
+    task.hi           = cpu.hi
+    task.lo           = cpu.lo
+    task.pc           = cpu.pc
+    task.next_pc      = cpu.next_pc
+    task.mode         = cpu.mode
+    task.saved_mode   = cpu.saved_mode
+    task.saved_pc     = cpu.saved_pc
+    task.cause_reg    = cpu.cause_reg
+    task.badvaddr_reg = cpu.badvaddr_reg
+    task.mappings     = list(cpu.mappings)
+
+
+def load_task_to_cpu(cpu: CPU, task: 'Task') -> None:
+    """Paint the incoming task's saved state onto the CPU. Mirror of
+    save_cpu_to_task; together they implement the context switch."""
+    cpu.gpr          = task.gpr.copy()
+    cpu.opr          = task.opr.copy()
+    cpu.hi           = task.hi
+    cpu.lo           = task.lo
+    cpu.pc           = task.pc
+    cpu.next_pc      = task.next_pc
+    cpu.mode         = task.mode
+    cpu.saved_mode   = task.saved_mode
+    cpu.saved_pc     = task.saved_pc
+    cpu.cause_reg    = task.cause_reg
+    cpu.badvaddr_reg = task.badvaddr_reg
+    cpu.mappings     = list(task.mappings)
+
+
+def context_switch(cpu: CPU, next_task: 'Task') -> None:
+    """Swap the running task. The outgoing task's state is saved to its
+    Task struct; the incoming task's state is painted onto the CPU. The
+    caller is responsible for having set the outgoing task's state field
+    appropriately (RUNNABLE for yield, EXITED for exit) and for queuing
+    it back on cpu.runnable if it should run again. The CALL dispatch
+    site is told to skip its post-call PC advance (the new task's PC is
+    already where it should be)."""
+    outgoing = cpu.current_task
+    if outgoing is not None:
+        save_cpu_to_task(cpu, outgoing)
+    load_task_to_cpu(cpu, next_task)
+    next_task.state = TASK_STATE_RUNNING
+    cpu.current_task = next_task
+    cpu._call_redirected_pc = True
+
+
+def pick_next_runnable(cpu: CPU) -> Optional['Task']:
+    """Pop the next runnable task from the round-robin queue, or return
+    None if the queue is empty."""
+    return cpu.runnable.pop(0) if cpu.runnable else None
+
+
+def make_bootstrap_task(cpu: CPU, code_ref: int, stack_ref: int) -> 'Task':
+    """After init_cpu has primed the CPU's register file and mappings,
+    capture them into a Task struct so the scheduler has something to
+    save out when a context switch eventually happens. The CPU and the
+    bootstrap task share their initial state by construction; the Task
+    struct is the home of that state once a context switch occurs."""
+    task = Task(descriptor_idx=alloc_task_descriptor(cpu),
+                code_ref=code_ref, stack_ref=stack_ref,
+                state=TASK_STATE_RUNNING)
+    save_cpu_to_task(cpu, task)
+    cpu.tasks[task.descriptor_idx] = task
+    cpu.current_task = task
+    return task
+
+
+# ---------------------------------------------------------------------------
 # Firmware primitive dispatch
 # ---------------------------------------------------------------------------
 
+def primitive_TaskCreate(cpu: CPU) -> None:
+    """Create a task with its own address space and prime its register
+    state. The new task starts in the NEW state — TaskResume moves it
+    onto the runnable queue. Default mappings: code at CODE_VA (R+X),
+    stack at STACK_TOP (R+W). No data segment by default; supervisor
+    can MapObject one in afterwards if the task needs globals."""
+    code_ref  = cpu.get_opr(1)
+    stack_ref = cpu.get_opr(2)
+    entry     = cpu.get_gpr(4) & 0xFFFFFFFF
+    init_r4   = cpu.get_gpr(5) & 0xFFFFFFFF
+    if entry & 0x80000000:
+        entry -= 0x100000000
+
+    if code_ref == 0 or stack_ref == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if ref_home(code_ref) != cpu.pid or ref_home(stack_ref) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+    if (ref_caps(code_ref) & CAP_X) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return
+    if (ref_caps(stack_ref) & (CAP_R | CAP_W)) != (CAP_R | CAP_W):
+        cpu.set_gpr(2, ERR_EPERM); return
+    code_idx, stack_idx = ref_index(code_ref), ref_index(stack_ref)
+    for idx in (code_idx, stack_idx):
+        if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None \
+                or not cpu.descriptors[idx].live:
+            cpu.set_gpr(2, ERR_ESTALE); return
+    code_desc, stack_desc = cpu.descriptors[code_idx], cpu.descriptors[stack_idx]
+    if code_desc.generation != ref_generation(code_ref) \
+            or stack_desc.generation != ref_generation(stack_ref):
+        cpu.set_gpr(2, ERR_ESTALE); return
+    if entry < 0 or entry >= code_desc.length:
+        cpu.set_gpr(2, ERR_EINVAL); return
+
+    task = Task(descriptor_idx=alloc_task_descriptor(cpu),
+                code_ref=code_ref, stack_ref=stack_ref,
+                state=TASK_STATE_NEW)
+    # Standard layout — same VAs as init_cpu so pcc-generated code that
+    # assumes flat addresses works in the new task too.
+    task.mappings = [
+        (CODE_VA, CODE_VA + code_desc.length, code_idx, 0,
+         CAP_R | CAP_X),
+        (STACK_TOP - stack_desc.length, STACK_TOP, stack_idx, 0,
+         CAP_R | CAP_W),
+    ]
+    task.pc      = (CODE_VA + entry) & 0xFFFFFFFF
+    task.next_pc = (task.pc + 4)     & 0xFFFFFFFF
+    # Child inherits the parent's object registers — that's how the
+    # parent passes service refs (terminal, hostfsd, shared scratch)
+    # without a separate handoff mechanism. Vol VI §4.1 doesn't pin
+    # the child's initial OR state, so inheriting matches the typical
+    # fork-style hand-off and matches snapshot_boot_state's pattern
+    # for handler dispatch. O0 stays the null reference. Supervisor
+    # that wants a clean slate can always overwrite afterwards.
+    task.opr     = list(cpu.opr)
+    task.opr[0]  = 0
+    task.gpr[4]  = init_r4
+    task.gpr[7]  = cpu.pid                    # PROCID by contract
+    task.gpr[29] = STACK_TOP - 16             # SP
+    # Inherit the parent's privilege mode by default; supervisor can
+    # demote a child by SCTRL-ing the new task's saved state via... well,
+    # there's no primitive for that yet. Today: same mode as parent.
+    task.mode    = cpu.mode
+    task.saved_mode = cpu.mode
+
+    cpu.tasks[task.descriptor_idx] = task
+    cpu.set_opr(1, task_ref_for(cpu, task))
+    cpu.set_gpr(2, ERR_OK)
+
+
+def _resolve_task_arg(cpu: CPU) -> Optional['Task']:
+    """Validate O1 as a task ref, return its Task or None (with R2 set)."""
+    ref = cpu.get_opr(1)
+    if ref == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return None
+    if ref_home(ref) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return None
+    if (ref_caps(ref) & CAP_V) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return None
+    idx = ref_index(ref)
+    desc = cpu.descriptors[idx] if 0 < idx < len(cpu.descriptors) else None
+    if desc is None or not desc.live or desc.generation != ref_generation(ref):
+        cpu.set_gpr(2, ERR_ESTALE); return None
+    if desc.type_tag != TAG_TASK or idx not in cpu.tasks:
+        cpu.set_gpr(2, ERR_EINVAL); return None
+    return cpu.tasks[idx]
+
+
+def primitive_TaskResume(cpu: CPU) -> None:
+    task = _resolve_task_arg(cpu)
+    if task is None:
+        return
+    if task.state == TASK_STATE_RUNNING or task.state == TASK_STATE_EXITED:
+        cpu.set_gpr(2, ERR_EBUSY); return
+    if task.state in (TASK_STATE_RUNNABLE,):
+        cpu.set_gpr(2, ERR_OK); return  # already queued; idempotent
+    task.state = TASK_STATE_RUNNABLE
+    cpu.runnable.append(task)
+    cpu.set_gpr(2, ERR_OK)
+
+
+def primitive_TaskSuspend(cpu: CPU) -> None:
+    task = _resolve_task_arg(cpu)
+    if task is None:
+        return
+    if task.state == TASK_STATE_EXITED:
+        cpu.set_gpr(2, ERR_EINVAL); return
+    if task.state == TASK_STATE_RUNNABLE:
+        try:
+            cpu.runnable.remove(task)
+        except ValueError:
+            pass
+    task.state = TASK_STATE_SUSPENDED
+    if task is cpu.current_task:
+        # Self-suspend: pick another runnable. If none, we'd deadlock;
+        # report EBUSY rather than wedge the CPU silently. Real OS would
+        # pull from a wait queue / interrupt.
+        nxt = pick_next_runnable(cpu)
+        if nxt is None:
+            cpu.set_gpr(2, ERR_EBUSY); return
+        cpu.set_gpr(2, ERR_OK)
+        # The suspended task sees R2=OK on resume.
+        save_cpu_to_task(cpu, task)
+        load_task_to_cpu(cpu, nxt)
+        nxt.state = TASK_STATE_RUNNING
+        cpu.current_task = nxt
+        cpu._call_redirected_pc = True
+        return
+    cpu.set_gpr(2, ERR_OK)
+
+
+def primitive_TaskYield(cpu: CPU, faulting_pc: int) -> None:
+    """Voluntarily surrender the rest of the quantum. Round-robin: pop
+    the next runnable, push the current onto the back of the queue, swap
+    state. If nobody else is runnable, this is a no-op."""
+    nxt = pick_next_runnable(cpu)
+    cur = cpu.current_task
+    if nxt is None or nxt is cur:
+        cpu.set_gpr(2, ERR_OK)
+        return
+    # The yielding task resumes at the instruction after the CALL. Bump
+    # PC before save so its restored state lands there, not on the CALL.
+    cpu.pc      = (faulting_pc + 4) & 0xFFFFFFFF
+    cpu.next_pc = (cpu.pc + 4)      & 0xFFFFFFFF
+    cpu.set_gpr(2, ERR_OK)            # what `cur` will see on resume
+    cur.state = TASK_STATE_RUNNABLE
+    cpu.runnable.append(cur)
+    context_switch(cpu, nxt)
+
+
+def primitive_TaskCurrent(cpu: CPU) -> None:
+    cur = cpu.current_task
+    if cur is None:
+        cpu.set_opr(1, 0); cpu.set_gpr(2, ERR_OK); return
+    cpu.set_opr(1, task_ref_for(cpu, cur))
+    cpu.set_gpr(2, ERR_OK)
+
+
 def primitive_TaskExit(cpu: CPU) -> None:
+    """Terminate the calling task. If another task is runnable, context-
+    switch to it; otherwise raise TaskExitSignal so the run loop tears
+    down the CPU as it always has."""
     code = cpu.get_gpr(4) & 0xFF
-    raise TaskExitSignal(code)
+    cur = cpu.current_task
+    if cur is not None:
+        cur.state = TASK_STATE_EXITED
+        cur.exit_code = code
+    nxt = pick_next_runnable(cpu)
+    if nxt is None:
+        # Last task on the CPU. Behave the way single-task code always
+        # has: bubble up the exit signal so the run loop captures the
+        # exit code and (for --reset-on-exit) reschedules the loader.
+        raise TaskExitSignal(code)
+    # Hand the CPU to the next runnable. The exited task is dropped on
+    # the floor — its descriptor stays live so TaskWait/TaskQuery can
+    # see the exit code; storage is empty so there's nothing to free.
+    context_switch(cpu, nxt)
 
 def primitive_ReadCycles(cpu: CPU) -> None:
     cpu.set_gpr(2, 0)
@@ -1889,7 +2227,7 @@ def primitive_InstallProgram(cpu: CPU) -> None:
         - Resets all GPRs except R7 (PROCID), R29 (SP=STACK_TOP-16),
           R30 (FP=0), R31 (RA=0).
         - Sets PC = CODE_VA + R4 and next_PC = PC + 4.
-        - Sets cpu._installed_program=True so the dispatch_call site
+        - Sets cpu._call_redirected_pc=True so the dispatch_call site
           knows to skip the post-call PC advance.
 
     The CPU's OR slots are NOT cleared (the guest inherits whatever
@@ -1975,7 +2313,7 @@ def primitive_InstallProgram(cpu: CPU) -> None:
 
     cpu.pc      = (CODE_VA + entry) & 0xFFFFFFFF
     cpu.next_pc = (cpu.pc + 4)      & 0xFFFFFFFF
-    cpu._installed_program = True
+    cpu._call_redirected_pc = True
     cpu.set_gpr(2, ERR_OK)
 
 
@@ -2025,7 +2363,12 @@ def primitive_MapObject(cpu: CPU) -> None:
 # that callable-from-user-code is the common case; exposing a privileged
 # capability is an explicit decision made here.
 PRIMITIVE_MIN_MODE = {
+    0x000: MODE_SUPERVISOR,  # TaskCreate       — installs a child task
     0x001: MODE_USER,        # TaskExit
+    0x002: MODE_SUPERVISOR,  # TaskResume       — drives the scheduler
+    0x003: MODE_SUPERVISOR,  # TaskSuspend
+    0x004: MODE_USER,        # TaskYield
+    0x005: MODE_USER,        # TaskCurrent
     0x009: MODE_SUPERVISOR,  # InstallProgram   — replaces task image
     0x100: MODE_USER,        # ObjAlloc
     0x101: MODE_USER,        # ObjFree
@@ -2052,8 +2395,18 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         cpu.set_gpr(3, 0)
         return
 
-    if prim == 0x001:
+    if prim == 0x000:
+        primitive_TaskCreate(cpu)
+    elif prim == 0x001:
         primitive_TaskExit(cpu)
+    elif prim == 0x002:
+        primitive_TaskResume(cpu)
+    elif prim == 0x003:
+        primitive_TaskSuspend(cpu)
+    elif prim == 0x004:
+        primitive_TaskYield(cpu, faulting_pc)
+    elif prim == 0x005:
+        primitive_TaskCurrent(cpu)
     elif prim == 0x009:
         primitive_InstallProgram(cpu)
     elif prim == 0x100:
@@ -2544,7 +2897,7 @@ def step(cpu: CPU) -> None:
             cpu.system.queue_send(msg)
     elif op == 0x3D:  # CALL — no delay slot.
         prim = target26
-        cpu._installed_program = False
+        cpu._call_redirected_pc = False
         try:
             dispatch_call(cpu, prim, pc)
         except BlockedSignal as b:
@@ -2554,7 +2907,7 @@ def step(cpu: CPU) -> None:
             cpu.cycles += 1
             emit_trace(cpu, pc, word, pre_gpr, pre_opr, pre_hi, pre_lo)
             return
-        if not cpu._installed_program:
+        if not cpu._call_redirected_pc:
             cpu.pc = to_u32(pc + 4)
             cpu.next_pc = to_u32(cpu.pc + 4)
         # Else: primitive_InstallProgram already set PC to the new
