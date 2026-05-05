@@ -8,6 +8,7 @@ manually via `bash build-one.sh foo.c foo.orx`).
 /> ls /programs
 build-one.sh
 count.c       count.orx
+dhry.c        dhry.orx
 exit42.c      exit42.orx
 hello.c       hello.orx
 hello_term.c  hello_term.orx
@@ -26,6 +27,14 @@ hello from inside the Tk window
 hello from inside the Tk window
 /> wait 0
 [task 0 exited 0]
+/> run /programs/dhry.orx
+Dhrystone Benchmark, Version 2.1 (Object RISC port)
+Iterations: 5000
+...
+Cycles per iteration: 4067
+  16 MHz: ~3934 dhry/s   = ~2.2 DMIPS
+  20 MHz: ~4918 dhry/s   = ~2.7 DMIPS
+[exited 0]
 ```
 
 ## Two output paths
@@ -60,9 +69,10 @@ hello from inside the Tk window          ← child's term_print
 
 The shell's `cmd_run` does one `task_yield` after `orx_spawn` so
 short children get a quantum to run before the shell blocks on
-the next keystroke. Long-running CPU-bound children would freeze
-the shell until they yield voluntarily — real preemption is a
-separate phase.
+the next keystroke. Long-running CPU-bound children don't starve
+the shell — Phase 36's timer preemption fires every 5000 cycles
+and yields back, so you can keep typing (and `dhry.orx` running
+inside the shell is the canonical worked example).
 
 If you forget to `wait`, the task descriptor sits in the libc
 task table EXITED until the shell exits. No exit-code harvest,
