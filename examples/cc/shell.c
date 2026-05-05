@@ -16,6 +16,7 @@
  *                     ('&' = background; shell's prompt returns
  *                     immediately, harvest exit code with `wait`)
  *     wait <task>   — block until backgrounded task exits, print code
+ *     jobs          — list backgrounded tasks + state
  *     cycles      — print the CPU's cycle counter
  *     time        — print microseconds since boot (wall clock, 32-bit)
  *     exit / quit — end the session
@@ -77,6 +78,7 @@ const char help_msg[] =
     "  echo <text>     — print the rest of the line\n"
     "  run <path>[&]   — load + run another .orx as a child task ('&' = background)\n"
     "  wait <task>     — block until backgrounded task exits; print its exit code\n"
+    "  jobs            — list backgrounded tasks and their state\n"
     "  cycles          — print the CPU's cycle counter\n"
     "  time            — print microseconds since boot (wall clock)\n"
     "  exit | quit     — leave the shell\n";
@@ -545,6 +547,69 @@ cmd_wait(const char *arg)
 	term_print("]\n");
 }
 
+/* Map TASK_STATE_* to a short label printed by cmd_jobs. */
+static const char *
+task_state_label(int state)
+{
+	switch (state) {
+	case TASK_STATE_NEW:       return "new";
+	case TASK_STATE_RUNNABLE:  return "runnable";
+	case TASK_STATE_RUNNING:   return "running";
+	case TASK_STATE_SUSPENDED: return "suspended";
+	case TASK_STATE_BLOCKED:   return "blocked";
+	case TASK_STATE_EXITED:    return "exited";
+	}
+	return "?";
+}
+
+static void
+cmd_jobs(void)
+{
+	unsigned int mask = task_active_mask();
+	int t;
+	int found = 0;
+	for (t = 0; t < TASK_MAX_CONCURRENT; t++) {
+		if (!(mask & (1 << t))) continue;
+		struct task_info info;
+		if (task_query((task_t)t, &info) != 0) continue;
+		term_print("[task ");
+		term_print_int(t);
+		term_print("] ");
+		term_print(task_state_label(info.state));
+		if (info.state == TASK_STATE_EXITED) {
+			term_print(" (exit ");
+			term_print_int(info.exit_code);
+			term_print(")");
+		}
+		term_print("\n");
+		found = 1;
+	}
+	if (!found)
+		term_print("(no live tasks)\n");
+}
+
+/* Auto-reaper. Called each prompt iteration: scans the libc task
+ * table, prints "[task N done CODE]" for any EXITED entries, and
+ * orx_unloads them so the slot frees up for the next spawn. */
+static void
+reap_exited_tasks(void)
+{
+	unsigned int mask = task_active_mask();
+	int t;
+	for (t = 0; t < TASK_MAX_CONCURRENT; t++) {
+		if (!(mask & (1 << t))) continue;
+		struct task_info info;
+		if (task_query((task_t)t, &info) != 0) continue;
+		if (info.state != TASK_STATE_EXITED) continue;
+		int code = orx_unload((task_t)t);
+		term_print("[task ");
+		term_print_int(t);
+		term_print(" done ");
+		term_print_int(code);
+		term_print("]\n");
+	}
+}
+
 static void
 cmd_cycles(void)
 {
@@ -597,6 +662,11 @@ main(void)
 		int len;
 		char *arg;
 
+		/* Auto-reap any background tasks that exited since the last
+		 * iteration. Prints "[task N done CODE]" before the prompt
+		 * if there's anything to harvest, mirroring the bash style. */
+		reap_exited_tasks();
+
 		print_prompt(cwd, prompt_buf);
 		len = read_line(line, sizeof(line), &h);
 		if (len == 0) continue;
@@ -625,6 +695,8 @@ main(void)
 		} else if (strcmp(line, "wait") == 0) {
 			if (*arg == 0) term_print("usage: wait <task>\n");
 			else cmd_wait(arg);
+		} else if (strcmp(line, "jobs") == 0) {
+			cmd_jobs();
 		} else if (strcmp(line, "cycles") == 0) {
 			cmd_cycles();
 		} else if (strcmp(line, "time") == 0) {

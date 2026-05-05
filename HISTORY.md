@@ -3209,6 +3209,98 @@ existing flow covers it end-to-end.
   as Phase 31 — CPU-bound bg tasks freeze the shell. Real
   preemption is still gated.
 
+## Phase 34 — `jobs` + auto-reap: backgrounding feels real (Ouroboros, day 11)
+
+The Phase 31 backgrounding worked but was clunky: spawn with
+`&`, then user has to remember the task number, then `wait` to
+harvest the exit code. Phase 34 adds the two pieces that turn
+this into a recognizable Unix-y shell: a `jobs` listing and an
+auto-reaper that prints `[task N done CODE]` whenever a bg task
+exits, before the next prompt.
+
+### `TaskQuery` (#0x008)
+
+Volume VI §4.2's `TaskQuery` was the obvious primitive for both
+features — it's the non-blocking inspection counterpart to
+`TaskWait`. Returns a packed state word in `R3`: state in low
+8 bits, processor id in next 8, exit code in upper 16 (only
+meaningful when state == EXITED). Restartable, no V cap
+required (matching `TaskWait`'s spec).
+
+Wired in simorisc as the canonical spec slot — first time we got
+a primitive number right on the first attempt without colliding
+with something already allocated.
+
+### libc bindings
+
+`task.c` gains two functions and an unpacked struct in
+`liborisc.h`:
+
+```c
+struct task_info {
+    int state;       /* TASK_STATE_* */
+    int processor;
+    int exit_code;
+};
+
+int          task_query(task_t t, struct task_info *out);
+unsigned int task_active_mask(void);  /* in-use slot bitmap */
+```
+
+`task_active_mask` exposes the libc's internal `task_slots_in_use`
+bitmap so callers can iterate the table without trial-and-error
+calls. `TASK_STATE_*` constants moved into the header so user
+code can reference them by name.
+
+### Shell `jobs` + auto-reaper
+
+`cmd_jobs` walks the active mask, calls `task_query` on each
+live slot, prints `[task N] state-name (exit C)` per entry. If
+the mask is empty: `(no live tasks)`.
+
+`reap_exited_tasks` runs at the top of each prompt iteration —
+same scan, but for any slot with `state == EXITED` it calls
+`orx_unload` (proper cleanup of code/data/stack via deferred
+free) and prints `[task N done CODE]`. The slot frees up for
+the next spawn. Mirrors bash's "[1] Done" notification.
+
+The interaction: a guest you `&`-spawned gets harvested before
+the next prompt without the user lifting a finger. `wait <N>` is
+still there for the rare case where you want to block on a
+specific task synchronously, but most of the time the
+auto-reaper handles it.
+
+### test_shell_bg → test_shell_jobs
+
+The Phase 31 `test_shell_bg.sh` typed `wait 0` after `run X &`
+and asserted on `[task 0 exited 0]`. With auto-reap, task 0 is
+gone by the time `wait` lands — the test now asserts on
+`[task 0 done 0]` (the auto-reaper's message) instead.
+
+New `test_shell_jobs.sh` exercises the full sequence: spawn,
+auto-reap, `jobs` shows `(no live tasks)`. 13 → 14 device/shell
+tests.
+
+New `14_tasks/08_taskquery_packed_word` validates the primitive
+itself: spawns a child that exits with `R4 = 0x42`, queries the
+EXITED descriptor, asserts state=5 (EXITED) and exit_code=0x42
+out of the packed word. 134 → 135 sim validation tests.
+
+### What's not yet done
+
+- **Per-job background metadata.** The shell only knows about
+  tasks via the libc table — no name, no spawn time. `jobs`
+  shows `[task 0] runnable` rather than `[1]+ Running run hello.orx &`.
+  A side table keyed by `task_t` could carry the name string.
+- **`jobs` enumeration race.** Auto-reap fires before each
+  prompt; `jobs` runs after. Practically, you'd never see a
+  live bg task in `jobs` because it would have been reaped
+  first. Acceptable for an MVP — `jobs` is mostly a "did
+  anything I think is alive go away" check.
+- **CPU-bound bg tasks**. Same caveat as Phase 31 — real
+  preemption is gated on the trap-handler-yield architectural
+  fix.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
