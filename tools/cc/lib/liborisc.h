@@ -137,4 +137,28 @@ int lb_init(void);
  * success, 255 on a load failure, or -1 on a poll failure. */
 int lb_spawn(const char *path);
 
+/* ---- task.c — task management (Vol VI §4) ----------------------- *
+ *
+ * MVP single-child API: each call operates on the task ref parked
+ * in O12 by task_spawn. Multi-child programs need to omov refs
+ * elsewhere themselves until the libc grows a real task table.
+ *
+ * Boot ABI for task-using programs:
+ *
+ *     O12 = current child task ref   (set by task_spawn)
+ *     O13 = parent's boot code ref   (parked by task_init)
+ *
+ * task_init() must be called once at program start, BEFORE main
+ * clobbers O1. Children inherit the parent's OPRs verbatim, so
+ * service refs (O5..O10), boot saves (O11/O14/O15), etc. are all
+ * visible to the child without redoing the init dances.
+ */
+
+void task_init(void);                              /* park O1 → O13 */
+int  task_spawn(void (*entry)(int), int arg);     /* fork → O12; return status */
+int  task_wait(void);                              /* block on O12 → return exit code */
+int  task_free(void);                              /* ObjFree(O12) → return status */
+void task_yield(void);                             /* surrender quantum */
+void task_exit(int code);                          /* terminate caller (no return) */
+
 #endif /* LIBORISC_H */
