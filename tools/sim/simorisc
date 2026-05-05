@@ -1821,11 +1821,13 @@ def make_bootstrap_task(cpu: CPU, code_ref: int, stack_ref: int) -> 'Task':
 def primitive_TaskCreate(cpu: CPU) -> None:
     """Create a task with its own address space and prime its register
     state. The new task starts in the NEW state — TaskResume moves it
-    onto the runnable queue. Default mappings: code at CODE_VA (R+X),
-    stack at STACK_TOP (R+W). No data segment by default; supervisor
-    can MapObject one in afterwards if the task needs globals."""
+    onto the runnable queue. Standard layout: code at CODE_VA (R+X),
+    stack at STACK_TOP (R+W), and (when O3 is non-null) data at DATA_VA
+    (R+W) — same VAs as init_cpu so pcc-generated code that assumes
+    flat addresses Just Works in the child."""
     code_ref  = cpu.get_opr(1)
     stack_ref = cpu.get_opr(2)
+    data_ref  = cpu.get_opr(3)              # optional; 0 = no data segment
     entry     = cpu.get_gpr(4) & 0xFFFFFFFF
     init_r4   = cpu.get_gpr(5) & 0xFFFFFFFF
     if entry & 0x80000000:
@@ -1851,17 +1853,36 @@ def primitive_TaskCreate(cpu: CPU) -> None:
     if entry < 0 or entry >= code_desc.length:
         cpu.set_gpr(2, ERR_EINVAL); return
 
+    data_idx, data_desc = None, None
+    if data_ref != 0:
+        if ref_home(data_ref) != cpu.pid:
+            cpu.set_gpr(2, ERR_EREMOTE); return
+        if (ref_caps(data_ref) & CAP_R) == 0:
+            cpu.set_gpr(2, ERR_EPERM); return
+        data_idx = ref_index(data_ref)
+        if data_idx >= len(cpu.descriptors) or cpu.descriptors[data_idx] is None \
+                or not cpu.descriptors[data_idx].live:
+            cpu.set_gpr(2, ERR_ESTALE); return
+        data_desc = cpu.descriptors[data_idx]
+        if data_desc.generation != ref_generation(data_ref):
+            cpu.set_gpr(2, ERR_ESTALE); return
+
     task = Task(descriptor_idx=alloc_task_descriptor(cpu),
                 code_ref=code_ref, stack_ref=stack_ref,
                 state=TASK_STATE_NEW)
-    # Standard layout — same VAs as init_cpu so pcc-generated code that
-    # assumes flat addresses works in the new task too.
     task.mappings = [
         (CODE_VA, CODE_VA + code_desc.length, code_idx, 0,
          CAP_R | CAP_X),
         (STACK_TOP - stack_desc.length, STACK_TOP, stack_idx, 0,
          CAP_R | CAP_W),
     ]
+    if data_idx is not None:
+        # Match init_cpu: data is mapped R+W so guests can mutate
+        # globals (the ref's caps may still be R-only — the
+        # ref-vs-mapping cap split is intentional, see init_cpu).
+        task.mappings.append(
+            (DATA_VA, DATA_VA + data_desc.length, data_idx, 0,
+             CAP_R | CAP_W))
     task.pc      = (CODE_VA + entry) & 0xFFFFFFFF
     task.next_pc = (task.pc + 4)     & 0xFFFFFFFF
     # Child inherits the parent's object registers — that's how the
@@ -2461,6 +2482,30 @@ def primitive_MapObject(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK)
     cpu.set_gpr(3, va)
 
+
+def primitive_Unmap(cpu: CPU) -> None:
+    """Volume VI #0x111. Drop the mapping that starts at exactly R4 and
+    has exactly R5 length. The simulator's mapping list permits
+    duplicates (older entries shadow newer ones — first-match-wins in
+    lookup_va), so a clean replace-via-MapObject sequence is
+    `Unmap(va,len); MapObject(...,va,len,...)`. Unmapping a range that
+    isn't a current mapping returns EINVAL.
+
+    Args:
+      R4: virtual address of the mapping to drop.
+      R5: length of the mapping (must match the original MapObject).
+
+    Returns: R2 = OK on success, EINVAL if no exact match.
+    """
+    va  = cpu.get_gpr(4) & 0xFFFFFFFF
+    length = cpu.get_gpr(5)
+    for i, (lo, hi, _, _, _) in enumerate(cpu.mappings):
+        if lo == va and hi == va + length:
+            del cpu.mappings[i]
+            cpu.set_gpr(2, ERR_OK); return
+    cpu.set_gpr(2, ERR_EINVAL)
+
+
 # Per-primitive minimum caller mode (Volume VI Section 2.4 + Volume II
 # Section 13). Anything not listed defaults to MODE_USER on the theory
 # that callable-from-user-code is the common case; exposing a privileged
@@ -2479,6 +2524,7 @@ PRIMITIVE_MIN_MODE = {
     0x103: MODE_USER,        # ObjDerive
     0x106: MODE_USER,        # ObjAllocStore
     0x110: MODE_SUPERVISOR,  # MapObject        — manipulates VA layout
+    0x111: MODE_SUPERVISOR,  # Unmap            — manipulates VA layout
     0x200: MODE_SUPERVISOR,  # InstallHandler   — registers trap-like callback
     0x203: MODE_USER,        # ReceiveQueueAttach
     0x204: MODE_USER,        # ReceiveQueuePoll
@@ -2526,6 +2572,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjAllocStore(cpu)
     elif prim == 0x110:
         primitive_MapObject(cpu)
+    elif prim == 0x111:
+        primitive_Unmap(cpu)
     elif prim == 0x200:
         primitive_InstallHandler(cpu)
     elif prim == 0x203:

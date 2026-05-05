@@ -468,7 +468,11 @@ cmd_run(const char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
 	resolve_path(cwd, arg, path);
-	int code = lb_spawn(path);
+	/* orx_run loads the .orx via hostfsd and TaskCreates the guest as
+	 * a child of this shell on the same CPU — no spare-CPU pool, no
+	 * linkbootd round trip. The shell is the supervisor; the guest is
+	 * its child. Vol VI primitives carry the whole exchange. */
+	int code = orx_run(path);
 	term_print(run_done_pre);
 	term_print_int(code);
 	term_print(run_done_post);

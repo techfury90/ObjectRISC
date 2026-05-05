@@ -184,4 +184,25 @@ int    task_free(task_t t);                        /* reap exited child */
 void   task_yield(void);                           /* surrender quantum */
 void   task_exit(int code);                        /* terminate caller (no return) */
 
+/* ---- orx.c — load and run a .orx executable as a child task ----- *
+ *
+ * The supervisor escape from "spawn programs only via linkbootd on a
+ * separate CPU." orx_run reads a .orx from the host filesystem,
+ * ObjAllocs code/data/stack objects, copies the file's text and data
+ * sections into them via temp VA mappings, then TaskCreates a child
+ * to run the entry point. Synchronous: blocks until the child exits.
+ *
+ * Depends on hf_init() having been called. Does NOT depend on
+ * task_init() — orx_run manages task creation directly.
+ *
+ * Returns the guest's exit code (0..255) on success, or one of:
+ *     -1  hf_open failed
+ *     -2  short header read or bad magic
+ *     -3  header validation failure
+ *     -4  ObjAlloc / MapObject / read failed during load
+ *     -5  TaskCreate / TaskResume / TaskWait failed
+ */
+
+int orx_run(const char *path);
+
 #endif /* LIBORISC_H */
