@@ -527,6 +527,8 @@ exception cause, the faulting address, and the page-table base. The
 detailed register set is enumerated in Volume V; the firmware-only
 registers controlling the object table, the crossbar routing, and the
 processor identification are not visible to supervisor-mode `LCTRL`.
+A supervisor-mode `LCTRL` or `SCTRL` of a firmware-only control
+register raises `privileged-instruction` rather than reading as zero.
 
 `ERET` returns from the most recent exception or `CALL`: it restores
 the saved privilege mode and resumes execution at `EPC`. It takes no
@@ -535,6 +537,30 @@ operand.
 The TLB-management instructions are not normally invoked by hand-
 written code; firmware uses them in the trap handlers responsible for
 maintaining per-task page tables.
+
+### 13.1 Encoding
+
+The privileged instructions share major opcode `SYSTEM = 0x10` and are
+sub-decoded by the `rs` field, in the COP0-style layout familiar to
+implementations of MIPS-derived ISAs. The control-register selector for
+`LCTRL` / `SCTRL` is carried in the `rd` field; the `funct` field
+selects among the operand-less `CO` operations.
+
+| `op`    | `rs`    | `funct` | Mnemonic           |
+|---------|---------|---------|--------------------|
+| `0x10`  | `0x00`  | —       | `LCTRL Rt, ctrl(Rd)` |
+| `0x10`  | `0x04`  | —       | `SCTRL ctrl(Rd), Rt` |
+| `0x10`  | `0x10`  | `0x01`  | `TLBR`             |
+| `0x10`  | `0x10`  | `0x02`  | `TLBWI`            |
+| `0x10`  | `0x10`  | `0x06`  | `TLBWR`            |
+| `0x10`  | `0x10`  | `0x08`  | `TLBP`             |
+| `0x10`  | `0x10`  | `0x18`  | `ERET`             |
+| `0x10`  | `0x10`  | `0x20`  | `WAIT`             |
+
+All other `(rs, funct)` combinations under `op = 0x10` are reserved and
+raise `reserved-instruction`. The privilege-mode check is applied
+before reserved-encoding decoding: an `op = 0x10` instruction issued in
+user mode raises `privileged-instruction` regardless of its sub-fields.
 
 ## 14. Traps, Exceptions, and the Restart Model
 
@@ -588,17 +614,18 @@ flow is correctly preserved.
 
 ## 15. Reserved Encodings
 
-This revision allocates thirty-five of the sixty-four major opcodes
-(adding `OREFLD` at `0x36` and `OREFST` at `0x37` to the previous
-revision's set), twenty-two of the sixty-four `SPECIAL` function
-codes, and nine of the sixteen `OBJECT` function codes (eight
-inspection/movement operations plus `OFENCE` at funct `0x8`). Every
-unallocated encoding raises `reserved-instruction` when executed.
+This revision allocates thirty-six of the sixty-four major opcodes
+(adding `SYSTEM` at `0x10` for the privileged-instruction group, which
+narrows the floating-point reservation to `0x11`–`0x1F`), twenty-two of
+the sixty-four `SPECIAL` function codes, and nine of the sixteen
+`OBJECT` function codes (eight inspection/movement operations plus
+`OFENCE` at funct `0x8`). Every unallocated encoding raises
+`reserved-instruction` when executed.
 
 The following ranges are reserved for anticipated extensions; conforming
 implementations shall not allocate them to local additions:
 
-- Major opcodes `0x10`–`0x1F` — floating-point and other coprocessor
+- Major opcodes `0x11`–`0x1F` — floating-point and other coprocessor
   extensions, to be defined by a future revision.
 - Major opcode `0x3E` — reserved for a future vector or wide-arithmetic
   extension.
@@ -631,8 +658,8 @@ denotes a reserved encoding that raises `reserved-instruction`.
 | `0x0D`   | `ORI`      | `0x30`   | `OBJECT`   |
 | `0x0E`   | `XORI`     | `0x31`   | `OLB`      |
 | `0x0F`   | `LUI`      | `0x32`   | `OLH`      |
-| `0x10`–`0x1F` | reserved (FP) | `0x33` | `OLW`  |
-|          |            | `0x34`   | `OLBU`     |
+| `0x10`   | `SYSTEM`   | `0x33`   | `OLW`      |
+| `0x11`–`0x1F` | reserved (FP) | `0x34` | `OLBU` |
 |          |            | `0x35`   | `OLHU`     |
 |          |            | `0x36`   | `OREFLD`   |
 |          |            | `0x37`   | `OREFST`   |
