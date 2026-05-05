@@ -2930,6 +2930,101 @@ hello + all 12 device/shell tests still green.
 - **Cross-CPU spawn.** `orx_run` hard-codes "spawn on this CPU."
   A `--cpu N` variant could parallelise.
 
+## Phase 31 — Backgrounding + Tk-window guests (Ouroboros, day 8)
+
+Two of Phase 30's "what's not yet done" items closed in one
+sweep: guests can now write to the Tk window safely, and the
+shell's `run` accepts a trailing `&` to spawn without waiting.
+
+### `term_print_only_init`
+
+[`tools/cc/lib/term.c`](tools/cc/lib/term.c) gains a strict
+subset of `term_init`: just three `omov`s parking boot
+`O2`/`O3`/`O4` into `O11`/`O14`/`O15`. No receive-queue attach,
+no `R+S` derive, no `SEND` to subscribe to the keyboard. A child
+that calls this can use `term_print*` (which lands in the parent's
+oriscterm window via inherited `O5`) without grabbing keystrokes
+out from under the parent shell.
+
+### `orx_spawn` — async loader returning `task_t`
+
+[`tools/cc/lib/orx.c`](tools/cc/lib/orx.c) split: `orx_spawn` does
+the load, registers the new task in the libc task table via two
+new task.c primitives (`task_register_o1` for OREFST-into-slot,
+`task_resume(task_t)` for OREFLD-and-resume), and returns the
+handle. `orx_run` becomes a thin wrapper:
+
+```c
+int orx_run(const char *path) {
+    task_t t = orx_spawn(path);
+    if (t < 0) return t;
+    int code = task_wait(t);
+    task_free(t);
+    return code;
+}
+```
+
+Backgrounded tasks live in the libc task table (in `O12`,
+managed by `task_init`); the shell harvests them later via
+`task_wait`/`task_free`. `task_init` had to move BEFORE
+`term_init`/`hf_init` in the shell's startup so it could capture
+the boot code ref from `O1` before anything clobbered it.
+
+### `&` and `wait` in the shell
+
+`cmd_run` parses a trailing `&` (with optional whitespace
+before): if present, it `orx_spawn`s the task, prints
+`[bg task N]`, then does one `task_yield` to give the child a
+quantum to run before the shell blocks on the next keystroke. New
+`wait <N>` command takes a task handle, calls `task_wait` +
+`task_free`, prints `[task N exited C]`.
+
+```
+/> run /programs/hello_term.orx &
+[bg task 0]
+hello from inside the Tk window
+/> wait 0
+[task 0 exited 0]
+```
+
+The `task_yield` after `orx_spawn` is the entire current
+preemption story: short-running children get to complete in that
+quantum, after which the shell resumes when the child blocks on
+its own I/O or `TaskExit`s. CPU-bound children that don't yield
+voluntarily would freeze the shell — real preemptive scheduling
+(timer-driven `TaskYield` from the trap handler) is still gated
+on the trap-handler-yield architectural fix from earlier phases.
+
+### Validation
+
+- New [`hello_term.c`](examples/cc/programs/hello_term.c) demo:
+  `term_print_only_init` + `term_print`, output lands in the Tk
+  window between the shell's `[exited]` line and the next
+  prompt.
+- New `tools/devices/tests/test_shell_bg.sh` exercises the full
+  `run X &` → `wait N` round trip and asserts on the rendered
+  terminal.
+- 12 → 13 device/shell tests; sim/asm/multiprocess/wire-format
+  all unchanged at 132/7/1/5.
+- The README [`examples/cc/programs/README.md`](examples/cc/programs/README.md)
+  rewrote to cover the print_str-vs-term_print split and the
+  backgrounding flow.
+
+### What's not yet done
+
+- **Object cleanup after `orx_spawn`.** Same leak as Phase 30 —
+  ~80 KiB per spawn. The `&` flow inherits it. Needs the drain
+  primitive.
+- **Real preemption.** A long-running CPU-bound bg task still
+  starves the shell. Timer-driven `TaskYield` from the trap
+  handler clobbers the trap's saved state (see Phase 27
+  caveats); needs a deferred-yield mechanism.
+- **`jobs` listing.** No way to enumerate live bg tasks from
+  inside the shell; user has to remember handles.
+- **Auto-reap on exit.** When a bg task exits, its exit code
+  sits in the table until `wait` collects it. A polling shell
+  loop could auto-print "[task N done]" notifications.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

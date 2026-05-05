@@ -12,7 +12,10 @@
  *     cd [path]   — change working directory (no arg → "/")
  *     pwd         — print the current working directory
  *     echo <text> — print the rest of the line
- *     run <path>  — load and run another .orx as a child task
+ *     run <path>[&] — load and run another .orx as a child task
+ *                     ('&' = background; shell's prompt returns
+ *                     immediately, harvest exit code with `wait`)
+ *     wait <task>   — block until backgrounded task exits, print code
  *     cycles      — print the CPU's cycle counter
  *     time        — print microseconds since boot (wall clock, 32-bit)
  *     exit / quit — end the session
@@ -72,13 +75,16 @@ const char help_msg[] =
     "  cd [<path>]     — change working directory (no arg → '/')\n"
     "  pwd             — print the current working directory\n"
     "  echo <text>     — print the rest of the line\n"
-    "  run <path>      — load and run another .orx as a child task\n"
+    "  run <path>[&]   — load + run another .orx as a child task ('&' = background)\n"
+    "  wait <task>     — block until backgrounded task exits; print its exit code\n"
     "  cycles          — print the CPU's cycle counter\n"
     "  time            — print microseconds since boot (wall clock)\n"
     "  exit | quit     — leave the shell\n";
 
 const char run_done_pre[] = "[exited ";
 const char run_done_post[] = "]\n";
+const char run_bg_pre[] = "[bg task ";
+const char run_bg_post[] = "]\n";
 const char more_prompt[] = "--More-- (space/RET, q to quit)";
 
 /* The shell maintains an absolute, normalized cwd ("/", "/foo",
@@ -467,16 +473,74 @@ cmd_echo(const char *arg)
 static void
 cmd_run(const char *cwd, const char *arg)
 {
+	/* Detect a trailing '&' (with optional whitespace before it).
+	 * If present: background the spawn — print [bg task N], then
+	 * task_yield once to give the child a quantum to run. The
+	 * shell's prompt comes back without waiting; user can `wait N`
+	 * later to harvest the exit code (or never, in which case the
+	 * task descriptor sits in the libc task table EXITED until the
+	 * shell exits). */
 	char path[PATH_MAX];
-	resolve_path(cwd, arg, path);
-	/* orx_run loads the .orx via hostfsd and TaskCreates the guest as
-	 * a child of this shell on the same CPU — no spare-CPU pool, no
-	 * linkbootd round trip. The shell is the supervisor; the guest is
-	 * its child. Vol VI primitives carry the whole exchange. */
-	int code = orx_run(path);
-	term_print(run_done_pre);
+	int  background = 0;
+
+	int alen = (int)strlen(arg);
+	while (alen > 0 && (arg[alen - 1] == ' ' || arg[alen - 1] == '\t'))
+		alen--;
+	if (alen > 0 && arg[alen - 1] == '&') {
+		background = 1;
+		alen--;
+		while (alen > 0 && (arg[alen - 1] == ' ' || arg[alen - 1] == '\t'))
+			alen--;
+	}
+
+	/* Copy the trimmed-and-de-ampersanded arg into a stack buffer
+	 * so resolve_path doesn't see the trailing '&'. */
+	char arg_copy[PATH_MAX];
+	if (alen >= PATH_MAX) alen = PATH_MAX - 1;
+	memcpy(arg_copy, arg, (unsigned int)alen);
+	arg_copy[alen] = '\0';
+
+	resolve_path(cwd, arg_copy, path);
+
+	if (background) {
+		task_t t = orx_spawn(path);
+		if (t < 0) {
+			term_print("orx_spawn failed: ");
+			term_print_int(t);
+			term_print("\n");
+			return;
+		}
+		term_print(run_bg_pre);
+		term_print_int(t);
+		term_print(run_bg_post);
+		/* Hand the child its first quantum. With cooperative
+		 * scheduling and no preemption, this is the only chance
+		 * a CPU-bound child has to make progress before the
+		 * shell blocks again on the next keystroke. */
+		task_yield();
+	} else {
+		int code = orx_run(path);
+		term_print(run_done_pre);
+		term_print_int(code);
+		term_print(run_done_post);
+	}
+}
+
+static void
+cmd_wait(const char *arg)
+{
+	int t = atoi(arg);
+	int code = task_wait((task_t)t);
+	if (code < 0) {
+		term_print("wait: bad task or task_wait error\n");
+		return;
+	}
+	task_free((task_t)t);
+	term_print("[task ");
+	term_print_int(t);
+	term_print(" exited ");
 	term_print_int(code);
-	term_print(run_done_post);
+	term_print("]\n");
 }
 
 static void
@@ -512,11 +576,15 @@ main(void)
 	h.head = 0;
 	h.count = 0;
 
+	/* task_init MUST run first — it parks the boot O1 (code ref) into
+	 * O13 before main clobbers O1. Term/hf inits happen after; their
+	 * boot-saves (O11/O14/O15) overlap by design (matching values).
+	 * orx_spawn uses the libc task table parked in O12 by task_init. */
+	task_init();
+
 	/* term_init parks boot O2/O3/O4 into O11/O14/O15; we don't need
 	 * to touch them ourselves here. (See term.c on why we avoid
-	 * `register __or __asm__("oN")` declarations for the saves.)
-	 * orx_run (used by cmd_run) doesn't need its own init — it
-	 * allocates a private OREF scratch in O7 on each call. */
+	 * `register __or __asm__("oN")` declarations for the saves.) */
 	term_init();
 	hf_init();
 
@@ -550,8 +618,11 @@ main(void)
 		} else if (strcmp(line, "echo") == 0) {
 			cmd_echo(arg);
 		} else if (strcmp(line, "run") == 0) {
-			if (*arg == 0) term_print("usage: run <path>\n");
+			if (*arg == 0) term_print("usage: run <path> [&]\n");
 			else cmd_run(cwd, arg);
+		} else if (strcmp(line, "wait") == 0) {
+			if (*arg == 0) term_print("usage: wait <task>\n");
+			else cmd_wait(arg);
 		} else if (strcmp(line, "cycles") == 0) {
 			cmd_cycles();
 		} else if (strcmp(line, "time") == 0) {
