@@ -356,6 +356,32 @@ calling task or returns `ENOSYS` per its policy.
 > Errors: `EINVAL` (length zero, not a multiple of 8, or too large),
 > `ENOMEM`.
 
+#### 5.1.2 `0x107  ObjFreeDeferred` — *Non-restartable.*
+
+> Like `ObjFree`, but the descriptor stays live for at least `R4`
+> milliseconds before being torn down. Designed for the case where
+> the caller has just SENT data through this object's storage and
+> the receiver may still issue `OBJ_READ_REQ`s for it after the
+> sender has moved on. Freeing immediately would lose those bytes;
+> deferring matches the chunkboot drain-window idiom (Volume V
+> Section 2.5 implementation note).
+>
+> Args:
+> - `O1`: object reference (must carry `V`).
+> - `R4`: drain delay in milliseconds; firmware clamps to an
+>   implementation-defined upper bound (this implementation: 60_000).
+>
+> Returns: `R2`: status.
+>
+> Errors: `EFAULT`, `EPERM`, `EREMOTE`, `ESTALE`,
+> `EINVAL` (refused on a `TAG_TASK` descriptor — the deferral
+> semantics interact badly with the scheduler's task-state machine,
+> which the immediate `ObjFree` path keeps consistent).
+>
+> The descriptor is freed regardless of whether anyone is still
+> reading from it when the deadline elapses; this is a hint for
+> receivers to drain, not a hard reference count.
+
 **`0x101  ObjFree`** — *Non-restartable.*
 
 > Increment the descriptor's generation counter and return its storage

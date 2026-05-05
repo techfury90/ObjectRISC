@@ -3025,6 +3025,95 @@ on the trap-handler-yield architectural fix from earlier phases.
   sits in the table until `wait` collects it. A polling shell
   loop could auto-print "[task N done]" notifications.
 
+## Phase 32 — `ObjFreeDeferred` closes the orx leak (Ouroboros, day 9)
+
+The "what's not yet done" item from Phases 30 and 31 — every
+`orx_spawn` leaked ~80 KiB because freeing the loaded code/data/
+stack would race the guest's last async SEND being read by
+oriscterm. Phase 32 adds the drain primitive that lets `orx_spawn`
+actually free its objects after a configurable window.
+
+### `ObjFreeDeferred` (#0x107)
+
+Volume VI §5.1.2 picks up a sibling to `ObjFree`: same arguments
+plus an `R4` drain delay in milliseconds (clamped to `[0, 60000]`).
+The descriptor stays live and continues to answer `OBJ_READ_REQ`s
+during the window, then is freed normally. Same idiom as the
+chunkboot CPU's `RESET_DRAIN_SECONDS` window in simorisc, but
+exposed as a callable primitive.
+
+`#0x107` rather than the next-after-ObjFree `#0x102` because Vol
+VI §5 already has `ObjRevoke` at `0x102` and `ObjMigrate` /
+`ObjQuery` at `0x104` / `0x105`. `0x107` is the next free slot
+in the object-lifecycle range.
+
+`TAG_TASK` descriptors are explicitly **rejected** with `EINVAL` —
+the immediate `ObjFree` path evicts the Python `Task` struct
+synchronously, which the deferral path can't do safely (the task
+might be referenced from `cpu.runnable` or `cpu.current_task`).
+Tasks must be reaped immediately, not deferred.
+
+### Run-loop integration
+
+`CPU` gained `deferred_frees: List[(deadline, idx)]`. The run
+loop scans it once per tick after the OBJ_READ_REQ drain and
+before the per-CPU step, freeing any whose deadline has passed.
+
+Pending deferred frees deliberately do NOT keep the loop alive
+in idle mode — that would block clean shell shutdowns (the test
+suite depends on this; a `run X &` followed by `exit` would
+otherwise wait the full 30s drain window before sim exits).
+Live CPUs already keep the loop turning via `any_progress`; once
+everyone's idle, the host process is winding down anyway and
+the OS reclaims everything.
+
+### `orx.c` integration
+
+`orx_spawn` now ends with three `ObjFreeDeferred` calls (code,
+data, stack) using a 30-second drain window. Each loaded object's
+descriptor stays live for 30 seconds after spawn, plenty of time
+for the guest to run, exit, and have any in-flight async SENDs
+fully consumed by oriscterm or hostfsd.
+
+The 30-second window is the practical upper bound on how long an
+interactive guest is expected to run; longer-lived guests would
+have their data pulled out from under them. A future
+`orx_unload(task_t)` that schedules the deferred frees only
+*after* `task_wait` returns — when we know the guest has actually
+exited — would handle the long-lived case. For now: 30 seconds
+covers everything we run interactively.
+
+### Validation
+
+Two new tests in `05_oreg`:
+
+- **`11_objfree_deferred`** — Allocate an object, schedule a
+  0-ms-deferred free, burn cycles to let the run loop's scan
+  process it, then call `ObjFree` on the same ref and assert
+  `ESTALE` (the descriptor is gone).
+- **`12_objfree_deferred_rejects_task`** — Try to `ObjFreeDeferred`
+  a `TAG_TASK` ref, expect `EINVAL`.
+
+132 → 134 sim validation tests passing. Asm + multiprocess +
+wire-format + 13 device/shell tests all still green; in
+particular `test_shell_run` and `test_shell_bg` now exercise the
+real free path (was leak-and-let-the-OS-clean-up).
+
+### What's not yet done
+
+- **`orx_unload` for long-lived guests.** The 30-second window
+  is enough for typical interactive use but not principled.
+  An explicit `orx_unload(task_t)` that schedules the deferred
+  frees after `task_wait` would handle arbitrary run times.
+- **Ref counting.** The drain window is wall-clock, not
+  arrival-driven. A receiver that takes >30s to drain still
+  loses bytes. Real ref counting would need bookkeeping in the
+  simulator's request-processing path.
+- **Guest-callable.** `ObjFreeDeferred` is `MODE_USER` so
+  anyone can call it; that's mostly fine since it can't free
+  someone else's task. Long-term it might want to be capability-
+  gated (require a specific cap on the ref).
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
