@@ -3301,6 +3301,105 @@ out of the packed word. 134 → 135 sim validation tests.
   preemption is gated on the trap-handler-yield architectural
   fix.
 
+## Phase 35 — Real preemption: deferred yield from trap handlers (Ouroboros, day 12)
+
+The architectural blocker since Phase 27 was that a timer
+handler couldn't safely call `TaskYield`: the immediate context
+switch saved the handler's mid-execution PC into the outgoing
+task's struct, so on resume the task would re-enter the handler
+mid-instruction (and then ERET would land at stale `saved_pc` /
+`saved_mode` because `cpu.saved_*` had been overwritten by the
+incoming task's own trap state, if any). Phase 35 fixes this
+with a deferred-yield mechanism, unblocking honest preemptive
+scheduling.
+
+### The fix
+
+Three changes to the simulator, no spec change:
+
+1. **`deliver_trap` checkpoints user state into the task struct.**
+   Before overwriting `cpu.pc` / `cpu.mode` with the handler entry,
+   `save_cpu_to_task(cpu, cpu.current_task)` copies the trapped
+   task's full register file, mappings, and trap-side ctrl regs
+   into its `Task` struct. From this point on, the task struct is
+   a valid resume image of the user task; the handler can clobber
+   `cpu.gpr` freely.
+2. **TaskYield-from-handler sets `yield_pending` instead of
+   context-switching.** New `cpu.in_trap_handler` flag (set by
+   `deliver_trap`, cleared by `ERET`) tells `primitive_TaskYield`
+   to take the deferred path: just set `cpu.yield_pending = True`
+   and return `OK`. The handler's call returns immediately so it
+   can finish its work and `ERET` normally.
+3. **`ERET` honors `yield_pending`.** Before exiting trap-handler
+   context, `ERET` reflects any handler-side `SCTRL` of EPC /
+   STATUS into `current_task.{pc, next_pc, mode}` so the resume
+   image stays current. Then:
+   - If `yield_pending`: pick the next runnable task (without
+     re-saving cpu state — the outgoing task's struct is already
+     clean from the trap-entry checkpoint), `load_task_to_cpu` the
+     incoming task, mark the outgoing one runnable.
+   - Otherwise: `load_task_to_cpu(current_task)` to restore user
+     GPRs/OPRs the handler may have clobbered, then override
+     `cpu.pc` / `cpu.mode` from the (possibly SCTRL-modified)
+     `cpu.saved_pc` / `cpu.saved_mode`.
+
+The asymmetry in the yield path — load the new task without
+saving the old — is the key insight. `deliver_trap` already saved
+the user state, and the handler's mid-execution state isn't worth
+preserving (the handler is done; it's exiting via ERET).
+
+### Bonus: trap handlers no longer leak GPR state
+
+A side effect of (3): handlers can no longer accidentally clobber
+the trapped task's GPRs. Phase 27's tests carefully avoided
+cross-clobber by partitioning register usage between handler and
+main loop. With full restore, that discipline is no longer
+required — a real OS pattern.
+
+### `14_tasks/09_preemptive_yield_via_timer`
+
+The validation test that proves preemption works:
+
+- `main` and `child` share a 4-byte scratch object (parked in
+  `O7` before TaskCreate so child inherits it via OPR copy).
+- `main` creates and resumes child, installs a timer handler,
+  arms `COMPARE = COUNT + 50` and enables `IE`, then drops into
+  a tight `olw + beqz` loop polling `flag = scratch[0]`.
+- `main` never voluntarily yields. Without preemption the loop
+  runs forever and `child` never runs.
+- Timer fires → handler re-arms timer, re-enables IE, calls
+  `TaskYield` (sets yield_pending), `ERET`s.
+- `ERET` sees `yield_pending`, switches to `child`. `child`
+  writes `flag = 0x37` and `TaskExit`s.
+- Scheduler picks `main` (only runnable). `main` resumes its
+  loop, sees `flag = 0x37`, exits with that.
+
+135 → 136 sim validation tests. All other suites unchanged.
+
+### What's now unblocked
+
+CPU-bound bg tasks no longer freeze the shell — once the timer
+is wired into the shell, the auto-reaper would notice exits and
+the supervisor stays responsive even when guests don't yield
+voluntarily. (Wiring the timer into the shell itself is a
+separate small change; this phase just makes the architecture
+support it.)
+
+### What's not yet done
+
+- **Shell isn't wired with a timer yet.** The mechanism is there
+  but the shell doesn't install a timer handler / arm COMPARE /
+  enable IE. A small follow-up adds a "supervisor preemption
+  tick" so CPU-bound bg tasks don't starve interactive use.
+- **Preemption while `blocked_on`.** The shell blocking on
+  `term_getkey` (ReceiveQueuePoll) parks the CPU; bg tasks
+  don't run during that time even with preemption installed.
+  The scheduler would need to switch to runnable tasks when
+  `current_task` is BLOCKED. Real OS pattern; future work.
+- **Saved-IE rides ERET.** Phase 27 caveat still applies: the
+  handler explicitly re-sets IE before ERETing rather than the
+  saved-IE bit riding back automatically. Cosmetic.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

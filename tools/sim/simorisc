@@ -801,6 +801,17 @@ class CPU(Port):
         # so the CALL dispatch site won't bump it past the redirect.
         self._call_redirected_pc = False
 
+        # Preemption plumbing (Phase 35). `in_trap_handler` is True
+        # between deliver_trap and the next ERET; while it's set,
+        # TaskYield-from-the-handler doesn't context-switch
+        # immediately (which would lose the trap's saved state).
+        # Instead it sets `yield_pending`, and ERET honors it by
+        # picking the next runnable task before resuming user mode.
+        # The trapping task's user state was checkpointed into its
+        # Task struct on trap delivery so the swap is clean.
+        self.in_trap_handler = False
+        self.yield_pending   = False
+
         # Pending deferred frees (Volume VI primitive #0x107,
         # ObjFreeDeferred). Each entry is (deadline_seconds, idx);
         # entries fire in run() once `time.time() >= deadline_seconds`,
@@ -1744,6 +1755,8 @@ def reset_cpu(cpu: CPU) -> None:
     cpu.next_trans_id  = 0
     cpu.reset_at_time  = 0
     cpu.deferred_frees = []
+    cpu.in_trap_handler = False
+    cpu.yield_pending  = False
     cpu.current_task   = None
     cpu.tasks          = {}
     cpu.runnable       = []
@@ -2011,7 +2024,21 @@ def primitive_TaskSuspend(cpu: CPU) -> None:
 def primitive_TaskYield(cpu: CPU, faulting_pc: int) -> None:
     """Voluntarily surrender the rest of the quantum. Round-robin: pop
     the next runnable, push the current onto the back of the queue, swap
-    state. If nobody else is runnable, this is a no-op."""
+    state. If nobody else is runnable, this is a no-op.
+
+    When called from inside a trap handler (cpu.in_trap_handler set
+    by deliver_trap), an immediate context_switch would save the
+    handler's mid-execution state into the outgoing task struct and
+    lose the trapped task's resume image. So instead we set
+    yield_pending and return; ERET honors it on the way out, after
+    reflecting any handler-side SCTRL of EPC/STATUS into the
+    outgoing task's resume image. This is the deferred-yield idiom
+    that makes timer-driven preemption safe."""
+    if cpu.in_trap_handler:
+        cpu.yield_pending = True
+        cpu.set_gpr(2, ERR_OK)
+        return
+
     nxt = pick_next_runnable(cpu)
     cur = cpu.current_task
     if nxt is None or nxt is cur:
@@ -2996,9 +3023,55 @@ def step(cpu: CPU) -> None:
                 raise Trap(CAUSE_PRIV_INSTR, pc,
                            f"SYSTEM.CO funct {fn:#x} in user mode")
             if fn == 0x18:    # ERET — return from exception or CALL
-                cpu.mode = cpu.saved_mode
-                cpu.pc = cpu.saved_pc
-                cpu.next_pc = to_u32(cpu.pc + 4)
+                cur = cpu.current_task
+                # Reflect any handler-side SCTRL of EPC/STATUS into the
+                # outgoing task's resume image so the trapped task picks
+                # up at the right post-handler location whether we
+                # ERET-resume or yield-then-resume.
+                if cur is not None:
+                    cur.pc      = cpu.saved_pc & 0xFFFFFFFF
+                    cur.next_pc = (cpu.saved_pc + 4) & 0xFFFFFFFF
+                    cur.mode    = cpu.saved_mode
+
+                if cpu.yield_pending:
+                    # The handler asked for a context switch via
+                    # TaskYield — honor it now, on the way out. The
+                    # outgoing task struct is already a valid resume
+                    # image (saved at trap delivery + reflected above);
+                    # just pick the next runnable and load it without
+                    # re-saving cpu state (which would clobber the
+                    # outgoing task struct with the handler's mid-
+                    # execution gprs).
+                    cpu.yield_pending   = False
+                    cpu.in_trap_handler = False
+                    nxt = pick_next_runnable(cpu)
+                    if nxt is not None and nxt is not cur and cur is not None:
+                        cur.state = TASK_STATE_RUNNABLE
+                        cpu.runnable.append(cur)
+                        load_task_to_cpu(cpu, nxt)
+                        nxt.state = TASK_STATE_RUNNING
+                        cpu.current_task = nxt
+                        cpu.cycles += 1
+                        emit_trace(cpu, pc, word, pre_gpr, pre_opr, pre_hi, pre_lo)
+                        return
+                    # Nothing else runnable (or we're somehow without a
+                    # current task): fall through to a normal ERET.
+
+                # Normal ERET: restore the trapped task's user GPRs/
+                # OPRs (so handler clobbers don't leak), then jump to
+                # the post-handler EPC in the post-handler mode.
+                cpu.in_trap_handler = False
+                if cur is not None:
+                    saved_pc_final   = cpu.saved_pc
+                    saved_mode_final = cpu.saved_mode
+                    load_task_to_cpu(cpu, cur)
+                    cpu.pc       = saved_pc_final & 0xFFFFFFFF
+                    cpu.next_pc  = (cpu.pc + 4) & 0xFFFFFFFF
+                    cpu.mode     = saved_mode_final
+                else:
+                    cpu.mode = cpu.saved_mode
+                    cpu.pc = cpu.saved_pc
+                    cpu.next_pc = to_u32(cpu.pc + 4)
                 cpu.cycles += 1
                 emit_trace(cpu, pc, word, pre_gpr, pre_opr, pre_hi, pre_lo)
                 return
@@ -3258,6 +3331,18 @@ def deliver_trap(cpu: CPU, t: Trap) -> bool:
         target_pc   = handler_va & 0xFFFFFFFF
         target_mode = MODE_SUPERVISOR
 
+    # Checkpoint the user task's full state into its Task struct
+    # BEFORE we overwrite cpu.pc / cpu.mode for the handler. This is
+    # what makes TaskYield-from-handler safe — when the handler
+    # eventually sets yield_pending and ERETs, the outgoing task
+    # struct already holds a valid resume image of the trapped task.
+    # Without this, we'd save the handler's mid-execution state
+    # instead and resume into junk on the next schedule. The ERET
+    # path also uses this to restore user GPRs the handler may have
+    # clobbered. (Phase 35.)
+    if cpu.current_task is not None:
+        save_cpu_to_task(cpu, cpu.current_task)
+
     cpu.saved_mode    = cpu.mode
     cpu.saved_pc      = t.faulting_pc & 0xFFFFFFFF
     cpu.cause_reg     = t.cause & 0xFFFFFFFF
@@ -3265,6 +3350,7 @@ def deliver_trap(cpu: CPU, t: Trap) -> bool:
     cpu.mode          = target_mode
     cpu.pc            = target_pc
     cpu.next_pc       = (cpu.pc + 4) & 0xFFFFFFFF
+    cpu.in_trap_handler = True
     if t.cause == CAUSE_EXTERNAL_INTERRUPT:
         cpu.status_ie = False
     # If we trapped while parked at a CALL waiting on a primitive (or at
