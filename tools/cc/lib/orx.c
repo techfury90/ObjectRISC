@@ -253,10 +253,11 @@ orx_read_into_va(int fd, unsigned int temp_va, unsigned int size)
 	return 0;
 }
 
-/* TaskCreate(O1=code, O2=stack, O3=data, R4=entry, R5=0) — stash
- * the resulting task ref into SLOT_TASK; restore O2/O3 from
- * O11/O15 before returning so the caller's print_str etc. keep
- * working. Returns firmware status. */
+/* TaskCreate(O1=code, O2=stack, O3=data, R4=entry, R5=0) — leave
+ * the resulting task ref in O1 for the caller to register into the
+ * libc task table via task_register_o1. Restore O2/O3 from O11/O15
+ * before returning so the caller's print_str etc. keep working.
+ * Returns firmware status. */
 static int
 orx_task_create(unsigned int entry, int has_data)
 {
@@ -270,7 +271,6 @@ orx_task_create(unsigned int entry, int has_data)
 			"addu  r5, r0, r0\n"
 			"call  #0x000\n"            /* TaskCreate → O1 = task */
 			"nop\n"
-			"orefst o1, 24(o7)\n"       /* SLOT_TASK */
 			"omov  o2, o11\n"           /* restore parent's stack ref */
 			"omov  o3, o15\n"           /* restore parent's data ref */
 			"addu  %0, r2, r0"
@@ -287,7 +287,6 @@ orx_task_create(unsigned int entry, int has_data)
 			"addu  r5, r0, r0\n"
 			"call  #0x000\n"
 			"nop\n"
-			"orefst o1, 24(o7)\n"
 			"omov  o2, o11\n"
 			"omov  o3, o15\n"
 			"addu  %0, r2, r0"
@@ -299,57 +298,28 @@ orx_task_create(unsigned int entry, int has_data)
 	return status;
 }
 
-/* TaskResume(SLOT_TASK). */
-static int
-orx_task_resume(void)
-{
-	int status;
-	asm volatile(
-		"orefld o1, 24(o7)\n"
-		"call  #0x002\n"
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		:
-		: "r2", "r3"
-	);
-	return status;
-}
-
-/* TaskWait(SLOT_TASK) → exit code in R3. */
-static int
-orx_task_wait(int *out_status)
-{
-	int status, code;
-	asm volatile(
-		"orefld o1, 24(o7)\n"
-		"call  #0x007\n"
-		"nop\n"
-		"addu  %0, r2, r0\n"
-		"addu  %1, r3, r0"
-		: "=r"(status), "=r"(code)
-		:
-		: "r2", "r3"
-	);
-	*out_status = status;
-	return code;
-}
-
 /*
- * orx_run — load .orx at `path` and run it as a child task.
+ * orx_spawn — load .orx at `path`, TaskCreate it, register the
+ * task in the libc task table (via task_register_o1), TaskResume,
+ * and return the resulting task_t handle. The caller is responsible
+ * for task_wait() / task_free() to harvest the exit code and reap
+ * the descriptor. orx_run wraps spawn+wait+free for synchronous
+ * use; backgrounded `run cmd &` calls orx_spawn and forgets.
  *
- * Returns the guest's exit code on success, or one of:
+ * Requires task_init() to have been called (the libc task table
+ * must exist in O12).
+ *
+ * Returns the task_t handle (0..TASK_MAX_CONCURRENT-1) on success,
+ * or one of:
  *     -1  hf_open failed (file not found or no permission)
  *     -2  short header read or bad magic
  *     -3  header validation failure
  *     -4  ObjAlloc / MapObject / read failed during load
- *     -5  TaskCreate / TaskResume / TaskWait failed
- *
- * Negative returns are distinguishable from real exit codes (which
- * are 0..255).
+ *     -5  TaskCreate / task_register / TaskResume failed
+ *     -6  libc task table is full
  */
-int
-orx_run(const char *path)
+task_t
+orx_spawn(const char *path)
 {
 	char hdr[32];
 
@@ -425,37 +395,60 @@ orx_run(const char *path)
 		orx_scratch_free(); return -4;
 	}
 
+	/* TaskCreate leaves the new task ref in O1. Hand it straight to
+	 * the libc table via task_register_o1 so the caller can use the
+	 * standard task_wait / task_free API. */
 	if (orx_task_create(entry, has_data) != 0) {
 		orx_free_slot(SLOT_STACK);
 		if (has_data) orx_free_slot(SLOT_DATA);
 		orx_free_slot(SLOT_CODE);
 		orx_scratch_free(); return -5;
 	}
-	if (orx_task_resume() != 0) {
-		orx_free_slot(SLOT_TASK);
+	task_t t = task_register_o1();
+	if (t < 0) {
+		/* Task table full. The task descriptor is now orphaned —
+		 * we can't reach it via the libc API, but it's harmless
+		 * (the task hasn't been resumed; it'll never run). */
+		orx_free_slot(SLOT_STACK);
+		if (has_data) orx_free_slot(SLOT_DATA);
+		orx_free_slot(SLOT_CODE);
+		orx_scratch_free(); return -6;
+	}
+	if (task_resume(t) != 0) {
+		task_free(t);
 		orx_free_slot(SLOT_STACK);
 		if (has_data) orx_free_slot(SLOT_DATA);
 		orx_free_slot(SLOT_CODE);
 		orx_scratch_free(); return -5;
 	}
 
-	int wstatus;
-	int code = orx_task_wait(&wstatus);
-
-	/* The guest's last act was probably an async term_print SEND. The
-	 * receiver (oriscterm, hostfsd, etc.) may still be issuing
-	 * OBJ_READ_REQs against the data/stack descriptor when we get
-	 * here — freeing immediately would lose those bytes. The
-	 * chunkboot path solved this with a wall-clock RESET_DRAIN_SECONDS
-	 * window in simorisc; orx_run doesn't have an equivalent yet, so
-	 * the loaded objects are intentionally leaked until we add either
-	 * a drain primitive (Vol VI extension) or a timed-free libc
-	 * helper. The scratch object IS freed — it's never referenced by
-	 * anyone outside orx_run, so dropping it loses nothing. */
-	orx_free_slot(SLOT_TASK);
+	/* Done — drop the orx scratch (we no longer need it; the task
+	 * ref now lives in the libc table). The loaded code/data/stack
+	 * objects are intentionally NOT freed here; freeing them would
+	 * race the guest's last async SEND being read by oriscterm. The
+	 * chunkboot path solved this with simorisc's RESET_DRAIN_SECONDS
+	 * window; orx_spawn needs an analogous drain primitive (or a
+	 * timed-free libc helper). For now, each spawn leaks ~80 KiB. */
 	orx_scratch_free();
+	return t;
+}
 
-	if (wstatus != 0)
+/*
+ * orx_run — the synchronous wrapper. Spawns the guest, waits for
+ * exit, reaps the task descriptor, returns the exit code.
+ *
+ * Returns 0..255 on success or the negative status code from
+ * orx_spawn (see above).
+ */
+int
+orx_run(const char *path)
+{
+	task_t t = orx_spawn(path);
+	if (t < 0)
+		return t;
+	int code = task_wait(t);
+	task_free(t);
+	if (code < 0)
 		return -5;
 	return code;
 }

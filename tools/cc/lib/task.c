@@ -254,6 +254,59 @@ task_spawn(void (*entry)(int), int arg)
 	return slot;
 }
 
+/* --- task_register_o1 / task_resume — handles for tasks the libc
+ * didn't create itself.
+ *
+ * orx.c's loader calls TaskCreate directly (it has its own
+ * code/data/stack-allocation flow), then needs to enroll the
+ * resulting task into the libc table so the user can task_wait /
+ * task_free it via the normal handle API. task_register_o1 finds
+ * a free slot, OREFSTs O1 (assumed to hold the task ref) into it,
+ * and returns the handle. task_resume then drives the named task
+ * to RUNNABLE — the equivalent of task_spawn's TaskResume step,
+ * but separated out so loaders can interleave their own work
+ * between TaskCreate and TaskResume.
+ *
+ * Returns -1 if the table is full (task_register_o1) or the
+ * handle is invalid (task_resume); otherwise the firmware status
+ * is propagated negated. */
+
+task_t
+task_register_o1(void)
+{
+	int slot;
+	for (slot = 0; slot < TASK_MAX_CONCURRENT; slot++) {
+		if (!(task_slots_in_use & (1 << slot)))
+			break;
+	}
+	if (slot >= TASK_MAX_CONCURRENT)
+		return -1;
+	task_store_from_o1(slot);
+	task_slots_in_use |= (1 << slot);
+	return slot;
+}
+
+int
+task_resume(task_t t)
+{
+	int status;
+	if (t < 0 || t >= TASK_MAX_CONCURRENT
+			|| !(task_slots_in_use & (1 << t)))
+		return -1;
+	task_load_to_o1(t);
+	asm volatile(
+		"call  #0x002\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r2"
+	);
+	if (status != 0)
+		return -status;
+	return 0;
+}
+
 /* --- task_wait: block until the named child exits, return its code
  *
  * Loads the child's ref from the table into O1, calls TaskWait. On

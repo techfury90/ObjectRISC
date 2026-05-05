@@ -129,6 +129,27 @@ _term_console_write(int source_is_stack, int offset, int count)
 	_term_restore_or();
 }
 
+/* --- term_print_only_init: park boot ORs, no keyboard subscribe -------
+ *
+ * For child tasks that only need to write to the Tk window (no
+ * keyboard input). Skips the receive-queue attach and the
+ * subscribe-to-keyboard SEND that term_init does — those would
+ * compete with the parent (the shell) for keystrokes when running
+ * on the same CPU. The child still inherits the parent's O5 (console
+ * service ref) via TaskCreate's OPR copy, so term_print* lands on
+ * the same Tk window the parent uses.
+ *
+ * Just three omovs: park boot O2/O3/O4 into O11/O14/O15 so
+ * _term_console_write can find them via _term_restore_or. */
+
+void
+term_print_only_init(void)
+{
+	asm volatile("omov o11, o2");
+	asm volatile("omov o14, o4");
+	asm volatile("omov o15, o3");
+}
+
 /* --- term_init: park boot ORs, attach queue, subscribe ---------------- */
 
 void

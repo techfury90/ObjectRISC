@@ -82,6 +82,7 @@ int hf_write(int fd, const char *buf, int count);   /* buf may be stack or data 
  * on the keyboard queue. */
 
 void term_init(void);
+void term_print_only_init(void);                   /* parks boot ORs, no kbd subscribe */
 void term_print(const char *s);
 void term_print_n(const char *buf, int count);     /* explicit length, async */
 void term_print_n_sync(const char *buf, int count);/* sync — blocks until the
@@ -184,6 +185,12 @@ int    task_free(task_t t);                        /* reap exited child */
 void   task_yield(void);                           /* surrender quantum */
 void   task_exit(int code);                        /* terminate caller (no return) */
 
+/* Lower-level handles for callers (orx.c, future loaders) that drive
+ * TaskCreate themselves and only need the libc to manage the table
+ * slot + TaskResume for them. */
+task_t task_register_o1(void);                     /* OREFST O1 → next free slot */
+int    task_resume(task_t t);                      /* OREFLD slot, call TaskResume */
+
 /* ---- orx.c — load and run a .orx executable as a child task ----- *
  *
  * The supervisor escape from "spawn programs only via linkbootd on a
@@ -203,6 +210,7 @@ void   task_exit(int code);                        /* terminate caller (no retur
  *     -5  TaskCreate / TaskResume / TaskWait failed
  */
 
-int orx_run(const char *path);
+int    orx_run(const char *path);
+task_t orx_spawn(const char *path);                /* async — caller waits/frees */
 
 #endif /* LIBORISC_H */
