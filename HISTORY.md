@@ -2049,6 +2049,144 @@ inline struct copy would close most of that gap. Dhrystone-as-
 shipped is the regression baseline to measure that work
 against.
 
+## Phase 24 — Privilege modes start working
+
+Vol II Section 13 has named the three privilege modes — user,
+supervisor, firmware — since the 0.1 revision, with `LCTRL`,
+`SCTRL`, `ERET`, `WAIT`, and the four TLB-management instructions
+listed as the privileged set. None of it was enforced. The
+simulator decoded major opcode `0x10` as reserved-instruction; the
+shell, the chunkboot loader, and every guest program ran at an
+implicit "everything is allowed" privilege level, indistinguishable
+from firmware. To start thinking about an actual operating system
+on top of this — a CMS to firmware's CP, in the VM/CMS analogy
+that motivated the work — the architecture had to take its own
+privilege rules seriously.
+
+This phase is the foundation: the smallest enforcement that a
+guest OS can start to lean on, with the spec brought into line
+with the implementation so future work doesn't drift again.
+
+### `SYSTEM` opcode (Vol II §13.1)
+
+Major opcode `0x10` is now `SYSTEM`. Sub-decoding follows the
+COP0 layout familiar from MIPS-derived ISAs: `rs = 0x00` is
+`LCTRL Rt, ctrl(Rd)`, `rs = 0x04` is `SCTRL ctrl(Rd), Rt`, and
+`rs = 0x10` is the operand-less `CO` group selected by `funct`
+(`TLBR/TLBWI/TLBWR/TLBP/ERET/WAIT`). The floating-point
+reservation in Appendix A narrows from `0x10`–`0x1F` to
+`0x11`–`0x1F`; the privileged-instruction set is now genuinely
+in the architecture rather than implied by §13's prose.
+
+asmorisc gains the eight mnemonics. `LCTRL` / `SCTRL` accept
+`$N` for the control-register selector with a new `$` token in
+the lexer; the operand-less ones take no operands.
+
+### Privilege state in `simorisc`
+
+CPUs gain a `mode` field (USER / SUPERVISOR / FIRMWARE), defaulting
+to supervisor so every existing program — shell, chunkboot loader,
+Dhrystone, the validation suite — keeps booting unchanged. A new
+`--mode` CLI flag overrides the default at boot, and is honored on
+reset (chunkboot-style `--reset-on-exit` slots come back in the
+same mode they started in).
+
+The privileged-instruction check fires at decode in `step()`:
+
+- `LCTRL` / `SCTRL` in user mode → `privileged-instruction` (cause 0x0b).
+- `LCTRL` / `SCTRL` of a firmware-only control register
+  (numbers ≥ 8: VECBASE, TLBHI, TLBLO, INDEX, RANDOM, OBJTAB_*,
+  ROUTE_BASE, ODC_*) in supervisor mode → `privileged-instruction`.
+- `ERET` / `WAIT` / TLB ops in user mode → `privileged-instruction`.
+- TLB ops in supervisor mode → `privileged-instruction`.
+
+The TLB ops execute as no-ops in firmware mode (the simulator
+backs VAs through `cpu.mappings`, not a real TLB) so firmware code
+that blindly issues `TLBWR` won't fault; this matches the spec's
+"reserved encodings" tier where the architectural behaviour is
+defined but no machine-visible state changes.
+
+Control-register backing storage covers the supervisor-visible
+subset (STATUS, CAUSE, EPC, BADVADDR, CONTEXT, COUNT, COMPARE,
+PROCID); the firmware-only registers read as zero. STATUS encodes
+the current mode in bits [1:0], so a future scheduler can drop a
+child task to user mode by `SCTRL $0, Rsuper` after setting up
+its image.
+
+### Per-primitive minimum mode in `CALL`
+
+`dispatch_call` now consults a `PRIMITIVE_MIN_MODE` table before
+invoking any primitive. A `CALL` from a mode below the
+primitive's minimum returns `ERR_EPERM` in `R2` without entering
+the primitive's body. Current allocations:
+
+- **Supervisor required**: `MapObject` (#0x110), `InstallProgram`
+  (#0x009), `InstallHandler` (#0x200) — anything that
+  manipulates the VA layout or installs trap-like callbacks.
+- **User accessible**: everything else this revision —
+  `TaskExit`, `ObjAlloc`, `ObjFree`, `ObjDerive`, `ObjAllocStore`,
+  `ReceiveQueueAttach`, `ReceiveQueuePoll`, `ReadCycles`,
+  `ConsoleWrite` (will move to a service eventually), `TimeNow`,
+  `ClockResolution`.
+
+Future page-table primitives will require firmware mode. The
+table is the central record of which primitives are intended for
+which trust tier; adding a new primitive means deciding its mode
+explicitly.
+
+Vol VI §2.3 picks up a paragraph documenting the EPERM-from-mode
+behavior so the spec and the simulator agree on how a guest OS
+will see the rule.
+
+### Validation
+
+Five new tests in `08_traps`:
+
+- `07_privileged_lctrl_user` — LCTRL in user mode → cause 0x0b.
+- `08_privileged_sctrl_user` — same for SCTRL.
+- `09_privileged_eret_user` — same for ERET.
+- `10_privileged_tlb_supervisor` — TLBWR in supervisor mode →
+  cause 0x0b (firmware-only).
+- `11_privileged_lctrl_fw_only` — LCTRL of VECBASE in supervisor
+  mode → cause 0x0b.
+
+Plus `09_call/05_call_eperm_user_mode` for the CALL EPERM path.
+The runner gained a `@mode:` directive so individual tests can
+opt into user or firmware mode without touching the harness.
+
+`08_traps/03_reserved_opcode.s` was the only existing test that
+asserted `0x10` was reserved; it's been retargeted to `0x11`,
+which still is.
+
+115 → 121 sim validation tests passing. The full asm + device +
+shell suites still green.
+
+### What's next
+
+Privilege modes are the floor; the OS is the building. Open
+questions (in roughly the order the user articulated them):
+
+- **Per-task address spaces.** The shell, the spawned guest, and
+  any other concurrent user-mode task today share one VA layout
+  per CPU. pcc generates flat-VA code, so isolation has to come
+  from the simulator switching `cpu.mappings` on context switch.
+  A "task" needs to become a first-class object with its own
+  mapping list.
+- **Supervisor scheduler.** Single-scheduler design (no double-
+  scheduler — VM/CMS without the CP-mediates-distrusting-guests
+  pressure). Wake-up boundaries are `TaskYield`, `TaskExit`, and
+  blocking IPC. Probably round-robin to start.
+- **Page-table primitives.** `MapObject` is the supervisor lever;
+  a `MapObjectInTask` for the supervisor to set up a child's
+  layout, plus `Unmap`, plus a way to fault on access.
+- **Trap delivery.** Right now `Trap` is a Python exception with no
+  in-architecture handler hookup. To run user-mode programs that
+  recover from arithmetic overflow or capability violations, traps
+  need to deliver to a supervisor-installed vector with `EPC` /
+  `Cause` / `BADVADDR` populated, and `ERET` actually unwinding
+  back. The control-register slots are present and `ERET`
+  decodes; the wiring isn't.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

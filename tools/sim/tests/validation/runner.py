@@ -88,6 +88,7 @@ class Expectations:
     expect_stderr_contains: list[str] = dataclasses.field(default_factory=list)
     max_cycles: int = DEFAULT_MAX_CYCLES
     processors: int = 1
+    mode: str = "supervisor"
 
     @property
     def is_trap_test(self) -> bool:
@@ -123,6 +124,10 @@ def parse_expectations(source: str) -> Expectations:
             exp.max_cycles = int(value, 0)
         elif key == "processors":
             exp.processors = int(value, 0)
+        elif key == "mode":
+            if value not in ("user", "supervisor", "firmware"):
+                raise ValueError(f"@mode: unknown value {value!r}")
+            exp.mode = value
         elif key == "category":
             pass    # informational
         else:
@@ -231,7 +236,8 @@ def run_one(source_path: Path, build_dir: Path) -> Result:
         return result
 
     sim_args = ["python3", str(SIMORISC),
-                "--max-cycles", str(exp.max_cycles)]
+                "--max-cycles", str(exp.max_cycles),
+                "--mode", exp.mode]
     if exp.processors > 1:
         sim_args += ["--processors", str(exp.processors)]
     sim_args.append(str(orx_path))

@@ -445,6 +445,18 @@ OBJECT_FUNCT = {
     "ofence": 0x8,
 }
 
+# SYSTEM (major opcode 0x10) sub-encodings — Volume II Section 13.
+# LCTRL/SCTRL select on rs; the CO group selects on rs=0x10 + funct.
+SYSTEM_OP = 0x10
+SYSTEM_RS_LCTRL = 0x00
+SYSTEM_RS_SCTRL = 0x04
+SYSTEM_RS_CO    = 0x10
+# Operand-less CO mnemonics → funct codes.
+SYSTEM_CO_FUNCT = {
+    "tlbr":  0x01, "tlbwi": 0x02, "tlbwr": 0x06, "tlbp": 0x08,
+    "eret":  0x18, "wait":  0x20,
+}
+
 
 # ---------------------------------------------------------------------------
 # Bit-field assembly helpers
@@ -627,6 +639,7 @@ _TOKEN_RE = re.compile(
     (?P<sym>[A-Za-z_.][A-Za-z0-9_.]*:?) |              # identifier / label
     (?P<num>-?(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+)) |  # number
     (?P<hash>\#) |                                     # call '#' sigil
+    (?P<dollar>\$) |                                   # ctrl-register sigil ($N)
     (?P<punct>[(),+\-])                                # punctuation (incl. expression ops)
     """,
     re.VERBOSE,
@@ -1188,6 +1201,14 @@ def handle_instruction(asm: Assembler, section: str, src: SourceLine,
         encode_object_rr(asm, section, src, name, operands)
         return
 
+    if name in ("lctrl", "sctrl"):
+        encode_lctrl_sctrl(asm, section, src, name, operands)
+        return
+
+    if name in SYSTEM_CO_FUNCT:
+        encode_system_co(asm, section, src, name, operands)
+        return
+
     raise AsmError(f"unknown mnemonic {name!r}", file, line, col)
 
 
@@ -1609,6 +1630,56 @@ def encode_send_inst(asm: Assembler, section: str, src: SourceLine, operands) ->
     os_ = parse_obj(t.text, file, line, t.col)
     word = encode_send(os_)
     emit_const(asm, section, file, line, 1, "send", word)
+
+
+# ---- SYSTEM (LCTRL / SCTRL / ERET / WAIT / TLB*) ----
+
+def _parse_ctrl_number(toks: list[Token], file: str, line: int) -> int:
+    """Accept either `$N` or a bare integer for the control-register
+    number operand. Range-check to [0, 31] (Volume V Section 2.10)."""
+    g = list(toks)
+    if g and g[0].kind == "dollar":
+        g = g[1:]
+    if len(g) != 1 or g[0].kind not in ("num", "char"):
+        raise AsmError("expected control-register number ($N or integer)",
+                       file, line, g[0].col if g else 1)
+    n = parse_int(g[0].text, file, line, g[0].col)
+    if not (0 <= n < 32):
+        raise AsmError(f"control-register {n} out of range [0, 31]",
+                       file, line, g[0].col)
+    return n
+
+
+def encode_lctrl_sctrl(asm: Assembler, section: str, src: SourceLine,
+                       name: str, operands) -> None:
+    file, line = src.file, src.line
+    if len(operands) != 2:
+        raise AsmError(f"{name} expects two operands", file, line, 1)
+    if name == "lctrl":
+        # `lctrl Rt, $ctrl` — read ctrl into Rt.
+        rt_t = _need_one_token(operands[0], file, line, "rt")
+        rt = parse_gpr(rt_t.text, file, line, rt_t.col)
+        ctrl = _parse_ctrl_number(operands[1], file, line)
+        rs = SYSTEM_RS_LCTRL
+    else:  # sctrl
+        # `sctrl $ctrl, Rt` — write Rt into ctrl.
+        ctrl = _parse_ctrl_number(operands[0], file, line)
+        rt_t = _need_one_token(operands[1], file, line, "rt")
+        rt = parse_gpr(rt_t.text, file, line, rt_t.col)
+        rs = SYSTEM_RS_SCTRL
+    word = encode_r(SYSTEM_OP, rs, rt, ctrl, 0, 0)
+    emit_const(asm, section, file, line, 1, name, word)
+
+
+def encode_system_co(asm: Assembler, section: str, src: SourceLine,
+                     name: str, operands) -> None:
+    """ERET / WAIT / TLB* take no operands."""
+    file, line = src.file, src.line
+    if operands and operands[0]:
+        raise AsmError(f"{name} takes no operands", file, line, 1)
+    fn = SYSTEM_CO_FUNCT[name]
+    word = encode_r(SYSTEM_OP, SYSTEM_RS_CO, 0, 0, 0, fn)
+    emit_const(asm, section, file, line, 1, name, word)
 
 
 # ---- CALL ----

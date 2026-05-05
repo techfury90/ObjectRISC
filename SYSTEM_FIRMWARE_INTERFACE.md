@@ -69,6 +69,15 @@ other invariants on the argument hold. A primitive that requires a
 live reference and is given a stale or null one returns `ESTALE` or
 `EFAULT` respectively, before any capability check is performed.
 
+Each primitive carries a *minimum caller mode* (Volume II Section 13).
+A `CALL` issued from a mode below the primitive's minimum returns
+`EPERM` in `R2` without entering the primitive's body and without
+modifying any other architecturally visible state. The current
+allocations are: `MapObject`, `InstallProgram`, and `InstallHandler`
+require supervisor mode; all other primitives in this revision are
+callable from user mode. Future page-table primitives will require
+firmware mode.
+
 ### 2.4 Standard Error Codes
 
 | Code | Symbol      | Meaning                                          |

@@ -110,6 +110,26 @@ TAG_SERVICE = 0x4103
 # Service object layout: 64 bytes, present on every CPU in multi-CPU mode.
 SERVICE_OBJ_SIZE = 64
 
+# Privilege modes (Volume II Section 13). Numerically ordered: a check
+# `cpu.mode >= MODE_SUPERVISOR` admits both supervisor and firmware.
+MODE_USER       = 0
+MODE_SUPERVISOR = 1
+MODE_FIRMWARE   = 2
+MODE_NAMES = {0: "user", 1: "supervisor", 2: "firmware"}
+
+# Control register numbers (Volume V Section 2.10). Registers 0–7 are
+# accessible from supervisor mode; 8 and above are firmware-only. Only a
+# subset is materialised in this simulator — see CPU._ctrl_read/_write.
+CTRL_STATUS   = 0
+CTRL_CAUSE    = 1
+CTRL_EPC      = 2
+CTRL_BADVADDR = 3
+CTRL_CONTEXT  = 4
+CTRL_COUNT    = 5
+CTRL_COMPARE  = 6
+CTRL_PROCID   = 7
+CTRL_SV_MAX   = 7   # any ctrl > this requires firmware mode
+
 # ---------------------------------------------------------------------------
 # Object descriptor and reference layout
 # ---------------------------------------------------------------------------
@@ -689,6 +709,21 @@ class CPU(Port):
         # dispatch site "I already moved PC, don't advance it".
         self._installed_program = False
 
+        # Privilege state (Volume II Section 13). Mode defaults to
+        # supervisor — this preserves the pre-privilege-modes behaviour
+        # of every existing program: shells, the chunkboot loader,
+        # everything that calls MapObject / InstallHandler / InstallProgram
+        # boots as supervisor and keeps working. main() honours --mode to
+        # override per-program (and per-CPU on reset).
+        self.mode = MODE_SUPERVISOR
+        # ERET destination, written when an exception or CALL would
+        # promote mode in a real implementation. The simulator runs
+        # primitives directly in Python rather than re-entering firmware
+        # code, so saved_mode is updated only by an explicit trap-handling
+        # path (not yet wired) and consumed by ERET.
+        self.saved_mode = MODE_SUPERVISOR
+        self.saved_pc   = 0
+
         # Trace control.
         self.trace_enabled = False
 
@@ -743,6 +778,34 @@ class CPU(Port):
 
     def get_opr(self, idx: int) -> int:
         return self.opr[idx] & 0xFFFFFFFFFFFFFFFF
+
+    # ---- privileged control registers (Volume V Section 2.10) ---------------
+
+    def ctrl_read(self, idx: int) -> int:
+        """LCTRL fetch. The simulator backs the architecturally visible
+        subset; firmware-only registers controlling the (absent) TLB,
+        object table, and crossbar route are read-as-zero."""
+        if   idx == CTRL_STATUS:   return self.mode & 0x3
+        elif idx == CTRL_CAUSE:    return 0  # no exception model yet
+        elif idx == CTRL_EPC:      return self.saved_pc & 0xFFFFFFFF
+        elif idx == CTRL_BADVADDR: return 0
+        elif idx == CTRL_CONTEXT:  return 0
+        elif idx == CTRL_COUNT:    return self.cycles & 0xFFFFFFFF
+        elif idx == CTRL_COMPARE:  return 0
+        elif idx == CTRL_PROCID:   return self.pid & 0xFFFFFFFF
+        return 0
+
+    def ctrl_write(self, idx: int, val: int) -> None:
+        """SCTRL store. PROCID is read-only (writes silently ignored, per
+        Volume V); STATUS writes update the current mode bits, which is
+        how supervisor code drops a child task to user mode after
+        installing it. The remaining writable slots are stubbed for now."""
+        v = val & 0xFFFFFFFF
+        if   idx == CTRL_STATUS:   self.mode = v & 0x3
+        elif idx == CTRL_EPC:      self.saved_pc = v
+        # CAUSE / BADVADDR / CONTEXT / COUNT / COMPARE: writable in spec
+        # but no architectural effect in this simulator yet.
+        # PROCID and the firmware-only registers (>= 8): ignore.
 
     # ---- object table -------------------------------------------------------
 
@@ -1497,6 +1560,9 @@ def reset_cpu(cpu: CPU) -> None:
     install_external_services(cpu, args["services"])
     snapshot_boot_state(cpu)
     cpu.set_gpr(6, prev_exit_code & 0xFF)
+    # Restore the boot-time privilege mode so a CPU rebooted under
+    # --mode=user comes back as user, not the supervisor default.
+    cpu.mode = getattr(cpu, "initial_mode", MODE_SUPERVISOR)
 
 
 # ---------------------------------------------------------------------------
@@ -1899,7 +1965,38 @@ def primitive_MapObject(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK)
     cpu.set_gpr(3, va)
 
+# Per-primitive minimum caller mode (Volume VI Section 2.4 + Volume II
+# Section 13). Anything not listed defaults to MODE_USER on the theory
+# that callable-from-user-code is the common case; exposing a privileged
+# capability is an explicit decision made here.
+PRIMITIVE_MIN_MODE = {
+    0x001: MODE_USER,        # TaskExit
+    0x009: MODE_SUPERVISOR,  # InstallProgram   — replaces task image
+    0x100: MODE_USER,        # ObjAlloc
+    0x101: MODE_USER,        # ObjFree
+    0x103: MODE_USER,        # ObjDerive
+    0x106: MODE_USER,        # ObjAllocStore
+    0x110: MODE_SUPERVISOR,  # MapObject        — manipulates VA layout
+    0x200: MODE_SUPERVISOR,  # InstallHandler   — registers trap-like callback
+    0x203: MODE_USER,        # ReceiveQueueAttach
+    0x204: MODE_USER,        # ReceiveQueuePoll
+    0x301: MODE_USER,        # ReadCycles
+    0x320: MODE_USER,        # ConsoleWrite     — debug primitive, will move
+    0x400: MODE_USER,        # TimeNow
+    0x410: MODE_USER,        # ClockResolution
+}
+
 def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
+    min_mode = PRIMITIVE_MIN_MODE.get(prim)
+    if min_mode is None:
+        cpu.set_gpr(2, ERR_ENOSYS)
+        cpu.set_gpr(3, 0)
+        return
+    if cpu.mode < min_mode:
+        cpu.set_gpr(2, ERR_EPERM)
+        cpu.set_gpr(3, 0)
+        return
+
     if prim == 0x001:
         primitive_TaskExit(cpu)
     elif prim == 0x009:
@@ -1928,9 +2025,6 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_TimeNow(cpu)
     elif prim == 0x410:
         primitive_ClockResolution(cpu)
-    else:
-        cpu.set_gpr(2, ERR_ENOSYS)
-        cpu.set_gpr(3, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1983,6 +2077,14 @@ def fmt_instr(pc: int, word: int, cpu: CPU) -> str:
     if op == 0x0D:                       return f"ori r{rt}, r{rs}, 0x{imm:04x}"
     if op == 0x0E:                       return f"xori r{rt}, r{rs}, 0x{imm:04x}"
     if op == 0x0F:                       return f"lui r{rt}, 0x{imm:04x}"
+    if op == 0x10:
+        if rs == 0x00: return f"lctrl r{rt}, ${rd}"
+        if rs == 0x04: return f"sctrl ${rd}, r{rt}"
+        if rs == 0x10:
+            return {0x01:"tlbr", 0x02:"tlbwi", 0x06:"tlbwr",
+                    0x08:"tlbp", 0x18:"eret",  0x20:"wait"
+                    }.get(fn, f"system?co.fn={fn:#x}")
+        return f"system?rs={rs:#x}"
     if op == 0x20:                       return f"lb r{rt}, {simm}(r{rs})"
     if op == 0x21:                       return f"lh r{rt}, {simm}(r{rs})"
     if op == 0x23:                       return f"lw r{rt}, {simm}(r{rs})"
@@ -2177,6 +2279,51 @@ def step(cpu: CPU) -> None:
         if r < -0x80000000 or r > 0x7FFFFFFF:
             raise Trap(CAUSE_ARITH_OVERFLOW, pc, "ADDI overflow")
         cpu.set_gpr(rt, to_u32(r))
+    elif op == 0x10:  # SYSTEM (privileged) — Volume II Section 13
+        # rs selects the sub-operation; rd carries the control-register
+        # number for LCTRL / SCTRL. All sub-ops trap in user mode; the
+        # TLB-management ops trap in supervisor mode too.
+        if rs == 0x00:    # LCTRL Rt, ctrl(Rd)
+            if cpu.mode < MODE_SUPERVISOR:
+                raise Trap(CAUSE_PRIV_INSTR, pc, "LCTRL in user mode")
+            if rd > CTRL_SV_MAX and cpu.mode < MODE_FIRMWARE:
+                raise Trap(CAUSE_PRIV_INSTR, pc,
+                           f"LCTRL ctrl{rd} requires firmware mode")
+            cpu.set_gpr(rt, cpu.ctrl_read(rd))
+        elif rs == 0x04:  # SCTRL ctrl(Rd), Rt
+            if cpu.mode < MODE_SUPERVISOR:
+                raise Trap(CAUSE_PRIV_INSTR, pc, "SCTRL in user mode")
+            if rd > CTRL_SV_MAX and cpu.mode < MODE_FIRMWARE:
+                raise Trap(CAUSE_PRIV_INSTR, pc,
+                           f"SCTRL ctrl{rd} requires firmware mode")
+            cpu.ctrl_write(rd, cpu.get_gpr(rt))
+        elif rs == 0x10:  # CO — sub-decoded by funct
+            if cpu.mode < MODE_SUPERVISOR:
+                raise Trap(CAUSE_PRIV_INSTR, pc,
+                           f"SYSTEM.CO funct {fn:#x} in user mode")
+            if fn == 0x18:    # ERET — return from exception or CALL
+                cpu.mode = cpu.saved_mode
+                cpu.pc = cpu.saved_pc
+                cpu.next_pc = to_u32(cpu.pc + 4)
+                cpu.cycles += 1
+                emit_trace(cpu, pc, word, pre_gpr, pre_opr, pre_hi, pre_lo)
+                return
+            elif fn == 0x20:  # WAIT — halt until interrupt
+                pass          # no interrupt model in this simulator
+            elif fn in (0x01, 0x02, 0x06, 0x08):  # TLBR/TLBWI/TLBWR/TLBP
+                if cpu.mode < MODE_FIRMWARE:
+                    raise Trap(CAUSE_PRIV_INSTR, pc,
+                               f"TLB op funct {fn:#x} requires firmware mode")
+                # No real TLB in this simulator — VAs are tracked by
+                # cpu.mappings, populated through MapObject. Treat as no-op
+                # so firmware code that blindly issues TLBWR survives.
+                pass
+            else:
+                raise Trap(CAUSE_RESERVED_INSTR, pc,
+                           f"SYSTEM.CO funct {fn:#x}")
+        else:
+            raise Trap(CAUSE_RESERVED_INSTR, pc,
+                       f"SYSTEM rs {rs:#x}")
     elif op == 0x09: cpu.set_gpr(rt, to_u32(gpr(rs) + simm))
     elif op == 0x0A: cpu.set_gpr(rt, 1 if sgpr(rs) < simm else 0)
     elif op == 0x0B: cpu.set_gpr(rt, 1 if gpr(rs) < (simm & 0xFFFFFFFF) else 0)
@@ -2472,7 +2619,19 @@ def main(argv: List[str]) -> int:
                     help="print each retired instruction with register effects")
     ap.add_argument("--max-cycles", type=int, default=10_000_000,
                     help="cycle bound (default 10000000)")
+    ap.add_argument("--mode", choices=["user", "supervisor", "firmware"],
+                    default="supervisor",
+                    help="initial privilege mode of the loaded task "
+                         "(Volume II §13). Default 'supervisor' so all "
+                         "existing programs keep working; pass 'user' to "
+                         "verify a guest stays out of LCTRL/SCTRL/MapObject/"
+                         "InstallProgram, or 'firmware' to allow TLB ops.")
     args = ap.parse_args(argv)
+    initial_mode = {
+        "user": MODE_USER,
+        "supervisor": MODE_SUPERVISOR,
+        "firmware": MODE_FIRMWARE,
+    }[args.mode]
 
     if args.connect is not None and args.processors != 1:
         sys.exit("simorisc: --connect implies single-CPU; --processors "
@@ -2507,15 +2666,19 @@ def main(argv: List[str]) -> int:
             "services":   args.service,
         }
         cpu.reset_on_exit = args.reset_on_exit
+        cpu.initial_mode  = initial_mode
         init_cpu(cpu, text_bytes, data_bytes, entry, stack_size)
         populate_self_service(cpu)
         install_external_services(cpu, args.service)
         snapshot_boot_state(cpu)
+        cpu.mode = initial_mode
     else:
         system.crossbar.trace_enabled = args.trace
         for cpu in system.cpus:
             cpu.trace_enabled = args.trace
+            cpu.initial_mode  = initial_mode
             init_cpu(cpu, text_bytes, data_bytes, entry, stack_size)
+            cpu.mode = initial_mode
         populate_service_objects(system)
         for cpu in system.cpus:
             snapshot_boot_state(cpu)
