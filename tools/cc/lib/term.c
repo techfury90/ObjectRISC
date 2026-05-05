@@ -157,7 +157,7 @@ term_init(void)
 	 * the issue by attaching its own mailbox queue (linkboot.c). */
 	asm volatile(
 		"omov  o1, o4\n"
-		"addiu r4, r0, 16\n"
+		"addiu r4, r0, 64\n"
 		"call  #0x203\n"
 		"nop\n"
 		"addu  %0, r2, r0"

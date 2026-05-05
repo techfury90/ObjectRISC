@@ -2794,6 +2794,142 @@ all done
   separately. Fine but worth documenting if anyone ever pokes
   at the table directly.
 
+## Phase 30 — Shell as supervisor (Ouroboros, day 7)
+
+The "real OS" milestone. The shell's `run cmd` no longer
+forwards to `linkbootd` to spin the guest up on a separate spare
+CPU; it loads the `.orx` from disk itself, ObjAllocs code/data/
+stack objects, and `TaskCreate`s the guest as a child task on the
+**same CPU**. The shell is now a real OS supervisor — orchestrating
+child tasks, catching their exit codes, and coexisting with them in
+one address-space-per-task layout.
+
+### `orx.c` libc loader
+
+`tools/cc/lib/orx.c` adds `int orx_run(const char *path)`. It
+opens the file via `hf_open`/`hf_read`, parses the 32-byte `.orx`
+header, allocates and populates code + data + stack objects, and
+spawns a child task with the standard CONTRACT.md §2 layout (code
+at `CODE_VA`, data at `DATA_VA`, stack at `STACK_TOP`). Synchronous:
+blocks until the child exits, returns its exit code.
+
+The loader's working storage is an `ObjAllocStore`-backed
+32-byte OR-typed scratch object parked in `O7` (the slot vacated
+by removing `lb_spawn` from the shell). Slot offsets `0`/`8`/`16`/`24`
+hold the code/data/stack/task refs across the long load sequence;
+`OREFLD`/`OREFST` with constant offsets shuttle them in and out
+of `O1` for primitive calls. The alternative — keeping refs in
+named OR slots — would have stomped on `O5`/`O6` (terminal
+services) since pcc doesn't track which OR slots are "owned" by
+which subsystem.
+
+### `simorisc` extensions
+
+Two firmware additions:
+
+- **`TaskCreate` accepts `O3` = data ref**. When non-null, the new
+  task gets a `DATA_VA` mapping (`R+W`) for it alongside the
+  existing code+stack mappings. Matches the CONTRACT.md §2 layout
+  pcc-compiled programs assume. `O3 = O0` (null) preserves the
+  previous behaviour for tasks that don't need globals.
+- **`Unmap` (#0x111)**. Drops the mapping that starts exactly at
+  `R4` with `R5` length. The simulator's mapping list is
+  first-match-wins, so without `Unmap` the loader's temp
+  `MapObject` at `0x300000` (used to populate the freshly-allocated
+  code object) would shadow itself on the second `run`. `Unmap`
+  + re-`MapObject` is the clean replace cycle.
+
+### Bugs found en route
+
+Two separate ones, both in the inline-asm wrappers and both
+silent until shell-as-supervisor stress-tested them.
+
+**(1) Sign-extending byte loads.** `beu32` was reading `.orx`
+header bytes via `(unsigned int)(unsigned char)p[i]`. pcc's orisc
+backend lowered the cast chain to a signed `lb`, which
+sign-extended `0xc0` (a real byte in our `text_size` field) to
+`0xFFFFFFC0` and OR'd it into the high bits of the result.
+text_size came back as `-64`. Workaround: explicit `& 0xff`
+after the load. (Real fix is in pcc; tracked.)
+
+**(2) Inline-asm input-reg-vs-clobber-reg conflict.** `orx_alloc_into_slot`
+had three input args (size, tag, caps) marshalled into r4/r5/r6
+via three sequential `addu` instructions. pcc placed the inputs
+in r4/r5/r6 themselves (despite them being in the clobber list);
+the first `addu r4, %1, r0` overwrote whatever pcc had picked for
+%3 (caps) since pcc had picked r4 for it. The third `addu r6, %3,
+r0` then read `%3` from a register holding the just-overwritten
+size value. The fix: write the addus in **reverse order** — read
+%3 → r6 first, then %2 → r5, then %1 → r4 — so each pcc-chosen
+input register is consumed before any of the others overwrites
+it. Same pattern recurs throughout `orx.c` and is documented
+with a leading comment.
+
+### Object-cleanup story is incomplete
+
+When the guest exits, its data segment may still be in flight in
+`oriscterm`'s receive queue (a `term_print` SEND completes async;
+the receiver issues `OBJ_READ_REQ` against the data ref some time
+later). If `orx_run` immediately `ObjFree`s the data object, the
+read fails — which is what the chunkboot path used to solve via
+the `RESET_DRAIN_SECONDS` wall-clock window in simorisc.
+
+`orx_run` doesn't have an equivalent. Today it intentionally
+**leaks** the code/data/stack objects after the guest exits;
+only the loader's scratch and the task descriptor are reaped.
+Per-`run` overhead: ~80 KiB. Acceptable for a few interactive
+runs; needs a real fix (drain primitive, or a "delayed free"
+mechanism) for long-lived shells.
+
+### Shell change
+
+`cmd_run` was a one-line swap: `lb_spawn(path)` → `orx_run(path)`.
+The shell still respects the `O7` slot in its `--service` line
+(now `0=0@0`, since linkbootd is no longer needed for `run`).
+
+`run_shell.sh` and the test runner drop the spare-CPU pool and
+the `linkbootd` daemon from their setup. The shell is the only
+CPU; oriscbar + hostfsd + oriscterm round it out.
+
+### Validation
+
+`tools/devices/tests/test_shell_run.sh` rewritten for the new
+architecture. The guest is now a `print_str`-only `hello.c`
+(firmware `ConsoleWrite` to host stdout — landing in the same
+file the shell writes to — rather than a `term_print` SEND that
+would compete with the shell for the keyboard subscription).
+Expected stdout has 2 "hello from guest" lines; rendered
+terminal has 2 `[exited 0]` markers.
+
+term.c's keyboard receive-queue depth was bumped from 16 to 64
+along the way — with shell and guest sharing one CPU, keystrokes
+queue up while the guest runs, and 16 was tight even for a
+two-`run`-then-`exit` test sequence.
+
+132 sim validation + 7 asm + 5 wire-format + multiprocess +
+hello + all 12 device/shell tests still green.
+
+### What's not yet done
+
+- **Object cleanup after `orx_run`.** Documented above. Needs a
+  drain primitive or libc-side timed-free. Until then, each
+  `run` leaks ~80 KiB.
+- **Guest can't safely use term_print.** The keyboard
+  subscription model conflicts: if the guest subscribes via
+  `term_init`, it competes with the shell for keystrokes. A
+  `term_print_only_init` (subscribe only to console, not
+  keyboard) would let guests print to the terminal without
+  hijacking input.
+- **Backgrounded `run` (`&`).** `orx_run` is synchronous. An
+  `orx_load_async` returning `task_t` would let the shell prompt
+  return immediately while the guest runs in the background.
+- **Standard I/O abstraction.** The "guest writes to host
+  stdout" hack works for the test but isn't OS-shaped. Real
+  Ouroboros wants some equivalent of Unix file descriptors that
+  the supervisor can wire up per child.
+- **Cross-CPU spawn.** `orx_run` hard-codes "spawn on this CPU."
+  A `--cpu N` variant could parallelise.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

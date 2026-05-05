@@ -1,20 +1,26 @@
 #!/bin/sh
-# test_shell_run.sh — end-to-end test for the shell's `run` command.
+# test_shell_run.sh — end-to-end test of the shell's `run` command.
+#
+# Phase 30 architecture: the shell IS the supervisor. cmd_run uses
+# orx_run (libc), which loads the .orx via hostfsd, ObjAllocs
+# code/data/stack, and TaskCreates a child on the SAME CPU. No
+# linkbootd, no pre-spawned spare CPU pool.
 #
 # Builds:
-#   - shell.orx (the leader CPU, with lb_spawn)
-#   - chunkboot.orx (loader baked into 4 spare CPUs)
-#   - hello.orx (a tiny guest program: term_init + term_print + exit)
+#   - shell.orx (the leader CPU, with orx_run)
+#   - hello.orx (a tiny guest: print_str + exit)
 #
-# Launches the full system (oriscbar + hostfsd + fake_terminal +
-# linkbootd + shell + 4 spare CPUs) and types:
-#     run hello.orx<RET>
-#     run hello.orx<RET>          (second time — proves the spare CPU
-#                                   was reset and re-announced)
-#     exit<RET>
+# Launches: oriscbar + hostfsd + fake_terminal + shell CPU.
+# Types:    run hello.orx<RET>
+#           run hello.orx<RET>      (twice — proves the supervisor
+#                                    can spawn N times in a row)
+#           exit<RET>
 #
-# Asserts the rendered console contains "hello from guest" twice and
-# both [exited 0] markers.
+# Asserts:
+#   - shell stdout contains "hello from guest" twice (firmware
+#     ConsoleWrite prints from the guest tasks land here)
+#   - rendered terminal contains both [exited 0] markers (the
+#     shell prints those via term_print after orx_run returns)
 
 set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -33,20 +39,22 @@ CCOM="$PCC_BUILD/cc/ccom/orisc-unknown-none-ccom"
 
 mkdir -p "$TMP/jail"
 
-# --- guest: a minimal "hello from guest" program -----------------------
+# --- guest: prints to firmware-side stdout (not the terminal) ---------
+# Using print_str means the guest doesn't subscribe to the keyboard,
+# which would compete with the shell's keystroke stream on the same
+# CPU. The output lands in cpu0.out, which the shell shares.
 cat > "$TMP/hello.c" <<'EOF'
 #include "liborisc.h"
 
 int
 main(void)
 {
-    term_init();
-    term_print("hello from guest\n");
+    print_str("hello from guest\n");
     return 0;
 }
 EOF
 
-build_orx() {
+build_guest() {
     src="$1"; out="$2"
     "$CPP"  -I tools/cc/arch/orisc -I tools/cc/lib "$src" > "$TMP/__pp.i"
     "$CCOM" < "$TMP/__pp.i" > "$TMP/__pp.s"
@@ -58,9 +66,9 @@ build_orx() {
         tools/cc/lib/liborisc.ora
 }
 
-build_orx "$TMP/hello.c" "$TMP/jail/hello.orx"
+build_guest "$TMP/hello.c" "$TMP/jail/hello.orx"
 
-# --- shell + chunkboot loader ------------------------------------------
+# --- shell ------------------------------------------------------------
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
     -DBUILD_BANNER='"Object RISC Shell (TEST)"' \
     examples/cc/shell.c > "$TMP/shell.i"
@@ -72,10 +80,7 @@ python3 tools/ld/orld -o "$TMP/shell.orx" \
     "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/shell.oro" \
     tools/cc/lib/liborisc.ora
 
-python3 examples/linkboot/gen_chunkboot.py >/dev/null
-python3 tools/asm/asmorisc examples/linkboot/chunkboot.s -o "$TMP/chunkboot.orx"
-
-# --- launch oriscbar + hostfsd + linkbootd + fake_terminal -------------
+# --- launch oriscbar + hostfsd + fake_terminal ------------------------
 SOCK="$TMP/oriscbar.sock"
 
 python3 tools/sim/oriscbar --socket "$SOCK" >/dev/null 2>&1 &
@@ -83,7 +88,7 @@ BAR=$!
 for _ in $(seq 50); do [ -S "$SOCK" ] && break; sleep 0.05; done
 
 python3 tools/devices/hostfsd \
-    --socket "$SOCK" --pid 17 --root "$TMP/jail" -v \
+    --socket "$SOCK" --pid 17 --root "$TMP/jail" \
     > "$TMP/hf.out" 2>&1 &
 HF=$!
 for _ in $(seq 50); do
@@ -91,31 +96,19 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-python3 tools/devices/linkbootd \
-    --socket "$SOCK" --pid 18 \
-    --shell-pids 0 --loader-pids 32,33,34,35 \
-    --root "$TMP/jail" -v \
-    > "$TMP/lb.out" 2>&1 &
-LB=$!
-for _ in $(seq 50); do
-    grep -q "linkbootd READY" "$TMP/lb.out" 2>/dev/null && break
-    sleep 0.05
-done
-
-# Type "run hello.orx\n" twice, then "exit\n".
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
     --event key:r --event key:u --event key:n --event key:0x20 \
     --event key:h --event key:e --event key:l --event key:l --event key:o \
-    --event key:0x2E --event key:o --event key:r --event key:x \
+    --event key:0x2e --event key:o --event key:r --event key:x \
     --event key:0x10D \
     --event key:r --event key:u --event key:n --event key:0x20 \
     --event key:h --event key:e --event key:l --event key:l --event key:o \
-    --event key:0x2E --event key:o --event key:r --event key:x \
+    --event key:0x2e --event key:o --event key:r --event key:x \
     --event key:0x10D \
     --event key:e --event key:x --event key:i --event key:t \
     --event key:0x10D \
-    --linger 15.0 --delay 0.25 \
+    --linger 12.0 --delay 0.20 \
     > "$TMP/term.out" 2>&1 &
 TERM_PID=$!
 for _ in $(seq 50); do
@@ -123,72 +116,44 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# Spare CPU service order matches run_shell.sh: linkbootd, pad,
-# console, keyboard, pad×2, hostfsd. The pad at O6 gets hijacked by
-# the loader for its R+S self-ref. After the loader's pre-jump
-# shift the guest sees the standard ABI (O5=console, O6=keyboard,
-# O10=hostfsd).
-SPARE_SVC="--service 18=1@9 --service 0=0@0 \
-           --service 16=1@9 --service 16=2@9 \
-           --service 0=0@0 --service 0=0@0 \
-           --service 17=1@9"
-
-# Shell CPU.
+# Shell CPU. Service order: O5=console, O6=keyboard, O10=hostfsd.
+# Linkbootd slot (was O7) intentionally null — Phase 30 shell doesn't
+# need it any more.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "16=1@9" --service "16=2@9" --service "18=1@9" \
-    --service "0=0@0" --service "0=0@0" --service "17=1@9" \
+    --service "16=1@9" --service "16=2@9" \
+    --service "0=0@0"  --service "0=0@0"  --service "0=0@0" \
+    --service "17=1@9" \
     "$TMP/shell.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
-
-# Spare CPU pool (4 of them, with --reset-on-exit).
-SPARES=""
-for SPARE_PID in 32 33 34 35; do
-    # shellcheck disable=SC2086
-    python3 tools/sim/simorisc --connect "$SOCK" --pid $SPARE_PID \
-        $SPARE_SVC --reset-on-exit \
-        "$TMP/chunkboot.orx" \
-        > "$TMP/cpu${SPARE_PID}.out" 2> "$TMP/cpu${SPARE_PID}.err" &
-    SPARES="$SPARES $!"
-done
 
 wait $TERM_PID 2>/dev/null || true
 sleep 0.5
 wait $CPU0 2>/dev/null || true
-# simorisc doesn't currently install a SIGTERM handler — KILL them
-# directly so we don't hang the test on a non-responsive spare.
-for p in $SPARES $LB $HF $BAR; do kill -KILL $p 2>/dev/null || true; done
-for p in $SPARES $LB $HF $BAR; do wait $p 2>/dev/null || true; done
+for p in $HF $BAR; do kill -KILL $p 2>/dev/null || true; done
+for p in $HF $BAR; do wait $p 2>/dev/null || true; done
 
-echo "--- linkbootd log ---"
-cat "$TMP/lb.out"
 echo "--- hostfsd log ---"
 cat "$TMP/hf.out"
 echo "--- shell stdout ---"
 cat "$TMP/cpu0.out"
 echo "--- shell stderr ---"
 cat "$TMP/cpu0.err"
-for SPARE_PID in 32 33 34 35; do
-    echo "--- cpu${SPARE_PID} stderr ---"
-    head -30 "$TMP/cpu${SPARE_PID}.err"
-done
-echo "--- term out ---"
-cat "$TMP/term.out"
 
 # Extract rendered console.
 sed -n '/--- console render ---/,$p' "$TMP/term.out" \
     | tail -n +2 > "$TMP/rendered.txt"
 
-GUEST_COUNT=$(grep -c "hello from guest" "$TMP/rendered.txt" || true)
+echo "--- rendered ---"
+cat "$TMP/rendered.txt"
+
+GUEST_COUNT=$(grep -c "hello from guest" "$TMP/cpu0.out" || true)
 EXIT_COUNT=$(grep -c "\[exited 0\]" "$TMP/rendered.txt" || true)
-echo "rendered: $GUEST_COUNT guest greetings, $EXIT_COUNT exit markers"
+echo "shell stdout: $GUEST_COUNT guest greetings; rendered: $EXIT_COUNT exit markers"
 
 [ "$GUEST_COUNT" -ge 2 ] \
     || { echo "FAIL: guest greeting appeared $GUEST_COUNT times (expected ≥2)" >&2; exit 1; }
-# Two guest runs proves the spare CPU was reset and re-announced. The
-# trailing "]\n" SEND races with the shell's next prompt SEND, and
-# fake_terminal's OBJ_READ_REQ for it can occasionally arrive after
-# the test winds down. Require ≥1 (not ≥2) to keep the assertion
-# stable.
+# Two exit markers prove orx_run completed twice. The trailing one
+# can race the test wind-down, so we accept ≥1.
 [ "$EXIT_COUNT" -ge 1 ] \
     || { echo "FAIL: [exited 0] appeared $EXIT_COUNT times (expected ≥1)" >&2; exit 1; }
 
