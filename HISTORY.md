@@ -2301,6 +2301,145 @@ table.
   exists; the `raise Trap(CAUSE_BUS_ERROR_D, ...)` callsites
   still pass faulting_pc but not the EA.
 
+## Phase 26 — Tasks and the cooperative scheduler (Ouroboros, day 3)
+
+Phase 25 made traps deliver to firmware code. Phase 26 makes the
+CPU actually multitasking: a `Task` is now a first-class swappable
+context, the scheduler picks the next runnable on every
+`TaskExit`/`TaskYield`, and per-task address spaces mean
+pcc-generated code (which assumes flat VAs) can be loaded into
+multiple tasks without colliding.
+
+### `Task` and per-task state
+
+Per-task: register file (gpr/opr/hi/lo), program counter
+(pc/next_pc), privilege state (mode/saved_mode/saved_pc), the
+trap-side control registers (cause_reg/badvaddr_reg), and the
+address-space mappings.
+
+Per-CPU (shared across tasks): descriptor table, inbox, request/
+response queues, cycle counter, **VECBASE**. The trap vector is
+firmware-installed once per CPU — having every task carry its own
+defeats the trap mechanism's purpose.
+
+The CPU's `gpr`/`opr`/`mappings`/etc. fields *are* the running
+task's live state. Context switch is a memcpy through the `Task`
+struct: `save_cpu_to_task(cpu, outgoing)` then
+`load_task_to_cpu(cpu, incoming)`.
+
+### Task primitives
+
+Six of Vol VI §4's nine task primitives are wired:
+
+- **`TaskCreate`** (#0x000, supervisor) — Allocates a task
+  descriptor (TAG_TASK = 0x4104), creates a `Task` struct with
+  the standard layout (code at `CODE_VA` R+X, stack at
+  `STACK_TOP` R+W), seeds R4 with the caller-supplied init value,
+  inherits the parent's OPRs (so service refs propagate without a
+  separate handoff mechanism), starts in `NEW`. Returns the task
+  ref in O1 with `R | V | C` caps.
+- **`TaskExit`** (#0x001, user) — Marks current `EXITED`, picks
+  next runnable, context-switches. If queue empty, falls back to
+  the pre-existing `TaskExitSignal` path (CPU goes inactive with
+  exit code captured) so single-task programs still work
+  unchanged.
+- **`TaskResume`** (#0x002, supervisor) — Validates the task ref
+  (live, generation matches, has V cap, is `TAG_TASK`),
+  transitions `NEW`/`SUSPENDED` → `RUNNABLE`, appends to the
+  back of the round-robin queue.
+- **`TaskSuspend`** (#0x003, supervisor) — Removes from the
+  runnable queue, marks `SUSPENDED`. Self-suspend triggers an
+  immediate context switch; if no other task is runnable, returns
+  `EBUSY` rather than wedging.
+- **`TaskYield`** (#0x004, user) — Pops the next runnable,
+  pushes the caller to the back, swaps. The caller's PC is
+  bumped past the CALL before save so on resume it picks up at
+  the next instruction. Round-robin FIFO.
+- **`TaskCurrent`** (#0x005, user) — Returns a fresh ref to the
+  calling task.
+
+Three left for later: `TaskBindProcessor` (multi-CPU; trivially
+single-CPU), `TaskWait` (needs the blocked-task wakeup machinery
+that the IPC primitives already half-have), `TaskQuery` (small;
+held back to bundle with TaskWait's state-word format).
+
+### Bootstrap task and `_call_redirected_pc`
+
+`init_cpu` ends with a call to `make_bootstrap_task`, which
+allocates a TAG_TASK descriptor for the implicit "main"
+execution context and snapshots the just-primed CPU state into
+its `Task` struct. Single-task programs never touch this Task —
+they `TaskExit` with no successor and the existing
+`TaskExitSignal` tear-down runs. Multi-task programs see the
+bootstrap as just another scheduler citizen.
+
+The CALL dispatch site's `_installed_program` flag (set by
+`InstallProgram` to suppress the post-CALL PC bump when the
+primitive has already moved PC) was renamed to
+`_call_redirected_pc` and reused by every context-switching
+primitive. Same mechanism, more honest name.
+
+### Pre-existing test casualty
+
+`07_firmware/10_call_zero_enosys` asserted that `CALL #0`
+returned `ENOSYS` because no primitive was defined at primitive
+number 0. Vol VI §4.1 has always listed `0x000 = TaskCreate`,
+so the test's premise was wrong even before Phase 26 — it just
+happened to pass because the simulator hadn't implemented
+`TaskCreate`. Test retargeted to `#0xFFF` (an unallocated number
+in the task range). Now an honest test of the ENOSYS path.
+
+### Validation
+
+Four new tests in a new `14_tasks` category:
+
+- **`01_create_resume_exit_chain`** — Bootstrap creates one
+  child, resumes it, exits with code 0. Scheduler picks child;
+  child exits with R4 = 42 (its init_r4). No more runnables →
+  `TaskExitSignal(42)` → CPU exits 42. Proves
+  TaskCreate/TaskResume/TaskExit cooperate.
+- **`02_yield_roundtrip`** — Bootstrap creates a child and a
+  shared scratch object (inherited by the child via the OPR
+  copy in TaskCreate), yields. Child stores 0x42 at scratch[0],
+  exits. Bootstrap resumes after the yield, reads scratch back,
+  exits with what the child wrote. Proves yield → save → load
+  → resume preserves register state and that per-task address
+  spaces still resolve shared object refs to the same descriptor.
+- **`03_task_current_returns_self`** — Two consecutive
+  `TaskCurrent` calls return refs that `oeq` treats as equal
+  (same descriptor index, same generation).
+- **`04_three_way_yield`** — Bootstrap, A, and B run in the
+  scheduled order with the FIFO queue evolving as
+  `[A, B] → [B, bootstrap] → [bootstrap] → []`. Each task
+  stamps a tag byte into shared scratch; bootstrap reads B's
+  tag back as proof B ran. Tests the round-robin order.
+
+124 → 128 sim validation tests passing. Asm + multiprocess +
+wire-format + 10 device/shell tests all still green.
+
+### What's not yet done
+
+- **`TaskWait`, `TaskQuery`, `TaskBindProcessor`.** Need to land
+  next; `TaskWait` blocks the caller until another task exits
+  and surfaces the exit code, which is the obvious complement to
+  the EXITED state already tracked.
+- **Preemptive scheduling.** Cooperative only for now — a task
+  that doesn't `TaskYield` runs forever. Real preemption needs
+  the timer-interrupt path (`COUNT`/`COMPARE` control registers,
+  external-interrupt cause delivery), which is its own phase.
+- **Cross-CPU scheduling.** All tasks today live on the CPU
+  whose `TaskCreate` allocated them. Migration is a multi-CPU
+  concern; gated on `TaskBindProcessor`.
+- **Task object reaping.** EXITED tasks stay in `cpu.tasks`
+  until CPU reset. `TaskQuery` will need that data; eventually
+  there'll be a reaping primitive.
+- **Trap delivery in non-supervisor tasks.** Now that there's
+  more than one task, the question of "whose VECBASE/handler"
+  gets more interesting. Today VECBASE is per-CPU and
+  unconditionally writes the handler with the trapping task's
+  context — fine while there's one supervisor managing all
+  tasks, but the architecture admits per-task handlers.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
