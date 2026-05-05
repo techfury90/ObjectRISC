@@ -2566,6 +2566,120 @@ Four new tests:
   must explicitly re-set IE before ERETing, which works but is
   one more thing for the OS author to remember.
 
+## Phase 28 — `task.c`: tasks reach C (Ouroboros, day 5)
+
+Phases 24–27 built kernel mechanisms; nothing on the system used
+them. Phase 28 lifts them into C: `tools/cc/lib/task.c` wraps
+`TaskCreate` / `TaskResume` / `TaskYield` / `TaskCurrent` /
+`TaskWait` / `TaskExit` plus the `ObjFree`-of-`TAG_TASK` reaping
+path, all callable from pcc-compiled programs.
+
+### API shape
+
+MVP single-child design — each call operates on the task ref
+parked in `O12` by `task_spawn`:
+
+```c
+void task_init(void);                      /* must be FIRST in main */
+int  task_spawn(void (*entry)(int), int arg);
+int  task_wait(void);                      /* returns child's exit code */
+int  task_free(void);
+void task_yield(void);
+void task_exit(int code);                  /* never returns */
+```
+
+`task_init()` parks `O1` (boot code ref), `O2` (boot stack), and
+`O3` (boot data) into `O13`/`O11`/`O15` — slot choices that match
+the term.c boot-save convention so a future `term_init + task_init`
+program gets one coherent set of saves regardless of init order.
+
+`task_spawn` allocates a fresh stack via `ObjAlloc(TAG_STACK)`,
+calls `TaskCreate` with the parent's code ref and the supplied
+function pointer (converted to a byte offset off `CODE_VA`),
+parks the new task ref in `O12`, restores `O2`/`O3` from
+`O11`/`O15` so the caller's subsequent `print_str` / `print_int`
+keep working, and `TaskResume`s.
+
+Multi-child programs need to `omov` refs out of `O12` between
+spawns. The libc will eventually grow a real task table and an
+opaque `task_t` handle; the slot dance is enough for the first
+demos.
+
+### Demo: `examples/cc/multitask`
+
+```c
+void double_and_exit(int n) { task_exit(n * 2); }
+
+int main(void) {
+    int args[3] = {7, 11, 21};
+    task_init();
+    for (int i = 0; i < 3; i++) {
+        task_spawn(double_and_exit, args[i]);
+        int result = task_wait();
+        print_str("child("); print_int(args[i]);
+        print_str(") -> "); print_int(result);
+        print_str("\n");
+        task_free();
+    }
+    print_str("parent done\n");
+    return 0;
+}
+```
+
+Output:
+
+```
+child(7) -> 14
+child(11) -> 22
+child(21) -> 42
+parent done
+```
+
+End-to-end through pcc → asmorisc → orld → simorisc, exercising
+the whole Phase 24–27 stack from real C source.
+
+### A bug found en route
+
+The first run printed `child() -> ` (empty integers). Cause:
+`task_spawn` was clobbering `O2` (writing the child's stack ref
+through it on the way to `TaskCreate`) but never restoring it.
+`console_write` reads stack-resident strings via `O2`, so
+`print_int`'s `char buf[16]` ended up indexed against the *child's*
+empty stack. Fix in the commit: save `O2`/`O3` to `O11`/`O15` at
+`task_init` time and restore both in `task_spawn` after the
+`TaskCreate` dance.
+
+This is the kind of bug where having a real C-level demo immediately
+caught what unit-tested asm would have missed. The supervisor-shell
+work that's coming will surface more of these — the OR-hygiene
+contract isn't fully captured by the type system yet.
+
+### Validation
+
+- New `tools/devices/tests/test_multitask.sh` builds and runs the
+  demo, asserts on the exact stdout.
+- All 132 sim validation tests still pass; libc rebuild still
+  produces the same 6 modules + the new `task.oro`.
+
+### What's not yet done
+
+- **Multi-child API.** The `O12`-as-handle convention works for
+  one child at a time. A real `task_t` handle backed by a libc-
+  managed object table is the natural next step — the user wants
+  to write code like `task_t kid_a = task_spawn(...);
+  task_t kid_b = task_spawn(...); task_wait_any();`.
+- **Shell as supervisor.** The current shell runs commands by
+  forwarding to linkbootd, which spins them up on a separate
+  pre-spawned CPU. Replacing that with `task_spawn` on the same
+  CPU would turn the shell into a real OS supervisor — needs
+  loading from disk into a code object (currently chunkboot does
+  that), then `TaskCreate` over it. Phase 29 candidate.
+- **Trap handlers from C.** `InstallTrapHandler` (#0x520) is
+  still asm-only. A C-level wrapper plus a way to write the
+  handler body in C (probably needs `__attribute__((interrupt))`
+  or a shim that does the LCTRL/SCTRL/ERET dance) would let
+  Ouroboros catch faulting tasks gracefully.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
