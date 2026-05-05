@@ -227,6 +227,31 @@ calling task or returns `ENOSYS` per its policy.
 > Returns: `R2`: status. `R3`: packed state word (state in low 8 bits,
 > processor in next 8, exit code in upper 16).
 
+**`0x00A  TaskKill`** — *Restartable.*
+
+> Externally terminate the named task. The task is moved to the
+> `EXITED` state with the supplied exit code, dropped from the
+> runnable queue if present, released from any pending IPC wait,
+> and any tasks blocked in `TaskWait` on it are woken. The task
+> object remains valid (so the killer can read the exit code via
+> `TaskQuery` or `TaskWait`); it is reclaimed by the usual
+> descriptor-free path once the parent releases its reference.
+>
+> A task may not kill itself with this primitive — call `TaskExit`
+> instead. Killing an already-`EXITED` task is a no-op and returns
+> success (idempotent reaping is convenient for shells).
+>
+> Args:
+> - `O1`: task object (must carry `V`).
+> - `R4`: exit code to install (low 8 bits).
+>
+> Returns: `R2`: status.
+>
+> Errors: `EFAULT` (null `O1`), `EPERM` (insufficient capabilities),
+> `EREMOTE` (target lives on a different processor), `ESTALE`
+> (descriptor freed or generation mismatched), `EINVAL` (target is
+> the calling task).
+
 **`0x009  InstallProgram`** — *Non-restartable.*
 
 > Replace the calling task's running program with a new one and

@@ -307,6 +307,38 @@ task_resume(task_t t)
 	return 0;
 }
 
+/* --- task_kill: externally terminate a task ----------------------
+ *
+ * Loads the child's ref from the table into O1, sets R4 = exit
+ * code, calls TaskKill (#0x00A). The descriptor stays parked in
+ * its slot — the caller still needs task_wait + task_free (or
+ * orx_unload) to actually reclaim it. Idempotent: killing a task
+ * that has already exited returns 0.
+ */
+int
+task_kill(task_t t, int code)
+{
+	int status;
+
+	if (t < 0 || t >= TASK_MAX_CONCURRENT
+			|| !(task_slots_in_use & (1 << t)))
+		return -1;
+
+	task_load_to_o1(t);
+	asm volatile(
+		"addu  r4, %1, r0\n"
+		"call  #0x00A\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "r"(code)
+		: "r2", "r4"
+	);
+	if (status != 0)
+		return -status;
+	return 0;
+}
+
 /* --- task_wait: block until the named child exits, return its code
  *
  * Loads the child's ref from the table into O1, calls TaskWait. On

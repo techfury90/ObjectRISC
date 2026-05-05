@@ -3504,6 +3504,95 @@ actually scheduled, so it can't race the saved CPU state.
   follow-up would either thread it through the handler or make it
   a libc configuration knob.
 
+## Phase 37 — `kill <task>`: closing the supervisor loop (Ouroboros, day 14)
+
+A backgrounded `run spinner.orx &` is unkillable in the previous
+shell. The spinner gets preempted (Phase 36), the prompt stays
+responsive (Phase 36), but the slot stays held until the spinner
+voluntarily exits — which a tight loop never does. Phase 37 closes
+that loop with an external-termination primitive and a one-line
+shell command on top of it.
+
+### `TaskKill` (#0x00A)
+
+A new task primitive: external termination by ref. `O1` names the
+target, `R4` carries the exit code, `R2` returns status.
+Semantics:
+
+- Marks the target `EXITED` with the supplied code.
+- Removes it from `cpu.runnable` if it was queued there, and clears
+  any saved `blocked_on` so a stale `_try_unblock` can't fire on a
+  corpse.
+- Wakes anyone parked in `TaskWait` on the target via
+  `_wake_waiters` (same machinery `TaskExit` uses on its own
+  termination), seeding their `R2`/`R3` so they observe the kill
+  code as if the target had exited normally.
+- Idempotent: killing an already-`EXITED` task returns `OK` so a
+  shell can race a `wait` against a `kill` without erroring.
+- Self-kill is rejected with `EINVAL` — `TaskExit` is for that.
+  Killing across processors is rejected with `EREMOTE`.
+
+The descriptor stays valid (the killer's `task_t` ref is still
+live) so `TaskQuery` / `TaskWait` work post-kill the same way they
+work post-`TaskExit`. Reclamation goes through the usual parent-
+side path: `task_wait` (immediate, since target is already
+`EXITED`), `ObjFreeDeferred` for code/data/stack, then `task_free`
+to release the libc slot. `orx_unload` already wraps that, so the
+shell's auto-reaper picks killed tasks up the same way it picks up
+voluntarily-exited ones.
+
+### libc + shell
+
+A thin `task_kill(task_t t, int code)` libc helper looks up the
+slot's ref (`OREFLD` from the table parked in `O12`), sets `R4`,
+and `CALL #0x00A`. Runs in user mode — it's a `MODE_USER`
+primitive, since the authority to kill comes from holding a
+ref-with-`V`, not from any privilege bit.
+
+The shell adds `cmd_kill`:
+
+```
+/> run spinner.orx &
+[bg task 0]
+/> kill 0
+[task 0 done 137]
+/>
+```
+
+Exit code 137 = 128 + 9, mirroring the POSIX shell convention for
+SIGKILL — a small wink to the analogy without claiming Object RISC
+has signals. `cmd_kill` itself prints nothing on success; the
+auto-reaper at the top of the next prompt iteration prints the
+standard `[task N done CODE]` line, so the kill path looks
+identical to a voluntary exit from the user's perspective.
+
+### Tests
+
+- **`14_tasks/11_taskkill_marks_exited`** (sim validation) — main
+  spawns a child whose body is `j spin; nop`. The killer issues
+  `TaskKill` with `R4 = 0x42`, then a second one (idempotent
+  no-op), then `TaskWait`s on the corpse and exits with the
+  recovered code. **138 sim validation tests.**
+- **`tools/devices/tests/test_shell_kill.sh`** — bg a 5M-iteration
+  CPU-bound spinner, `kill 0` it, and assert the auto-reaper
+  prints `[task 0 done 137]`. Without `TaskKill` the shell would
+  be stuck with the spinner runnable until either it finished or
+  the test timed out.
+
+### What's now unblocked
+
+- A user can clean up after themselves. `run thing &` is no
+  longer a one-way commitment.
+- The shell can grow a `Ctrl-C` story — same primitive, just
+  trigger it on a kbd interrupt. (Not in this phase: needs a
+  way to map a keystroke to "kill the foregrounded task," which
+  in turn wants a notion of "foreground" that the shell doesn't
+  have yet.)
+- Future signal-style work — `TaskSignal`, custom handlers — would
+  use the same shape (`O1` = target, `R4` = signal code), but is
+  much more invasive than `TaskKill`'s "just mark it dead." Out of
+  scope for now.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

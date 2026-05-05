@@ -16,6 +16,7 @@
  *                     ('&' = background; shell's prompt returns
  *                     immediately, harvest exit code with `wait`)
  *     wait <task>   — block until backgrounded task exits, print code
+ *     kill <task>   — externally terminate a backgrounded task (exit 137)
  *     jobs          — list backgrounded tasks + state
  *     cycles      — print the CPU's cycle counter
  *     time        — print microseconds since boot (wall clock, 32-bit)
@@ -78,6 +79,7 @@ const char help_msg[] =
     "  echo <text>     — print the rest of the line\n"
     "  run <path>[&]   — load + run another .orx as a child task ('&' = background)\n"
     "  wait <task>     — block until backgrounded task exits; print its exit code\n"
+    "  kill <task>     — externally terminate a backgrounded task (exit 137)\n"
     "  jobs            — list backgrounded tasks and their state\n"
     "  cycles          — print the CPU's cycle counter\n"
     "  time            — print microseconds since boot (wall clock)\n"
@@ -547,6 +549,32 @@ cmd_wait(const char *arg)
 	term_print("]\n");
 }
 
+/* SIGKILL-equivalent exit code. POSIX shells report 128 + signum
+ * for signal-killed children (137 = 128 + 9 = SIGKILL); we mirror
+ * the convention so `kill N` followed by a `wait N` shows 137. */
+#define KILL_EXIT_CODE 137
+
+static void
+cmd_kill(const char *arg)
+{
+	int t;
+	int rc;
+
+	if (*arg == 0) {
+		term_print("usage: kill <task>\n");
+		return;
+	}
+	t = atoi(arg);
+	rc = task_kill((task_t)t, KILL_EXIT_CODE);
+	if (rc < 0) {
+		term_print("kill: bad task or task_kill error\n");
+		return;
+	}
+	/* Don't print anything on success — the auto-reaper at the
+	 * top of the next prompt iteration will print the standard
+	 * "[task N done 137]" line. */
+}
+
 /* Map TASK_STATE_* to a short label printed by cmd_jobs. */
 static const char *
 task_state_label(int state)
@@ -701,6 +729,8 @@ main(void)
 		} else if (strcmp(line, "wait") == 0) {
 			if (*arg == 0) term_print("usage: wait <task>\n");
 			else cmd_wait(arg);
+		} else if (strcmp(line, "kill") == 0) {
+			cmd_kill(arg);
 		} else if (strcmp(line, "jobs") == 0) {
 			cmd_jobs();
 		} else if (strcmp(line, "cycles") == 0) {

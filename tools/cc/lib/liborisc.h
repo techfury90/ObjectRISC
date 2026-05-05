@@ -181,6 +181,7 @@ typedef int task_t;
 void   task_init(void);                            /* allocate the task table */
 task_t task_spawn(void (*entry)(int), int arg);    /* fork; return slot handle */
 int    task_wait(task_t t);                        /* block on t; return exit code */
+int    task_kill(task_t t, int code);              /* mark t EXITED with code */
 int    task_free(task_t t);                        /* reap exited child */
 void   task_yield(void);                           /* surrender quantum */
 void   task_exit(int code);                        /* terminate caller (no return) */
