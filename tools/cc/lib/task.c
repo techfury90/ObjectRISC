@@ -411,3 +411,53 @@ task_active_mask(void)
 {
 	return task_slots_in_use;
 }
+
+/* --- task_install_preempt_timer — wire the timer handler --------
+ *
+ * Installs preempt_handler.s::preempt_timer_handler as the
+ * supervisor handler for cause 0x01 (external-interrupt) via Vol VI
+ * #0x520 InstallTrapHandler, then arms COMPARE = COUNT + quantum
+ * and sets STATUS.IE so the timer starts firing. From this point
+ * on, runaway CPU-bound tasks on the same CPU don't starve the
+ * caller: every `quantum` cycles the handler fires, calls
+ * TaskYield (deferred), and ERET picks the next runnable task.
+ *
+ * `quantum` is in cycles; the handler hardcodes 5000 internally
+ * for the re-arm so this argument only sets the FIRST interval.
+ * (Future libc could expose the quantum as a tunable in shared
+ * state read by the handler.) */
+
+extern void preempt_timer_handler(void);
+
+void
+task_install_preempt_timer(unsigned int quantum)
+{
+	/* InstallTrapHandler(R4=cause=1, R5=va=preempt_timer_handler) */
+	asm volatile(
+		"addiu r4, r0, 1\n"
+		"la    r5, preempt_timer_handler\n"
+		"call  #0x520\n"
+		"nop"
+		:
+		:
+		: "r2", "r3", "r4", "r5"
+	);
+	/* Arm: COMPARE = COUNT + quantum. */
+	asm volatile(
+		"lctrl r4, $5\n"
+		"addu  r4, r4, %0\n"
+		"sctrl $6, r4"
+		:
+		: "r"(quantum)
+		: "r4"
+	);
+	/* Set STATUS.IE (bit 4), preserving mode bits. */
+	asm volatile(
+		"lctrl r4, $0\n"
+		"ori   r4, r4, 0x10\n"
+		"sctrl $0, r4"
+		:
+		:
+		: "r4"
+	);
+}

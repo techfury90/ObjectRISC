@@ -32,6 +32,19 @@ for src in "$LIB_DIR"/*.c; do
     oros="$oros $obj"
 done
 
+# Standalone .s files (handlers / glue) that can't easily be expressed
+# as inline asm inside a C function — typically because pcc would emit
+# a function prologue/epilogue around the label that interferes with
+# the calling convention (e.g., a trap handler entered via a vector
+# rather than a normal call).
+for src in "$LIB_DIR"/*.s; do
+    [ -f "$src" ] || continue
+    name=$(basename "$src" .s)
+    obj="$LIB_DIR/$name.oro"
+    python3 "$ROOT/tools/asm/asmorisc" -r "$src" -o "$obj"
+    oros="$oros $obj"
+done
+
 # shellcheck disable=SC2086
 python3 "$ROOT/tools/ld/oar" c "$LIB_DIR/liborisc.ora" $oros
 
