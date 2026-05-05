@@ -368,3 +368,46 @@ task_free(task_t t)
 	}
 	return status;
 }
+
+/* --- task_query / task_active_mask — non-blocking inspection ----
+ *
+ * Vol VI #0x008 returns a packed state word: state in low 8 bits,
+ * processor id in next 8, exit code in upper 16 (only meaningful
+ * when state == TASK_STATE_EXITED). We unpack into the
+ * caller-supplied task_info_t for ergonomics.
+ *
+ * task_active_mask returns the libc's internal bitmap of in-use
+ * task table slots so the shell can iterate `jobs` and the
+ * auto-reaper can poll without taking locks. */
+
+int
+task_query(task_t t, struct task_info *out)
+{
+	int status, packed;
+
+	if (t < 0 || t >= TASK_MAX_CONCURRENT
+			|| !(task_slots_in_use & (1 << t)))
+		return -1;
+	task_load_to_o1(t);
+	asm volatile(
+		"call  #0x008\n"
+		"nop\n"
+		"addu  %0, r2, r0\n"
+		"addu  %1, r3, r0"
+		: "=r"(status), "=r"(packed)
+		:
+		: "r2", "r3"
+	);
+	if (status != 0)
+		return -status;
+	out->state     = packed & 0xff;
+	out->processor = (packed >> 8) & 0xff;
+	out->exit_code = (packed >> 16) & 0xff;
+	return 0;
+}
+
+unsigned int
+task_active_mask(void)
+{
+	return task_slots_in_use;
+}

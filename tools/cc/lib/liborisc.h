@@ -191,6 +191,25 @@ void   task_exit(int code);                        /* terminate caller (no retur
 task_t task_register_o1(void);                     /* OREFST O1 → next free slot */
 int    task_resume(task_t t);                      /* OREFLD slot, call TaskResume */
 
+/* Non-blocking inspection (Vol VI #0x008 TaskQuery). state values
+ * mirror simorisc's TASK_STATE_*; exit_code is meaningful only when
+ * state == TASK_STATE_EXITED. */
+#define TASK_STATE_NEW        0
+#define TASK_STATE_RUNNABLE   1
+#define TASK_STATE_RUNNING    2
+#define TASK_STATE_SUSPENDED  3
+#define TASK_STATE_BLOCKED    4
+#define TASK_STATE_EXITED     5
+
+struct task_info {
+	int state;
+	int processor;
+	int exit_code;
+};
+
+int          task_query(task_t t, struct task_info *out);
+unsigned int task_active_mask(void);               /* in-use slot bitmap */
+
 /* ---- orx.c — load and run a .orx executable as a child task ----- *
  *
  * The supervisor escape from "spawn programs only via linkbootd on a

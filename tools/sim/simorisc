@@ -2067,6 +2067,31 @@ def primitive_TaskExit(cpu: CPU) -> None:
     context_switch(cpu, nxt)
 
 
+def primitive_TaskQuery(cpu: CPU) -> None:
+    """Volume VI §4.2 #0x008. Return summary information about a task:
+    its state, the processor it lives on, and its exit code if it
+    terminated. Non-blocking; suitable for polling.
+
+    Args:
+      O1: task object reference (no V cap required, like TaskWait).
+
+    Returns:
+      R2: status (OK / EFAULT / EREMOTE / EPERM / ESTALE / EINVAL).
+      R3: packed state word (low 8 bits = state per TASK_STATE_*,
+          next 8 bits = processor id, upper 16 bits = exit code if
+          state == TASK_STATE_EXITED, else 0)."""
+    target = _resolve_task_arg(cpu, require_v=False)
+    if target is None:
+        return
+    state = target.state & 0xFF
+    proc  = cpu.pid & 0xFF
+    code  = (target.exit_code or 0) & 0xFFFF \
+            if target.state == TASK_STATE_EXITED else 0
+    packed = state | (proc << 8) | (code << 16)
+    cpu.set_gpr(2, ERR_OK)
+    cpu.set_gpr(3, packed)
+
+
 def primitive_TaskWait(cpu: CPU, faulting_pc: int) -> None:
     """Block the calling task until O1 has terminated. The exit code is
     returned in R3 (Volume VI §4.1). If O1 is already EXITED the call
@@ -2601,6 +2626,7 @@ PRIMITIVE_MIN_MODE = {
     0x003: MODE_SUPERVISOR,  # TaskSuspend
     0x004: MODE_USER,        # TaskYield
     0x005: MODE_USER,        # TaskCurrent
+    0x008: MODE_USER,        # TaskQuery
     0x007: MODE_USER,        # TaskWait
     0x009: MODE_SUPERVISOR,  # InstallProgram   — replaces task image
     0x100: MODE_USER,        # ObjAlloc
@@ -2645,6 +2671,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_TaskCurrent(cpu)
     elif prim == 0x007:
         primitive_TaskWait(cpu, faulting_pc)
+    elif prim == 0x008:
+        primitive_TaskQuery(cpu)
     elif prim == 0x009:
         primitive_InstallProgram(cpu)
     elif prim == 0x100:
