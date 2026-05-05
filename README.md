@@ -44,7 +44,12 @@ the simulator implements directly.
 [`HISTORY.md`](HISTORY.md) traces the project's evolution — three
 passes on Volume I, the Apollo correction, the toolchain's
 contract-first dispatch, the validation suite, multi-CPU, the
-wire-level crossbar, multi-process, and the manual revision.
+wire-level crossbar, multi-process, the manual revision, and the
+seven phases (24–30) of **Ouroboros** — the OS layer growing on
+top: privilege modes, trap delivery, tasks/scheduler, supervisor
+handlers, timer interrupts, the C-level task API, and the shell
+becoming a real supervisor that spawns guests as child tasks on
+its own CPU.
 
 Combined PDFs are in the repo root:
 [`ObjectRISC.pdf`](ObjectRISC.pdf) (Computer Modern, 72 pp) and
@@ -70,18 +75,25 @@ vendored pcc and needs `./configure && make` once (see
 | [`tools/devices/hostfsd`](tools/devices)     | Host-filesystem server (open/read/write/close, optional jail) |
 | [`tools/oriscrun`](tools/oriscrun)           | Launcher: spawns crossbar + devices + CPU processes  |
 | [`tools/cc`](tools/cc/arch/orisc)            | Vendored pcc with an Object RISC backend (`arch/orisc/`) |
-| [`tools/cc/lib`](tools/cc/lib)               | C library (liborisc.ora) — console I/O, string/memory primitives |
+| [`tools/cc/lib`](tools/cc/lib)               | C library (liborisc.ora) — console I/O, string/memory, hostfs, terminal, tasks (`task.c`), .orx loader (`orx.c`) |
 
 ### Validation
 
-114 tests across thirteen categories — integer, logical, memory,
-control flow, object registers, object memory, firmware, traps,
-CALL, golden programs, multi-CPU (with link boot), loadable modules,
-and receive queues:
+132 tests across fourteen categories — integer, logical, memory,
+control flow, object registers, object memory, firmware, traps
+(including privileged-instruction enforcement and supervisor-mode
+handler delivery), CALL (including EPERM gating), golden programs,
+multi-CPU (with link boot), loadable modules, receive queues, and
+tasks (TaskCreate / TaskWait / TaskYield / timer preemption):
 
 ```sh
 python3 tools/sim/tests/validation/runner.py
 ```
+
+Plus 12 device/shell integration tests under
+[`tools/devices/tests/`](tools/devices/tests/) — the shell, hostfsd,
+oriscterm, the multi-task and concurrent-children libc demos, and
+shell-as-supervisor running guest `.orx` files end-to-end.
 
 ## Quick taste
 
@@ -170,28 +182,120 @@ it to the simulated console:
 examples/cc/run_host_cat.sh    # cat README.md from inside an emulated CPU
 ```
 
-The MVP shell — `help` / `cat` / `more` / `ls` / `cd` / `pwd` /
-`echo` / `run` / `cycles` / `time` / `exit`, with a build-date
-banner shifted back 40 years, command history (up/down arrow
-recall), backspace with visual undo, and a `--More--` paginator
-on `more` and `help`. Paths resolve against the shell's own cwd;
-the prompt mirrors it (`/sub>`). The `run` command spawns another
-`.orx` onto a pool of four spare CPUs (each running a chunked-boot
-loader) via the `linkbootd` server; the spare CPU is reset on the
-guest's TaskExit and re-announces, so the slot is reusable. The
-`[exited N]` line surfaces the guest's actual exit code.
+## Ouroboros — the OS layer
+
+Built on top of the architecture, [phases 24–30 of HISTORY](HISTORY.md)
+record the growth of an in-tree OS layer named **Ouroboros** —
+named (after a brief stop at "OROS" = Object RISC OS) for the
+snake-eating-its-tail symbolism: the OS runs on the architecture
+whose toolchain self-hosts; traps return where they came from
+via `ERET`; and the VM/CMS analogy that motivates the design
+(CP = firmware, CMS = Ouroboros) is itself a recursive shape.
+
+What's wired so far:
+
+- **Privilege modes** (Vol II §13): user / supervisor / firmware,
+  enforced at decode for `LCTRL` / `SCTRL` / `ERET` / `WAIT` / TLB ops,
+  and at `CALL` dispatch via per-primitive minimum-mode gating.
+- **Trap delivery** (Vol II §14.1): on a trap the CPU populates
+  `EPC` / `Cause` / `BadVAddr`, saves the current mode into
+  `Status`, switches to firmware, and jumps to `VECBASE + offset[cause]`.
+  `ERET` reverses it. A supervisor-installable handler primitive
+  (`InstallTrapHandler`, #0x520) bypasses the firmware-only
+  `VECBASE` for guest OSes.
+- **Tasks & scheduler** (Vol VI §4): `Task` is a first-class
+  swappable execution context with its own register file, PC,
+  privilege state, and address-space mappings. `TaskCreate` /
+  `TaskExit` / `TaskResume` / `TaskSuspend` / `TaskYield` /
+  `TaskCurrent` / `TaskWait` are wired; cooperative round-robin
+  scheduler picks the next runnable on every yield/exit.
+- **Per-task address spaces.** pcc-generated code that assumes
+  the flat CONTRACT.md §2 layout (`CODE_VA` / `DATA_VA` /
+  `STACK_TOP`) Just Works in spawned children — they each get a
+  fresh layout pointing at their own code/data/stack objects.
+- **Timer interrupt path.** `STATUS.IE` + `COMPARE` raises
+  `external-interrupt` (cause 0x01) when the cycle counter
+  crosses the compare value; `deliver_trap` auto-clears `IE` so
+  handlers don't re-fire mid-handler.
+- **C libc API.** [`tools/cc/lib/task.c`](tools/cc/lib/task.c)
+  exposes a multi-child `task_t` handle abstraction over an
+  OREF-backed task table. [`tools/cc/lib/orx.c`](tools/cc/lib/orx.c)
+  loads a `.orx` from disk via `hostfsd`, sets up code/data/stack
+  objects, and `TaskCreate`s it as a child task — that's how
+  the shell's `run` command works under Phase 30.
+
+### The Ouroboros shell
+
+The MVP shell is no longer just an interactive front-end — it's the
+**supervisor**. `cmd_run` calls `orx_run` which loads the `.orx`
+itself, allocates code/data/stack objects, and `TaskCreate`s the
+guest as a child task on the shell's own CPU. No separate
+spawn-server, no spare-CPU pool, no chunked-boot trip across the
+crossbar — just a parent task forking a child.
+
+Commands: `help` / `cat` / `more` / `ls` / `cd` / `pwd` / `echo` /
+`run` / `cycles` / `time` / `exit`. Command history (up/down
+arrow recall), backspace with visual undo, `--More--` paginator
+on `more` and `help`, paths resolved against the shell's cwd
+(prompt mirrors it: `/sub>`). The build-date banner is shifted
+back 40 years (alternate-history conceit).
+
+Launch:
 
 ```sh
 examples/cc/run_shell.sh       # opens a Tk terminal on the shell
-# /> ls
-# /> cd src
-# /src> cat hello.c
-# /src> cd ..
-# /> run hello.orx
-# hello from guest
-# [exited 0]
-# /> exit
 ```
+
+The runner builds any `.c` files under
+[`examples/cc/programs/`](examples/cc/programs/) on launch, so
+they're immediately runnable from inside the shell. A few demo
+programs ship with the repo:
+
+```
+/> ls /programs
+build-one.sh
+count.c
+count.orx
+exit42.c
+exit42.orx
+hello.c
+hello.orx
+README.md
+/> run /programs/hello.orx
+[exited 0]
+/> run /programs/count.orx
+[exited 0]
+/> run /programs/exit42.orx
+[exited 42]
+```
+
+`hello` / `count` / `exit42` use `print_str` / `print_int`, which
+go through firmware `ConsoleWrite` to host stdout (the terminal
+where you launched `run_shell.sh`, **not** the Tk oriscterm
+window). The `[exited N]` line is what the shell prints back to
+the Tk window via `term_print` after `orx_run` returns.
+
+To add a new program:
+
+```sh
+echo '#include "liborisc.h"
+int main(void) { print_str("hi\n"); return 7; }
+' > examples/cc/programs/hi.c
+
+# Either restart run_shell.sh (it rebuilds .orx files on launch),
+# or rebuild this one directly:
+bash examples/cc/programs/build-one.sh \
+    examples/cc/programs/hi.c examples/cc/programs/hi.orx
+```
+
+then from inside the shell: `run /programs/hi.orx`.
+
+The `print_str`-vs-`term_print` split is documented in
+[`examples/cc/programs/README.md`](examples/cc/programs/README.md):
+the guest can't safely `term_init` while the shell is running on
+the same CPU because both would compete for the keyboard
+subscription. A `term_print_only_init` (subscribe to console
+only) is the obvious next step.
 
 Dhrystone v2.1 — the canonical 1984 benchmark, ported to the
 Object RISC C runtime. Reports cycle count + dhry/s + DMIPS at
