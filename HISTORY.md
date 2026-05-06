@@ -3593,6 +3593,103 @@ identical to a voluntary exit from the user's perspective.
   much more invasive than `TaskKill`'s "just mark it dead." Out of
   scope for now.
 
+## Phase 38 — Grid plumbing + a full-screen viewer (Ouroboros, day 15)
+
+A real terminal UI starts feeling possible once you can paint
+character cells at arbitrary `(col, row)` positions. We've had
+the grid service in oriscterm since the early graphics work but
+nothing on the CPU side touched it. Phase 38 wires the grid into
+liborisc and builds the first full-screen app on top: a
+`view <path>` shell builtin.
+
+### Wiring
+
+- **Canvas resized to 80×24.** Was 80×16 with 24 rows of stream
+  text on top — fine for a small graphics demo, cramped for an
+  app. The text pane is unchanged; the canvas now matches it.
+- **`liborisc` gains `grid_print` / `grid_print_n` / `grid_clear`.**
+  Same async pull-based dance as `term_print`: we SEND to the grid
+  service in `O7`, the terminal `OBJ_READ_REQ`s the bytes, and
+  drops them at `(col, row)` on the Canvas.
+- **Boot ABI: `O7 = oriscterm grid` (idx 3).** The shell's
+  `run_shell.sh` and the test launchers all carry the new spec.
+  The original plan was a separate `O8 = vector` slot for
+  `VEC_CLEAR`, but `hf_init` already claims `O8` for its private
+  mailbox — caused a mysterious "no idx=4 SENDs" symptom during
+  bring-up. Rather than reshuffle libc's slot accounting, we
+  fold clear-all into the grid service: a `SEND` with
+  `col == row == -1` (sentinel) wipes the canvas, and the
+  oriscterm side honours it. One ref does both jobs.
+
+### `cmd_view`
+
+The shell builtin. Reads the file into an 8 KB stack buffer,
+indexes line starts (cap 512 lines), and paints a window of it
+on the grid. 23 content rows + 1 status row showing
+`view: <path>  <line>/<n>  q=quit`. Navigation:
+
+```
+j / DOWN          one line down
+k / UP            one line up
+SPACE             page down
+b / BACKSPACE     page up
+g / G             top / bottom
+q / Q / ESC       quit
+```
+
+Files larger than the buffer (or files with > 512 lines) get a
+`(truncated)` tag in the status. Lines longer than 80 columns
+are clipped at column 80 — both honest about what's shown
+without trying to be clever. The viewer wipes the canvas on
+quit so the shell prompt isn't sitting next to a stale frame.
+
+A pcc note: the orisc backend only passes the first four args in
+registers and doesn't yet spill arg 5+ to stack, so the render
+helper takes a `struct view_state *` instead of six positional
+arguments. Same trick we used in Phase 38's grid library wrappers.
+
+### `fake_terminal` learns the grid
+
+The test fake-terminal previously only modelled the console (idx 1),
+keyboard (idx 2), and pointer (idx 6) services. Phase 38 adds:
+
+- An 80×24 in-memory cell grid.
+- The grid SEND handler (with the same `OBJ_READ_REQ` pull dance
+  as console).
+- The clear-sentinel handling.
+- A `grid_last_frame` snapshot stashed before each clear, since
+  full-screen apps wipe on exit and the final post-quit grid is
+  empty.
+- A grid + last-frame dump in the trailing render block.
+
+This makes `test_shell_view.sh` directly assertable against the
+exact characters that landed on the canvas.
+
+### Tests
+
+- **`tools/devices/tests/test_shell_view.sh`** — types
+  `view greeting.txt`, then `q`, then `exit`. Asserts the last-
+  frame snapshot has the file's three lines on rows 0..2 and the
+  expected status line on row 23, and that the shell returned to
+  its prompt afterwards. **17 device/shell tests, all pass.**
+  The 138 sim validation tests are unaffected.
+
+### What's not yet done
+
+- **Lines wider than 80 cols are clipped, not wrapped.** For a
+  viewer this is fine; an editor will probably want a horizontal
+  scroll mode.
+- **Cell tracking on the oriscterm side.** Right now overlapping
+  paints stack visually — a third paint at the same `(col, row)`
+  draws on top of the previous two. The viewer dodges this by
+  always preceding a frame with `grid_clear`. The eventual
+  editor will repaint constantly and want proper cell-replace
+  semantics so brute-force clear-and-redraw doesn't flicker.
+  Earmarked for Phase 39.
+- **Mouse on the canvas.** The pointer service exists. The
+  viewer doesn't use it. Could be neat (click-to-scroll), not
+  urgent.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

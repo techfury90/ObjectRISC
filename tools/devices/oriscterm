@@ -259,10 +259,12 @@ class Terminal:
         font = tkfont.Font(family="Menlo", size=14)
         # Text pane is sized for an interactive shell session — 24
         # rows is the legacy terminal default. Below it the graphics
-        # canvas still gets a fixed 16-row strip for grid / vector /
-        # raster / pointer demos; programs that don't touch graphics
-        # (the shell, kbd_echo, host-cat) just see a tall text area
-        # with an empty canvas band underneath.
+        # canvas gets its own 80×24 strip for grid / vector / raster /
+        # pointer; programs that don't touch graphics (the shell,
+        # kbd_echo, host-cat) just see a tall text area with an empty
+        # canvas band underneath. Sizing the canvas to the same 80×24
+        # as the text pane lets a full-screen grid app (Phase 38's
+        # `view`, the eventual editor) feel proportionate.
         self.text = tk.Text(self.root, width=80, height=24,
                             bg="#0a0a14", fg="#d8d8d8",
                             insertbackground="#d8d8d8",
@@ -285,7 +287,7 @@ class Terminal:
         self.cell_w = font.measure("M")
         self.cell_h = font.metrics("linespace")
         self.canvas_cols = 80
-        self.canvas_rows = 16
+        self.canvas_rows = 24
         self.canvas_w = self.cell_w * self.canvas_cols
         self.canvas_h = self.cell_h * self.canvas_rows
         self.canvas = tk.Canvas(self.root,
@@ -464,12 +466,21 @@ class Terminal:
         The terminal pulls the bytes via OBJ_READ_REQ (same dance as
         the console service) and renders them on the Canvas at the
         given character-cell position.
+
+        Special case: a SEND with col == 0xFFFFFFFF and row ==
+        0xFFFFFFFF (i.e. signed -1, -1) clears the entire canvas.
+        Lets a single grid-service slot do both jobs without the
+        caller having to hold a separate vector-service ref. The
+        sender's O2 / offset / length are ignored on a clear.
         """
         source_ref = or_payload[1]
         offset = int_payload[0]
         length = int_payload[1]
         col    = int_payload[2]
         row    = int_payload[3]
+        if col == 0xFFFFFFFF and row == 0xFFFFFFFF:
+            self.canvas.delete("all")
+            return
         if source_ref == 0 or length == 0:
             return
         src_pid = ref_home(source_ref)
