@@ -60,6 +60,14 @@
  * arrays of task_t against it. Keep them in sync. */
 #define TABLE_BYTES (TASK_MAX_CONCURRENT * 8)
 
+/* The task-table objstore doubles as orx.c's persistent state. orx
+ * picks up at byte offset TABLE_BYTES — see tools/cc/lib/orx.c for
+ * the layout there. We oversize the allocation here so orx doesn't
+ * have to re-allocate (and doesn't have to claim its own OPR slot —
+ * that frees O7 for the grid service ref). */
+#define ORX_STATE_BYTES   408
+#define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
+
 /* Bit set when the corresponding table slot holds a live ref. Lives
  * in regular int memory; pcc treats it as a normal global. */
 static unsigned int task_slots_in_use;
@@ -82,7 +90,7 @@ task_init(void)
 		"nop\n"
 		"omov  o12, o1"
 		:
-		: "i"(TABLE_BYTES), "i"(TAG_DATA), "i"(CAP_R | CAP_W)
+		: "i"(ALLOC_BYTES), "i"(TAG_DATA), "i"(CAP_R | CAP_W)
 		: "r2", "r3", "r4", "r5", "r6"
 	);
 	task_slots_in_use = 0;

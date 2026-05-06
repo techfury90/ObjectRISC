@@ -93,7 +93,12 @@ class FakeTerminal:
         self.sock = sock
         self.pid = pid
         self.buf = bytearray()
-        self.kbd_sub = None
+        # Multiple kbd subscribers can register (e.g. shell + a
+        # backgrounded editor program). The focused index decides
+        # which one each `key:` event lands on; a `focus` event
+        # cycles it. Mirrors oriscterm's F1-cycle behaviour.
+        self.kbd_subs: list = []
+        self.kbd_focus: int = 0
         self.ptr_sub = None
         self.ptr_state = 0
         self.trans = 0
@@ -149,8 +154,10 @@ class FakeTerminal:
               f"sub=0x{sub_ref:016x} R4={p[2]} R5={p[3]}",
               file=sys.stderr, flush=True)
         if idx == KEYBOARD_INDEX and sub_ref:
-            self.kbd_sub = sub_ref
-            print(f"fake_terminal: kbd subscribe 0x{sub_ref:016x}", flush=True)
+            if sub_ref not in self.kbd_subs:
+                self.kbd_subs.append(sub_ref)
+            print(f"fake_terminal: kbd subscribe 0x{sub_ref:016x} "
+                  f"(now {len(self.kbd_subs)} sub(s))", flush=True)
         elif idx == POINTER_INDEX and sub_ref:
             self.ptr_sub = sub_ref
             print(f"fake_terminal: ptr subscribe 0x{sub_ref:016x}", flush=True)
@@ -259,8 +266,19 @@ class FakeTerminal:
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.drain_pending_subs(0.05)
-            if (not want_kbd or self.kbd_sub is not None) \
+            if (not want_kbd or self.kbd_subs) \
                and (not want_ptr or self.ptr_sub is not None):
+                return True
+        return False
+
+    def wait_for_n_kbd(self, n, timeout=10.0):
+        """Block until at least `n` keyboard subscribers have arrived
+        (used after spawning extra programs that take their own kbd
+        subscriptions, like the standalone editor)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.drain_pending_subs(0.05)
+            if len(self.kbd_subs) >= n:
                 return True
         return False
 
@@ -269,14 +287,25 @@ class FakeTerminal:
         self.trans = (self.trans + 1) & 0xFFFF
         return t
 
+    def cycle_focus(self):
+        """Mirror oriscterm's F1 behaviour: advance kbd_focus to the
+        next subscriber. No-op when 0 or 1 subs."""
+        n = len(self.kbd_subs)
+        if n > 1:
+            self.kbd_focus = (self.kbd_focus + 1) % n
+            print(f"fake_terminal: kbd focus → {self.kbd_focus + 1}/{n}",
+                  flush=True)
+
     def send_key(self, code, mods=0):
-        if self.kbd_sub is None:
+        if not self.kbd_subs:
             sys.exit("fake_terminal: no kbd subscriber for key event")
+        idx = self.kbd_focus if self.kbd_focus < len(self.kbd_subs) else 0
+        sub = self.kbd_subs[idx]
         pkt = build_send_deliver(
-            src_pid=self.pid, dst_pid=ref_home(self.kbd_sub),
-            trans=self._next_trans(), recipient_ref=self.kbd_sub,
+            src_pid=self.pid, dst_pid=ref_home(sub),
+            trans=self._next_trans(), recipient_ref=sub,
             int_payload=[code, mods, 0, 0],
-            or_payload=[self.kbd_sub, 0, 0, 0],
+            or_payload=[sub, 0, 0, 0],
         )
         self.sock.sendall(struct.pack(">I", len(pkt)) + pkt)
         print(f"fake_terminal: sent key code=0x{code:x} mods=0x{mods:x}",
@@ -319,6 +348,9 @@ def parse_code(s):
 
 def parse_event(spec):
     """Return (kind, args)."""
+    # Bare events (no payload) — focus is the only one for now.
+    if spec == "focus":
+        return ("focus",)
     if ":" not in spec:
         sys.exit(f"fake_terminal: malformed --event {spec!r} (need kind:args)")
     kind, rest = spec.split(":", 1)
@@ -333,6 +365,8 @@ def parse_event(spec):
         return ("down", int(parts[0]), int(parts[1]), int(parts[2]))
     if kind == "up":
         return ("up", int(parts[0]), int(parts[1]), int(parts[2]))
+    if kind == "wait-kbd":
+        return ("wait-kbd", int(parts[0]))
     sys.exit(f"fake_terminal: unknown event kind {kind!r}")
 
 
@@ -368,7 +402,7 @@ def main():
     need_ptr = any(e[0] in ("motion", "down", "up") for e in events)
     if not term.wait_for(need_kbd, need_ptr, args.subscribe_timeout):
         sys.exit(f"fake_terminal: required subscriptions did not arrive "
-                 f"(kbd={'ok' if term.kbd_sub else 'pending'}, "
+                 f"(kbd={'ok' if term.kbd_subs else 'pending'}, "
                  f"ptr={'ok' if term.ptr_sub else 'pending'})")
 
     for ev in events:
@@ -383,6 +417,20 @@ def main():
             term.send_down(ev[1], ev[2], ev[3])
         elif ev[0] == "up":
             term.send_up(ev[1], ev[2], ev[3])
+        elif ev[0] == "focus":
+            # Local-only: cycle which kbd subscriber receives keys.
+            # No SEND goes out — mirrors oriscterm's F1 (terminal
+            # consumes the hotkey and just changes its routing).
+            term.cycle_focus()
+        elif ev[0] == "wait-kbd":
+            # Block until at least N keyboard subscribers have
+            # registered. Useful between launching a backgrounded
+            # CPU-side program and sending it keystrokes — without
+            # this you race the program's term_init.
+            n = ev[1]
+            if not term.wait_for_n_kbd(n, timeout=20.0):
+                sys.exit(f"fake_terminal: only {len(term.kbd_subs)}/{n} "
+                         f"kbd subscribers arrived")
 
     # Final drain — give the CPU a chance to flush its last outputs.
     term.drain_pending_subs(args.linger)

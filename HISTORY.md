@@ -3796,6 +3796,131 @@ was on the canvas before the wipe-on-quit.
   editor's full-frame repaint is a few dozen SENDs per
   keystroke, which is well below the timer quantum.
 
+## Phase 40 — Editor as a backgrounded program + focus switching (Ouroboros, day 17)
+
+The Phase 39 editor was a shell builtin: cmd_edit ran in the
+shell's task. That meant the shell was blocked while editing,
+and there was no separation between "what's running where". Phase
+40 breaks edit out into its own `.orx` and adds a hotkey to
+switch keyboard focus between the shell (upper text pane) and
+whichever app owns the lower grid canvas.
+
+### oriscterm: F1 cycles kbd focus
+
+When more than one program subscribes to the keyboard service,
+the terminal now routes each key to a single *focused*
+subscriber. The F1 hotkey cycles the focus index; F1 itself is
+always consumed by oriscterm, never delivered. Title bar shows
+`kbd focus N/M (F1 to cycle)` whenever there's more than one
+subscriber. With one subscriber (the common case), the hotkey
+is a no-op and behaviour is unchanged.
+
+### `examples/cc/programs/edit.c`
+
+Same body as the old cmd_edit, repackaged as a standalone
+guest. Calls full `term_init()` (including the kbd subscribe
+SEND) so it shows up as oriscterm subscriber #2 alongside the
+shell. Hardcoded to a fixed scratchpad path (`/scratch.txt`)
+since the shell still doesn't pass argv to guests — that's
+Phase 41 material.
+
+```
+/> run /programs/edit.orx &
+[bg task 0]
+/>                       ← shell still has focus, type away here
+                          press F1 →
+[ canvas now shows the editor; type goes to it ]
+                          ^S ^X to save+quit, F1 to return to shell
+[task 0 done 0]
+```
+
+### Multi-instance plumbing fixes
+
+Two bugs surfaced as soon as a second program tried to use
+oriscterm + hostfsd at the same time as the shell:
+
+1. **`term_init` shared O4 with the parent.** Both shell and
+   editor were deriving the keyboard subscribe-cap from O4
+   (boot self-svc), inherited verbatim by the child task. Same
+   source → same derived ref → oriscterm dedup'd them as one
+   subscriber. Fix: `term_init` now ObjAllocs its own private
+   service object and parks it in **O9** (term mailbox); the
+   subscribe-cap derives from there, so each instance gets a
+   distinct ref. `term_getkey` polls O9 instead of O4.
+
+2. **`hostfsd` keyed sessions by sender pid.** Both shell and
+   editor live on CPU 0, so hostfsd routed both their requests
+   to whichever subscribed first — the shell. The editor's
+   `hf_open` reply went to the shell's mailbox; the editor
+   blocked forever. Fix: each `hf_*` SEND now carries the
+   caller's mailbox in O3 as a per-call reply_cap. hostfsd
+   matches sessions by underlying object (same home + index
+   as the subscribed sub-ref), falling back to the per-pid
+   lookup when O3 is null.
+
+These changes touched `term_init` / `term_getkey` /
+`term_print_n_sync` / all four `hf_*` operations / `hf_init` —
+several of which used to clobber O9 to park scratch sub-caps.
+They now derive directly into O2 or O3 (the SEND payload slots)
+without parking in long-lived OPRs.
+
+### orx state moves out of O7
+
+Adjacent fix forced by Phase 38: the grid service ref lives at
+O7, but `orx.c` had been claiming O7 for its own per-spawn
+manifest (lazily allocated on first `orx_run`). When the shell's
+`cmd_run` ran first and then a child tried to use the grid, the
+grid SEND went to orx's data object (no `S` cap) and trapped.
+
+orx's persistent state now lives at the back end of `task.c`'s
+objstore (O12, oversized by `ORX_STATE_BYTES = 408` to fit). All
+orx OREFLD/OREFST offsets shift by +128 (`TABLE_BYTES`) to land
+past the libc task table. `orx_state_init` becomes a no-op —
+`task_init` already allocated everything orx needs. O7 is freed
+for the grid ref to keep across cmd_run invocations.
+
+### `fake_terminal`
+
+- Replaces `kbd_sub` (single ref) with `kbd_subs` (list) +
+  `kbd_focus` (index).
+- New `--event focus` toggles focus locally (mirrors F1 — no SEND
+  goes out, just changes routing).
+- New `--event wait-kbd:N` blocks until at least N kbd
+  subscribers have registered. Tests use this between launching
+  a backgrounded program and sending it keystrokes; without it
+  you race the program's `term_init`.
+
+### Tests
+
+- **`tools/devices/tests/test_shell_edit.sh`** — completely
+  rewritten. Pre-creates `/scratch.txt`, spawns
+  `run /programs/edit.orx &`, waits for the editor's kbd
+  subscribe (`wait-kbd:2`), `focus`-cycles the keyboard to the
+  editor, navigates to end-of-line + types `!`, hits `^S` and
+  `^X`, focus-cycles back, then `exit`s the shell. Asserts the
+  on-disk `scratch.txt` reflects the insert and that the focus
+  log line shows the cycle landed.
+- All 18 device/shell tests pass; **138 sim validation tests**
+  unaffected.
+
+### What's not yet done
+
+- **Argument passing to guests.** The editor opens a hardcoded
+  `/scratch.txt`. A real `edit foo.txt` flow needs `cmd_run` to
+  hand its remaining args to the spawned program — likely via a
+  shared service object the libc unpacks into argv[]. Phase 41.
+- **Focus indicator on the canvas itself.** The title bar
+  reflects focus, but that's outside the canvas — easy to miss.
+  A small marker in the corner of the grid would help.
+- **Stale subscriber cleanup.** When the editor exits, oriscterm
+  still has its sub_ref in `kbd_subscribers`. Cycling focus to
+  it would silently drop keys (the underlying descriptor is
+  gone). Needs a "remove sub on send-fail" cleanup pass.
+- **hostfsd protocol cleanup.** The per-call reply_cap is a
+  workaround over the legacy per-pid session lookup. A future
+  pass should remove the legacy fallback and require all calls
+  to carry reply_cap.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

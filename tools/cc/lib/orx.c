@@ -14,19 +14,18 @@
  * Boot ABI required of callers
  * ----------------------------
  * orx_run depends on hf_init() having been called (it uses hf_open
- * / hf_read / hf_close to fetch the file). It does NOT depend on
- * task_init being called — orx_run manages task creation directly,
- * not through the task.c handle table. Callers can use orx_run and
- * the task.c API in the same program.
+ * / hf_read / hf_close to fetch the file) AND on task_init() having
+ * been called: orx's persistent scratch + per-task manifest now
+ * lives at the back end of task.c's objstore in O12, past the
+ * 128-byte task table.
  *
- *     O7  = orx scratch object   (private; allocated on first orx_run)
+ *     O12 (offset >= 128) = orx scratch + manifest
  *
- * O7 must be free at orx_run entry — the only existing libc slot user
- * was linkboot.c, and a program that uses orx_run shouldn't also use
- * lb_spawn (the supervisor IS the spawn). The four working refs the
- * loader juggles (code / data / stack / task) live in the OR-typed
- * scratch at offsets 0 / 8 / 16 / 24, accessed by OREFLD/OREFST
- * with constant offsets.
+ * Used to live in O7 in its own object, but Phase 38's grid service
+ * ref also wanted O7. Co-located with the task table to free the
+ * slot. The four working refs the loader juggles (code / data /
+ * stack / task) live in the OR-typed scratch at offsets 0/8/16/24
+ * past the task-table base.
  *
  * What's NOT done yet:
  *   - No concurrent invocations: orx_run is synchronous (load,
@@ -63,27 +62,23 @@
 #define CAP_V 0x10
 #define CAP_C 0x40
 
-/* O7-parked persistent state object layout. The first 24 bytes are
- * scratch slots used by orx_spawn during the load (overwritten on
- * each call); bytes 24..407 hold a per-task manifest of the loaded
- * code/data/stack refs, indexed by the task_t handle the libc table
- * assigned. orx_unload(t) reads manifest[t] to know which objects
- * to ObjFreeDeferred when the guest exits.
+/* Persistent state layout. We append to the task-table objstore at
+ * O12 — task.c oversizes the allocation by ORX_STATE_BYTES so we
+ * can pick up at byte offset 128 (= TABLE_BYTES). Within our
+ * region: the first 24 bytes are scratch slots used during a load
+ * (overwritten on each call), and bytes 24..407 hold a per-task
+ * manifest of the loaded code/data/stack refs, indexed by the
+ * libc task_t handle. orx_unload(t) reads manifest[t] to know
+ * which objects to ObjFreeDeferred on exit.
  *
- *   bytes      meaning
- *   0    .. 7  scratch SLOT_CODE   (current spawn's loaded code ref)
- *   8    ..15  scratch SLOT_DATA
- *   16   ..23  scratch SLOT_STACK
- *   24+t*24+0  manifest[t].code    (1 ≤ t ≤ TASK_MAX_CONCURRENT)
- *   24+t*24+8  manifest[t].data
- *   24+t*24+16 manifest[t].stack
- *
- * Total bytes: 24 + 16*24 = 408. */
+ * The actual offsets baked into the orefst/orefld switches below
+ * are pre-shifted by 128 (e.g., what would have been "0(o7)" is
+ * "128(o12)"). The constants below are kept for documentation and
+ * for the SLOT enum that refers to per-task scratch positions. */
 #define SLOT_CODE      0
 #define SLOT_DATA      8
 #define SLOT_STACK    16
 #define MANIFEST_BASE 24
-#define STATE_BYTES   408
 
 /* Drain delay handed to ObjFreeDeferred from orx_unload — chosen
  * comfortably larger than the longest plausible OBJ_READ_REQ
@@ -113,35 +108,23 @@ round4(unsigned int n)
 
 /* --- persistent state lifecycle --------------------------------- */
 
-/* orx_state_initialized is the lazy-init guard: 0 = state object
- * not yet ObjAllocStore'd, 1 = O7 holds the persistent state ref.
- * Lives in regular int memory (the .data segment). */
-static int orx_state_initialized;
-
-/* ObjAllocStore the 408-byte persistent state and park in O7. Lazy
- * — returns OK immediately on subsequent calls without re-allocating
- * (the same object is reused across all orx_spawn invocations). */
+/* orx's persistent state is now embedded inside the task-table
+ * objstore (O12, allocated by task_init). All offsets in the
+ * orefst/orefld switches below are pre-shifted by TABLE_BYTES (128)
+ * so they land past the libc task table. orx_state_init is kept
+ * for ABI compatibility — it just verifies task_init has run by
+ * checking O12 is non-null — but does not allocate any more.
+ *
+ * Why share the slot: O7 used to be ours, but Phase 38's grid
+ * service ref also wants O7 (oriscterm idx 3). Co-locating with
+ * the task table frees O7 without needing a new OPR slot. */
 static int
 orx_state_init(void)
 {
-	if (orx_state_initialized)
-		return 0;
-	int status;
-	asm volatile(
-		"addiu r4, r0, %1\n"
-		"addiu r5, r0, %2\n"
-		"addiu r6, r0, %3\n"
-		"call  #0x106\n"            /* ObjAllocStore */
-		"nop\n"
-		"omov  o7, o1\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "i"(STATE_BYTES), "i"(TAG_DATA), "i"(CAP_R | CAP_W | CAP_V | CAP_C)
-		: "r2", "r3", "r4", "r5", "r6"
-	);
-	if (status == 0)
-		orx_state_initialized = 1;
-	return status;
+	/* No-op now that task_init owns the storage. Kept as a function
+	 * (rather than removed) so other libc translation units can
+	 * still link against it without churn. */
+	return 0;
 }
 
 /* ObjAlloc a code/data/stack object of the requested size & tag,
@@ -174,9 +157,9 @@ orx_alloc_into_slot(unsigned int size, unsigned int tag, unsigned int caps,
 	if (status != 0)
 		return status;
 	switch (slot) {
-	case SLOT_CODE:  asm volatile("orefst o1, 0(o7)");  break;
-	case SLOT_DATA:  asm volatile("orefst o1, 8(o7)");  break;
-	case SLOT_STACK: asm volatile("orefst o1, 16(o7)"); break;
+	case SLOT_CODE:  asm volatile("orefst o1, 128(o12)");  break;
+	case SLOT_DATA:  asm volatile("orefst o1, 136(o12)");  break;
+	case SLOT_STACK: asm volatile("orefst o1, 144(o12)"); break;
 	}
 	return 0;
 }
@@ -190,9 +173,9 @@ orx_free_slot(int slot)
 {
 	int status;
 	switch (slot) {
-	case SLOT_CODE:  asm volatile("orefld o1, 0(o7)");  break;
-	case SLOT_DATA:  asm volatile("orefld o1, 8(o7)");  break;
-	case SLOT_STACK: asm volatile("orefld o1, 16(o7)"); break;
+	case SLOT_CODE:  asm volatile("orefld o1, 128(o12)");  break;
+	case SLOT_DATA:  asm volatile("orefld o1, 136(o12)");  break;
+	case SLOT_STACK: asm volatile("orefld o1, 144(o12)"); break;
 	}
 	asm volatile(
 		"call  #0x101\n"
@@ -222,22 +205,22 @@ static void
 manifest_save(int t)
 {
 	switch (t) {
-	case  0: asm volatile("orefst o1, 24(o7)\norefst o2, 32(o7)\norefst o3, 40(o7)"); break;
-	case  1: asm volatile("orefst o1, 48(o7)\norefst o2, 56(o7)\norefst o3, 64(o7)"); break;
-	case  2: asm volatile("orefst o1, 72(o7)\norefst o2, 80(o7)\norefst o3, 88(o7)"); break;
-	case  3: asm volatile("orefst o1, 96(o7)\norefst o2, 104(o7)\norefst o3, 112(o7)"); break;
-	case  4: asm volatile("orefst o1, 120(o7)\norefst o2, 128(o7)\norefst o3, 136(o7)"); break;
-	case  5: asm volatile("orefst o1, 144(o7)\norefst o2, 152(o7)\norefst o3, 160(o7)"); break;
-	case  6: asm volatile("orefst o1, 168(o7)\norefst o2, 176(o7)\norefst o3, 184(o7)"); break;
-	case  7: asm volatile("orefst o1, 192(o7)\norefst o2, 200(o7)\norefst o3, 208(o7)"); break;
-	case  8: asm volatile("orefst o1, 216(o7)\norefst o2, 224(o7)\norefst o3, 232(o7)"); break;
-	case  9: asm volatile("orefst o1, 240(o7)\norefst o2, 248(o7)\norefst o3, 256(o7)"); break;
-	case 10: asm volatile("orefst o1, 264(o7)\norefst o2, 272(o7)\norefst o3, 280(o7)"); break;
-	case 11: asm volatile("orefst o1, 288(o7)\norefst o2, 296(o7)\norefst o3, 304(o7)"); break;
-	case 12: asm volatile("orefst o1, 312(o7)\norefst o2, 320(o7)\norefst o3, 328(o7)"); break;
-	case 13: asm volatile("orefst o1, 336(o7)\norefst o2, 344(o7)\norefst o3, 352(o7)"); break;
-	case 14: asm volatile("orefst o1, 360(o7)\norefst o2, 368(o7)\norefst o3, 376(o7)"); break;
-	case 15: asm volatile("orefst o1, 384(o7)\norefst o2, 392(o7)\norefst o3, 400(o7)"); break;
+	case  0: asm volatile("orefst o1, 152(o12)\norefst o2, 160(o12)\norefst o3, 168(o12)"); break;
+	case  1: asm volatile("orefst o1, 176(o12)\norefst o2, 184(o12)\norefst o3, 192(o12)"); break;
+	case  2: asm volatile("orefst o1, 200(o12)\norefst o2, 208(o12)\norefst o3, 216(o12)"); break;
+	case  3: asm volatile("orefst o1, 224(o12)\norefst o2, 232(o12)\norefst o3, 240(o12)"); break;
+	case  4: asm volatile("orefst o1, 248(o12)\norefst o2, 256(o12)\norefst o3, 264(o12)"); break;
+	case  5: asm volatile("orefst o1, 272(o12)\norefst o2, 280(o12)\norefst o3, 288(o12)"); break;
+	case  6: asm volatile("orefst o1, 296(o12)\norefst o2, 304(o12)\norefst o3, 312(o12)"); break;
+	case  7: asm volatile("orefst o1, 320(o12)\norefst o2, 328(o12)\norefst o3, 336(o12)"); break;
+	case  8: asm volatile("orefst o1, 344(o12)\norefst o2, 352(o12)\norefst o3, 360(o12)"); break;
+	case  9: asm volatile("orefst o1, 368(o12)\norefst o2, 376(o12)\norefst o3, 384(o12)"); break;
+	case 10: asm volatile("orefst o1, 392(o12)\norefst o2, 400(o12)\norefst o3, 408(o12)"); break;
+	case 11: asm volatile("orefst o1, 416(o12)\norefst o2, 424(o12)\norefst o3, 432(o12)"); break;
+	case 12: asm volatile("orefst o1, 440(o12)\norefst o2, 448(o12)\norefst o3, 456(o12)"); break;
+	case 13: asm volatile("orefst o1, 464(o12)\norefst o2, 472(o12)\norefst o3, 480(o12)"); break;
+	case 14: asm volatile("orefst o1, 488(o12)\norefst o2, 496(o12)\norefst o3, 504(o12)"); break;
+	case 15: asm volatile("orefst o1, 512(o12)\norefst o2, 520(o12)\norefst o3, 528(o12)"); break;
 	}
 }
 
@@ -246,22 +229,22 @@ static void
 manifest_load(int t)
 {
 	switch (t) {
-	case  0: asm volatile("orefld o1, 24(o7)\norefld o2, 32(o7)\norefld o3, 40(o7)"); break;
-	case  1: asm volatile("orefld o1, 48(o7)\norefld o2, 56(o7)\norefld o3, 64(o7)"); break;
-	case  2: asm volatile("orefld o1, 72(o7)\norefld o2, 80(o7)\norefld o3, 88(o7)"); break;
-	case  3: asm volatile("orefld o1, 96(o7)\norefld o2, 104(o7)\norefld o3, 112(o7)"); break;
-	case  4: asm volatile("orefld o1, 120(o7)\norefld o2, 128(o7)\norefld o3, 136(o7)"); break;
-	case  5: asm volatile("orefld o1, 144(o7)\norefld o2, 152(o7)\norefld o3, 160(o7)"); break;
-	case  6: asm volatile("orefld o1, 168(o7)\norefld o2, 176(o7)\norefld o3, 184(o7)"); break;
-	case  7: asm volatile("orefld o1, 192(o7)\norefld o2, 200(o7)\norefld o3, 208(o7)"); break;
-	case  8: asm volatile("orefld o1, 216(o7)\norefld o2, 224(o7)\norefld o3, 232(o7)"); break;
-	case  9: asm volatile("orefld o1, 240(o7)\norefld o2, 248(o7)\norefld o3, 256(o7)"); break;
-	case 10: asm volatile("orefld o1, 264(o7)\norefld o2, 272(o7)\norefld o3, 280(o7)"); break;
-	case 11: asm volatile("orefld o1, 288(o7)\norefld o2, 296(o7)\norefld o3, 304(o7)"); break;
-	case 12: asm volatile("orefld o1, 312(o7)\norefld o2, 320(o7)\norefld o3, 328(o7)"); break;
-	case 13: asm volatile("orefld o1, 336(o7)\norefld o2, 344(o7)\norefld o3, 352(o7)"); break;
-	case 14: asm volatile("orefld o1, 360(o7)\norefld o2, 368(o7)\norefld o3, 376(o7)"); break;
-	case 15: asm volatile("orefld o1, 384(o7)\norefld o2, 392(o7)\norefld o3, 400(o7)"); break;
+	case  0: asm volatile("orefld o1, 152(o12)\norefld o2, 160(o12)\norefld o3, 168(o12)"); break;
+	case  1: asm volatile("orefld o1, 176(o12)\norefld o2, 184(o12)\norefld o3, 192(o12)"); break;
+	case  2: asm volatile("orefld o1, 200(o12)\norefld o2, 208(o12)\norefld o3, 216(o12)"); break;
+	case  3: asm volatile("orefld o1, 224(o12)\norefld o2, 232(o12)\norefld o3, 240(o12)"); break;
+	case  4: asm volatile("orefld o1, 248(o12)\norefld o2, 256(o12)\norefld o3, 264(o12)"); break;
+	case  5: asm volatile("orefld o1, 272(o12)\norefld o2, 280(o12)\norefld o3, 288(o12)"); break;
+	case  6: asm volatile("orefld o1, 296(o12)\norefld o2, 304(o12)\norefld o3, 312(o12)"); break;
+	case  7: asm volatile("orefld o1, 320(o12)\norefld o2, 328(o12)\norefld o3, 336(o12)"); break;
+	case  8: asm volatile("orefld o1, 344(o12)\norefld o2, 352(o12)\norefld o3, 360(o12)"); break;
+	case  9: asm volatile("orefld o1, 368(o12)\norefld o2, 376(o12)\norefld o3, 384(o12)"); break;
+	case 10: asm volatile("orefld o1, 392(o12)\norefld o2, 400(o12)\norefld o3, 408(o12)"); break;
+	case 11: asm volatile("orefld o1, 416(o12)\norefld o2, 424(o12)\norefld o3, 432(o12)"); break;
+	case 12: asm volatile("orefld o1, 440(o12)\norefld o2, 448(o12)\norefld o3, 456(o12)"); break;
+	case 13: asm volatile("orefld o1, 464(o12)\norefld o2, 472(o12)\norefld o3, 480(o12)"); break;
+	case 14: asm volatile("orefld o1, 488(o12)\norefld o2, 496(o12)\norefld o3, 504(o12)"); break;
+	case 15: asm volatile("orefld o1, 512(o12)\norefld o2, 520(o12)\norefld o3, 528(o12)"); break;
 	}
 }
 
@@ -270,22 +253,22 @@ static void
 manifest_clear(int t)
 {
 	switch (t) {
-	case  0: asm volatile("orefst o0, 24(o7)\norefst o0, 32(o7)\norefst o0, 40(o7)"); break;
-	case  1: asm volatile("orefst o0, 48(o7)\norefst o0, 56(o7)\norefst o0, 64(o7)"); break;
-	case  2: asm volatile("orefst o0, 72(o7)\norefst o0, 80(o7)\norefst o0, 88(o7)"); break;
-	case  3: asm volatile("orefst o0, 96(o7)\norefst o0, 104(o7)\norefst o0, 112(o7)"); break;
-	case  4: asm volatile("orefst o0, 120(o7)\norefst o0, 128(o7)\norefst o0, 136(o7)"); break;
-	case  5: asm volatile("orefst o0, 144(o7)\norefst o0, 152(o7)\norefst o0, 160(o7)"); break;
-	case  6: asm volatile("orefst o0, 168(o7)\norefst o0, 176(o7)\norefst o0, 184(o7)"); break;
-	case  7: asm volatile("orefst o0, 192(o7)\norefst o0, 200(o7)\norefst o0, 208(o7)"); break;
-	case  8: asm volatile("orefst o0, 216(o7)\norefst o0, 224(o7)\norefst o0, 232(o7)"); break;
-	case  9: asm volatile("orefst o0, 240(o7)\norefst o0, 248(o7)\norefst o0, 256(o7)"); break;
-	case 10: asm volatile("orefst o0, 264(o7)\norefst o0, 272(o7)\norefst o0, 280(o7)"); break;
-	case 11: asm volatile("orefst o0, 288(o7)\norefst o0, 296(o7)\norefst o0, 304(o7)"); break;
-	case 12: asm volatile("orefst o0, 312(o7)\norefst o0, 320(o7)\norefst o0, 328(o7)"); break;
-	case 13: asm volatile("orefst o0, 336(o7)\norefst o0, 344(o7)\norefst o0, 352(o7)"); break;
-	case 14: asm volatile("orefst o0, 360(o7)\norefst o0, 368(o7)\norefst o0, 376(o7)"); break;
-	case 15: asm volatile("orefst o0, 384(o7)\norefst o0, 392(o7)\norefst o0, 400(o7)"); break;
+	case  0: asm volatile("orefst o0, 152(o12)\norefst o0, 160(o12)\norefst o0, 168(o12)"); break;
+	case  1: asm volatile("orefst o0, 176(o12)\norefst o0, 184(o12)\norefst o0, 192(o12)"); break;
+	case  2: asm volatile("orefst o0, 200(o12)\norefst o0, 208(o12)\norefst o0, 216(o12)"); break;
+	case  3: asm volatile("orefst o0, 224(o12)\norefst o0, 232(o12)\norefst o0, 240(o12)"); break;
+	case  4: asm volatile("orefst o0, 248(o12)\norefst o0, 256(o12)\norefst o0, 264(o12)"); break;
+	case  5: asm volatile("orefst o0, 272(o12)\norefst o0, 280(o12)\norefst o0, 288(o12)"); break;
+	case  6: asm volatile("orefst o0, 296(o12)\norefst o0, 304(o12)\norefst o0, 312(o12)"); break;
+	case  7: asm volatile("orefst o0, 320(o12)\norefst o0, 328(o12)\norefst o0, 336(o12)"); break;
+	case  8: asm volatile("orefst o0, 344(o12)\norefst o0, 352(o12)\norefst o0, 360(o12)"); break;
+	case  9: asm volatile("orefst o0, 368(o12)\norefst o0, 376(o12)\norefst o0, 384(o12)"); break;
+	case 10: asm volatile("orefst o0, 392(o12)\norefst o0, 400(o12)\norefst o0, 408(o12)"); break;
+	case 11: asm volatile("orefst o0, 416(o12)\norefst o0, 424(o12)\norefst o0, 432(o12)"); break;
+	case 12: asm volatile("orefst o0, 440(o12)\norefst o0, 448(o12)\norefst o0, 456(o12)"); break;
+	case 13: asm volatile("orefst o0, 464(o12)\norefst o0, 472(o12)\norefst o0, 480(o12)"); break;
+	case 14: asm volatile("orefst o0, 488(o12)\norefst o0, 496(o12)\norefst o0, 504(o12)"); break;
+	case 15: asm volatile("orefst o0, 512(o12)\norefst o0, 520(o12)\norefst o0, 528(o12)"); break;
 	}
 }
 
@@ -310,9 +293,9 @@ orx_map_slot(int slot, unsigned int va, unsigned int length)
 {
 	int status;
 	switch (slot) {
-	case SLOT_CODE:  asm volatile("orefld o1, 0(o7)");  break;
-	case SLOT_DATA:  asm volatile("orefld o1, 8(o7)");  break;
-	case SLOT_STACK: asm volatile("orefld o1, 16(o7)"); break;
+	case SLOT_CODE:  asm volatile("orefld o1, 128(o12)");  break;
+	case SLOT_DATA:  asm volatile("orefld o1, 136(o12)");  break;
+	case SLOT_STACK: asm volatile("orefld o1, 144(o12)"); break;
 	}
 	/* Reverse order — see orx_alloc_into_slot's comment. */
 	asm volatile(
@@ -378,9 +361,9 @@ orx_task_create(unsigned int entry, int has_data)
 	int status;
 	if (has_data) {
 		asm volatile(
-			"orefld o1, 0(o7)\n"        /* code */
-			"orefld o2, 16(o7)\n"       /* stack */
-			"orefld o3, 8(o7)\n"        /* data */
+			"orefld o1, 128(o12)\n"        /* code */
+			"orefld o2, 144(o12)\n"       /* stack */
+			"orefld o3, 136(o12)\n"        /* data */
 			"addu  r4, %1, r0\n"
 			"addu  r5, r0, r0\n"
 			"call  #0x000\n"            /* TaskCreate → O1 = task */
@@ -394,8 +377,8 @@ orx_task_create(unsigned int entry, int has_data)
 		);
 	} else {
 		asm volatile(
-			"orefld o1, 0(o7)\n"
-			"orefld o2, 16(o7)\n"
+			"orefld o1, 128(o12)\n"
+			"orefld o2, 144(o12)\n"
 			"onull  o3\n"
 			"addu  r4, %1, r0\n"
 			"addu  r5, r0, r0\n"
@@ -543,15 +526,15 @@ orx_spawn(const char *path)
 	 * intermediate spills. */
 	if (has_data) {
 		asm volatile(
-			"orefld o1, 0(o7)\n"
-			"orefld o2, 8(o7)\n"
-			"orefld o3, 16(o7)"
+			"orefld o1, 128(o12)\n"
+			"orefld o2, 136(o12)\n"
+			"orefld o3, 144(o12)"
 		);
 	} else {
 		asm volatile(
-			"orefld o1, 0(o7)\n"
+			"orefld o1, 128(o12)\n"
 			"onull  o2\n"
-			"orefld o3, 16(o7)"
+			"orefld o3, 144(o12)"
 		);
 	}
 	manifest_save(t);
@@ -582,11 +565,11 @@ orx_unload(task_t t)
 	int code = task_wait(t);
 	if (code < 0)
 		return code;
-	if (!orx_state_initialized) {
-		/* No state object — nothing to OREFLD. Just task_free. */
-		task_free(t);
-		return code;
-	}
+	/* The manifest lives in O12 (allocated by task_init). If the
+	 * caller skipped task_init the OREFLD below would fault — but
+	 * any program reaching orx_unload necessarily went through
+	 * orx_run, which needs hf_init, which the shell pairs with
+	 * task_init. Trusting that. */
 	/* OREFLD manifest[t].{code,data,stack} → O1/O2/O3, then
 	 * ObjFreeDeferred each in turn (omov o1, oN to swap operands). */
 	manifest_load(t);
