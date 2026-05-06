@@ -156,23 +156,18 @@ hf_init(void)
 		return -1;
 	}
 
-	/* Derive an R|S sub-ref into O9 to hand to hostfsd. (No
-	 * `register __or __asm__` declarations — see term.c::term_init
-	 * for why.) O9 is scratch — the keyboard subscribe ref already
-	 * lived there briefly during term_init and is no longer
-	 * needed. */
+	/* Derive an R|S sub-ref from the mailbox and SEND it to
+	 * hostfsd as OP_SUBSCRIBE. We move the derived ref straight
+	 * into O2 (the SEND's source slot) without parking it in O9 —
+	 * O9 is now claimed by term_init for its own kbd queue, and
+	 * stomping on it here would lose the editor's mailbox. */
 	asm volatile(
 		"omov  o1, o8\n"
 		"addiu r4, r0, 9\n"           /* R|S */
-		"call  #0x103\n"              /* ObjDerive */
+		"call  #0x103\n"              /* ObjDerive → O1 = sub-cap */
 		"nop\n"
-		"omov  o9, o1"
-	);
-
-	/* Send OP_SUBSCRIBE to hostfsd (in O10) with the mailbox R|S. */
-	asm volatile(
-		"omov  o1, o10\n"
-		"omov  o2, o9\n"
+		"omov  o2, o1\n"              /* O2 = sub-cap for SEND */
+		"omov  o1, o10\n"             /* O1 = hostfsd */
 		"onull o3\n"
 		"addiu r4, r0, 4\n"          /* OP_SUBSCRIBE */
 		"addiu r5, r0, 0\n"
@@ -205,7 +200,7 @@ hf_open(const char *path, int flags)
 		asm volatile(
 			"omov  o1, o10\n"
 			"omov  o2, o11\n"            /* stack ref */
-			"onull o3\n"
+			"omov  o3, o8\n"
 			"addiu r4, r0, 0\n"          /* OP_OPEN */
 			"addu  r5, %0, r0\n"
 			"addu  r6, %1, r0\n"
@@ -220,7 +215,7 @@ hf_open(const char *path, int flags)
 		asm volatile(
 			"omov  o1, o10\n"
 			"omov  o2, o15\n"            /* data ref */
-			"onull o3\n"
+			"omov  o3, o8\n"
 			"addiu r4, r0, 0\n"
 			"addu  r5, %0, r0\n"
 			"addu  r6, %1, r0\n"
@@ -254,7 +249,7 @@ hf_opendir(const char *path)
 		asm volatile(
 			"omov  o1, o10\n"
 			"omov  o2, o11\n"
-			"onull o3\n"
+			"omov  o3, o8\n"
 			"addiu r4, r0, 5\n"          /* OP_OPENDIR */
 			"addu  r5, %0, r0\n"
 			"addu  r6, %1, r0\n"
@@ -269,7 +264,7 @@ hf_opendir(const char *path)
 		asm volatile(
 			"omov  o1, o10\n"
 			"omov  o2, o15\n"
-			"onull o3\n"
+			"omov  o3, o8\n"
 			"addiu r4, r0, 5\n"
 			"addu  r5, %0, r0\n"
 			"addu  r6, %1, r0\n"
@@ -296,7 +291,7 @@ hf_close(int fd)
 	asm volatile(
 		"omov  o1, o10\n"
 		"onull o2\n"
-		"onull o3\n"
+		"omov  o3, o8\n"
 		"addiu r4, r0, 1\n"            /* OP_CLOSE */
 		"addu  r5, %0, r0\n"
 		"addiu r6, r0, 0\n"
@@ -330,7 +325,7 @@ hf_read(int fd, char *buf, int count)
 	asm volatile(
 		"omov  o1, o10\n"
 		"omov  o2, o11\n"              /* stack ref (R|W) */
-		"onull o3\n"
+		"omov  o3, o8\n"
 		"addiu r4, r0, 2\n"            /* OP_READ */
 		"addu  r5, %0, r0\n"
 		"addu  r6, %1, r0\n"
@@ -359,7 +354,7 @@ hf_write(int fd, const char *buf, int count)
 		asm volatile(
 			"omov  o1, o10\n"
 			"omov  o2, o11\n"
-			"onull o3\n"
+			"omov  o3, o8\n"
 			"addiu r4, r0, 3\n"        /* OP_WRITE */
 			"addu  r5, %0, r0\n"
 			"addu  r6, %1, r0\n"
@@ -374,7 +369,7 @@ hf_write(int fd, const char *buf, int count)
 		asm volatile(
 			"omov  o1, o10\n"
 			"omov  o2, o15\n"
-			"onull o3\n"
+			"omov  o3, o8\n"
 			"addiu r4, r0, 3\n"
 			"addu  r5, %0, r0\n"
 			"addu  r6, %1, r0\n"

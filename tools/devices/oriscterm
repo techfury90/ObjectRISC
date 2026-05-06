@@ -218,7 +218,11 @@ class Terminal:
         # SENDs key events to. Updated by SENDs to KEYBOARD_INDEX
         # (a non-null O3 payload subscribes that ref; a null O3
         # unsubscribes the sender's last subscription).
+        # When more than one CPU subscribes, only the focused one
+        # receives keys; F1 cycles focus between them. The shell's
+        # subscribe lands first → starts focused.
         self.kbd_subscribers: list = []
+        self.kbd_focus_idx: int = 0
         # Active pointer subscribers — same pattern as keyboard.
         # Bitmask of currently-pressed buttons (bit N == button N down).
         self.ptr_subscribers: list = []
@@ -606,12 +610,15 @@ class Terminal:
             # null SEND clears everyone — fine for the demo.
             n = len(self.kbd_subscribers)
             self.kbd_subscribers.clear()
+            self.kbd_focus_idx = 0
+            self._update_title()
             self._log(f"keyboard: unsubscribed {n} subscriber(s)")
             return
         if sub_ref in self.kbd_subscribers:
             self._log(f"keyboard: subscriber 0x{sub_ref:016x} already known")
             return
         self.kbd_subscribers.append(sub_ref)
+        self._update_title()
         self._log(f"keyboard: subscribed 0x{sub_ref:016x} "
                   f"(now {len(self.kbd_subscribers)} subscriber(s))")
 
@@ -703,27 +710,51 @@ class Terminal:
     }
 
     def _on_key_press(self, event) -> None:
+        # F1 is the focus-cycle hotkey: never delivered, always
+        # consumed by the terminal. Cycles which subscriber receives
+        # subsequent keys. With one subscriber this is a no-op; with
+        # zero subscribers it's also a no-op.
+        if event.keysym == "F1":
+            n = len(self.kbd_subscribers)
+            if n > 1:
+                self.kbd_focus_idx = (self.kbd_focus_idx + 1) % n
+                self._update_title()
+            return
         if not self.kbd_subscribers:
             return  # nobody listening; drop
         code = self._codepoint_from_event(event)
         if code is None:
             return  # uninteresting key (modifier-only, etc.)
         mods = self._modifiers_from_event(event)
-        # SEND one key event per subscriber. Each SEND carries:
-        #   recipient = the subscriber's reply ref
-        #   R4 = codepoint, R5 = modifier mask
-        for sub_ref in list(self.kbd_subscribers):
-            trans = self.next_trans_id & 0xFFFF
-            self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
-            evt_pkt = build_send_deliver(
-                src_pid=self.my_pid,
-                dst_pid=ref_home(sub_ref),
-                trans_id=trans,
-                recipient_ref=sub_ref,
-                int_payload=[code, mods, 0, 0],
-                or_payload=[sub_ref, 0, 0, 0],
-            )
-            self.send_packet(evt_pkt)
+        # Route to the focused subscriber only. With one subscriber
+        # (the common case), kbd_focus_idx == 0 and behaviour is
+        # identical to the pre-multi-sub world.
+        idx = self.kbd_focus_idx
+        if idx >= len(self.kbd_subscribers):
+            idx = 0
+        sub_ref = self.kbd_subscribers[idx]
+        trans = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        evt_pkt = build_send_deliver(
+            src_pid=self.my_pid,
+            dst_pid=ref_home(sub_ref),
+            trans_id=trans,
+            recipient_ref=sub_ref,
+            int_payload=[code, mods, 0, 0],
+            or_payload=[sub_ref, 0, 0, 0],
+        )
+        self.send_packet(evt_pkt)
+
+    def _update_title(self) -> None:
+        """Reflect the current focus + subscriber count in the window
+        title. Helps a user notice the F1 toggle landed."""
+        n = len(self.kbd_subscribers)
+        if n <= 1:
+            self.root.title(f"Object RISC Terminal · pid={self.my_pid}")
+        else:
+            self.root.title(
+                f"Object RISC Terminal · pid={self.my_pid} · "
+                f"kbd focus {self.kbd_focus_idx + 1}/{n} (F1 to cycle)")
 
     def _codepoint_from_event(self, event) -> Optional[int]:
         # Tk fills `keysym` for every key and `char` for printable ones.

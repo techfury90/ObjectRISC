@@ -167,17 +167,41 @@ term_init(void)
 	asm volatile("omov o14, o4");
 	asm volatile("omov o15, o3");
 
-	/* Attach a receive queue (depth 16). This queue is shared:
-	 * keyboard events AND hostfsd responses both land here. The
-	 * shared-queue design has a known limitation — a long-running
-	 * hf_read loop interleaved with keystrokes can mis-decode
-	 * messages. The right fix is separate per-service queues; for
-	 * now we keep the depth small so excess keystrokes during long
-	 * cmd_cat / cmd_ls runs are dropped at the door rather than
-	 * silently corrupting the response stream. lb_spawn sidesteps
-	 * the issue by attaching its own mailbox queue (linkboot.c). */
+	/* Allocate our own private mailbox service object → O9.
+	 *
+	 * Why not reuse the boot self-svc (O4) the way earlier versions
+	 * of this code did: TaskCreate copies the parent's OPRs to the
+	 * child verbatim, so a backgrounded program that calls term_init
+	 * would derive its kbd subscribe-cap from the SAME O4 the
+	 * parent already used — producing the same ref and getting
+	 * dedup'd by oriscterm. Per-instance service objects let each
+	 * program have its own kbd queue and subscribe ref, which is
+	 * what the Phase 40 focus-switching depends on. */
 	asm volatile(
-		"omov  o1, o4\n"
+		"addiu r4, r0, 16\n"
+		"addiu r5, r0, 0x4103\n"     /* TAG_SERVICE */
+		"addiu r6, r0, 0x5b\n"        /* R|W|S|V|C */
+		"addiu r7, r0, 0\n"
+		"call  #0x100\n"              /* ObjAlloc → O1 = mailbox */
+		"nop\n"
+		"omov  o9, o1\n"              /* O9 = term mailbox (long-lived) */
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r1", "r2", "r4", "r5", "r6", "r7"
+	);
+	(void)status;
+
+	/* Attach a receive queue (depth 16) to O9. This queue is
+	 * shared: keyboard events AND hostfsd responses both land
+	 * here. Known limitation — a long-running hf_read loop
+	 * interleaved with keystrokes can mis-decode messages. The
+	 * right fix is separate per-service queues; for now the depth
+	 * is small enough that excess keystrokes during long
+	 * cmd_cat / cmd_ls runs are dropped at the door rather than
+	 * silently corrupting the response stream. */
+	asm volatile(
+		"omov  o1, o9\n"
 		"addiu r4, r0, 64\n"
 		"call  #0x203\n"
 		"nop\n"
@@ -188,20 +212,17 @@ term_init(void)
 	);
 	(void)status;
 
-	/* Derive an R|S self-ref into O9 (our subscribe-cap scratch
-	 * slot) to hand to the keyboard service. */
+	/* Derive an R|S sub-ref from O9, hand it straight to the kbd
+	 * service via SEND. The derived ref lives in O2 just long
+	 * enough for the SEND to copy it onto the wire; no need to
+	 * park it permanently. */
 	asm volatile(
-		"omov  o1, o4\n"
-		"addiu r4, r0, 9\n"
-		"call  #0x103\n"
+		"omov  o1, o9\n"
+		"addiu r4, r0, 9\n"           /* R|S */
+		"call  #0x103\n"              /* ObjDerive → O1 = sub-cap */
 		"nop\n"
-		"omov  o9, o1"
-	);
-
-	/* Subscribe to the keyboard (O6). */
-	asm volatile(
-		"omov  o1, o6\n"
-		"omov  o2, o9\n"
+		"omov  o2, o1\n"              /* O2 = sub-cap for SEND */
+		"omov  o1, o6\n"              /* O1 = keyboard service */
 		"onull o3\n"
 		"addiu r4, r0, 0\n"
 		"addiu r5, r0, 0\n"
@@ -277,15 +298,17 @@ term_print_n_sync(const char *buf, int count)
 		offset = (int)(va - DATA_VA);
 	}
 
-	/* Derive an R|S sub-ref of the hf mailbox into O9 — the SEND
-	 * payload's O3 slot. The receiver only needs to be able to
-	 * SEND back; R|S is the minimum. */
+	/* Derive an R|S sub-ref of the hf mailbox and stash it in O3
+	 * — the SEND payload's reply_cap slot. The receiver only
+	 * needs to be able to SEND back; R|S is the minimum. We park
+	 * directly in O3 (vs O9 like older code did) because O9 is
+	 * now the term-init kbd mailbox, which we can't clobber. */
 	asm volatile(
 		"omov  o1, o8\n"
 		"addiu r4, r0, 9\n"             /* R|S */
-		"call  #0x103\n"                /* ObjDerive */
+		"call  #0x103\n"                /* ObjDerive → O1 = sub-cap */
 		"nop\n"
-		"omov  o9, o1"                  /* o9 = mailbox R|S */
+		"omov  o3, o1"                  /* O3 = reply_cap for SEND */
 		:
 		:
 		: "r1", "r2", "r4"
@@ -295,7 +318,6 @@ term_print_n_sync(const char *buf, int count)
 		asm volatile(
 			"omov  o1, o5\n"            /* console */
 			"omov  o2, o11\n"           /* stack source */
-			"omov  o3, o9\n"            /* reply_cap */
 			"addu  r4, %0, r0\n"
 			"addu  r5, %1, r0\n"
 			"addiu r6, r0, 0\n"
@@ -309,7 +331,6 @@ term_print_n_sync(const char *buf, int count)
 		asm volatile(
 			"omov  o1, o5\n"
 			"omov  o2, o15\n"           /* data source */
-			"omov  o3, o9\n"
 			"addu  r4, %0, r0\n"
 			"addu  r5, %1, r0\n"
 			"addiu r6, r0, 0\n"
@@ -392,7 +413,7 @@ term_getkey(int *out_mods)
 {
 	int status, code, mods;
 	asm volatile(
-		"omov  o1, o4\n"
+		"omov  o1, o9\n"                /* O9 = term mailbox (term_init) */
 		"addiu r4, r0, -1\n"            /* infinite timeout */
 		"call  #0x204\n"                /* ReceiveQueuePoll */
 		"nop\n"

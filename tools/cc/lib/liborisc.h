@@ -72,6 +72,10 @@ int hf_write(int fd, const char *buf, int count);   /* buf may be stack or data 
  *
  *     O5  = oriscterm console  (--service order)
  *     O6  = oriscterm keyboard (--service order)
+ *     O9  = term mailbox       (allocated by term_init; receives
+ *                                key events the terminal SENDs; do
+ *                                NOT clobber after init — term_getkey
+ *                                polls it)
  *     O11 = boot stack ref     (parked by term_init)
  *     O14 = boot self-svc      (parked by term_init)
  *     O15 = boot data ref      (parked by term_init)

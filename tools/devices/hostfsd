@@ -430,7 +430,11 @@ class HostFSD:
         if op == OP_SUBSCRIBE:
             self._do_subscribe(sender_pid, or_payload)
             return
-        sess = self._session_for_sender(sender_pid)
+        # or_payload[2] is the sender's O3 — the per-call reply_cap.
+        # If non-null we use it to disambiguate sessions for multi-
+        # program CPUs (the editor + the shell, etc.).
+        reply_cap = or_payload[2] if len(or_payload) > 2 else 0
+        sess = self._session_for_sender(sender_pid, reply_cap)
         if sess is None:
             self._log(f"op {op} from pid={sender_pid} with no subscription; "
                       f"dropping")
@@ -449,8 +453,25 @@ class HostFSD:
             self._log(f"unknown op {op} from pid={sender_pid}")
             self._reply(sess, E_INVAL, 0)
 
-    def _session_for_sender(self, sender_pid: int) -> Optional[Session]:
-        # Pick the session whose reply_ref's home matches the sender.
+    def _session_for_sender(self, sender_pid: int,
+                            reply_cap: int = 0) -> Optional[Session]:
+        # Prefer disambiguation by reply_cap when the caller provided
+        # one — match by underlying object (same home + index as the
+        # subscribed sub-ref, which has identical bits except for
+        # caps). Lets multiple programs on the same CPU each have
+        # their own hostfsd session: each subscribes with a sub-cap
+        # of its own private mailbox, then on every subsequent SEND
+        # passes that mailbox in O3 so we can route to the right
+        # session.
+        if reply_cap != 0:
+            tgt_home = ref_home(reply_cap)
+            tgt_idx  = ref_index(reply_cap)
+            for sub_ref, sess in self.sessions.items():
+                if ref_home(sub_ref) == tgt_home \
+                   and ref_index(sub_ref) == tgt_idx:
+                    return sess
+        # Legacy fallback: pick by sender_pid alone. Works as long as
+        # there's only one subscriber per CPU.
         for sub_ref, sess in self.sessions.items():
             if ref_home(sub_ref) == sender_pid:
                 return sess
