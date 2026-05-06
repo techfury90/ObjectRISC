@@ -3690,6 +3690,112 @@ exact characters that landed on the canvas.
   viewer doesn't use it. Could be neat (click-to-scroll), not
   urgent.
 
+## Phase 39 — A small full-screen editor (Ouroboros, day 16)
+
+Phase 38 built the read-only viewer; Phase 39 turns the same
+canvas into something you can type into. `edit <path>` in the
+shell is a modeless, nano-style editor — printable keys insert,
+arrows move, `^S` writes, `^X` quits. The supporting work is
+two pieces of plumbing: the oriscterm grid finally tracks cells,
+and the libc was already enough to express the rest.
+
+### oriscterm grid: per-cell text-item tracking
+
+Phase 38's grid handler created a fresh `create_text` Canvas item
+for every paint, with the explicit caveat that overlapping paints
+were the caller's problem. Fine when the only client was a viewer
+that always preceded a frame with `grid_clear`. Not fine for an
+editor that repaints after every keystroke — successive frames
+would visually pile up.
+
+Now the grid handler keeps a `(col, row) → Canvas item id` dict.
+Each painted character either replaces the existing item at that
+cell or adds a new one. A space is treated as "clear this cell"
+(no new item is added). `grid_clear` and `VEC_CLEAR` wipe the
+dict in lockstep with `canvas.delete("all")`.
+
+Text-item count therefore stays bounded by what's actually shown,
+and the editor can blast a full 80×24 frame on every keystroke
+without flickering or leaking items.
+
+### `cmd_edit`
+
+A self-contained shell builtin. State lives in a `struct
+edit_state` on `cmd_edit`'s stack:
+
+- `lines[100][96]` — the buffer (≈9.4 KB).
+- `line_lens[100]` — per-line length.
+- `n_lines`, `cur_row`, `cur_col`, `top_row`, `dirty`,
+  `truncated`, `path`.
+
+Operations are direct array manipulations — no rope, no gap
+buffer, no virtual EOL. Insert shifts a line's tail right by one
+byte; backspace at column 0 merges with the previous line by
+copying bytes and shifting subsequent lines up; ENTER splits the
+current line at the cursor and shifts later lines down.
+
+Rendering each frame:
+
+1. `grid_clear()` (single SEND with the col=row=-1 sentinel).
+2. One `grid_print_n` per visible line (≤ 23 SENDs).
+3. A single `_` painted at the cursor cell so the user can see
+   where the next insert will land. The cursor glyph overlays
+   whatever character is under it — accepted limitation, fine
+   for a first cut.
+4. Status line at row 23: `edit: <path> [*] L,C   ^S=save ^X=quit`.
+   The `*` flips on at the first edit and clears after a
+   successful save.
+
+Save uses `hf_open(... HF_O_WRONLY|CREAT|TRUNC)` then one
+`hf_write` per non-empty line plus a `\n`. No atomic-rename
+dance; corruption on a mid-save crash is theoretically possible
+but unlikely on a single-host integration.
+
+The editor is constrained to 100 lines × 95 chars. Larger
+files load up to the cap with the tail dropped (and a
+`(truncated)` tag in the status). Same convention as the
+viewer — honest about the buffer rather than partial-loading
+silently.
+
+### `fake_terminal` already does cell tracking
+
+The grid model in `fake_terminal` is a 2-D `bytearray[24][80]`
+indexed by `(col, row)`. Overwriting a cell just rewrites the
+byte — implicit cell-replace semantics. So no work needed there
+for Phase 39. The `grid_last_frame` snapshot machinery from
+Phase 38 still gives the editor test a reliable view of what
+was on the canvas before the wipe-on-quit.
+
+### Tests
+
+- **`tools/devices/tests/test_shell_edit.sh`** — pre-creates a
+  two-line file, opens it via `edit`, navigates to the end of
+  line 2 with one DOWN + many RIGHT presses, types `!`, hits
+  `^S`, hits `^X`, then exits the shell. The post-test asserts
+  read the file back off the host filesystem and verify both
+  lines are intact and line 2 ends with `!`. The grid
+  last-frame snapshot also confirms the status line was painted
+  with the right path.
+- All 18 device/shell tests pass; **138 sim validation tests**
+  unaffected.
+
+### What's not yet done
+
+- **No undo, no search, no copy/paste, no horizontal scroll.**
+  All natural follow-ups; none in scope here.
+- **Cursor obscures the character under it.** A vector-service
+  rectangle behind the cell would solve this cleanly, but
+  vector lives at idx 4 — and `hf_init` has already claimed
+  `O8`. Either grow the boot-ABI slot count or fold a cursor
+  primitive into the grid service the same way `clear` was.
+- **Save is not atomic.** A crash mid-write would leave the
+  file truncated. Trivial to fix with a write-temp-and-rename
+  once `hostfsd` grows a `rename`.
+- **Long-running typing might want preempt-aware drain.**
+  Phase 36 keeps the shell responsive against bg tasks; the
+  editor's full-frame repaint is a few dozen SENDs per
+  keystroke, which is well below the timer quantum.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

@@ -33,7 +33,7 @@ import sys
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # Wire-format constants must agree with simorisc/oriscbar.
 HELLO_MAGIC  = 0xC0FFEEAA
@@ -298,6 +298,14 @@ class Terminal:
         self.canvas_font = font
         self.vec_color = VEC_PALETTE[1]   # current stroke / fill color
 
+        # Per-cell text-item tracking. Without this, a second grid SEND
+        # at (col, row) would draw on top of the first — visually
+        # stacking glyphs. The editor (Phase 39) repaints constantly
+        # and needs proper cell-replace semantics. Maps (col, row) to
+        # a Canvas item id; on re-paint we delete the old id first.
+        # Cleared by VEC_CLEAR and the grid clear sentinel (col=-1).
+        self.grid_items: Dict[Tuple[int, int], int] = {}
+
         # Capture every keystroke at the toplevel so we get them whether
         # focus is on the (disabled) text widget or the root.
         self.root.bind("<Key>", self._on_key_press)
@@ -480,6 +488,7 @@ class Terminal:
         row    = int_payload[3]
         if col == 0xFFFFFFFF and row == 0xFFFFFFFF:
             self.canvas.delete("all")
+            self.grid_items.clear()
             return
         if source_ref == 0 or length == 0:
             return
@@ -527,6 +536,7 @@ class Terminal:
 
         if cmd == VEC_CLEAR:
             self.canvas.delete("all")
+            self.grid_items.clear()
             return
 
         if cmd == VEC_SET_COLOR:
@@ -623,15 +633,29 @@ class Terminal:
         if info["action"] == "console" and flags == 0:
             self._append(text)
         elif info["action"] == "grid" and flags == 0:
-            x = info["col"] * self.cell_w
-            y = info["row"] * self.cell_h
-            # Anchor "nw" puts the top-left of the text at (x, y), so a
-            # cell at (col, row) occupies cell_w × cell_h at (col*cw,
-            # row*ch) — overlapping prior text at the same position is
-            # the caller's responsibility.
-            self.canvas.create_text(x, y, text=text, anchor="nw",
-                                    fill=self.vec_color,
-                                    font=self.canvas_font)
+            base_col = info["col"]
+            row      = info["row"]
+            # One Canvas item per character cell. Anchor "nw" puts the
+            # top-left of the glyph at (col*cw, row*ch). For each cell
+            # we touch, delete any existing item at that (col, row)
+            # first so we get clean replace semantics — the editor
+            # repaints constantly and would otherwise stack glyphs.
+            for i, ch in enumerate(text):
+                col = base_col + i
+                key = (col, row)
+                old = self.grid_items.pop(key, None)
+                if old is not None:
+                    self.canvas.delete(old)
+                if ch == ' ':
+                    # Painting a space is "clear this cell" — the old
+                    # item is already gone, no need to add a no-op.
+                    continue
+                x = col * self.cell_w
+                y = row * self.cell_h
+                item = self.canvas.create_text(x, y, text=ch, anchor="nw",
+                                               fill=self.vec_color,
+                                               font=self.canvas_font)
+                self.grid_items[key] = item
 
         # If the console request carried a reply capability, send a
         # header-only ack SEND_DELIVER through it so the sender can
