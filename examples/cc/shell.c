@@ -502,16 +502,31 @@ cmd_run(const char *cwd, const char *arg)
 	}
 
 	/* Copy the trimmed-and-de-ampersanded arg into a stack buffer
-	 * so resolve_path doesn't see the trailing '&'. */
+	 * so we can mutate (NUL-terminate at the path/args split) and
+	 * pass slices to orx. resolve_path doesn't see the trailing
+	 * '&' or any args. */
 	char arg_copy[PATH_MAX];
 	if (alen >= PATH_MAX) alen = PATH_MAX - 1;
 	memcpy(arg_copy, arg, (unsigned int)alen);
 	arg_copy[alen] = '\0';
 
+	/* Split path from args at the first whitespace. Everything
+	 * after the first word goes through program_args() to the
+	 * spawned program. */
+	int psplit = 0;
+	while (psplit < alen
+	       && arg_copy[psplit] != ' ' && arg_copy[psplit] != '\t')
+		psplit++;
+	int args_start = psplit;
+	while (args_start < alen
+	       && (arg_copy[args_start] == ' '
+	           || arg_copy[args_start] == '\t'))
+		args_start++;
+	arg_copy[psplit] = '\0';
 	resolve_path(cwd, arg_copy, path);
 
 	if (background) {
-		task_t t = orx_spawn(path);
+		task_t t = orx_spawn(path, arg_copy + args_start);
 		if (t < 0) {
 			term_print("orx_spawn failed: ");
 			term_print_int(t);
@@ -527,7 +542,7 @@ cmd_run(const char *cwd, const char *arg)
 		 * shell blocks again on the next keystroke. */
 		task_yield();
 	} else {
-		int code = orx_run(path);
+		int code = orx_run(path, arg_copy + args_start);
 		term_print(run_done_pre);
 		term_print_int(code);
 		term_print(run_done_post);

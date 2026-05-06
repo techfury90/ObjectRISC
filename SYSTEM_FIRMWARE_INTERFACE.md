@@ -143,6 +143,10 @@ calling task or returns `ENOSYS` per its policy.
 > Args:
 > - `O1`: code object (must carry `X`).
 > - `O2`: initial stack object (must carry `R` and `W`).
+> - `O3`: data object (must carry `R`); null permitted.
+> - `O4`: argv buffer (must carry `R`); null permitted. When non-null,
+>   mapped R-only at the platform's argv VA so the new task can read
+>   its arguments via a known address.
 > - `R4`: byte offset within the code object at which to begin.
 > - `R5`: initial value to place in `R4` of the new task.
 >

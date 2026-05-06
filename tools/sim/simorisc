@@ -1702,6 +1702,7 @@ def load_orx_file(path: str) -> Tuple[bytes, bytes, int, int]:
 
 CODE_VA = 0x00010000
 DATA_VA = 0x00040000
+ARGV_VA = 0x000A0000
 STACK_TOP = 0x00200000
 
 
@@ -1955,12 +1956,14 @@ def primitive_TaskCreate(cpu: CPU) -> None:
     """Create a task with its own address space and prime its register
     state. The new task starts in the NEW state — TaskResume moves it
     onto the runnable queue. Standard layout: code at CODE_VA (R+X),
-    stack at STACK_TOP (R+W), and (when O3 is non-null) data at DATA_VA
-    (R+W) — same VAs as init_cpu so pcc-generated code that assumes
-    flat addresses Just Works in the child."""
+    stack at STACK_TOP (R+W), data at DATA_VA (R+W) when O3 is
+    non-null, and an args/argv buffer at ARGV_VA (R-only) when O4 is
+    non-null — same VAs as init_cpu so pcc-generated code that
+    assumes flat addresses Just Works in the child."""
     code_ref  = cpu.get_opr(1)
     stack_ref = cpu.get_opr(2)
     data_ref  = cpu.get_opr(3)              # optional; 0 = no data segment
+    args_ref  = cpu.get_opr(4)              # optional; 0 = no args buffer
     entry     = cpu.get_gpr(4) & 0xFFFFFFFF
     init_r4   = cpu.get_gpr(5) & 0xFFFFFFFF
     if entry & 0x80000000:
@@ -2000,6 +2003,20 @@ def primitive_TaskCreate(cpu: CPU) -> None:
         if data_desc.generation != ref_generation(data_ref):
             cpu.set_gpr(2, ERR_ESTALE); return
 
+    args_idx, args_desc = None, None
+    if args_ref != 0:
+        if ref_home(args_ref) != cpu.pid:
+            cpu.set_gpr(2, ERR_EREMOTE); return
+        if (ref_caps(args_ref) & CAP_R) == 0:
+            cpu.set_gpr(2, ERR_EPERM); return
+        args_idx = ref_index(args_ref)
+        if args_idx >= len(cpu.descriptors) or cpu.descriptors[args_idx] is None \
+                or not cpu.descriptors[args_idx].live:
+            cpu.set_gpr(2, ERR_ESTALE); return
+        args_desc = cpu.descriptors[args_idx]
+        if args_desc.generation != ref_generation(args_ref):
+            cpu.set_gpr(2, ERR_ESTALE); return
+
     task = Task(descriptor_idx=alloc_task_descriptor(cpu),
                 code_ref=code_ref, stack_ref=stack_ref,
                 state=TASK_STATE_NEW)
@@ -2016,6 +2033,14 @@ def primitive_TaskCreate(cpu: CPU) -> None:
         task.mappings.append(
             (DATA_VA, DATA_VA + data_desc.length, data_idx, 0,
              CAP_R | CAP_W))
+    if args_idx is not None:
+        # Argv buffer mapped R-only at ARGV_VA. Programs that want
+        # their args grab them via the libc helper which dereferences
+        # this VA. Programs that don't care just don't map and the
+        # VA stays unmapped — accessing it would trap.
+        task.mappings.append(
+            (ARGV_VA, ARGV_VA + args_desc.length, args_idx, 0,
+             CAP_R))
     task.pc      = (CODE_VA + entry) & 0xFFFFFFFF
     task.next_pc = (task.pc + 4)     & 0xFFFFFFFF
     # Child inherits the parent's object registers — that's how the
