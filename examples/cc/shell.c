@@ -8,6 +8,7 @@
  *     help        — short list of commands
  *     cat <path>  — print the contents of a host file
  *     more <path> — like cat, but paginated (space/RET to advance, q to quit)
+ *     view <path> — full-screen file viewer using the grid canvas (q to quit)
  *     ls [path]   — list a host directory (default: cwd)
  *     cd [path]   — change working directory (no arg → "/")
  *     pwd         — print the current working directory
@@ -35,6 +36,8 @@
  * Boot ABI (set up by run_shell.sh via --service order):
  *     O5  = oriscterm console  (idx 1)
  *     O6  = oriscterm keyboard (idx 2)
+ *     O7  = oriscterm grid     (idx 3)  — used by cmd_view (Phase 38);
+ *                                          carries both paint + clear
  *     O10 = hostfsd            (pid 17, idx 1)
  *     O11 = boot stack ref     (parked by term_init)
  *     O14 = boot self-svc      (parked by term_init)
@@ -73,6 +76,7 @@ const char help_msg[] =
     "  help            — this message\n"
     "  cat <path>      — print the contents of a host file\n"
     "  more <path>     — like cat, but paginated (space/RET to advance, q to quit)\n"
+    "  view <path>     — full-screen file viewer on the grid canvas (q to quit)\n"
     "  ls [<path>]     — list a host directory (default: cwd)\n"
     "  cd [<path>]     — change working directory (no arg → '/')\n"
     "  pwd             — print the current working directory\n"
@@ -549,6 +553,195 @@ cmd_wait(const char *arg)
 	term_print("]\n");
 }
 
+/* --- view: full-screen file viewer on the grid canvas (Phase 38) -----
+ *
+ * Reads the whole file into a stack buffer (cap: VIEW_BUF_BYTES),
+ * indexes its line starts (cap: VIEW_MAX_LINES), and paints a
+ * window of it onto the oriscterm grid canvas (80×24). Bottom row
+ * is a status line; the remaining 23 are content. Arrow keys / vi
+ * keys scroll; q or ESC quit. Files larger than the buffer get
+ * truncated with a "(truncated)" suffix in the status; lines
+ * longer than the canvas get clipped at column 80.
+ *
+ * No pager-style backwards reads — we hold the whole buffer in
+ * memory. That's good enough for a Phase 38 demo on the typical
+ * 4-32KB shell scripts and source files we might want to read.
+ * Bigger files want a paging design; out of scope for now. */
+
+#define VIEW_BUF_BYTES   8192
+#define VIEW_MAX_LINES   512
+#define VIEW_GRID_COLS   80
+#define VIEW_GRID_ROWS   24
+#define VIEW_CONTENT_ROWS 23
+
+/* Bundled so view_render fits in pcc's 4-register arg limit. */
+struct view_state {
+	const char *buf;
+	const int  *line_off;
+	int         n_lines;
+	int         top_row;
+	const char *path;
+	int         truncated;
+};
+
+/* Append 1+ chars to a status-line buffer, advancing *sp. Caps at
+ * the grid column count so we never overrun the row. */
+static int
+view_status_append(char *status, int sp, const char *s)
+{
+	while (*s && sp < VIEW_GRID_COLS) status[sp++] = *s++;
+	return sp;
+}
+
+static int
+view_status_append_int(char *status, int sp, int v)
+{
+	char numbuf[12];
+	int nb = 0;
+	int j;
+	if (v == 0) numbuf[nb++] = '0';
+	while (v > 0) { numbuf[nb++] = '0' + (v % 10); v /= 10; }
+	for (j = nb - 1; j >= 0 && sp < VIEW_GRID_COLS; j--)
+		status[sp++] = numbuf[j];
+	return sp;
+}
+
+static void
+view_render(struct view_state *vs)
+{
+	int i;
+	int row;
+	int len;
+	int start;
+	int end;
+	char status[VIEW_GRID_COLS];
+	int sp;
+
+	grid_clear();
+
+	for (i = 0; i < VIEW_CONTENT_ROWS; i++) {
+		row = vs->top_row + i;
+		if (row >= vs->n_lines) break;
+		start = vs->line_off[row];
+		end   = (row + 1 < vs->n_lines)
+		        ? vs->line_off[row + 1]
+		        : vs->line_off[vs->n_lines];
+		/* Drop the trailing \n so it doesn't render as a glyph. */
+		if (end > start && vs->buf[end - 1] == '\n') end--;
+		len = end - start;
+		if (len > VIEW_GRID_COLS) len = VIEW_GRID_COLS;
+		if (len > 0)
+			grid_print_n(0, i, vs->buf + start, len);
+	}
+
+	sp = 0;
+	sp = view_status_append(status, sp, "view: ");
+	sp = view_status_append(status, sp, vs->path);
+	if (vs->truncated)
+		sp = view_status_append(status, sp, " (truncated)");
+	sp = view_status_append(status, sp, "  ");
+	sp = view_status_append_int(status, sp, vs->top_row + 1);
+	sp = view_status_append(status, sp, "/");
+	sp = view_status_append_int(status, sp, vs->n_lines);
+	sp = view_status_append(status, sp, "  q=quit");
+	grid_print_n(0, VIEW_CONTENT_ROWS, status, sp);
+}
+
+static void
+cmd_view(const char *cwd, const char *arg)
+{
+	char path[PATH_MAX];
+	char buf[VIEW_BUF_BYTES];
+	int  line_off[VIEW_MAX_LINES + 1];
+	int  buf_len = 0;
+	int  n_lines = 0;
+	int  top_row = 0;
+	int  truncated = 0;
+	int  fd;
+	int  n;
+	int  i;
+	int  key;
+	int  mods;
+	int  max_top;
+
+	resolve_path(cwd, arg, path);
+	fd = hf_open(path, HF_O_RDONLY);
+	if (fd < 0) {
+		term_print("view: cannot open '");
+		term_print(arg);
+		term_print("'\n");
+		return;
+	}
+	while (buf_len < VIEW_BUF_BYTES
+	       && (n = hf_read(fd, buf + buf_len,
+	                       VIEW_BUF_BYTES - buf_len)) > 0) {
+		buf_len += n;
+	}
+	hf_close(fd);
+	/* Best-effort detection of "we capped out": if a final read filled
+	 * us to the brim, the file MIGHT be longer. We don't know without
+	 * another read; mark truncated to be honest about it. */
+	if (buf_len >= VIEW_BUF_BYTES) truncated = 1;
+
+	/* Index line starts. line_off[i] is the byte offset of line i;
+	 * line_off[n_lines] is the end-of-buffer sentinel. */
+	line_off[0] = 0;
+	n_lines = 0;
+	for (i = 0; i < buf_len; i++) {
+		if (buf[i] == '\n') {
+			n_lines++;
+			if (n_lines >= VIEW_MAX_LINES) {
+				truncated = 1;
+				break;
+			}
+			line_off[n_lines] = i + 1;
+		}
+	}
+	/* Tail line without a trailing \n. */
+	if (n_lines < VIEW_MAX_LINES
+	    && (n_lines == 0 || line_off[n_lines] < buf_len)) {
+		n_lines++;
+	}
+	line_off[n_lines] = buf_len;
+
+	for (;;) {
+		struct view_state vs;
+		max_top = n_lines - VIEW_CONTENT_ROWS;
+		if (max_top < 0) max_top = 0;
+		if (top_row > max_top) top_row = max_top;
+		if (top_row < 0) top_row = 0;
+
+		vs.buf       = buf;
+		vs.line_off  = line_off;
+		vs.n_lines   = n_lines;
+		vs.top_row   = top_row;
+		vs.path      = path;
+		vs.truncated = truncated;
+		view_render(&vs);
+
+		key = term_getkey(&mods);
+		if (key == 'q' || key == 'Q' || key == TK_ESCAPE) {
+			break;
+		} else if (key == TK_UP || key == 'k') {
+			top_row--;
+		} else if (key == TK_DOWN || key == 'j') {
+			top_row++;
+		} else if (key == ' ') {
+			top_row += VIEW_CONTENT_ROWS;
+		} else if (key == 'b' || key == TK_BACKSPACE) {
+			top_row -= VIEW_CONTENT_ROWS;
+		} else if (key == 'g') {
+			top_row = 0;
+		} else if (key == 'G') {
+			top_row = max_top;
+		}
+	}
+
+	/* Wipe the canvas before returning so the shell prompt doesn't
+	 * sit alongside the last viewed frame. */
+	grid_clear();
+}
+
 /* SIGKILL-equivalent exit code. POSIX shells report 128 + signum
  * for signal-killed children (137 = 128 + 9 = SIGKILL); we mirror
  * the convention so `kill N` followed by a `wait N` shows 137. */
@@ -715,6 +908,9 @@ main(void)
 		} else if (strcmp(line, "more") == 0) {
 			if (*arg == 0) term_print("usage: more <path>\n");
 			else cmd_more(cwd, arg);
+		} else if (strcmp(line, "view") == 0) {
+			if (*arg == 0) term_print("usage: view <path>\n");
+			else cmd_view(cwd, arg);
 		} else if (strcmp(line, "ls") == 0) {
 			cmd_ls(cwd, *arg ? arg : ".");
 		} else if (strcmp(line, "cd") == 0) {

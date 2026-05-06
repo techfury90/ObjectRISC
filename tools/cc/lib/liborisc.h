@@ -93,6 +93,23 @@ void term_print_char(char c);
 void term_print_int(int n);
 void term_print_hex(unsigned int n);
 
+/* ---- grid.c — oriscterm grid (idx 3) client ----------------------
+ *
+ * Paint byte sequences at character-cell positions (col, row) on
+ * the graphics canvas, and clear the whole canvas. The grid
+ * service carries both paint (col/row >= 0) and clear (col=row=-1
+ * sentinel) on a single ref — handy because hf_init lays claim to
+ * O8 at runtime, leaving a separate vector slot crowded out.
+ *
+ *     O7  = oriscterm grid     (--service N=3@9 in slot 3)
+ *
+ * term_init or term_print_only_init MUST run first — they park
+ * the boot OPRs grid.c reuses. */
+
+void grid_print(int col, int row, const char *s);
+void grid_print_n(int col, int row, const char *buf, int count);
+void grid_clear(void);
+
 /* term_getkey: blocks until the next keystroke arrives. Returns
  * the codepoint (ASCII for printable, ≥0x100 for special — see
  * KEY_* in tools/devices/oriscterm). Modifier mask written to

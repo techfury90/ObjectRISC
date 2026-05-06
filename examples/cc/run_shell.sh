@@ -77,11 +77,14 @@ python3 tools/ld/orld -o "$TMP/shell.orx" \
 # --service slot order (each spec lands at the next free O5..O15):
 #   O5  = oriscterm console  (16=1@9)
 #   O6  = oriscterm keyboard (16=2@9)
-#   O7  = pad (was linkbootd; orx_run doesn't need it)
-#   O8..O9 = unused (pad)
+#   O7  = oriscterm grid     (16=3@9)  — Phase 38, used by cmd_view +
+#                                       grid_clear (the grid service
+#                                       handles both paint and clear)
+#   O8  = pad — claimed at runtime by hf_init for its private mailbox
+#   O9  = pad
 #   O10 = hostfsd            (17=1@9)
 exec python3 tools/oriscrun \
     --terminal pid=16 \
     --hostfsd "pid=17,root=$ROOT" \
-    --cpu "pid=0:program=$TMP/shell.orx,service=16=1@9,service=16=2@9,service=0=0@0,service=0=0@0,service=0=0@0,service=17=1@9" \
+    --cpu "pid=0:program=$TMP/shell.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=0@0,service=0=0@0,service=17=1@9" \
     --leader 0 --leader-timeout 600

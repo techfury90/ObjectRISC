@@ -38,7 +38,11 @@ PKT_SEND_DELIVER  = 0x20
 
 CONSOLE_INDEX  = 1
 KEYBOARD_INDEX = 2
+GRID_INDEX     = 3
 POINTER_INDEX  = 6
+
+GRID_COLS = 80
+GRID_ROWS = 24
 
 PTR_MOTION = 0x00
 PTR_DOWN   = 0x01
@@ -99,6 +103,14 @@ class FakeTerminal:
         # writes to a redirected stdout get block-buffered and lost).
         self.console_reads: dict = {}
         self.console_render = bytearray()
+        # Grid-service rendering. Each cell starts as a space; grid
+        # SENDs paint bytes at (col, row), VEC_CLEAR resets to all-
+        # spaces. We also keep the *last non-empty* grid snapshot
+        # before each VEC_CLEAR — useful for tests against full-
+        # screen apps (the viewer, the future editor) which wipe the
+        # canvas on exit so the final post-quit grid is empty.
+        self.grid = [[ord(' ')] * GRID_COLS for _ in range(GRID_ROWS)]
+        self.grid_last_frame = None
 
     def drain_pending_subs(self, timeout):
         """Pull bytes off the socket until both `timeout` seconds have
@@ -158,7 +170,37 @@ class FakeTerminal:
             if source_ref and length:
                 trans = self._next_trans()
                 self.console_reads[trans] = {
+                    "kind": "console",
                     "len": length, "reply_cap": reply_cap,
+                }
+                pkt_out = build_obj_read_req(
+                    self.pid, ref_home(source_ref), trans,
+                    source_ref, offset, length)
+                self.sock.sendall(struct.pack(">I", len(pkt_out)) + pkt_out)
+        elif idx == GRID_INDEX:
+            # Grid SEND: O2 = source ref, R4 = offset, R5 = length,
+            # R6 = col, R7 = row. Special: col=row=0xFFFFFFFF clears
+            # the whole canvas (no payload pulled). Otherwise we
+            # OBJ_READ_REQ the bytes and paint them into the in-
+            # memory grid at the named cell.
+            source_ref = p[8] | (p[9] << 32)
+            offset = p[2]
+            length = p[3]
+            col    = p[4]
+            row    = p[5]
+            if col == 0xFFFFFFFF and row == 0xFFFFFFFF:
+                # Stash the last frame iff anything had been painted.
+                # Empty wipes (the viewer's enter-and-exit clears)
+                # don't overwrite an earlier substantive frame.
+                if any(c != ord(' ') for r in self.grid for c in r):
+                    self.grid_last_frame = [list(r) for r in self.grid]
+                self.grid = [[ord(' ')] * GRID_COLS for _ in range(GRID_ROWS)]
+                return
+            if source_ref and length:
+                trans = self._next_trans()
+                self.console_reads[trans] = {
+                    "kind": "grid", "len": length,
+                    "col": col, "row": row,
                 }
                 pkt_out = build_obj_read_req(
                     self.pid, ref_home(source_ref), trans,
@@ -190,10 +232,20 @@ class FakeTerminal:
             return
         words = pkt["payload"]
         raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in words)
-        # Mirror oriscterm's \b handling: byte 0x08 deletes the
-        # previous byte from the rendered stream, no-op at start.
-        # Without this the shell's backspace echo shows up as raw
-        # \x08 bytes in test transcripts.
+        kind = info.get("kind", "console")
+        if kind == "grid":
+            col = info["col"]
+            row = info["row"]
+            if 0 <= row < GRID_ROWS:
+                for i, b in enumerate(raw[:n]):
+                    c = col + i
+                    if 0 <= c < GRID_COLS:
+                        self.grid[row][c] = b
+            return
+        # Default: console rendering. Mirror oriscterm's \b handling:
+        # byte 0x08 deletes the previous byte from the rendered
+        # stream, no-op at start. Without this the shell's backspace
+        # echo shows up as raw \x08 bytes in test transcripts.
         for b in raw[:n]:
             if b == 0x08:
                 if self.console_render:
@@ -339,6 +391,17 @@ def main():
     # event-log lines interleaved.
     sys.stdout.write("--- console render ---\n")
     sys.stdout.write(term.console_render.decode("utf-8", errors="replace"))
+    # Grid render: 24 rows of 80 cells. Right-trimmed to the last
+    # non-space column so the snapshot stays readable.
+    sys.stdout.write("\n--- grid render ---\n")
+    for row in term.grid:
+        line = bytes(row).decode("utf-8", errors="replace").rstrip()
+        sys.stdout.write(line + "\n")
+    if term.grid_last_frame is not None:
+        sys.stdout.write("\n--- grid last frame ---\n")
+        for row in term.grid_last_frame:
+            line = bytes(row).decode("utf-8", errors="replace").rstrip()
+            sys.stdout.write(line + "\n")
     sys.stdout.flush()
     return 0
 
