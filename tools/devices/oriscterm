@@ -733,6 +733,13 @@ class Terminal:
         if sym in self._KEYSYM_TO_CODE:
             return self._KEYSYM_TO_CODE[sym]
         ch = event.char
+        # Synthesize C0 control chars for Ctrl+letter on platforms where
+        # Tk leaves event.char empty (notably macOS/Aqua). Without this
+        # the editor never sees ^S / ^X / etc. — the keystroke gets
+        # dropped right here. We map the alphabetic keysym + the Ctrl
+        # modifier bit into the 0x01..0x1A range the editor expects.
+        if (event.state & 0x4) and len(sym) == 1 and sym.isalpha():
+            return ord(sym.lower()) & 0x1F
         if ch and len(ch) >= 1:
             b = ch.encode('utf-8', errors='ignore')
             if not b:
