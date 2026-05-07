@@ -17,7 +17,7 @@
  * the user typed. The shell fills both fields in cmd_run.
  *
  * No length is shipped — programs that want true argc/argv split
- * args themselves (see e.g. examples/cc/programs/edit.c).
+ * args themselves (see e.g. ouroboros/programs/edit.c).
  *
  * If the launcher didn't set up an argv mapping, dereferencing
  * ARGV_VA traps. The convention is: orx_run ALWAYS sets up an

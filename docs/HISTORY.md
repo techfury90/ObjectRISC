@@ -4217,6 +4217,61 @@ dynamically; deferring that to a later phase.
   WITHOUT a manual second F1 (proving focus auto-returned).
 - All 18 device/shell + 138 sim validation tests still pass.
 
+## Phase 42 — Repo reorg (Ouroboros gets its own roof)
+
+Pure plumbing pass — no behaviour changes, every test still
+passes. The repo had been growing Ouroboros (the OS) inside
+`examples/cc/`, and the architecture documentation was a flat
+pile of `.md` files at the repo root. Two moves and a top-level
+Makefile:
+
+- `examples/cc/shell.c` → `ouroboros/shell.c`
+- `examples/cc/programs/` → `ouroboros/programs/`
+- `examples/cc/run_shell.sh` → deleted; replaced by `make boot`
+- `examples/cc/programs/build-one.sh` → deleted; subsumed by
+  Makefile pattern rules
+- All architecture `.md` files (CONTRACT, INSTRUCTION_SET, the
+  seven volumes, HISTORY) → `docs/`
+- PDFs + `build_pdf.py` + `preamble.tex` → `docs/`
+- `scripts/boot.sh` is the new launcher (was `examples/cc/run_shell.sh`);
+  computes today-minus-40, rebuilds the shell with the
+  alternate-history banner, symlinks `build/programs/` into the
+  jail at `/programs/`, and execs `tools/oriscrun`.
+
+The new `Makefile` at the top level is the canonical build entry
+point:
+
+    make            — build liborisc, the shell, and every program
+                     (incremental — pcc + asmorisc + orld pipeline
+                     wrapped in pattern rules)
+    make boot       — build, then start Ouroboros
+    make lib        — just liborisc.ora
+    make shell      — just the shell
+    make programs   — just the programs
+    make clean      — wipe build/
+
+Build artefacts now land under `build/` (gitignored): `build/lib/`
+for individual liborisc objects, `build/runtime/` for crt0 +
+console_io, `build/programs/` for `.orx` guests, and
+`build/{liborisc.ora,shell.orx}` at the top.
+
+Test scripts no longer inline the cpp/ccom/asm/ld pipeline for
+the shared parts — they call `make -s lib` to ensure liborisc is
+built, then build their per-test shell + guests against
+`build/liborisc.ora`. Custom shells (with test-specific banners)
+and one-off guest programs still get built inline so each test
+stays self-contained.
+
+`tools/cc/lib/build.sh` is now a thin `exec make lib` wrapper —
+old muscle memory keeps working, but the artefact lives at
+`build/liborisc.ora` (was `tools/cc/lib/liborisc.ora`).
+
+Discoverable entry point — first thing in the README is now
+"`make boot` to start Ouroboros." The `examples/` tree is back
+to being just demos: standalone C and assembly programs,
+`linkboot/`, the Dhrystone smoke test that runs without the
+shell, the multitask demos.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

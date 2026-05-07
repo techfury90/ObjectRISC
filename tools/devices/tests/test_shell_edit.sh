@@ -33,8 +33,8 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
 
-if [ ! -f tools/cc/lib/liborisc.ora ]; then
-    bash tools/cc/lib/build.sh >/dev/null
+if [ ! -f build/liborisc.ora ]; then
+    make -s lib >/dev/null
 fi
 
 TMP=$(mktemp -d)
@@ -54,24 +54,24 @@ mkdir -p "$TMP/jail/sub"
 echo "Hi there" > "$TMP/jail/sub/scratch.txt"
 
 # --- editor program: standalone .orx -----------------------------------
-"$CPP" -I tools/cc/arch/orisc -I tools/cc/lib examples/cc/programs/edit.c > "$TMP/edit.i"
+"$CPP" -I tools/cc/arch/orisc -I tools/cc/lib ouroboros/programs/edit.c > "$TMP/edit.i"
 "$CCOM" < "$TMP/edit.i" > "$TMP/edit.s"
 python3 tools/asm/asmorisc -r tools/cc/arch/orisc/crt0.s       -o "$TMP/crt0.oro"
 python3 tools/asm/asmorisc -r tools/cc/arch/orisc/console_io.s -o "$TMP/cio.oro"
 python3 tools/asm/asmorisc -r "$TMP/edit.s"                    -o "$TMP/edit.oro"
 python3 tools/ld/orld -o "$TMP/jail/programs/edit.orx" \
     "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/edit.oro" \
-    tools/cc/lib/liborisc.ora
+    build/liborisc.ora
 
 # --- shell ------------------------------------------------------------
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
     -DBUILD_BANNER='"Object RISC Shell (FOCUS)"' \
-    examples/cc/shell.c > "$TMP/shell.i"
+    ouroboros/shell.c > "$TMP/shell.i"
 "$CCOM" < "$TMP/shell.i" > "$TMP/shell.s"
 python3 tools/asm/asmorisc -r "$TMP/shell.s"                   -o "$TMP/shell.oro"
 python3 tools/ld/orld -o "$TMP/shell.orx" \
     "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/shell.oro" \
-    tools/cc/lib/liborisc.ora
+    build/liborisc.ora
 
 SOCK="$TMP/oriscbar.sock"
 python3 tools/sim/oriscbar --socket "$SOCK" >/dev/null 2>&1 &
