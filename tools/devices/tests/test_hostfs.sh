@@ -9,8 +9,8 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
 
-if [ ! -f tools/cc/lib/liborisc.ora ]; then
-    bash tools/cc/lib/build.sh >/dev/null
+if [ ! -f build/liborisc.ora ]; then
+    make -s lib >/dev/null
 fi
 
 TMP=$(mktemp -d)
@@ -76,7 +76,7 @@ python3 tools/asm/asmorisc -r tools/cc/arch/orisc/console_io.s  -o "$TMP/console
 python3 tools/asm/asmorisc -r "$TMP/p.s"                        -o "$TMP/p.oro"
 python3 tools/ld/orld -o "$TMP/test.orx" \
     "$TMP/crt0.oro" "$TMP/console_io.oro" "$TMP/p.oro" \
-    tools/cc/lib/liborisc.ora
+    build/liborisc.ora
 
 SOCK="$TMP/oriscbar.sock"
 python3 tools/sim/oriscbar --socket "$SOCK" >/dev/null 2>&1 &

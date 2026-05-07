@@ -1,8 +1,10 @@
-# examples/cc/programs
+# ouroboros/programs
 
 Sample guests for the shell's `run` command. Each `.c` here gets
-built to a same-named `.orx` automatically by `run_shell.sh` (or
-manually via `bash build-one.sh foo.c foo.orx`).
+built to a same-named `.orx` under `build/programs/` by `make`.
+`make boot` symlinks `build/programs/` into the hostfsd jail at
+`/programs/`, so they're immediately runnable from inside the
+shell.
 
 ```
 /> ls /programs
@@ -80,10 +82,15 @@ but no harm.
 
 ## Adding a new program
 
-Drop `foo.c` here, re-run `run_shell.sh` (it rebuilds on launch),
-then `run /programs/foo.orx`. Or rebuild this one directly:
+Drop `foo.c` here, re-run `make` (the Makefile picks it up
+automatically — there's a uniform `%.c → %.orx` pattern rule),
+then from inside the shell: `run /programs/foo.orx`.
 
 ```sh
-bash examples/cc/programs/build-one.sh \
-    examples/cc/programs/foo.c examples/cc/programs/foo.orx
+echo '#include "liborisc.h"
+int main(void) { print_str("hi\n"); return 7; }
+' > ouroboros/programs/hi.c
+make programs
+# `make boot` if not already running, then inside the shell:
+#   /> run /programs/hi.orx
 ```

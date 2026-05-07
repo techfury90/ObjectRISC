@@ -41,9 +41,9 @@ fi
 TMP=$(mktemp -d)
 trap "rm -rf $TMP" EXIT
 
-LIBORISC="tools/cc/lib/liborisc.ora"
+LIBORISC="build/liborisc.ora"
 if [ ! -f "$LIBORISC" ]; then
-    bash tools/cc/lib/build.sh >/dev/null
+    make -s lib >/dev/null
 fi
 
 # 1) Compile the user's program (cpp + ccom). Both -I dirs:

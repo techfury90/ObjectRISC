@@ -26,35 +26,39 @@ terminal device, and a validation suite.
 
 ### Architecture documentation (the seven volumes)
 
-| Volume | File                                                     | Subject                              |
-|--------|----------------------------------------------------------|--------------------------------------|
-| I      | [`OVERVIEW.md`](OVERVIEW.md)                             | Architectural pitch and shape        |
-| II     | [`INSTRUCTION_SET.md`](INSTRUCTION_SET.md)               | The ISA                              |
-| III    | [`OBJECT_SYSTEM.md`](OBJECT_SYSTEM.md)                   | References, descriptors, capabilities |
-| IV     | [`INTERCONNECT_PROTOCOL.md`](INTERCONNECT_PROTOCOL.md)   | Crossbar wire format                 |
-| V      | [`REFERENCE_IMPLEMENTATION.md`](REFERENCE_IMPLEMENTATION.md) | OR-1000 / OR-XBAR-1 reference designs |
-| VI     | [`SYSTEM_FIRMWARE_INTERFACE.md`](SYSTEM_FIRMWARE_INTERFACE.md) | Firmware primitive ABI               |
-| VII    | [`PROGRAMMING_PRACTICE.md`](PROGRAMMING_PRACTICE.md)     | ABI, idioms, worked example          |
+All under [`docs/`](docs/):
 
-[`CONTRACT.md`](CONTRACT.md) pins what the architecture spec leaves
-to the integrator: the `.orx` binary format, the loader's initial
-task state, and the host-side semantics of the firmware primitives
-the simulator implements directly.
+| Volume | File                                                                | Subject                              |
+|--------|---------------------------------------------------------------------|--------------------------------------|
+| I      | [`docs/OVERVIEW.md`](docs/OVERVIEW.md)                              | Architectural pitch and shape        |
+| II     | [`docs/INSTRUCTION_SET.md`](docs/INSTRUCTION_SET.md)                | The ISA                              |
+| III    | [`docs/OBJECT_SYSTEM.md`](docs/OBJECT_SYSTEM.md)                    | References, descriptors, capabilities |
+| IV     | [`docs/INTERCONNECT_PROTOCOL.md`](docs/INTERCONNECT_PROTOCOL.md)    | Crossbar wire format                 |
+| V      | [`docs/REFERENCE_IMPLEMENTATION.md`](docs/REFERENCE_IMPLEMENTATION.md) | OR-1000 / OR-XBAR-1 reference designs |
+| VI     | [`docs/SYSTEM_FIRMWARE_INTERFACE.md`](docs/SYSTEM_FIRMWARE_INTERFACE.md) | Firmware primitive ABI               |
+| VII    | [`docs/PROGRAMMING_PRACTICE.md`](docs/PROGRAMMING_PRACTICE.md)      | ABI, idioms, worked example          |
 
-[`HISTORY.md`](HISTORY.md) traces the project's evolution — three
-passes on Volume I, the Apollo correction, the toolchain's
+[`docs/CONTRACT.md`](docs/CONTRACT.md) pins what the architecture
+spec leaves to the integrator: the `.orx` binary format, the
+loader's initial task state, and the host-side semantics of the
+firmware primitives the simulator implements directly.
+
+[`docs/HISTORY.md`](docs/HISTORY.md) traces the project's evolution
+— three passes on Volume I, the Apollo correction, the toolchain's
 contract-first dispatch, the validation suite, multi-CPU, the
 wire-level crossbar, multi-process, the manual revision, and the
-seven phases (24–30) of **Ouroboros** — the OS layer growing on
-top: privilege modes, trap delivery, tasks/scheduler, supervisor
-handlers, timer interrupts, the C-level task API, and the shell
-becoming a real supervisor that spawns guests as child tasks on
-its own CPU.
+phases of **Ouroboros** — the OS layer growing on top: privilege
+modes, trap delivery, tasks/scheduler, supervisor handlers, timer
+interrupts, the C-level task API, the shell becoming a real
+supervisor that spawns guests as child tasks on its own CPU,
+focus-switchable interactive guests (the editor), and program
+arguments + cwd passing.
 
-Combined PDFs are in the repo root:
-[`ObjectRISC.pdf`](ObjectRISC.pdf) (Computer Modern, 72 pp) and
-[`ObjectRISC-Palatino.pdf`](ObjectRISC-Palatino.pdf) (TeX Gyre
-Pagella, 79 pp).
+Combined PDFs:
+[`docs/ObjectRISC.pdf`](docs/ObjectRISC.pdf) (Computer Modern,
+72 pp) and
+[`docs/ObjectRISC-Palatino.pdf`](docs/ObjectRISC-Palatino.pdf)
+(TeX Gyre Pagella, 79 pp).
 
 ### Toolchain
 
@@ -105,10 +109,20 @@ compiler is the exception: a vendored pcc that needs `./configure
 tools/cc/build.sh        # produces /tmp/pcc-build/cc/{cpp,ccom}/orisc-*
 ```
 
-After that, `examples/cc/run_c.sh` and the `tools/devices/tests/`
-scripts find the binaries automatically. Override the location
-with `PCC_BUILD=/path/to/build tools/cc/build.sh` if `/tmp` isn't
-where you want it.
+Then `make` builds liborisc, the shell, and every program in
+`ouroboros/programs/` — and `make boot` drops you into Ouroboros
+in a Tk window:
+
+```sh
+make            # build everything (incremental)
+make boot       # build + run Ouroboros
+make clean      # nuke build/
+```
+
+After pcc is bootstrapped, `examples/cc/run_c.sh` and the
+`tools/devices/tests/` scripts find the binaries automatically.
+Override the location with `PCC_BUILD=/path/to/build` if `/tmp`
+isn't where you want it.
 
 Hello world (assembly, doesn't need pcc):
 
@@ -243,70 +257,58 @@ back 40 years (alternate-history conceit).
 Launch:
 
 ```sh
-examples/cc/run_shell.sh       # opens a Tk terminal on the shell
+make boot       # build + start Ouroboros in a Tk window
 ```
 
-The runner builds any `.c` files under
-[`examples/cc/programs/`](examples/cc/programs/) on launch, so
-they're immediately runnable from inside the shell. A few demo
-programs ship with the repo:
+`make` builds the shell into `build/shell.orx` and every program
+in [`ouroboros/programs/`](ouroboros/programs/) into
+`build/programs/*.orx`. `make boot` symlinks `build/programs/`
+into the hostfsd jail at `/programs/`, so they're immediately
+runnable from inside the shell:
 
 ```
 /> ls /programs
-build-one.sh
-count.c
 count.orx
-exit42.c
+dhry.orx
+edit.orx
 exit42.orx
-hello.c
 hello.orx
-README.md
+hello_term.orx
 /> run /programs/hello.orx
-[exited 0]
-/> run /programs/count.orx
 [exited 0]
 /> run /programs/exit42.orx
 [exited 42]
+/> run /programs/edit.orx hello.c
+... (full-screen editor opens; F1 to return focus, ^X to quit)
 ```
 
 `hello` / `count` / `exit42` use `print_str` / `print_int`, which
 go through firmware `ConsoleWrite` to host stdout (the terminal
-where you launched `run_shell.sh`, **not** the Tk oriscterm
-window). The `[exited N]` line is what the shell prints back to
-the Tk window via `term_print` after `orx_run` returns.
+where you launched `make boot`, **not** the Tk oriscterm window).
+The `[exited N]` line is what the shell prints back to the Tk
+window via `term_print` after `orx_run` returns.
 
-To add a new program:
-
-```sh
-echo '#include "liborisc.h"
-int main(void) { print_str("hi\n"); return 7; }
-' > examples/cc/programs/hi.c
-
-# Either restart run_shell.sh (it rebuilds .orx files on launch),
-# or rebuild this one directly:
-bash examples/cc/programs/build-one.sh \
-    examples/cc/programs/hi.c examples/cc/programs/hi.orx
-```
-
-then from inside the shell: `run /programs/hi.orx`.
+To add a new program: drop a `.c` file in
+[`ouroboros/programs/`](ouroboros/programs/) and rerun `make`.
+The Makefile picks it up automatically — there's a uniform
+`%.c → %.orx` pattern rule.
 
 The `print_str`-vs-`term_print` split is documented in
-[`examples/cc/programs/README.md`](examples/cc/programs/README.md):
-the guest can't safely `term_init` while the shell is running on
-the same CPU because both would compete for the keyboard
-subscription. A `term_print_only_init` (subscribe to console
-only) is the obvious next step.
+[`ouroboros/programs/README.md`](ouroboros/programs/README.md).
 
-Dhrystone v2.1 — the canonical 1984 benchmark, ported to the
-Object RISC C runtime. Reports cycle count + dhry/s + DMIPS at
-the OR-1000's nominal 16/20 MHz clock rates from Vol I §3
-(VAX 11/780 = 1.0 DMIPS reference):
+Dhrystone v2.1 — the canonical 1984 benchmark, runs from inside
+the shell. Reports cycle count + dhry/s + DMIPS at the OR-1000's
+nominal 16/20 MHz clock rates from Vol I §3 (VAX 11/780 = 1.0
+DMIPS reference):
 
-```sh
-examples/cc/dhrystone/run.sh
-# Cycles per iteration: 4067
-# 16 MHz: ~3936 dhry/s   = ~2.2 DMIPS
-# 20 MHz: ~4920 dhry/s   = ~2.7 DMIPS
+```
+/> run /programs/dhry.orx
+Dhrystone Benchmark, Version 2.1 (Object RISC port)
+Iterations: 5000
+...
+Cycles per iteration: 4074
+16 MHz: ~3927 dhry/s   = ~2.2 DMIPS
+20 MHz: ~4909 dhry/s   = ~2.7 DMIPS
 ```
 
 The `hello_or.c` and `print_or.c` variants use the `__or`

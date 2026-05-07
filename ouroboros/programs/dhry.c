@@ -5,7 +5,7 @@
  * one difference: the result lines come out via `term_print*`
  * (oriscterm SENDs) instead of `print_*` (firmware ConsoleWrite to
  * the host stderr), so the output appears in the Tk window when
- * you `run /examples/cc/programs/dhry.orx` from the shell.
+ * you `run /programs/dhry.orx` from the shell.
  *
  * Phase 36 makes this fun rather than fragile: the timer preempts
  * the dhrystone task every 5000 cycles so the shell stays
