@@ -49,6 +49,11 @@
  * subsequent loads can reuse the same VAs. */
 #define TEMP_CODE_VA 0x00300000
 #define TEMP_DATA_VA 0x00400000
+/* Long-lived mapping in the PARENT for the shared argv buffer. Once
+ * orx_argv_alloc establishes it, we leave it mapped forever — the
+ * per-spawn cost shrinks to a memcpy (no MapObject/Unmap pair). The
+ * VA sits above all the per-load temps so it doesn't collide. */
+#define ARGS_PARENT_VA 0x00500000
 
 #define DEFAULT_STACK_SIZE 0x10000   /* 64 KiB — matches init_cpu */
 
@@ -350,26 +355,145 @@ orx_read_into_va(int fd, unsigned int temp_va, unsigned int size)
 	return 0;
 }
 
-/* Args object: 256-byte TAG_DATA buffer holding a NUL-terminated
- * args string. orx allocates one per spawn, MapObjects it into the
- * parent at TEMP_DATA_VA briefly to write the bytes, then parks the
- * ref in O4 right before TaskCreate so the firmware maps it at
- * ARGV_VA in the child. The args object intentionally leaks (256
- * bytes per spawn) — tracking it in the per-task manifest would
- * require a second pass over the orefst/orefld switches; out of
- * scope for v1. */
-/* TEMPORARILY removed orx_setup_args + helpers — Phase 41a ships
- * with the full shell-side argv plumbing (cmd_run parses, orx_run/
- * orx_spawn accept args, program_args() libc helper) but defers
- * the actual ARGV_VA mapping to a Phase 41b. The combination of
- * the orx_setup_args dance (ObjAlloc + MapObject + memcpy + Unmap)
- * with our cmd_run rewrite triggered a cross-test interaction I
- * couldn't isolate cleanly within a single PR. */
+/* Args object: a 256-byte TAG_DATA buffer holding a NUL-terminated
+ * args string the spawned program will see at ARGV_VA. We allocate
+ * it once (lazy, on first orx_spawn) and reuse the same object for
+ * every subsequent spawn — the contents are overwritten per call.
+ *
+ * Why one shared object instead of one per spawn:
+ *
+ *   - Per-spawn ObjAlloc grows the descriptor table forever (we
+ *     can't easily free until the child exits, and even then we'd
+ *     need a per-task manifest slot).
+ *   - The race "child still reading args while parent overwrites"
+ *     doesn't happen in practice: the child copies args to its
+ *     own buffer right after term_init / hf_init in main(), well
+ *     before the parent could spawn another guest concurrently.
+ *
+ * The ref lives in orx-state ORX_SLOT_ARGV (orx-region offset 408
+ * → o12 offset 128 + 408 = 536). The lazy-init guard is just
+ * "is the slot null?" — orefst-checked via OISN. */
+#define ARGV_BUF_SIZE 256
+
+/* Copy args bytes into the temp mapping at `va`. Receiving va as a
+ * register dodges pcc's `la r,N` emission for casting a literal. */
+static void
+orx_argv_copy(unsigned int va, const char *args)
+{
+	char *dst = (char *)va;
+	unsigned int i = 0;
+	if (args) {
+		while (i + 1 < ARGV_BUF_SIZE && args[i]) {
+			dst[i] = args[i];
+			i++;
+		}
+	}
+	dst[i] = '\0';
+}
+
+/* ObjAlloc the shared argv object and OREFST its ref into
+ * ORX_SLOT_ARGV. Returns firmware status. The OREFST happens
+ * inside the same asm block as the call so no compiler-emitted
+ * instructions can land between (which is fine for GPRs but pcc
+ * makes no guarantees about OPR preservation across its lowering). */
+static int
+orx_argv_alloc(void)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, %1\n"
+		"addiu r5, r0, %2\n"
+		"addiu r6, r0, %3\n"
+		"call  #0x100\n"
+		"nop\n"
+		"orefst o1, 536(o12)\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(ARGV_BUF_SIZE), "i"(TAG_DATA),
+		  "i"(CAP_R | CAP_W | CAP_V | CAP_C)
+		: "r2", "r3", "r4", "r5", "r6"
+	);
+	return status;
+}
+
+/* MapObject(O1=argv, va=ARGS_PARENT_VA, 0, R+W, ARGV_BUF_SIZE).
+ * Establishes the long-lived parent-side mapping; called once after
+ * orx_argv_alloc. Separated from alloc so the alloc fast-path
+ * stays a single-asm-block guarantee, matching orx_alloc_into_slot. */
+static int
+orx_argv_map(void)
+{
+	int status;
+	asm volatile(
+		"orefld o1, 536(o12)\n"
+		"addiu r7, r0, %2\n"
+		"addiu r6, r0, %1\n"
+		"addu  r5, r0, r0\n"
+		"lui   r4, %3\n"
+		"call  #0x110\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(CAP_R | CAP_W),
+		  "i"(ARGV_BUF_SIZE),
+		  "i"(ARGS_PARENT_VA >> 16)
+		: "r2", "r3", "r4", "r5", "r6", "r7"
+	);
+	return status;
+}
+
+/* Is the argv slot still null? (i.e. needs lazy alloc.) */
+static int
+orx_argv_is_null(void)
+{
+	int isn;
+	asm volatile(
+		"orefld o1, 536(o12)\n"
+		"oisn   %0, o1"
+		: "=r"(isn)
+		:
+		: "r1"
+	);
+	return isn;
+}
+
+/* End-to-end: on first call, ObjAlloc the shared argv object and
+ * MapObject it R+W at ARGS_PARENT_VA in the parent (a one-shot
+ * cost). On every subsequent call: just memcpy `args` into the
+ * already-mapped buffer — no firmware primitives, no per-spawn
+ * map/unmap pair. The ref persists in ORX_SLOT_ARGV;
+ * orx_task_create OREFLDs it into O4 just before TaskCreate, so the
+ * firmware maps the same object at ARGV_VA in the child.
+ *
+ * Multi-spawn callers (shells) should call orx_init() at boot so
+ * the alloc + map cost lands BEFORE the spawn path. Single-shot
+ * programs can rely on the lazy alloc here. */
 static int
 orx_setup_args(const char *args)
 {
-	(void)args;
+	if (orx_argv_is_null()) {
+		int status = orx_argv_alloc();
+		if (status != 0) return status;
+	}
+	orx_argv_copy((unsigned int)ARGS_PARENT_VA, args);
 	return 0;
+}
+
+/* Public boot-time initialization: pre-allocate + persistently map
+ * the shared argv buffer. Optional — orx_setup_args lazily allocates
+ * on first spawn if this wasn't called — but recommended for any
+ * program that spawns multiple children, because moving the
+ * one-time ObjAlloc + MapObject pair out of the first orx_run keeps
+ * the spawn path predictable (just a memcpy). Idempotent: safe to
+ * call more than once. */
+int
+orx_init(void)
+{
+	if (orx_argv_is_null()) {
+		int s = orx_argv_alloc();
+		if (s != 0) return s;
+	}
+	return orx_argv_map();
 }
 
 /* TaskCreate(O1=code, O2=stack, O3=data, O4=args, R4=entry, R5=0)
@@ -381,6 +505,13 @@ static int
 orx_task_create(unsigned int entry, int has_data)
 {
 	int status;
+	/* Pull the shared argv ref orx_setup_args wrote into
+	 * ORX_SLOT_ARGV up to O4. The firmware's TaskCreate reads
+	 * O4 as the optional argv buffer, mapped R-only at ARGV_VA
+	 * in the child's address space. Done as its own asm so the
+	 * main asm body stays short — pcc has been observed to lose
+	 * a `\n` inside very long inline asm strings. */
+	asm volatile("orefld o4, 536(o12)");
 	if (has_data) {
 		asm volatile(
 			"orefld o1, 128(o12)\n"
@@ -414,6 +545,10 @@ orx_task_create(unsigned int entry, int has_data)
 			: "r2", "r3", "r4", "r5"
 		);
 	}
+	/* Restore parent's O4 to the boot self-svc — keeps the OR-
+	 * hygiene contract for callers that rely on O4 between this
+	 * return and the next term_print/hf_*. */
+	asm volatile("omov o4, o14");
 	return status;
 }
 
@@ -514,10 +649,12 @@ orx_spawn(const char *path, const char *args)
 		return -4;
 	}
 
-	/* Phase 41a stub: orx_setup_args is currently a no-op. The
-	 * shell still parses args from the command line and threads
-	 * them down here, but they don't reach the child yet. */
-	(void)orx_setup_args(args);
+	if (orx_setup_args(args) != 0) {
+		orx_free_slot(SLOT_STACK);
+		if (has_data) orx_free_slot(SLOT_DATA);
+		orx_free_slot(SLOT_CODE);
+		return -4;
+	}
 
 	/* TaskCreate leaves the new task ref in O1. Hand it straight to
 	 * the libc table via task_register_o1 so the caller can use the

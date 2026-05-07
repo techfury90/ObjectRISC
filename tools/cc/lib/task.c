@@ -64,8 +64,12 @@
  * picks up at byte offset TABLE_BYTES — see tools/cc/lib/orx.c for
  * the layout there. We oversize the allocation here so orx doesn't
  * have to re-allocate (and doesn't have to claim its own OPR slot —
- * that frees O7 for the grid service ref). */
-#define ORX_STATE_BYTES   408
+ * that frees O7 for the grid service ref).
+ *
+ * 416 = 24 (orx scratch: code/data/stack) + 384 (16 × 24-byte
+ * manifest entries) + 8 (ORX_SLOT_ARGV: a long-lived ref to the
+ * shared argv buffer used by every spawn — Phase 41b). */
+#define ORX_STATE_BYTES   416
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Bit set when the corresponding table slot holds a live ref. Lives

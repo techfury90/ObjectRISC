@@ -892,6 +892,11 @@ main(void)
 	term_init();
 	hf_init();
 
+	/* Pre-allocate orx's shared argv buffer so the per-spawn cost
+	 * shrinks to a memcpy. Keeps orx_spawn predictable and avoids
+	 * any first-spawn tax on the shell's preempt-driven scheduling. */
+	orx_init();
+
 	/* Wire the preemption timer. From here on, a CPU-bound bg task
 	 * spawned via `run cmd &` can't starve the shell — the handler
 	 * fires every 5000 cycles, calls TaskYield (deferred), and ERET
@@ -912,6 +917,14 @@ main(void)
 
 		print_prompt(cwd, prompt_buf);
 		len = read_line(line, sizeof(line), &h);
+		/* Second reap pass: a bg task may have exited WHILE we were
+		 * blocked in read_line. Catching it here, between the input
+		 * and the dispatch, lets the auto-reap message land before
+		 * the user-typed command's output (so e.g. `wait 0` after a
+		 * naturally-completing bg task prints "[task 0 done 0]"
+		 * from us, then "[task 0 exited 0]" — wait succeeds with
+		 * code 0 vs failing on a missing task). */
+		reap_exited_tasks();
 		if (len == 0) continue;
 
 		arg = split_arg(line);

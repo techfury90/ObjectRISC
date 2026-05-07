@@ -3987,6 +3987,124 @@ implementation gets its own follow-up.
   free it. With ~256 bytes per spawn it's a tiny leak, but
   worth cleaning up.
 
+## Phase 41b — Argv buffer wiring + a TaskExit scheduler fix (Ouroboros, day 19)
+
+The bottom half of argv. `program_args()` now returns a real
+pointer into a real ARGV_VA mapping; `edit /foo.txt` opens
+`/foo.txt`. Got there via two unexpected detours.
+
+What's wired:
+
+- **`liborisc/orx.c`**: a single shared 256-byte args object
+  (`TAG_DATA`, R+W+V+C). ObjAlloc'd once on first spawn (or
+  eagerly via the new `orx_init()`), persistently mapped R+W
+  in the parent at `ARGS_PARENT_VA = 0x00500000`, and parked
+  in `ORX_SLOT_ARGV` (orx-state offset 408 → `o12+536`) for
+  the per-spawn `orefld o4` into `O4` immediately before
+  `TaskCreate`. The per-spawn cost shrinks to a memcpy — no
+  `MapObject`/`Unmap` pair on every `orx_run`.
+- **`orx_init()`** (new public libc fn): pre-allocates the
+  buffer + sets up the parent mapping. Optional, but the
+  shell calls it at boot so the alloc/map cost lands BEFORE
+  the preempt timer is armed and the per-spawn path stays
+  predictable. The lazy fallback in `orx_setup_args` keeps
+  single-shot programs working without the boot dance.
+- **`liborisc/argv.c::program_args`** synthesizes
+  `(char *)0xa0000` via `lui r,0xa; ori r,r,0` because pcc's
+  natural `(char *)CONSTANT` lowering emits an `la r,N`
+  pseudo that asmorisc rejects. Same workaround pattern as
+  the existing `liborisc/host_io.c`.
+- **`task.c`**: `ORX_STATE_BYTES` bumped from 408 to 416 to
+  reserve the 8-byte `ORX_SLOT_ARGV` past the manifest area.
+  Total `o12` storage is now 544 bytes
+  (`TABLE_BYTES=128 + 416`).
+
+### The detour: TaskExit on a lone-blocked CPU
+
+Phase 41a's argv plumbing (the empty-string stub) shipped
+because every attempt to wire the actual mapping broke
+`test_shell_bg` non-deterministically. Bisecting the failure
+to a single `orx_argv_is_null()` call (an `orefld` + `oisn`
+inside a function-call frame, ~30 cycles) finally unmasked
+the real bug — and it wasn't in the libc.
+
+`primitive_TaskExit` was tearing down the CPU as soon as
+`pick_next_runnable()` returned `None`, even when other
+tasks were `BLOCKED` and might yet wake. Concretely: shell
+spawns a bg task, calls `task_yield`, child runs. If the
+child runs to completion in one quantum (baseline timing),
+the shell is still `RUNNABLE`, `TaskExit` picks it, and
+everything works. If a preempt fires mid-child (which is
+what those extra ~30 cycles enabled), the shell finishes its
+`cmd_run`, returns to the prompt, and blocks in
+`RecvQueuePoll` BEFORE the child completes. When the child
+finally `TaskExit`s, no runnable task → `TaskExitSignal` →
+`cpu.active = False` → CPU brick. The shell's keystroke
+arrives, `_wake_blocked_tasks` happily promotes it to
+`RUNNABLE`, but no path in `run()` schedules it — the CPU
+is dead.
+
+Fix in `simorisc`:
+
+- New `BlockedOnExitWait` sentinel. When `TaskExit` finds
+  no runnable but `any(t.state == TASK_STATE_BLOCKED for t
+  in cpu.tasks.values())`, park the CPU on this sentinel
+  instead of raising. The blocked-but-runnable branch in
+  `run()` then context-switches into whichever task wakes
+  first.
+- The same blocked-but-runnable branch was also flipping the
+  `cur` task to `TASK_STATE_BLOCKED` blindly during the
+  switch, which would corrupt `cpu.current_task` if it was
+  already `EXITED`. Now skipped for exited tasks — they stay
+  exited, no `save_cpu_to_task` call.
+
+### The other detour: the auto-reaper race
+
+Even with the simulator fix, `test_shell_bg` still failed —
+just differently. The test asserts `[task 0 done 0]` (the
+auto-reaper's wording) appears. With the new timing, the
+shell's main-loop top-of-iteration `reap_exited_tasks()` now
+runs while the child is still mid-term-print, so it has
+nothing to reap; by the time the user-typed `wait 0` arrives
+and the shell wakes from `read_line`, the next loop top's
+reap finds nothing because `cmd_wait` already harvested it
+(printing `[task 0 exited 0]` instead).
+
+Fix in `examples/cc/shell.c`: a second `reap_exited_tasks()`
+call right after `read_line` returns, before dispatching the
+typed command. Catches tasks that exited while we were
+blocked in `getkey`. Mirrors the bash convention of
+announcing background-job completion at the prompt
+boundary, not just at the top of the read loop.
+
+### Tests
+
+- All 18 device/shell tests pass, stable across 3 back-to-
+  back full-suite runs.
+- New manual smoke check: a guest that copies
+  `program_args()` into a stack buffer and `term_print`s it
+  receives the exact command-line slice (`got: [hello world]`
+  for `run echo_args.orx hello world`). Note that calling
+  `term_print` directly on the `program_args()` pointer
+  doesn't work — `term_print` assumes its source is in the
+  data segment or stack, and computes a wrong offset for the
+  ARGV_VA region. Programs that want to display args need to
+  copy first.
+
+### What's not yet done
+
+- **Manifest tracking** for the args object (still). The
+  shared-buffer design moots the per-spawn leak — there's
+  exactly one args object per CPU, freed when the CPU
+  itself goes away — but if a future spawn ever needs a
+  larger buffer than 256 bytes, the helpers grow trivially.
+- The conditional fast-path for empty args (skip `memcpy`,
+  zero just byte 0) was tempting but couldn't be made
+  unconditionally correct without the orx_init dance — and
+  with the simulator fix in place the timing race no longer
+  forces the optimization. Shipping the simpler always-call
+  path.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
