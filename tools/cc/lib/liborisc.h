@@ -266,6 +266,7 @@ void task_install_preempt_timer(unsigned int quantum);
  *     -5  TaskCreate / TaskResume / TaskWait failed
  */
 
+int    orx_init(void);                                 /* optional boot-time arg-buffer pre-alloc */
 int    orx_run(const char *path, const char *args);    /* sync; args may be NULL or "" */
 task_t orx_spawn(const char *path, const char *args);  /* async — caller waits/frees */
 int    orx_unload(task_t t);                           /* wait + deferred-free + reap */

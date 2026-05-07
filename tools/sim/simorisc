@@ -335,6 +335,20 @@ class BlockedOnResponse(BlockedSignal):
         self.is_write = is_write
 
 
+class BlockedOnExitWait(BlockedSignal):
+    """Set by primitive_TaskExit when the exiting task was the only
+    runnable task but other tasks remain BLOCKED (e.g., a shell
+    parked on RecvQueuePoll waiting for a key). The CPU stays alive
+    so _process_requests can answer in-flight OBJ_READ_REQs from
+    the just-finished task's data segment, and so _wake_blocked_tasks
+    can promote a blocked task once its condition fires; the
+    blocked-but-runnable branch in run() then context-switches into
+    it. There's no "unblock" condition tied to this signal — it's a
+    sentinel, not a wait — so _try_unblock returns False and the
+    blocked-but-runnable branch is the only path that consumes it."""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Wire-level packet format (Volume IV §3, §4)
 # ---------------------------------------------------------------------------
@@ -1525,7 +1539,13 @@ class System:
                         cur = cpu.current_task
                         nxt = pick_next_runnable(cpu)
                         if nxt is not None and nxt is not cur:
-                            if cur is not None:
+                            if cur is not None and cur.state != TASK_STATE_EXITED:
+                                # Park the live current task as BLOCKED;
+                                # save_cpu_to_task captures cpu.blocked_on
+                                # so its wait state is restored when it's
+                                # scheduled back. EXITED tasks just stay
+                                # EXITED — nothing to save and we don't
+                                # want to flip them to BLOCKED.
                                 cur.state = TASK_STATE_BLOCKED
                                 save_cpu_to_task(cpu, cur)
                             load_task_to_cpu(cpu, nxt)
@@ -2187,9 +2207,14 @@ def _wake_waiters(cpu: CPU, exiting: 'Task') -> None:
 
 def primitive_TaskExit(cpu: CPU) -> None:
     """Terminate the calling task. Wake any tasks waiting on it, then
-    context-switch to the next runnable. If nothing is runnable
-    (including waiters we just promoted), bubble up TaskExitSignal so
-    the run loop tears down the CPU as it always has."""
+    context-switch to the next runnable. If nothing is runnable BUT
+    there are still BLOCKED tasks (e.g., a shell parked in
+    RecvQueuePoll waiting on a key), park the CPU on a sentinel
+    BlockedOnExitWait so the run loop's _wake_blocked_tasks can
+    eventually promote one and the blocked-but-runnable branch can
+    pick it up. Only if no runnable AND no blocked tasks do we tear
+    down the CPU via TaskExitSignal — that's the genuinely-finished
+    case where there's nobody left to run."""
     code = cpu.get_gpr(4) & 0xFF
     cur = cpu.current_task
     if cur is not None:
@@ -2197,9 +2222,18 @@ def primitive_TaskExit(cpu: CPU) -> None:
         cur.exit_code = code
         _wake_waiters(cpu, cur)
     nxt = pick_next_runnable(cpu)
-    if nxt is None:
-        raise TaskExitSignal(code)
-    context_switch(cpu, nxt)
+    if nxt is not None:
+        context_switch(cpu, nxt)
+        return
+    # Are there any tasks that might yet wake?
+    has_blocked = any(t.state == TASK_STATE_BLOCKED for t in cpu.tasks.values())
+    if has_blocked:
+        # Park the CPU. The blocked-but-runnable branch in run() will
+        # context_switch into the woken task. Until then, _process_requests
+        # and _wake_blocked_tasks keep firing every loop tick.
+        cpu.blocked_on = BlockedOnExitWait()
+        return
+    raise TaskExitSignal(code)
 
 
 def primitive_TaskKill(cpu: CPU) -> None:

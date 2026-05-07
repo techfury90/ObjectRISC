@@ -24,15 +24,19 @@
 
 #define ARGV_VA  0x000a0000U
 
-/* Phase 41a: argv plumbing exists at the shell + libc API surface
- * but the actual ARGV_VA mapping isn't wired into orx_setup_args
- * yet (deferred to a 41b). Until then this helper hands back a
- * static empty string so callers don't trap dereferencing the
- * unmapped ARGV_VA. */
-static const char program_args_empty[] = "";
-
+/* Return (char *)ARGV_VA. We avoid the natural `return (char
+ * *)ARGV_VA;` because pcc lowers a literal-cast to a `la r,N`
+ * load-address pseudo, and asmorisc rejects it. Synthesize the VA
+ * with lui+ori inline asm instead — exact same two instructions
+ * the lowering would emit, just without the pseudo. */
 const char *
 program_args(void)
 {
-	return program_args_empty;
+	const char *p;
+	asm volatile(
+		"lui  %0, 0xa\n"
+		"ori  %0, %0, 0"
+		: "=r"(p)
+	);
+	return p;
 }
