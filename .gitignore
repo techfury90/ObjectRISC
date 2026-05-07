@@ -24,6 +24,11 @@ docs/*.out
 # suite's --build-dir scratch when someone overrides its default.
 build/
 
+# Symlink scripts/boot.sh creates so the hostfsd jail can resolve
+# /programs to build/programs. Reused across boots; cleaned up
+# automatically when the layout changes (boot.sh re-creates it).
+/programs
+
 # autoconf cache (regenerated on `autoconf`)
 tools/cc/autom4te.cache/
 
