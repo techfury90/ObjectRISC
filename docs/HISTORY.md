@@ -4272,6 +4272,21 @@ to being just demos: standalone C and assembly programs,
 `linkboot/`, the Dhrystone smoke test that runs without the
 shell, the multitask demos.
 
+## Phase 43 — `edit` as a shell builtin
+
+Tiny psychological-glue commit. `edit foo.c` was three keystrokes
+shy of typing `run /programs/edit.orx foo.c &` — the same
+keystrokes you'd type a hundred times in a session. So `edit` is
+now a builtin in the shell: hardcodes `/programs/edit.orx` as the
+binary, threads the user's argument through as args, always
+backgrounded. Same `[bg task N]` print, same `task_yield` after,
+same focus + cwd machinery underneath.
+
+`test_shell_edit.sh` switched over to `edit scratch.txt` instead
+of the verbose `run /programs/edit.orx scratch.txt &`, which both
+exercises the new builtin and shortens the keystroke sequence the
+test fakes through.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
