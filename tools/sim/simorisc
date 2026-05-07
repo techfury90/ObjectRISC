@@ -3605,8 +3605,18 @@ def install_external_services(cpu: CPU, specs: List[str]) -> None:
             sys.exit(f"simorisc: --service spec out of range: {spec!r}")
         if slot > 15:
             sys.exit("simorisc: too many --service specs (O5..O15 limit)")
-        ref = make_ref(generation=1, home=pid_v, index=idx_v, caps=caps_v)
-        cpu.set_opr(slot, ref)
+        # "0=0@0" is the conventional pad/skip placeholder. Emit a
+        # literal-zero ref rather than make_ref(gen=1, ...)'s
+        # 0x0001000000000000 sentinel — a literal zero is what
+        # OISN considers null and what callers expect when checking
+        # "is this slot empty." (Pre-Phase-45a code that just used
+        # the slot as scratch isn't affected — both encodings have
+        # caps=0 and would trap on inspect either way.)
+        if pid_v == 0 and idx_v == 0 and caps_v == 0:
+            cpu.set_opr(slot, 0)
+        else:
+            ref = make_ref(generation=1, home=pid_v, index=idx_v, caps=caps_v)
+            cpu.set_opr(slot, ref)
         slot += 1
 
 

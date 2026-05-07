@@ -289,4 +289,20 @@ int    orx_run  (const char *path, const char *args, const char *cwd);  /* sync 
 task_t orx_spawn(const char *path, const char *args, const char *cwd);  /* async */
 int    orx_unload(task_t t);                           /* wait + deferred-free + reap */
 
+/* ---- sup.c — supervisor RPC client ----------------------------- *
+ *
+ * `sup_spawn` is the supervised cousin of `orx_spawn`: instead of
+ * loading the .orx and TaskCreating directly, it SENDs a spawn
+ * request to the local supervisor (the program ouroboros/supervisor.c)
+ * and waits for the resulting task ref to come back. The supervisor
+ * sub-cap lives in O12 + SUP_SLOT, parked there by `task_init` from
+ * the boot ABI's O8. Programs that weren't launched by a supervisor
+ * get -1 from sup_spawn and should fall back to orx_spawn (or
+ * accept that spawning isn't available in their context).
+ *
+ * Phase 45a — locally-routed only. Phase 45b lifts this to N CPUs
+ * via per-CPU supervisors discovered through the wire protocol. */
+
+task_t sup_spawn(const char *path, const char *args, const char *cwd);
+
 #endif /* LIBORISC_H */

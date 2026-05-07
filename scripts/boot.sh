@@ -1,7 +1,15 @@
 #!/bin/sh
 # boot.sh — start Ouroboros: the OS layer atop Object RISC.
 #
-# Invoked from the top level via `make boot`. Spawns:
+# Phase 45a (this version): the shell is still CPU 0's direct
+# leader. The supervisor program exists in the tree
+# (ouroboros/supervisor.c, builds to build/supervisor.orx) and the
+# libc has the spawn-RPC client (sup.c::sup_spawn) but the boot
+# leader is still shell.orx so the existing test harnesses keep
+# passing on the fallback path. Phase 45b will flip the leader
+# once the wire-protocol edge cases are nailed down.
+#
+# Spawned processes by `make boot`:
 #   - oriscbar  (crossbar)
 #   - oriscterm (Tk terminal, pid 16)
 #   - hostfsd   (host FS access, pid 17, jailed to repo root)
@@ -9,16 +17,16 @@
 #                    else tears down)
 #
 # The shell announces itself with the current real-world date minus
-# 40 years (alternate-history conceit) — computed at build time and
-# baked into shell.orx via the SHELL_BUILD_BANNER make variable, so
-# the shell.orx in build/ already carries today-minus-40 by the time
-# we exec.
+# 40 years (alternate-history conceit) — computed here, passed via
+# SHELL_BUILD_BANNER to make.
 #
 # Programs you can `run` from inside the shell live under
 # ouroboros/programs/ — built by `make programs` into build/programs/
 # and visible inside the hostfsd jail at "/programs/..." because
 # build/programs is symlinked into the jail at the start of this
-# script.
+# script. The shell itself is built to build/programs/shell.orx;
+# boot.sh resolves directly to that file rather than going through
+# the symlinked /programs path.
 
 set -eu
 
@@ -26,9 +34,6 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
 # Compute today-minus-40 and rebuild the shell with that banner.
-# macOS's `date -v -40y` does the year arithmetic; on Linux use
-# `date -d "40 years ago"`. `%-l` strips the leading-space-padded
-# hour; `tr -s ' '` collapses the day-of-month space-padding from `%e`.
 if date -v -40y +"%Y" >/dev/null 2>&1; then
     PAST=$(date -v -40y +"%b %e %Y %-l:%M %p" | tr -s ' ')
 else
@@ -54,12 +59,12 @@ fi
 # --service slot order (each spec lands at the next free O5..O15):
 #   O5  = oriscterm console  (16=1@9)
 #   O6  = oriscterm keyboard (16=2@9)
-#   O7  = oriscterm grid     (16=3@9)  — used by cmd_view + grid_clear
-#   O8  = pad — claimed at runtime by hf_init for its private mailbox
+#   O7  = oriscterm grid     (16=3@9)
+#   O8  = pad (supervisor sub-cap when 45b flips the leader; null today)
 #   O9  = pad
 #   O10 = hostfsd            (17=1@9)
 exec python3 tools/oriscrun \
     --terminal pid=16 \
     --hostfsd "pid=17,root=$ROOT" \
-    --cpu "pid=0:program=$ROOT/build/shell.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=0@0,service=0=0@0,service=17=1@9" \
+    --cpu "pid=0:program=$ROOT/build/programs/shell.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=0@0,service=0=0@0,service=17=1@9" \
     --leader 0 --leader-timeout 600

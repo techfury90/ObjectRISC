@@ -507,15 +507,53 @@ orx_init(void)
 	return orx_argv_map();
 }
 
+/* Byte offsets within O12 of the slots orx_task_create reads to
+ * inject a custom O8 into the child (used by the supervisor in
+ * Phase 45a so the spawned task's task_init harvests its sub-cap).
+ *
+ * ORX_SLOT_CHILD_O8 — the cap to put in O8 just before TaskCreate.
+ *   Null in the common case (no override; child inherits parent's
+ *   O8 as before).
+ * ORX_SLOT_O8_SAVE — transient stash for the parent's O8 across
+ *   TaskCreate when an override IS active. */
+#define ORX_SLOT_CHILD_O8_OFFSET 560
+#define ORX_SLOT_O8_SAVE_OFFSET  568
+
 /* TaskCreate(O1=code, O2=stack, O3=data, O4=args, R4=entry, R5=0)
  * — leave the resulting task ref in O1 for the caller to register
  * into the libc task table via task_register_o1. Restore O2/O3/O4
  * before returning so the caller's print_str / hf_* keep working.
- * Returns firmware status. */
+ * Returns firmware status.
+ *
+ * Phase 45a: if ORX_SLOT_CHILD_O8 is non-null, swap that ref into
+ * O8 just before TaskCreate (so the child's task_init harvests
+ * it via the boot-O8 → SUP_SLOT path) and restore the parent's
+ * O8 after. The override is set by the supervisor so its
+ * spawned tasks inherit a working supervisor sub-cap. */
 static int
 orx_task_create(unsigned int entry, int has_data)
 {
 	int status;
+	int o8_isn;
+
+	/* Probe ORX_SLOT_CHILD_O8 — non-null means we need the
+	 * O8-swap dance around TaskCreate. */
+	asm volatile(
+		"orefld o14, 560(o12)\n"
+		"oisn   %0, o14"
+		: "=r"(o8_isn)
+		:
+		: "r1"
+	);
+	if (!o8_isn) {
+		/* Non-null override. Save current O8 to ORX_SLOT_O8_SAVE,
+		 * then move the override (just OREFLD'd to O14) into O8. */
+		asm volatile(
+			"orefst o8, 568(o12)\n"
+			"omov   o8, o14"
+		);
+	}
+
 	/* Pull the shared argv ref orx_setup_args wrote into
 	 * ORX_SLOT_ARGV up to O4. The firmware's TaskCreate reads
 	 * O4 as the optional argv buffer, mapped R-only at ARGV_VA
@@ -560,6 +598,12 @@ orx_task_create(unsigned int entry, int has_data)
 	 * hygiene contract for callers that rely on O4 between this
 	 * return and the next term_print/hf_*. */
 	asm volatile("omov o4, o14");
+
+	/* Phase 45a: if we swapped O8 around TaskCreate, restore
+	 * the parent's O8 from ORX_SLOT_O8_SAVE. */
+	if (!o8_isn) {
+		asm volatile("orefld o8, 568(o12)");
+	}
 	return status;
 }
 

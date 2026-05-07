@@ -527,9 +527,9 @@ cmd_run(const char *cwd, const char *arg)
 	resolve_path(cwd, arg_copy, path);
 
 	if (background) {
-		task_t t = orx_spawn(path, arg_copy + args_start, cwd);
+		task_t t = sup_spawn(path, arg_copy + args_start, cwd);
 		if (t < 0) {
-			term_print("orx_spawn failed: ");
+			term_print("spawn failed: ");
 			term_print_int(t);
 			term_print("\n");
 			return;
@@ -543,7 +543,14 @@ cmd_run(const char *cwd, const char *arg)
 		 * shell blocks again on the next keystroke. */
 		task_yield();
 	} else {
-		int code = orx_run(path, arg_copy + args_start, cwd);
+		task_t t = sup_spawn(path, arg_copy + args_start, cwd);
+		if (t < 0) {
+			term_print("spawn failed: ");
+			term_print_int(t);
+			term_print("\n");
+			return;
+		}
+		int code = orx_unload(t);
 		term_print(run_done_pre);
 		term_print_int(code);
 		term_print(run_done_post);
@@ -555,16 +562,16 @@ cmd_run(const char *cwd, const char *arg)
  * backgrounded. Saves typing `run /programs/edit.orx foo.c &` —
  * which is the entire psychological win, since edit is the most
  * common bg-spawn the shell does. The args/cwd handoff matches
- * cmd_run's & path: orx_spawn fills both fields of the shared
+ * cmd_run's & path: sup_spawn fills both fields of the shared
  * argv buffer, edit reads them via program_args() / program_cwd()
  * and resolves relative paths against cwd just like the cmd_run
  * path does. */
 static void
 cmd_edit(const char *cwd, const char *arg)
 {
-	task_t t = orx_spawn("/programs/edit.orx", arg, cwd);
+	task_t t = sup_spawn("/programs/edit.orx", arg, cwd);
 	if (t < 0) {
-		term_print("orx_spawn failed: ");
+		term_print("spawn failed: ");
 		term_print_int(t);
 		term_print("\n");
 		return;
