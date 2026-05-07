@@ -88,7 +88,7 @@ for _ in $(seq 50); do
 done
 
 # Type:  cd /sub<RET>
-#        run /programs/edit.orx scratch.txt &<RET>
+#        edit scratch.txt<RET>          ← builtin: spawns /programs/edit.orx &
 #        wait-kbd:2 (until editor subscribes)
 #        focus (cycle to editor)
 #        DOWN-arrow then RIGHT * 8 to land at end of "Hi there", then '!'
@@ -100,14 +100,9 @@ python3 tools/devices/tests/fake_terminal.py \
     --event key:c --event key:d --event key:0x20 \
     --event key:0x2f --event key:s --event key:u --event key:b \
     --event key:0x10D \
-    --event key:r --event key:u --event key:n --event key:0x20 \
-    --event key:0x2f --event key:p --event key:r --event key:o --event key:g --event key:r --event key:a --event key:m --event key:s \
-    --event key:0x2f --event key:e --event key:d --event key:i --event key:t \
-    --event key:0x2e --event key:o --event key:r --event key:x \
-    --event key:0x20 \
+    --event key:e --event key:d --event key:i --event key:t --event key:0x20 \
     --event key:s --event key:c --event key:r --event key:a --event key:t --event key:c --event key:h \
     --event key:0x2e --event key:t --event key:x --event key:t \
-    --event key:0x20 --event key:0x26 \
     --event key:0x10D \
     --event wait-kbd:2 \
     --event focus \

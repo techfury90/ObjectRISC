@@ -82,6 +82,7 @@ const char help_msg[] =
     "  pwd             — print the current working directory\n"
     "  echo <text>     — print the rest of the line\n"
     "  run <path>[&]   — load + run another .orx as a child task ('&' = background)\n"
+    "  edit [<path>]   — shorthand for `run /programs/edit.orx <path> &`\n"
     "  wait <task>     — block until backgrounded task exits; print its exit code\n"
     "  kill <task>     — externally terminate a backgrounded task (exit 137)\n"
     "  jobs            — list backgrounded tasks and their state\n"
@@ -549,6 +550,31 @@ cmd_run(const char *cwd, const char *arg)
 	}
 }
 
+/* `edit <path>` is a thin builtin: hardcodes /programs/edit.orx as
+ * the binary and threads the user's path through as args, always
+ * backgrounded. Saves typing `run /programs/edit.orx foo.c &` —
+ * which is the entire psychological win, since edit is the most
+ * common bg-spawn the shell does. The args/cwd handoff matches
+ * cmd_run's & path: orx_spawn fills both fields of the shared
+ * argv buffer, edit reads them via program_args() / program_cwd()
+ * and resolves relative paths against cwd just like the cmd_run
+ * path does. */
+static void
+cmd_edit(const char *cwd, const char *arg)
+{
+	task_t t = orx_spawn("/programs/edit.orx", arg, cwd);
+	if (t < 0) {
+		term_print("orx_spawn failed: ");
+		term_print_int(t);
+		term_print("\n");
+		return;
+	}
+	term_print(run_bg_pre);
+	term_print_int(t);
+	term_print(run_bg_post);
+	task_yield();
+}
+
 static void
 cmd_wait(const char *arg)
 {
@@ -951,6 +977,8 @@ main(void)
 		} else if (strcmp(line, "run") == 0) {
 			if (*arg == 0) term_print("usage: run <path> [&]\n");
 			else cmd_run(cwd, arg);
+		} else if (strcmp(line, "edit") == 0) {
+			cmd_edit(cwd, arg);
 		} else if (strcmp(line, "wait") == 0) {
 			if (*arg == 0) term_print("usage: wait <task>\n");
 			else cmd_wait(arg);
