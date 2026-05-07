@@ -306,26 +306,50 @@ main(void)
 	term_init();
 	hf_init();
 
-	/* Pick the file to edit from the args the shell handed us
-	 * (program_args() returns whatever the launcher buffered —
-	 * empty string in Phase 41a, since the actual ARGV_VA
-	 * mapping isn't wired yet). First whitespace-token wins;
-	 * empty / blank → default scratchpad. */
+	/* Pick the file to edit from the args the shell handed us.
+	 * First whitespace-token wins; empty / blank → default
+	 * scratchpad. Relative paths (anything not starting with `/`)
+	 * are resolved against the launcher's cwd, since hostfsd has
+	 * no per-task cwd concept and would otherwise resolve them
+	 * against its jail root regardless of where the user typed
+	 * `edit foo.c` from. */
 	{
 		const char *args = program_args();
+		const char *cwd  = program_cwd();
 		int dst = 0;
 		while (*args == ' ' || *args == '\t') args++;
-		while (*args && *args != ' ' && *args != '\t'
-		       && dst < EDIT_PATH_MAX - 1) {
-			es.path[dst++] = *args++;
-		}
-		es.path[dst] = '\0';
-		if (es.path[0] == '\0') {
+		if (*args == '\0') {
 			const char *def = EDIT_DEFAULT_PATH;
 			int i;
 			for (i = 0; def[i] && i < EDIT_PATH_MAX - 1; i++)
 				es.path[i] = def[i];
 			es.path[i] = '\0';
+		} else if (*args == '/') {
+			/* Absolute — copy verbatim. */
+			while (*args && *args != ' ' && *args != '\t'
+			       && dst < EDIT_PATH_MAX - 1) {
+				es.path[dst++] = *args++;
+			}
+			es.path[dst] = '\0';
+		} else {
+			/* Relative — prefix with cwd + "/" (skip the slash
+			 * if cwd already ends in one, e.g. cwd == "/"). */
+			if (cwd && cwd[0]) {
+				while (*cwd && dst < EDIT_PATH_MAX - 1) {
+					es.path[dst++] = *cwd++;
+				}
+				if (dst > 0 && es.path[dst - 1] != '/'
+				    && dst < EDIT_PATH_MAX - 1) {
+					es.path[dst++] = '/';
+				}
+			} else if (dst < EDIT_PATH_MAX - 1) {
+				es.path[dst++] = '/';
+			}
+			while (*args && *args != ' ' && *args != '\t'
+			       && dst < EDIT_PATH_MAX - 1) {
+				es.path[dst++] = *args++;
+			}
+			es.path[dst] = '\0';
 		}
 	}
 
@@ -372,5 +396,9 @@ main(void)
 	}
 
 	grid_clear();
+	/* Drop our keyboard subscription so the focus-cycle list shrinks
+	 * back to just the shell. Without this, oriscterm would keep the
+	 * dead subscriber and F1 cycles could land on a stale queue. */
+	term_shutdown();
 	return 0;
 }

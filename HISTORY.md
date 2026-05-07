@@ -4145,6 +4145,78 @@ puts the imagined silicon roughly between an early-1980s
   their own `@max-cycles`, unaffected by the default
   change).
 
+## Phase 41d — cwd passthrough + targeted kbd unsubscribe (Ouroboros, day 19)
+
+Two related "program lifecycle hygiene" fixes from real
+in-shell testing:
+
+**Bug 1 — `edit hello.c` from a non-root cwd showed an empty
+buffer.** The shell resolved the executable path against cwd
+but passed the user's `args` string verbatim to the spawned
+program. `edit` called `hf_open("hello.c")` and hostfsd
+resolved that against its jail root (it has no per-task cwd
+concept), so the file came up missing.
+
+Fix: pass cwd to spawned programs. The shared argv buffer
+now holds two NUL-terminated strings back-to-back:
+
+    [0..]                  args   (NUL-terminated)
+    [strlen(args)+1 ..]    cwd    (NUL-terminated)
+
+`program_args()` keeps its existing contract (returns a
+pointer to the first segment — old programs see no change).
+A new `program_cwd()` walks past the first NUL to find the
+launcher's working directory. `orx_run` / `orx_spawn` gained
+a `cwd` parameter; the shell threads its current cwd through
+in `cmd_run`. `edit` now prefixes relative paths with cwd
+before opening — so `cd /sub; run /programs/edit.orx
+hello.c` opens `/sub/hello.c` as expected.
+
+**Bug 2 — quitting a program left its keyboard subscription
+in oriscterm's focus list.** There's no process-death
+notification in the wire protocol; oriscterm only learns
+about subscriber lifecycle through explicit
+subscribe/unsubscribe SENDs. A program that just `TaskExit`s
+leaves a dead entry — F1 cycles still land on it, keys
+silently drop into a stale queue, and the user has to figure
+out something is wrong.
+
+Fix: a new libc `term_shutdown()` that derives the same
+`R|S` sub-cap term_init originally registered (ObjDerive is
+deterministic over (gen, home, idx, caps), so the bytes are
+identical) and SENDs it back to the keyboard service with
+`R4 = 1` — the new "targeted unsubscribe" command. Edit
+calls `term_shutdown()` right before returning from main.
+
+oriscterm's keyboard handler grew the R4 dispatch:
+
+    R4 = 0  →  subscribe (existing default)
+    R4 = 1  →  unsubscribe by sub-ref (find in list, remove
+              just that one entry; quietly ignored if no
+              match — supports defensive double-call)
+
+The legacy `O2=null → unsubscribe-all` path stays as-is for
+back-compat, but new callers should use the targeted form so
+they don't kick the shell out of the focus list while
+cleaning up after themselves. fake_terminal mirrors both
+paths so the tests see realistic behaviour.
+
+Programs that crash before reaching `term_shutdown` will
+still leave a dead subscriber. A wire-level NACK from the
+home CPU on stale-target SENDs would let oriscterm prune
+dynamically; deferring that to a later phase.
+
+### Tests
+
+- `test_shell_edit.sh` updated to exercise both fixes:
+  `cd /sub` first, then `run /programs/edit.orx scratch.txt
+  &` (relative path), and asserts (a) the inserted `!`
+  lands in `/sub/scratch.txt` (not `/scratch.txt`), (b) the
+  unsubscribe log line appears with subscriber count back to
+  1, and (c) the shell receives the post-edit `exit` keys
+  WITHOUT a manual second F1 (proving focus auto-returned).
+- All 18 device/shell + 138 sim validation tests still pass.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

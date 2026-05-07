@@ -153,11 +153,32 @@ class FakeTerminal:
         print(f"fake_terminal: SEND to idx={idx} recipient=0x{recipient_ref:016x} "
               f"sub=0x{sub_ref:016x} R4={p[2]} R5={p[3]}",
               file=sys.stderr, flush=True)
-        if idx == KEYBOARD_INDEX and sub_ref:
-            if sub_ref not in self.kbd_subs:
-                self.kbd_subs.append(sub_ref)
-            print(f"fake_terminal: kbd subscribe 0x{sub_ref:016x} "
-                  f"(now {len(self.kbd_subs)} sub(s))", flush=True)
+        if idx == KEYBOARD_INDEX:
+            cmd = p[2]   # R4 = 0 subscribe, 1 unsubscribe (mirrors oriscterm)
+            if cmd == 1 and sub_ref:
+                # Targeted unsubscribe by sub-ref.
+                if sub_ref in self.kbd_subs:
+                    self.kbd_subs.remove(sub_ref)
+                    if self.kbd_focus >= len(self.kbd_subs):
+                        self.kbd_focus = 0
+                    print(f"fake_terminal: kbd unsubscribe 0x{sub_ref:016x} "
+                          f"(now {len(self.kbd_subs)} sub(s))", flush=True)
+                else:
+                    print(f"fake_terminal: kbd unsubscribe for unknown "
+                          f"0x{sub_ref:016x} (no-op)", flush=True)
+            elif sub_ref:
+                if sub_ref not in self.kbd_subs:
+                    self.kbd_subs.append(sub_ref)
+                print(f"fake_terminal: kbd subscribe 0x{sub_ref:016x} "
+                      f"(now {len(self.kbd_subs)} sub(s))", flush=True)
+            else:
+                # Legacy unsubscribe-all on null sub_ref (kept for
+                # callers that still use the coarse v1 convention).
+                n = len(self.kbd_subs)
+                self.kbd_subs.clear()
+                self.kbd_focus = 0
+                print(f"fake_terminal: kbd unsubscribe "
+                      f"(was {n} sub(s), now 0 sub(s))", flush=True)
         elif idx == POINTER_INDEX and sub_ref:
             self.ptr_sub = sub_ref
             print(f"fake_terminal: ptr subscribe 0x{sub_ref:016x}", flush=True)

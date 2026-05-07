@@ -597,22 +597,50 @@ class Terminal:
 
     def _handle_keyboard_send(self, int_payload, or_payload) -> None:
         """SEND payload convention for the keyboard service:
-            O2 = subscriber's reply ref to receive key events
-                 (the terminal will SEND each event to this ref).
-                 If null, unsubscribe everything previously subscribed
-                 by senders carrying this same ref.
+            R4 = 0  → subscribe (default)
+                 1  → unsubscribe by sub-ref (matches O2 against the
+                      list, removes the one matching entry; quietly
+                      ignored if no match — supports programs that
+                      double-call term_shutdown).
+            O2 = subscriber's reply ref:
+                 - On subscribe: the ref the terminal will SEND key
+                   events to.
+                 - On unsubscribe (R4=1): the same sub-cap that was
+                   originally registered. The libc derives both via
+                   ObjDerive(O9, R|S), and the sim's ObjDerive is
+                   deterministic over (gen, home, idx, caps), so the
+                   two refs are bit-identical.
+                 - On subscribe with O2=null: legacy "unsubscribe-all"
+                   path (a coarse v1 convenience; targeted unsubs
+                   below are the cleaner option). Kept so existing
+                   callers don't break.
         """
+        cmd = int_payload[0] & 0xFFFFFFFF
         sub_ref = or_payload[1]   # sender's O2 → wire slot 1 → handler O3
+        if cmd == 1 and sub_ref:
+            # Targeted unsubscribe.
+            try:
+                idx_in_list = self.kbd_subscribers.index(sub_ref)
+            except ValueError:
+                self._log(f"keyboard: unsubscribe for unknown "
+                          f"0x{sub_ref:016x} (no-op)")
+                return
+            self.kbd_subscribers.pop(idx_in_list)
+            # If the focus pointer was on this entry or past it, fix
+            # it up so the next F1 cycle still lands somewhere sane.
+            if self.kbd_focus_idx >= len(self.kbd_subscribers):
+                self.kbd_focus_idx = 0
+            self._update_title()
+            self._log(f"keyboard: unsubscribed 0x{sub_ref:016x} "
+                      f"(now {len(self.kbd_subscribers)} subscriber(s))")
+            return
         if sub_ref == 0:
-            # Unsubscribe-all (this is intentionally coarse for v1; if
-            # we ever support multiple subs per CPU, refine to "remove
-            # subs whose home matches the sender"). Currently a single
-            # null SEND clears everyone — fine for the demo.
+            # Legacy unsubscribe-all. Single null SEND clears everyone.
             n = len(self.kbd_subscribers)
             self.kbd_subscribers.clear()
             self.kbd_focus_idx = 0
             self._update_title()
-            self._log(f"keyboard: unsubscribed {n} subscriber(s)")
+            self._log(f"keyboard: unsubscribed {n} subscriber(s) (all)")
             return
         if sub_ref in self.kbd_subscribers:
             self._log(f"keyboard: subscriber 0x{sub_ref:016x} already known")
