@@ -60,17 +60,39 @@
  * arrays of task_t against it. Keep them in sync. */
 #define TABLE_BYTES (TASK_MAX_CONCURRENT * 8)
 
-/* The task-table objstore doubles as orx.c's persistent state. orx
- * picks up at byte offset TABLE_BYTES — see tools/cc/lib/orx.c for
- * the layout there. We oversize the allocation here so orx doesn't
- * have to re-allocate (and doesn't have to claim its own OPR slot —
- * that frees O7 for the grid service ref).
+/* The task-table objstore doubles as orx.c's persistent state and
+ * (Phase 45a) sup.c's + supervisor.c's. orx picks up at byte offset
+ * TABLE_BYTES; sup follows. We oversize the allocation here so
+ * none of them have to re-allocate (and don't have to claim
+ * their own OPR slot).
  *
- * 416 = 24 (orx scratch: code/data/stack) + 384 (16 × 24-byte
- * manifest entries) + 8 (ORX_SLOT_ARGV: a long-lived ref to the
- * shared argv buffer used by every spawn — Phase 41b). */
-#define ORX_STATE_BYTES   416
+ * 448 = 24 (orx scratch: code/data/stack)
+ *     + 384 (16 × 24-byte orx manifest entries)
+ *     + 8 (ORX_SLOT_ARGV: long-lived ref to the shared argv buffer)
+ *     + 8 (SUP_SLOT: supervisor sub-cap harvested from O8 at
+ *          task_init time; null when the program wasn't launched
+ *          by a supervisor)
+ *     + 8 (REPLY_MB_SLOT: long-lived ref to sup.c's reply mailbox,
+ *          allocated lazily on first sup_spawn)
+ *     + 8 (ORX_SLOT_CHILD_O8: supervisor-only — the sub-cap to
+ *          inject into the child's O8 around TaskCreate. orx.c's
+ *          orx_task_create reads this and swaps O8 in/out
+ *          transparently. Null in non-supervisor callers; their
+ *          children inherit the parent's O8 as before.)
+ *     + 8 (ORX_SLOT_O8_SAVE: transient — orx_task_create stashes
+ *          the parent's O8 here while the override is active in
+ *          O8, restores after TaskCreate.) */
+#define ORX_STATE_BYTES   448
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
+
+/* Byte offset within O12 of the supervisor sub-cap parked from O8
+ * by task_init. Programs launched by the supervisor see a valid
+ * R+S sub-ref here; programs launched directly by oriscrun (the
+ * supervisor itself, validation tests, the linkboot demos) see
+ * null. sup.c reads this to find the supervisor for spawn requests.
+ *
+ * = TABLE_BYTES + 24 (orx scratch) + 384 (manifest) + 8 (argv) = 544. */
+#define SUP_SLOT_OFFSET   544
 
 /* Bit set when the corresponding table slot holds a live ref. Lives
  * in regular int memory; pcc treats it as a normal global. */
@@ -92,9 +114,19 @@ task_init(void)
 		"addiu r6, r0, %2\n"
 		"call  #0x106\n"
 		"nop\n"
-		"omov  o12, o1"
+		"omov  o12, o1\n"
+
+		/* Phase 45a: harvest the supervisor sub-cap from the boot
+		 * ABI's O8 slot and park it in O12 at SUP_SLOT_OFFSET, so
+		 * sup.c can find it after subsequent libc inits (term_init,
+		 * hf_init) reuse O8 for their own mailboxes. Programs that
+		 * weren't launched by a supervisor see O8 = null and the
+		 * slot ends up null too — sup_spawn checks for this and
+		 * returns an error rather than dispatching. */
+		"orefst o8, %3(o12)"
 		:
-		: "i"(ALLOC_BYTES), "i"(TAG_DATA), "i"(CAP_R | CAP_W)
+		: "i"(ALLOC_BYTES), "i"(TAG_DATA), "i"(CAP_R | CAP_W),
+		  "i"(SUP_SLOT_OFFSET)
 		: "r2", "r3", "r4", "r5", "r6"
 	);
 	task_slots_in_use = 0;

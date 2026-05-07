@@ -41,14 +41,19 @@ CRT0_ORO := $(BUILD)/runtime/crt0.oro
 CIO_ORO  := $(BUILD)/runtime/console_io.oro
 RUNTIME  := $(CRT0_ORO) $(CIO_ORO)
 
-# --- the shell --------------------------------------------------------
+# --- the shell + the supervisor ---------------------------------------
 # The shell embeds a banner via -DBUILD_BANNER. Default to the
 # production string; override with `make SHELL_BUILD_BANNER='"…"'`
 # (e.g., `make SHELL_BUILD_BANNER='"Object RISC Shell (TEST)"'` from
 # inside a test harness).
+#
+# Phase 45a: the shell is now a program loaded by the supervisor at
+# boot, so it lives in $(BUILD)/programs/ alongside edit/dhry/etc.
+# The supervisor (CPU 0's leader) is the new top-level .orx.
 
 SHELL_BUILD_BANNER ?= "Object RISC Shell"
-SHELL_ORX          := $(BUILD)/shell.orx
+SHELL_ORX          := $(BUILD)/programs/shell.orx
+SUPERVISOR_ORX     := $(BUILD)/supervisor.orx
 
 # --- ouroboros programs ----------------------------------------------
 
@@ -57,13 +62,15 @@ PROGRAM_ORXS := $(patsubst ouroboros/programs/%.c,$(BUILD)/programs/%.orx,$(PROG
 
 # --- top-level targets ------------------------------------------------
 
-.PHONY: all boot clean lib programs shell help
+.PHONY: all boot clean lib programs shell supervisor help
 
 all: $(LIBORISC) $(SHELL_ORX) $(PROGRAM_ORXS)
 
 lib: $(LIBORISC)
 
 shell: $(SHELL_ORX)
+
+supervisor: $(SUPERVISOR_ORX)
 
 programs: $(PROGRAM_ORXS)
 
@@ -75,9 +82,10 @@ clean:
 
 help:
 	@echo "Targets:"
-	@echo "  make           — build everything (liborisc, shell, programs)"
+	@echo "  make           — build liborisc + supervisor + shell + programs"
 	@echo "  make boot      — build, then start Ouroboros"
 	@echo "  make lib       — build just liborisc.ora"
+	@echo "  make supervisor— build just the supervisor"
 	@echo "  make shell     — build just the shell"
 	@echo "  make programs  — build just the programs"
 	@echo "  make clean     — remove build/"
@@ -108,14 +116,27 @@ $(CIO_ORO): tools/cc/arch/orisc/console_io.s | $(BUILD)/runtime
 	$(ASMORISC) -r $< -o $@
 
 # Shell — special-cased so we can pass -DBUILD_BANNER.
+# Lives under $(BUILD)/programs/ now (Phase 45a) so the supervisor
+# can hostfsd-load it from /programs/shell.orx at boot.
 
-$(BUILD)/shell.oro: ouroboros/shell.c | $(BUILD)
+$(BUILD)/programs/shell.oro: ouroboros/shell.c | $(BUILD)/programs
 	$(CPP)  $(CFLAGS) -DBUILD_BANNER='$(SHELL_BUILD_BANNER)' $< > $(@:.oro=.i)
 	$(CCOM) < $(@:.oro=.i) > $(@:.oro=.s)
 	$(ASMORISC) -r $(@:.oro=.s) -o $@
 
-$(SHELL_ORX): $(BUILD)/shell.oro $(RUNTIME) $(LIBORISC) | $(BUILD)
-	$(ORLD) -o $@ $(RUNTIME) $(BUILD)/shell.oro $(LIBORISC)
+$(SHELL_ORX): $(BUILD)/programs/shell.oro $(RUNTIME) $(LIBORISC) | $(BUILD)/programs
+	$(ORLD) -o $@ $(RUNTIME) $(BUILD)/programs/shell.oro $(LIBORISC)
+
+# Supervisor — Ouroboros's init / spawn server (Phase 45a). The
+# top-level .orx that CPU 0's leader runs.
+
+$(BUILD)/supervisor.oro: ouroboros/supervisor.c | $(BUILD)
+	$(CPP)  $(CFLAGS) $< > $(@:.oro=.i)
+	$(CCOM) < $(@:.oro=.i) > $(@:.oro=.s)
+	$(ASMORISC) -r $(@:.oro=.s) -o $@
+
+$(SUPERVISOR_ORX): $(BUILD)/supervisor.oro $(RUNTIME) $(LIBORISC) | $(BUILD)
+	$(ORLD) -o $@ $(RUNTIME) $(BUILD)/supervisor.oro $(LIBORISC)
 
 # Programs — uniform c→oro→orx pipeline.
 

@@ -4325,6 +4325,87 @@ the focused program is something that doesn't render at the top
 of its loop — that program just has to handle (or ignore)
 TK_FOCUS_IN explicitly.
 
+## Phase 45a — Supervisor extraction: foundation
+
+The first staged step toward multi-CPU Ouroboros: separate the
+*shell* (a user program) from the *supervisor* (the spawn-and-task-
+management server). This PR lays the foundation; the next will
+flip CPU 0's boot leader.
+
+What ships now:
+
+- **`tools/cc/lib/sup.c`** — client side of the spawn RPC. New
+  libc fn `sup_spawn(path, args, cwd)`: SENDs a request to the
+  supervisor referenced by `O12 + SUP_SLOT` and waits on a per-
+  program reply mailbox for the resulting task ref. With no
+  supervisor (`SUP_SLOT == 0`), falls back to calling `orx_spawn`
+  directly — which is the only exercised path through 45a since
+  the shell is still CPU 0's leader.
+- **`tools/cc/lib/task.c`** — `task_init` now harvests boot O8
+  into a new `SUP_SLOT` (offset 544) inside the libc-managed O12
+  objstore. Programs launched by a supervisor will find their
+  sub-cap there after subsequent inits (`hf_init`, `term_init`)
+  reclaim O8 for their own mailboxes.
+- **`tools/cc/lib/orx.c`** — `orx_task_create` reads two new
+  optional libc slots: `ORX_SLOT_CHILD_O8` (offset 560) holds
+  the cap to inject into the child's O8 around TaskCreate;
+  `ORX_SLOT_O8_SAVE` (offset 568) is its transient save slot
+  for the parent's O8 across the swap. Null in
+  non-supervisor callers — child inherits the parent's O8 as
+  before.
+- **`tools/sim/simorisc`** — `install_external_services` emits a
+  literal-zero ref for the `0=0@0` pad placeholder instead of
+  the historical `make_ref(gen=1, ...)`'s `0x0001000000000000`.
+  OISN now correctly identifies an unfilled boot slot as null,
+  which `sup_have_supervisor` depends on to detect the fallback
+  case.
+- **`ouroboros/supervisor.c`** — the supervisor program itself,
+  buildable via `make supervisor` but not in `make all` and not
+  yet wired into `scripts/boot.sh`. Phase 45b will revisit and
+  exercise it. ~250 lines of source representing the shape of
+  the spawn-RPC server: allocate mailbox, derive sub-cap into
+  `ORX_SLOT_CHILD_O8`, spawn the shell as first task, dispatch
+  loop on the mailbox.
+- **Shell** (`ouroboros/shell.c`) — `cmd_run` and `cmd_edit`
+  swap `orx_spawn` → `sup_spawn`. Through 45a this is a no-op
+  rename via the fallback path; through 45b it'll start hitting
+  the actual RPC.
+
+What's deferred to 45b:
+
+The "boot supervisor as CPU 0 leader" flip. The RPC machinery
+itself works — supervisor mailbox allocation, dispatch loop,
+shell spawning with O8 injection — but a real-world boot has
+edge cases I want to nail down separately rather than ship
+half-debugged: stack-pointer corruption observed during the
+shell's second `read_line` iteration (post-cmd_run), with the
+saved `out` argument loading as `0x700001` (= supervisor's
+SPAWN_REQ_VA + 1) suggesting either an OPR clobber I haven't
+isolated or a TaskCreate-time mapping bleed. Worth its own
+focused PR.
+
+What's effectively wire-frozen by this PR:
+
+- The `(path\0args\0cwd\0)` packing of the spawn-request bytes
+  object (matches `program_args` / `program_cwd`'s argv-buffer
+  encoding from Phase 41d).
+- The reply protocol: supervisor SENDs (R4=status, O2=task_ref)
+  to the requester's reply_cap.
+- Op codes — `op=1` is spawn; 2/3 reserved for kill/wait if
+  ever needed (today those operate on task refs directly via
+  firmware primitives, no RPC needed).
+- The libc-managed O12 layout: `SUP_SLOT` at +544,
+  `REPLY_MB_SLOT` at +552, `ORX_SLOT_CHILD_O8` at +560,
+  `ORX_SLOT_O8_SAVE` at +568. `ORX_STATE_BYTES` bumped 432→448,
+  `ALLOC_BYTES` 560→576.
+
+### Tests
+
+- All 18 device/shell tests pass (fallback path).
+- All 138 sim validation tests pass.
+- `make supervisor` succeeds; `build/supervisor.orx` is a real
+  binary — just not yet booted as the leader.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
