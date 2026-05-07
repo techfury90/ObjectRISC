@@ -112,6 +112,15 @@ KEY_PAGE_UP   = 0x186
 KEY_PAGE_DOWN = 0x187
 KEY_F1        = 0x190    # F2..F12 are 0x191..0x19B
 
+# Synthetic event the terminal emits to a subscriber when F1 cycles
+# focus to it. Programs that draw something to the screen (the
+# editor, a future window manager, anything painting the grid)
+# observe this as a "you have the keyboard now — repaint if you
+# care" signal: most main-loop architectures already redraw before
+# blocking on the next key, so falling through with no explicit
+# handler is enough to get a fresh paint. mods is always 0.
+KEY_FOCUS_IN  = 0x10E    # adjacent to KEY_RETURN (0x10D)
+
 # Modifier mask (R5 in keyboard event SENDs). One bit per modifier.
 MOD_SHIFT = 0x01
 MOD_CTRL  = 0x02
@@ -737,16 +746,38 @@ class Terminal:
         **{f"F{i}": KEY_F1 + (i - 1) for i in range(1, 13)},
     }
 
+    def _send_key_to(self, sub_ref: int, code: int, mods: int) -> None:
+        """SEND a single key event to the named subscriber. Factored
+        out of _on_key_press so F1's focus-cycle path can also fire a
+        synthetic KEY_FOCUS_IN to the newly-focused subscriber."""
+        trans = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        evt_pkt = build_send_deliver(
+            src_pid=self.my_pid,
+            dst_pid=ref_home(sub_ref),
+            trans_id=trans,
+            recipient_ref=sub_ref,
+            int_payload=[code, mods, 0, 0],
+            or_payload=[sub_ref, 0, 0, 0],
+        )
+        self.send_packet(evt_pkt)
+
     def _on_key_press(self, event) -> None:
         # F1 is the focus-cycle hotkey: never delivered, always
         # consumed by the terminal. Cycles which subscriber receives
-        # subsequent keys. With one subscriber this is a no-op; with
-        # zero subscribers it's also a no-op.
+        # subsequent keys. After cycling we send a synthetic
+        # KEY_FOCUS_IN to the newly-focused subscriber so it can
+        # repaint immediately (most programs render at the top of
+        # their main loop, blocking in term_getkey while unfocused
+        # — without the synthetic event they'd hold their last frame
+        # until the user typed something real).
         if event.keysym == "F1":
             n = len(self.kbd_subscribers)
             if n > 1:
                 self.kbd_focus_idx = (self.kbd_focus_idx + 1) % n
                 self._update_title()
+                self._send_key_to(self.kbd_subscribers[self.kbd_focus_idx],
+                                  KEY_FOCUS_IN, 0)
             return
         if not self.kbd_subscribers:
             return  # nobody listening; drop
@@ -760,18 +791,7 @@ class Terminal:
         idx = self.kbd_focus_idx
         if idx >= len(self.kbd_subscribers):
             idx = 0
-        sub_ref = self.kbd_subscribers[idx]
-        trans = self.next_trans_id & 0xFFFF
-        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
-        evt_pkt = build_send_deliver(
-            src_pid=self.my_pid,
-            dst_pid=ref_home(sub_ref),
-            trans_id=trans,
-            recipient_ref=sub_ref,
-            int_payload=[code, mods, 0, 0],
-            or_payload=[sub_ref, 0, 0, 0],
-        )
-        self.send_packet(evt_pkt)
+        self._send_key_to(self.kbd_subscribers[idx], code, mods)
 
     def _update_title(self) -> None:
         """Reflect the current focus + subscriber count in the window

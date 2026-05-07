@@ -143,6 +143,14 @@ int  term_getkey(int *out_mods);
 #define TK_BACKSPACE 0x108
 #define TK_TAB       0x109
 #define TK_RETURN    0x10D
+/* Synthetic event the terminal sends to the newly-focused subscriber
+ * each time F1 cycles focus — a "you have the keyboard now, repaint
+ * if you care" hint. Programs that draw something to the screen and
+ * render at the top of their main loop (the editor, future window
+ * managers) get a free redraw on focus-in just by ignoring the key
+ * code: term_getkey returns, no handler matches, the next iteration's
+ * render fires. Mods are always 0. */
+#define TK_FOCUS_IN  0x10E
 #define TK_ESCAPE    0x11B
 #define TK_DELETE    0x17F
 #define TK_UP        0x180

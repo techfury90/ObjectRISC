@@ -310,12 +310,15 @@ class FakeTerminal:
 
     def cycle_focus(self):
         """Mirror oriscterm's F1 behaviour: advance kbd_focus to the
-        next subscriber. No-op when 0 or 1 subs."""
+        next subscriber, then SEND a synthetic KEY_FOCUS_IN to the
+        newly-focused subscriber so it can repaint immediately. No-op
+        when 0 or 1 subs."""
         n = len(self.kbd_subs)
         if n > 1:
             self.kbd_focus = (self.kbd_focus + 1) % n
             print(f"fake_terminal: kbd focus → {self.kbd_focus + 1}/{n}",
                   flush=True)
+            self.send_key(0x10E, 0)   # KEY_FOCUS_IN — see oriscterm
 
     def send_key(self, code, mods=0):
         if not self.kbd_subs:

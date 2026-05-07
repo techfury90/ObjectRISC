@@ -4287,6 +4287,44 @@ of the verbose `run /programs/edit.orx scratch.txt &`, which both
 exercises the new builtin and shortens the keystroke sequence the
 test fakes through.
 
+## Phase 44 — Synthetic KEY_FOCUS_IN on F1
+
+Discovered while playing with the post-edit-builtin shell: spawn
+two editors with `edit a.c` + `edit b.c`, F1 to cycle between
+them, and they actually multitask. Each runs as its own task,
+holds its own grid state, blocks in `term_getkey` until F1 makes
+it the focused subscriber. Type and the focused one repaints.
+
+The one rough edge: the focused editor only repaints **when you
+type something**. If you F1 to it and just look, you see whatever
+was on screen from whichever editor painted last — only the next
+keystroke triggers `edit_render`.
+
+Fix is one synthetic event. New keycode `KEY_FOCUS_IN = 0x10E`
+(adjacent to RETURN at 0x10D — both terminal-event semantics).
+oriscterm SENDs it to the newly-focused subscriber every time F1
+cycles. fake_terminal mirrors. Programs whose main loop renders
+at the top of each iteration (the editor; future window managers
+and grid-painting tools) get a free redraw on focus-in just by
+ignoring the keycode — `term_getkey` returns, no handler matches,
+the next iteration's render fires.
+
+The key was placed in the existing terminal-event range (0x100s)
+rather than the special-key range (0x180s) on purpose: it's an
+event the **terminal** generates, not a keyboard key the user
+pressed. RETURN, BACKSPACE, ESCAPE all live in 0x10x for the same
+reason. `liborisc.h` exports the libc mirror as `TK_FOCUS_IN`.
+
+The factored `oriscterm._send_key_to(sub_ref, code, mods)` helper
+(extracted from `_on_key_press`) is reused by the F1 path. Cleaner
+than inlining the SEND-builder twice.
+
+Net result: with two editors open, F1 between them and the new
+one paints immediately. Same effect with three. Same effect when
+the focused program is something that doesn't render at the top
+of its loop — that program just has to handle (or ignore)
+TK_FOCUS_IN explicitly.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
