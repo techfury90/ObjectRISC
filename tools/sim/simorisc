@@ -1475,9 +1475,15 @@ class System:
     def run(self, max_cycles: int) -> int:
         """Round-robin one instruction per active CPU per tick; dispatch
         handler tasks on idle CPUs with queued SENDs. Returns the exit code
-        of CPU 0 (or of whichever CPU last exited if CPU 0 didn't run)."""
+        of CPU 0 (or of whichever CPU last exited if CPU 0 didn't run).
+
+        `max_cycles == 0` means unlimited — the loop runs until the
+        natural exit conditions fire (TaskExitSignal with no remaining
+        work, or socket EOF in --connect mode). The default 10M cap is
+        there as a CI safety net for runaway tests, not as a real
+        budget for interactive use."""
         ticks = 0
-        while ticks < max_cycles:
+        while max_cycles == 0 or ticks < max_cycles:
             any_progress = False
             # Drain incoming bytes from the crossbar transport (no-op for
             # InProcessCrossbar). This must happen before per-CPU work so
@@ -3648,8 +3654,14 @@ def main(argv: List[str]) -> int:
                          "CPU a reusable boot target.")
     ap.add_argument("--trace", action="store_true",
                     help="print each retired instruction with register effects")
-    ap.add_argument("--max-cycles", type=int, default=10_000_000,
-                    help="cycle bound (default 10000000)")
+    ap.add_argument("--max-cycles", type=int, default=None,
+                    help="cycle bound. Default 10_000_000 in standalone "
+                         "mode (a CI-friendly safety net for runaway "
+                         "tests); 0 / unset in --connect (socket) mode "
+                         "means unlimited — interactive sessions are "
+                         "owned by the crossbar lifecycle, not by an "
+                         "instruction count. Pass an explicit value to "
+                         "override either default.")
     ap.add_argument("--mode", choices=["user", "supervisor", "firmware"],
                     default="supervisor",
                     help="initial privilege mode of the loaded task "
@@ -3714,8 +3726,17 @@ def main(argv: List[str]) -> int:
         for cpu in system.cpus:
             snapshot_boot_state(cpu)
 
+    # Resolve the cycle bound. Default is 10M for standalone (a CI
+    # safety net for runaway tests); 0 / unset in --connect mode means
+    # unlimited because interactive sessions are owned by the
+    # crossbar lifecycle, not by an instruction count.
+    if args.max_cycles is None:
+        max_cycles = 0 if args.connect is not None else 10_000_000
+    else:
+        max_cycles = args.max_cycles
+
     try:
-        return system.run(args.max_cycles)
+        return system.run(max_cycles)
     finally:
         system.crossbar.close()
 
