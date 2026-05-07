@@ -4105,6 +4105,46 @@ boundary, not just at the top of the read loop.
   forces the optimization. Shipping the simpler always-call
   path.
 
+## Phase 41c — Dhrystone runs from the shell (Ouroboros, day 19)
+
+A small follow-up on the back of 41b: `run dhry.orx` from the
+shell now actually finishes instead of dying mid-benchmark
+with `simorisc: max cycles exceeded (10000000)`. The fix is a
+one-liner in spirit:
+
+- `simorisc --max-cycles` defaults to **0 (unlimited)** when
+  `--connect` is set, and 10M only in standalone mode. The
+  10M cap exists as a CI safety net for runaway `.s` tests
+  via `tools/sim/tests/validation/runner.py` (which sets its
+  own bound per-test, default 100k); it never made sense for
+  an interactive socket-driven session whose lifetime is
+  owned by the crossbar, not by an instruction count. The
+  `system.run` loop now treats `max_cycles == 0` as "loop
+  until the natural exit conditions fire".
+
+Result on this dev box (Apple M-series Python 3.13):
+
+    Dhrystone Benchmark, Version 2.1 (Object RISC port)
+    Iterations: 5000
+    ...
+    Cycles elapsed:       20371748
+    Cycles per iteration: 4074
+    16 MHz: ~3927 dhry/s   = ~2.2 DMIPS
+    20 MHz: ~4909 dhry/s   = ~2.7 DMIPS
+
+So a Dhrystone iteration costs ~4k Object RISC cycles, which
+puts the imagined silicon roughly between an early-1980s
+68000 (~1.4 DMIPS at 12.5 MHz) and a late-1980s 68020
+(~3 DMIPS at 16 MHz). About what we wanted from a
+1986-vintage chip.
+
+### Tests
+
+- All 18 device/shell tests still pass.
+- All 138 sim validation tests still pass (they each set
+  their own `@max-cycles`, unaffected by the default
+  change).
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
