@@ -13,14 +13,23 @@
 #ifndef LIBORISC_H
 #define LIBORISC_H
 
-/* ---- argv.c — program arguments handed in by the launcher ----- *
+/* ---- argv.c — program arguments + cwd handed in by the launcher ----- *
  *
- * Returns a pointer to a NUL-terminated string with everything the
- * shell typed after the program path. Programs that want individual
- * args split it themselves. Returns "" if the launcher didn't pass
- * any arguments (orx_run always maps an empty buffer when none). */
+ * `program_args()` returns a pointer to a NUL-terminated string with
+ * everything the shell typed after the program path. Programs that
+ * want individual args split it themselves.
+ *
+ * `program_cwd()` returns the launcher's working directory at the
+ * moment of spawn. Programs that take user-typed paths should
+ * prepend cwd to relative arguments — the libc has no per-task cwd
+ * concept, so hostfsd resolves every path against its jail root and
+ * "edit hello.c" from a non-root cwd would otherwise miss.
+ *
+ * Both return "" if the launcher passed nothing for that field
+ * (orx_run always maps a buffer with both fields, even when empty). */
 
 const char *program_args(void);
+const char *program_cwd(void);
 
 /* ---- io.c — console output ------------------------------------- */
 
@@ -96,6 +105,7 @@ int hf_write(int fd, const char *buf, int count);   /* buf may be stack or data 
 
 void term_init(void);
 void term_print_only_init(void);                   /* parks boot ORs, no kbd subscribe */
+void term_shutdown(void);                          /* unsubscribe from kbd before exit */
 void term_print(const char *s);
 void term_print_n(const char *buf, int count);     /* explicit length, async */
 void term_print_n_sync(const char *buf, int count);/* sync — blocks until the
@@ -267,8 +277,8 @@ void task_install_preempt_timer(unsigned int quantum);
  */
 
 int    orx_init(void);                                 /* optional boot-time arg-buffer pre-alloc */
-int    orx_run(const char *path, const char *args);    /* sync; args may be NULL or "" */
-task_t orx_spawn(const char *path, const char *args);  /* async — caller waits/frees */
+int    orx_run  (const char *path, const char *args, const char *cwd);  /* sync */
+task_t orx_spawn(const char *path, const char *args, const char *cwd);  /* async */
 int    orx_unload(task_t t);                           /* wait + deferred-free + reap */
 
 #endif /* LIBORISC_H */

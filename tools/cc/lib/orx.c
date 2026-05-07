@@ -375,10 +375,14 @@ orx_read_into_va(int fd, unsigned int temp_va, unsigned int size)
  * "is the slot null?" — orefst-checked via OISN. */
 #define ARGV_BUF_SIZE 256
 
-/* Copy args bytes into the temp mapping at `va`. Receiving va as a
- * register dodges pcc's `la r,N` emission for casting a literal. */
+/* Lay out the args buffer at `va`: `args\0cwd\0`. Args first to
+ * preserve `program_args() = (char *)ARGV_VA` (dereferencing it
+ * still reads the args string, NUL-terminated). cwd lives past
+ * the args terminator so `program_cwd()` can find it by walking
+ * the buffer past one NUL. Either may be NULL/"". Receiving va as
+ * a register dodges pcc's `la r,N` lowering for cast-from-literal. */
 static void
-orx_argv_copy(unsigned int va, const char *args)
+orx_argv_copy(unsigned int va, const char *args, const char *cwd)
 {
 	char *dst = (char *)va;
 	unsigned int i = 0;
@@ -386,6 +390,13 @@ orx_argv_copy(unsigned int va, const char *args)
 		while (i + 1 < ARGV_BUF_SIZE && args[i]) {
 			dst[i] = args[i];
 			i++;
+		}
+	}
+	dst[i++] = '\0';
+	unsigned int j = 0;
+	if (cwd) {
+		while (i + 1 < ARGV_BUF_SIZE && cwd[j]) {
+			dst[i++] = cwd[j++];
 		}
 	}
 	dst[i] = '\0';
@@ -469,13 +480,13 @@ orx_argv_is_null(void)
  * the alloc + map cost lands BEFORE the spawn path. Single-shot
  * programs can rely on the lazy alloc here. */
 static int
-orx_setup_args(const char *args)
+orx_setup_args(const char *args, const char *cwd)
 {
 	if (orx_argv_is_null()) {
 		int status = orx_argv_alloc();
 		if (status != 0) return status;
 	}
-	orx_argv_copy((unsigned int)ARGS_PARENT_VA, args);
+	orx_argv_copy((unsigned int)ARGS_PARENT_VA, args, cwd);
 	return 0;
 }
 
@@ -573,7 +584,7 @@ orx_task_create(unsigned int entry, int has_data)
  *     -6  libc task table is full
  */
 task_t
-orx_spawn(const char *path, const char *args)
+orx_spawn(const char *path, const char *args, const char *cwd)
 {
 	char hdr[32];
 
@@ -649,7 +660,7 @@ orx_spawn(const char *path, const char *args)
 		return -4;
 	}
 
-	if (orx_setup_args(args) != 0) {
+	if (orx_setup_args(args, cwd) != 0) {
 		orx_free_slot(SLOT_STACK);
 		if (has_data) orx_free_slot(SLOT_DATA);
 		orx_free_slot(SLOT_CODE);
@@ -756,9 +767,9 @@ orx_unload(task_t t)
  * orx_spawn / orx_unload.
  */
 int
-orx_run(const char *path, const char *args)
+orx_run(const char *path, const char *args, const char *cwd)
 {
-	task_t t = orx_spawn(path, args);
+	task_t t = orx_spawn(path, args, cwd);
 	if (t < 0)
 		return t;
 	return orx_unload(t);

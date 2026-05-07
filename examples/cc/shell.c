@@ -526,7 +526,7 @@ cmd_run(const char *cwd, const char *arg)
 	resolve_path(cwd, arg_copy, path);
 
 	if (background) {
-		task_t t = orx_spawn(path, arg_copy + args_start);
+		task_t t = orx_spawn(path, arg_copy + args_start, cwd);
 		if (t < 0) {
 			term_print("orx_spawn failed: ");
 			term_print_int(t);
@@ -542,7 +542,7 @@ cmd_run(const char *cwd, const char *arg)
 		 * shell blocks again on the next keystroke. */
 		task_yield();
 	} else {
-		int code = orx_run(path, arg_copy + args_start);
+		int code = orx_run(path, arg_copy + args_start, cwd);
 		term_print(run_done_pre);
 		term_print_int(code);
 		term_print(run_done_post);

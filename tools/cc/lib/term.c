@@ -236,6 +236,52 @@ term_init(void)
 	_term_restore_or();
 }
 
+/* --- term_shutdown: unsubscribe from the keyboard before exit --------
+ *
+ * oriscterm tracks each subscribed program's sub-ref in a list and
+ * has no way to notice when a program TaskExits — there's no
+ * process-death notification in the wire protocol. A program that
+ * exits without unsubscribing leaves a dead entry in the focus-cycle
+ * list, so F1 may land on it and keys silently disappear into a
+ * stale queue.
+ *
+ * Programs that called term_init should call term_shutdown right
+ * before TaskExit / main return. The protocol is "SEND R4=1,
+ * O2=our sub-cap to the keyboard service" — oriscterm matches the
+ * cap in its subscriber list and removes that one entry, leaving
+ * other subscribers (e.g. the parent shell) untouched. The cap
+ * we derive here is bit-identical to the one term_init originally
+ * derived: ObjDerive on O9 (our mailbox) with caps R|S, and the
+ * sim's ObjDerive is deterministic over (gen, home, idx, caps).
+ *
+ * Programs that crash before reaching term_shutdown will still
+ * leave a dead subscriber. Robust cleanup of those is a separate
+ * problem (a wire-level NACK from the home CPU when a SEND target
+ * is stale would let oriscterm prune dynamically). */
+
+void
+term_shutdown(void)
+{
+	asm volatile(
+		"omov  o1, o9\n"               /* O1 = our mailbox */
+		"addiu r4, r0, 9\n"            /* R|S — same caps as term_init */
+		"call  #0x103\n"               /* ObjDerive → O1 = sub-cap */
+		"nop\n"
+		"omov  o2, o1\n"               /* O2 = sub-cap to unsubscribe */
+		"omov  o1, o6\n"               /* O1 = keyboard service */
+		"onull o3\n"
+		"addiu r4, r0, 1\n"            /* R4 = 1 → unsubscribe */
+		"addiu r5, r0, 0\n"
+		"addiu r6, r0, 0\n"
+		"addiu r7, r0, 0\n"
+		"send  o1"
+		:
+		:
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+	_term_restore_or();
+}
+
 /* --- terminal output: console-write SENDs to oriscterm ---------------- */
 
 void
