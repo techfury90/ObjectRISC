@@ -13,6 +13,15 @@
 #ifndef LIBORISC_H
 #define LIBORISC_H
 
+/* ---- argv.c — program arguments handed in by the launcher ----- *
+ *
+ * Returns a pointer to a NUL-terminated string with everything the
+ * shell typed after the program path. Programs that want individual
+ * args split it themselves. Returns "" if the launcher didn't pass
+ * any arguments (orx_run always maps an empty buffer when none). */
+
+const char *program_args(void);
+
 /* ---- io.c — console output ------------------------------------- */
 
 void print_str(const char *s);
@@ -257,8 +266,8 @@ void task_install_preempt_timer(unsigned int quantum);
  *     -5  TaskCreate / TaskResume / TaskWait failed
  */
 
-int    orx_run(const char *path);
-task_t orx_spawn(const char *path);                /* async — caller waits/frees */
-int    orx_unload(task_t t);                       /* wait + deferred-free + reap */
+int    orx_run(const char *path, const char *args);    /* sync; args may be NULL or "" */
+task_t orx_spawn(const char *path, const char *args);  /* async — caller waits/frees */
+int    orx_unload(task_t t);                           /* wait + deferred-free + reap */
 
 #endif /* LIBORISC_H */

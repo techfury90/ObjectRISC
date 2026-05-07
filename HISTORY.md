@@ -3921,6 +3921,72 @@ for the grid ref to keep across cmd_run invocations.
   pass should remove the legacy fallback and require all calls
   to carry reply_cap.
 
+## Phase 41a — Argv plumbing (top half) (Ouroboros, day 18)
+
+The shell can now parse `run /programs/edit.orx /etc/hosts` —
+the path/args split happens in `cmd_run`, the args string
+threads through `orx_run` / `orx_spawn`, and a new libc helper
+`program_args()` is the documented API the spawned program
+uses to read them.
+
+What's wired:
+
+- **Spec**: `TaskCreate` (#0x000) gains an optional `O4` slot.
+  When non-null at TaskCreate time, the firmware maps the
+  referenced object R-only at `ARGV_VA` (0x000A0000) in the
+  child's address space. Documented in
+  `SYSTEM_FIRMWARE_INTERFACE.md`.
+- **simorisc**: validates `O4`, adds an `(ARGV_VA, ARGV_VA+len)`
+  mapping with `CAP_R` to the child's mapping list.
+- **`liborisc/argv.c`**: `program_args()` returning a `const
+  char *`. Returns a pointer the program can pass to
+  `strlen` / dereference safely.
+- **`orx_run` / `orx_spawn`**: signatures gain an `args` param.
+  `cmd_run` parses the rest of the line after the path and
+  passes it through.
+- **`edit.c`** uses `program_args()` to pick its target file,
+  falling back to `/scratch.txt` when no args are given.
+
+### What's not wired (deferred to Phase 41b)
+
+The actual ARGV_VA mapping — the libc piece that allocates an
+args buffer, copies the args into it, and parks the ref in `O4`
+just before TaskCreate — is stubbed in this phase. `program_args()`
+returns a static empty string for now, so `edit /foo.txt` still
+opens `/scratch.txt`.
+
+The infrastructure work hit a tricky cross-test interaction
+where the original `orx_setup_args` (ObjAlloc + MapObject +
+memcpy + Unmap) plus the new two-buffer `cmd_run` triggered a
+regression in `test_shell_bg` — turned out the second
+`PATH_MAX` buffer on `cmd_run`'s stack pushed it past the
+shell's stack budget under certain banner lengths. A
+single-buffer rewrite of `cmd_run` (NUL-terminate the path/args
+in place, slice instead of copy twice) fixed that, but by then
+the budget for this PR was spent. The full `orx_setup_args`
+implementation gets its own follow-up.
+
+### Tests
+
+- All 18 device/shell tests still pass; **138 sim validation
+  tests** unaffected.
+- `test_shell_edit.sh` continues to verify the focus-switch
+  flow with the editor opening `/scratch.txt` (the default
+  when `program_args()` is empty).
+
+### What's not yet done
+
+- **Phase 41b**: actual ARGV_VA mapping. The
+  `simorisc`/spec/libc API surface is in place; the missing
+  piece is `liborisc/orx.c::orx_setup_args` allocating + copying
+  + parking the ref. Needs care around pcc's register
+  allocation across helper-function boundaries (OPRs are
+  caller-saved scratch in the orisc backend, so the args ref
+  has to ride through an objstore slot, not a register).
+- **Manifest tracking** of the args object so `orx_unload` can
+  free it. With ~256 bytes per spawn it's a tiny leak, but
+  worth cleaning up.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

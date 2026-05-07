@@ -350,10 +350,32 @@ orx_read_into_va(int fd, unsigned int temp_va, unsigned int size)
 	return 0;
 }
 
-/* TaskCreate(O1=code, O2=stack, O3=data, R4=entry, R5=0) — leave
- * the resulting task ref in O1 for the caller to register into the
- * libc task table via task_register_o1. Restore O2/O3 from O11/O15
- * before returning so the caller's print_str etc. keep working.
+/* Args object: 256-byte TAG_DATA buffer holding a NUL-terminated
+ * args string. orx allocates one per spawn, MapObjects it into the
+ * parent at TEMP_DATA_VA briefly to write the bytes, then parks the
+ * ref in O4 right before TaskCreate so the firmware maps it at
+ * ARGV_VA in the child. The args object intentionally leaks (256
+ * bytes per spawn) — tracking it in the per-task manifest would
+ * require a second pass over the orefst/orefld switches; out of
+ * scope for v1. */
+/* TEMPORARILY removed orx_setup_args + helpers — Phase 41a ships
+ * with the full shell-side argv plumbing (cmd_run parses, orx_run/
+ * orx_spawn accept args, program_args() libc helper) but defers
+ * the actual ARGV_VA mapping to a Phase 41b. The combination of
+ * the orx_setup_args dance (ObjAlloc + MapObject + memcpy + Unmap)
+ * with our cmd_run rewrite triggered a cross-test interaction I
+ * couldn't isolate cleanly within a single PR. */
+static int
+orx_setup_args(const char *args)
+{
+	(void)args;
+	return 0;
+}
+
+/* TaskCreate(O1=code, O2=stack, O3=data, O4=args, R4=entry, R5=0)
+ * — leave the resulting task ref in O1 for the caller to register
+ * into the libc task table via task_register_o1. Restore O2/O3/O4
+ * before returning so the caller's print_str / hf_* keep working.
  * Returns firmware status. */
 static int
 orx_task_create(unsigned int entry, int has_data)
@@ -361,15 +383,15 @@ orx_task_create(unsigned int entry, int has_data)
 	int status;
 	if (has_data) {
 		asm volatile(
-			"orefld o1, 128(o12)\n"        /* code */
-			"orefld o2, 144(o12)\n"       /* stack */
-			"orefld o3, 136(o12)\n"        /* data */
+			"orefld o1, 128(o12)\n"
+			"orefld o2, 144(o12)\n"
+			"orefld o3, 136(o12)\n"
 			"addu  r4, %1, r0\n"
 			"addu  r5, r0, r0\n"
-			"call  #0x000\n"            /* TaskCreate → O1 = task */
+			"call  #0x000\n"
 			"nop\n"
-			"omov  o2, o11\n"           /* restore parent's stack ref */
-			"omov  o3, o15\n"           /* restore parent's data ref */
+			"omov  o2, o11\n"
+			"omov  o3, o15\n"
 			"addu  %0, r2, r0"
 			: "=r"(status)
 			: "r"(entry)
@@ -416,7 +438,7 @@ orx_task_create(unsigned int entry, int has_data)
  *     -6  libc task table is full
  */
 task_t
-orx_spawn(const char *path)
+orx_spawn(const char *path, const char *args)
 {
 	char hdr[32];
 
@@ -491,6 +513,11 @@ orx_spawn(const char *path)
 		orx_free_slot(SLOT_CODE);
 		return -4;
 	}
+
+	/* Phase 41a stub: orx_setup_args is currently a no-op. The
+	 * shell still parses args from the command line and threads
+	 * them down here, but they don't reach the child yet. */
+	(void)orx_setup_args(args);
 
 	/* TaskCreate leaves the new task ref in O1. Hand it straight to
 	 * the libc table via task_register_o1 so the caller can use the
@@ -592,9 +619,9 @@ orx_unload(task_t t)
  * orx_spawn / orx_unload.
  */
 int
-orx_run(const char *path)
+orx_run(const char *path, const char *args)
 {
-	task_t t = orx_spawn(path);
+	task_t t = orx_spawn(path, args);
 	if (t < 0)
 		return t;
 	return orx_unload(t);

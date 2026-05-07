@@ -7,10 +7,13 @@
  * keyboard focus between the shell (upper text pane) and this
  * editor (lower grid canvas) — type to whichever pane has focus.
  *
- * Argument-passing isn't wired into the shell yet (Phase 41
- * material), so the editor opens a fixed scratchpad path
- * (EDIT_SCRATCH_PATH) on launch. Save/quit work as in the old
- * builtin — ^S writes back to that path, ^X exits.
+ * The shell parses argv from `run /programs/edit.orx <path>`
+ * and threads it down via orx_spawn → libc program_args(). In
+ * Phase 41a the libc helper returns an empty string (the
+ * actual ARGV_VA mapping is deferred to Phase 41b), so until
+ * then the editor falls back to a fixed scratchpad path
+ * (EDIT_DEFAULT_PATH). Save/quit work the same: ^S writes back
+ * to the chosen path, ^X exits.
  *
  * Does its own term_init (full — including the kbd subscribe
  * SEND), which is what makes it show up as a second oriscterm
@@ -22,7 +25,8 @@
 
 #include "liborisc.h"
 
-#define EDIT_SCRATCH_PATH "/scratch.txt"
+#define EDIT_DEFAULT_PATH "/scratch.txt"
+#define EDIT_PATH_MAX     128
 
 #define EDIT_MAX_LINES   100
 #define EDIT_LINE_MAX    96
@@ -42,6 +46,7 @@ struct edit_state {
 	int   top_row;
 	int   dirty;
 	int   truncated;
+	char  path[EDIT_PATH_MAX];
 };
 
 static int
@@ -94,7 +99,7 @@ edit_render(struct edit_state *es)
 
 	sp = 0;
 	sp = edit_status_append(status, sp, "edit: ");
-	sp = edit_status_append(status, sp, EDIT_SCRATCH_PATH);
+	sp = edit_status_append(status, sp, es->path);
 	if (es->dirty)
 		sp = edit_status_append(status, sp, " *");
 	if (es->truncated)
@@ -219,7 +224,7 @@ edit_save(struct edit_state *es)
 	int i;
 	char nl = '\n';
 
-	fd = hf_open(EDIT_SCRATCH_PATH,
+	fd = hf_open(es->path,
 	             HF_O_WRONLY | HF_O_CREAT | HF_O_TRUNC);
 	if (fd < 0) return -1;
 	for (i = 0; i < es->n_lines; i++) {
@@ -255,7 +260,7 @@ edit_load(struct edit_state *es)
 	es->dirty    = 0;
 	es->truncated = 0;
 
-	fd = hf_open(EDIT_SCRATCH_PATH, HF_O_RDONLY);
+	fd = hf_open(es->path, HF_O_RDONLY);
 	if (fd < 0) return;
 
 	while ((n = hf_read(fd, rdbuf, sizeof(rdbuf))) > 0) {
@@ -300,6 +305,29 @@ main(void)
 	 * focus-cycle hotkey. */
 	term_init();
 	hf_init();
+
+	/* Pick the file to edit from the args the shell handed us
+	 * (program_args() returns whatever the launcher buffered —
+	 * empty string in Phase 41a, since the actual ARGV_VA
+	 * mapping isn't wired yet). First whitespace-token wins;
+	 * empty / blank → default scratchpad. */
+	{
+		const char *args = program_args();
+		int dst = 0;
+		while (*args == ' ' || *args == '\t') args++;
+		while (*args && *args != ' ' && *args != '\t'
+		       && dst < EDIT_PATH_MAX - 1) {
+			es.path[dst++] = *args++;
+		}
+		es.path[dst] = '\0';
+		if (es.path[0] == '\0') {
+			const char *def = EDIT_DEFAULT_PATH;
+			int i;
+			for (i = 0; def[i] && i < EDIT_PATH_MAX - 1; i++)
+				es.path[i] = def[i];
+			es.path[i] = '\0';
+		}
+	}
 
 	edit_load(&es);
 
