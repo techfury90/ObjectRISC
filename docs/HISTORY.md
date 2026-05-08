@@ -4468,6 +4468,74 @@ makes this transparent to the libc client).
   starts, `run /programs/hello.orx` round-trips through the
   supervisor, `exit` shuts down everything cleanly.
 
+## Phase 45c — Every CPU boots the supervisor (Ouroboros, day 23)
+
+Multi-CPU groundwork: every CPU boots the same `supervisor.orx`,
+but only PROCID 0 (the leader) spawns a shell as its first user
+task. Workers allocate their own spawn-service mailbox, derive
+their own `ORX_SLOT_CHILD_O8` sub-cap, then enter the dispatch
+loop ready to service spawn requests from peers — today nothing
+SENDs to them, but the architecture is in place for Phase 45e
+(supervisor-to-supervisor delegation).
+
+The framing matters: with each CPU running its own supervisor,
+"the supervisor for tasks living on CPU N" is just CPU N's local
+supervisor. A shell's `sup_spawn` always goes to its local
+supervisor (parked in `SUP_SLOT` by `task_init` from boot O8),
+which does a local `TaskCreate` and returns a local task ref.
+Local `TaskWait` just works. The TaskCreate-is-local /
+TaskWait-is-local constraints in simorisc stop being a pain
+because we never need to do either across CPUs in the common
+case. Cross-CPU only matters when a supervisor wants to *delegate*
+a spawn to a peer — and even then it's supervisor-to-supervisor
+SEND, neither side ever doing a remote TaskCreate or remote
+TaskWait directly.
+
+What changed:
+
+- **`supervisor.c`** — new `read_procid()` helper using
+  `lctrl r,$7` (Vol V §2.10 control register 7). `main()` branches
+  on it: leader spawns the shell, workers skip straight to the
+  dispatch loop. The boot banner now reads "supervisor: booting
+  (leader)" or "supervisor: booting (worker)" so multi-CPU stdout
+  is unambiguous. The op=2 (sup_shutdown) handler is gated on
+  `is_leader` — workers ignore it (they have no shell to halt
+  on; they get torn down externally when the leader exits via
+  oriscrun's `--leader 0` watcher).
+- **`scripts/boot.sh`** — adds a second `--cpu pid=1:program=…/
+  supervisor.orx,…` line with the same service refs as CPU 0
+  (refs to objects on the device PIDs; the device daemons handle
+  multiple subscribers). When the leader's shell exits, oriscrun
+  SIGTERMs CPU 1 alongside the cleanup.
+- **`tools/devices/tests/test_supervisor_multicpu.sh`** — new
+  end-to-end test asserting both supervisors announce themselves
+  with the right role (leader vs worker), the leader's `exit`
+  drives its supervisor to halt cleanly via the op=2 SEND, and
+  the worker stays quiet (no shell-done message — wrong-PROCID
+  branch isn't taken).
+
+What's deferred to 45d/e:
+
+- 45d: simorisc remote Task primitives (TaskWait/TaskQuery/TaskKill
+  via wire packets — analogous to the existing `BlockedOnResponse`
+  for OL/OS). Not on the critical path for 45c since each shell
+  only ever waits on its local supervisor's children, but
+  prerequisite for cross-CPU spawn placement in 45e.
+- 45e: supervisor-to-supervisor SEND for cross-CPU spawn. New
+  op=3 (delegate_spawn) on the wire protocol; the source
+  supervisor SENDs to a peer's mailbox, the peer spawns locally,
+  the result propagates back. Once 45d is in, the result task
+  ref is location-transparent to the originating shell.
+
+### Tests
+
+- All 20 device tests pass, including the new
+  `test_supervisor_multicpu.sh`.
+- All 138 sim validation tests still pass.
+- `make boot` brings up two supervisor CPUs; CPU 0 spawns the
+  shell, CPU 1 sits in its dispatch loop, `exit` tears
+  everything down cleanly.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

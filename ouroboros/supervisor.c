@@ -95,6 +95,19 @@ static void sup_restore_data_ref(void)
 #define SUP_PRINT(s)    do { sup_restore_data_ref(); print_str(s); } while (0)
 #define SUP_PRINT_INT(n) do { sup_restore_data_ref(); print_int(n); } while (0)
 
+/* Read the firmware PROCID control register (Vol V §2.10, ctrl 7).
+ * Phase 45c: every CPU runs the same supervisor.orx; only the
+ * leader (PROCID == 0) spawns the shell as its first user task,
+ * the rest sit in the dispatch loop ready to service spawn
+ * requests from peers (when 45e wires that up). */
+static int
+read_procid(void)
+{
+	int pid;
+	asm volatile("lctrl %0, $7" : "=r"(pid));
+	return pid;
+}
+
 /* Allocate a 16-byte TAG_SERVICE object, attach a queue, park the
  * full ref in O9. Subsequent TaskCreates derive a fresh R+S sub-cap
  * from O9 each time and inject it into the child's O8. */
@@ -361,9 +374,10 @@ poll_one_request(int *out_op, int *out_len)
 	return status;
 }
 
-const char banner[] = "supervisor: booting\n";
-const char shell_done[] = "supervisor: shell exited; halting\n";
-const char unknown_op[] = "supervisor: unknown op\n";
+const char banner_leader[]   = "supervisor: booting (leader)\n";
+const char banner_worker[]   = "supervisor: booting (worker)\n";
+const char shell_done[]      = "supervisor: shell exited; halting\n";
+const char unknown_op[]      = "supervisor: unknown op\n";
 
 int
 main(void)
@@ -382,40 +396,47 @@ main(void)
 	 * ORX_SLOT_CHILD_O8 and does the swap transparently. */
 	install_child_o8_override();
 
-	print_str(banner);
+	int procid    = read_procid();
+	int is_leader = (procid == 0);
 
-	/* Bring up the shell as our first user task. orx_spawn →
-	 * orx_task_create injects the override, so the shell's
-	 * task_init harvests our sub-cap. */
-	task_t shell = orx_spawn(SHELL_PATH, "", "/");
-	if (shell < 0) {
-		SUP_PRINT("supervisor: failed to spawn shell: ");
-		SUP_PRINT_INT((int)shell);
-		SUP_PRINT("\n");
-		return 1;
-	}
-	if (task_resume(shell) != 0) {
-		SUP_PRINT("supervisor: failed to resume shell\n");
-		return 1;
+	print_str(is_leader ? banner_leader : banner_worker);
+
+	/* Phase 45c: only the leader (PROCID 0) spawns the shell. Worker
+	 * supervisors sit in the dispatch loop ready to service spawn
+	 * requests from peers — today nothing SENDs to them, but the
+	 * mailbox is allocated, the dispatch loop is running, and the
+	 * sub-cap is ready in ORX_SLOT_CHILD_O8 so any task this
+	 * supervisor *does* eventually create inherits the right
+	 * boot ABI. Phase 45e wires up supervisor-to-supervisor SENDs
+	 * for cross-CPU spawn placement. */
+	if (is_leader) {
+		task_t shell = orx_spawn(SHELL_PATH, "", "/");
+		if (shell < 0) {
+			SUP_PRINT("supervisor: failed to spawn shell: ");
+			SUP_PRINT_INT((int)shell);
+			SUP_PRINT("\n");
+			return 1;
+		}
+		if (task_resume(shell) != 0) {
+			SUP_PRINT("supervisor: failed to resume shell\n");
+			return 1;
+		}
+		(void)shell;   /* shell-exit detection is via op=2 SEND
+		                * below, not task_query. */
 	}
 
-	/* Service spawn requests forever. Wake-up is event-driven:
-	 * each `run`/`edit` from the shell SENDs op=1 (spawn), and
-	 * the shell SENDs op=2 (sup_shutdown) right before its
-	 * TaskExit on `exit`/`quit`. The latter unblocks our poll
-	 * deterministically — without it, the supervisor would sit
-	 * in poll_one_request forever while the shell exited
-	 * underneath it (simorisc only ticks finite poll timeouts
-	 * down for the *current* task, and a blocked supervisor
-	 * isn't current once the shell starts running).
+	/* Dispatch loop. Wake-up is event-driven: each `run`/`edit`
+	 * from a shell SENDs op=1 (spawn), and the leader's shell
+	 * SENDs op=2 (sup_shutdown) right before its TaskExit on
+	 * `exit`/`quit`. The latter unblocks the leader's poll
+	 * deterministically.
 	 *
-	 * `shell` is intentionally unused here — we don't track its
-	 * state directly, op=2 is the wake signal. Phase 45c may
-	 * grow remote-CPU shells whose lifetimes are decoupled from
-	 * the local shell; today the supervisor's lifetime mirrors
-	 * the leader shell's. */
-	(void)shell;
-
+	 * Worker supervisors get torn down externally when the leader
+	 * exits — oriscrun's `--leader 0` watches CPU 0 and SIGTERMs
+	 * the rest of the process group on its exit. (See
+	 * tools/oriscrun.) Without that external teardown a worker
+	 * would block in poll_one_request forever waiting for a SEND
+	 * that never comes. */
 	for (;;) {
 		int op, len;
 		int status = poll_one_request(&op, &len);
@@ -423,9 +444,11 @@ main(void)
 
 		if (op == 1) {
 			handle_spawn_request(len);
-		} else if (op == 2) {
+		} else if (op == 2 && is_leader) {
 			/* Graceful shutdown — sup_shutdown() in libc, called
-			 * by the shell right before its TaskExit. No reply. */
+			 * by the leader's shell right before its TaskExit.
+			 * No reply. Workers ignore op=2 (no shell to halt
+			 * on); they wait for the external teardown signal. */
 			SUP_PRINT(shell_done);
 			return 0;
 		} else {
