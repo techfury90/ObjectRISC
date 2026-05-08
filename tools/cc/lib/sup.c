@@ -298,3 +298,38 @@ sup_spawn(const char *path, const char *args, const char *cwd)
 
 	return task_register_o1();
 }
+
+/* sup_shutdown — fire-and-forget op=2 SEND telling the supervisor
+ * "I'm about to TaskExit, you can wind down too." No reply. The
+ * shell calls this from its `exit`/`quit` path right before
+ * returning out of main() (which crt0 lowers to TaskExit).
+ *
+ * Why we need it: simorisc's finite-timeout ReceiveQueuePoll only
+ * decrements its tick counter when the polling task is the current
+ * task on its CPU. A supervisor blocked on poll while the shell
+ * runs (and then exits) would never wake — the timeout would never
+ * count down. An explicit SEND from the shell delivers a real
+ * message into the supervisor's queue, satisfying the wake
+ * condition deterministically. (See supervisor.c's poll_one_request
+ * comment for the full design note.)
+ *
+ * No-op when there's no supervisor (program launched directly by
+ * oriscrun, validation tests, etc.) — same fallback gate as
+ * sup_spawn. */
+void
+sup_shutdown(void)
+{
+	if (!sup_have_supervisor()) return;
+
+	asm volatile(
+		"orefld o1, 544(o12)\n"        /* supervisor sub-cap */
+		"onull  o2\n"
+		"onull  o3\n"
+		"addiu  r4, r0, 2\n"           /* op = shutdown */
+		"addiu  r5, r0, 0\n"
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		: : : "r1", "r4", "r5", "r6", "r7"
+	);
+}

@@ -47,9 +47,10 @@ RUNTIME  := $(CRT0_ORO) $(CIO_ORO)
 # (e.g., `make SHELL_BUILD_BANNER='"Object RISC Shell (TEST)"'` from
 # inside a test harness).
 #
-# Phase 45a: the shell is now a program loaded by the supervisor at
+# Phase 45a/b: the shell is now a program loaded by the supervisor at
 # boot, so it lives in $(BUILD)/programs/ alongside edit/dhry/etc.
-# The supervisor (CPU 0's leader) is the new top-level .orx.
+# The supervisor (CPU 0's leader) is the new top-level .orx — built
+# by `make supervisor`, included in `all` so `make boot` gets it.
 
 SHELL_BUILD_BANNER ?= "Object RISC Shell"
 SHELL_ORX          := $(BUILD)/programs/shell.orx
@@ -64,7 +65,7 @@ PROGRAM_ORXS := $(patsubst ouroboros/programs/%.c,$(BUILD)/programs/%.orx,$(PROG
 
 .PHONY: all boot clean lib programs shell supervisor help
 
-all: $(LIBORISC) $(SHELL_ORX) $(PROGRAM_ORXS)
+all: $(LIBORISC) $(SHELL_ORX) $(SUPERVISOR_ORX) $(PROGRAM_ORXS)
 
 lib: $(LIBORISC)
 

@@ -4406,6 +4406,68 @@ What's effectively wire-frozen by this PR:
 - `make supervisor` succeeds; `build/supervisor.orx` is a real
   binary — just not yet booted as the leader.
 
+## Phase 45b — Supervisor as CPU 0's boot leader (Ouroboros, day 22)
+
+The flip. `scripts/boot.sh` now launches `build/supervisor.orx` as
+CPU 0's boot leader — the supervisor is the program init runs, and
+the shell is its first user task. Every `run`/`edit` from the shell
+goes through the SEND-RPC the libc plumbing built in 45a.
+
+What changed to make the boot work end-to-end:
+
+- **Reply-cap stash slot in the supervisor**
+  (`SUP_SCRATCH_SLOT_OFFSET = 576`, libc bump `ORX_STATE_BYTES`
+  448→456). The bug 45a uncovered was the supervisor's
+  `reply_to_requester` doing `omov o1, o3` to put the reply_cap
+  into O1 for SEND — but `orx_spawn` (called between dequeue and
+  reply) clobbers O3 via its manifest restore path. The trap
+  surfaced as "SEND lacks S on O1" because O3 by then held the
+  freshly-spawned child's stack ref. The supervisor now stashes
+  O3 into the new scratch slot immediately after the dequeue and
+  reloads it before the SEND.
+- **`SUP_PRINT` / `SUP_PRINT_INT` macros** in `supervisor.c`. Same
+  underlying problem from a different angle: `print_str` /
+  `console_write` reads `O3` as the data-section ref, and any
+  `orx_spawn` / `sup_spawn` / `ObjDerive` clobbers O3 along the
+  way. The macros restore `O3` from `O15` (where `task_init`
+  parked the boot data ref) before each call. Three callers in
+  the supervisor used them; the rest of libc isn't affected
+  because the shell uses `term_print` (which restores its own
+  OPRs) for visible output.
+- **Event-driven shutdown via `sup_shutdown()`** (new libc fn
+  in `tools/cc/lib/sup.c`). The supervisor's main loop blocks
+  on its spawn mailbox with infinite timeout. We can't poll-with-
+  finite-timeout-then-check-shell-state because simorisc only
+  ticks finite timeouts down on the task's *current* quantum, and
+  a blocked supervisor never gets one once the shell starts
+  running. The shell SENDs op=2 on `exit`/`quit` right before
+  TaskExit; the supervisor handles op=2 by printing the exit
+  banner and `return 0`-ing out of main (which crt0 lowers to
+  TaskExit, tearing down the CPU).
+- **`scripts/boot.sh`**: `--cpu pid=0:program=…/supervisor.orx`
+  is the leader; the comment block updated to match. `make all`
+  now includes `$(SUPERVISOR_ORX)` so `make boot` builds it.
+- **`tools/devices/tests/test_supervisor.sh`** — end-to-end test
+  that asserts the spawn round-trip works (`hello-from-supervised-
+  spawn` reaches the supervisor's stdout) and the shutdown SEND
+  reaches the supervisor (`supervisor: shell exited; halting`
+  prints, supervisor exits cleanly so `wait $CPU0` returns
+  rather than the harness having to kill it).
+
+What's still single-CPU: the supervisor and shell live on the same
+CPU (CPU 0). Phase 45c+ adds remote shells on additional CPUs via
+chunkboot, with their `sup_spawn` SENDs routing back to CPU 0's
+supervisor over the wire (the existing wire-level home-pid routing
+makes this transparent to the libc client).
+
+### Tests
+
+- All 19 device tests pass, including the new `test_supervisor.sh`.
+- All 138 sim validation tests still pass.
+- `make boot` runs cleanly; supervisor announces itself, shell
+  starts, `run /programs/hello.orx` round-trips through the
+  supervisor, `exit` shuts down everything cleanly.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

@@ -1,31 +1,35 @@
 /*
  * supervisor.c — Ouroboros init / spawn server.
  *
- * Phase 45a — extract the spawn-and-task-management role out of the
- * shell. CPU 0 boots into supervisor.orx; the supervisor allocates a
- * spawn-service mailbox, TaskCreates the shell as its first user
- * task, and then services spawn requests over SEND for the shell
- * (and, in 45b, for remote shells on other CPUs via chunkboot).
+ * Phase 45b — CPU 0's boot leader. The supervisor allocates a
+ * spawn-service mailbox, derives a sub-cap into ORX_SLOT_CHILD_O8
+ * (so every TaskCreate it does injects the cap into the child's
+ * O8 → SUP_SLOT path), TaskCreates the shell as its first user
+ * task, and then services spawn requests over SEND. The shell's
+ * `run`/`edit` go through libc's sup_spawn → SEND → us → orx_spawn
+ * round trip; the shell's `exit` SENDs op=2 (sup_shutdown) so we
+ * can wind down the loop without polling.
  *
  * The supervisor:
  *   - holds the boot service refs (term, kbd, grid, hostfsd) that
  *     each spawned task should inherit;
  *   - owns the .orx loader (orx_spawn machinery);
- *   - exposes ONE service: spawn (op=1). Future ops slot in at
- *     op=2/3 (kill/wait) when we want the supervisor to mediate
- *     those too — for 45a callers operate on task refs directly
- *     since refs work transparently across local CPU boundaries
- *     and the supervisor doesn't need to be in the lifecycle path.
+ *   - exposes two ops: 1 = spawn, 2 = shutdown. Future ops slot in
+ *     at 3+ (kill/wait/etc.) when we want the supervisor to
+ *     mediate those too — for now callers operate on task refs
+ *     directly since refs work transparently across local CPU
+ *     boundaries.
  *
  * Wire protocol on the spawn mailbox (sender → us, RecvQueuePoll
  * dequeues with R3 carrying the first int arg, O1-O4 the OR
  * payload):
- *     R3 = op (1 = spawn)
- *     R4 = byte length of the request payload
- *     O2 = TAG_DATA bytes object: path\0args\0cwd\0
- *     O3 = reply_cap (R+S sub-cap of caller's mailbox)
+ *     R3 = op (1 = spawn, 2 = shutdown)
+ *     R4 = byte length of the request payload (0 for shutdown)
+ *     O2 = TAG_DATA bytes object: path\0args\0cwd\0   (spawn only)
+ *     O3 = reply_cap (R+S sub-cap of caller's mailbox; spawn only —
+ *          shutdown is fire-and-forget)
  *
- * Reply (us → caller, SEND):
+ * Spawn reply (us → caller, SEND):
  *     R4 = status (0 OK, negative for orx_spawn-style failures)
  *     O2 = the new task ref (or null on failure)
  *
@@ -33,10 +37,10 @@
  *     O5 = console     (boot)
  *     O6 = keyboard    (boot)
  *     O7 = grid        (boot)
- *     O8 = hf mailbox  (claimed by hf_init; temporarily swapped to
- *                       the spawn-service sub-cap during TaskCreate
- *                       so the child's task_init harvests it from
- *                       O8 → SUP_SLOT)
+ *     O8 = hf mailbox  (claimed by hf_init; orx_task_create swaps
+ *                       to the spawn-service sub-cap during each
+ *                       TaskCreate so the child's task_init
+ *                       harvests it from O8 → SUP_SLOT)
  *     O9 = supervisor's spawn-service mailbox (full ref, allocated
  *           at boot)
  *     O10 = hostfsd    (boot)
@@ -46,7 +50,10 @@
  * to the host's stdout — NOT the Tk terminal. That keeps the
  * supervisor independent of term_init / term_print_only_init, frees
  * O14 for use as scratch around TaskCreate, and matches the
- * convention we settled on for `dhry.c` and friends earlier.
+ * convention we settled on for `dhry.c` and friends earlier. NB:
+ * print_str reads O3 as the data-section ref, which orx_spawn
+ * clobbers — wrap calls in SUP_PRINT() to restore O3 from O15
+ * (where task_init parked the boot data ref).
  */
 
 #include "liborisc.h"
@@ -65,6 +72,28 @@
  * it into the child's O8 around every TaskCreate, transparently
  * to the rest of orx_spawn. */
 #define ORX_SLOT_CHILD_O8_OFFSET 560
+
+/* Byte offset within O12 of the supervisor's scratch slot — used
+ * to stash the per-request reply_cap (sender's O3) across the
+ * orx_spawn call, which clobbers O1..O3 via its manifest restore.
+ * Allocated as the last slot of the libc OR-store object (see
+ * task.c's ORX_STATE_BYTES comment). */
+#define SUP_SCRATCH_SLOT_OFFSET  576
+
+/* console_write reads O3 to find the data section. orx_spawn /
+ * sup_spawn / ObjDerive all clobber O3 along the way. task_init
+ * parked the boot data ref in O15 — restore O3 from O15 before
+ * any print_str call that follows a primitive that touches O3.
+ *
+ * We wrap print_str / print_int via these macros so the rest of
+ * the file reads naturally; "sup_" prefix to avoid colliding
+ * with the libc symbols. */
+static void sup_restore_data_ref(void)
+{
+	asm volatile("omov o3, o15");
+}
+#define SUP_PRINT(s)    do { sup_restore_data_ref(); print_str(s); } while (0)
+#define SUP_PRINT_INT(n) do { sup_restore_data_ref(); print_int(n); } while (0)
 
 /* Allocate a 16-byte TAG_SERVICE object, attach a queue, park the
  * full ref in O9. Subsequent TaskCreates derive a fresh R+S sub-cap
@@ -225,13 +254,15 @@ reply_to_requester(task_t t, int status)
 		asm volatile("onull o1");
 	}
 
-	/* SEND to reply_cap (held in O3 from the dequeued msg).
-	 *   recipient = O3
-	 *   O2 = task ref (in O1 right now → omov)
+	/* SEND to reply_cap. The cap was stashed into SUP_SCRATCH_SLOT
+	 * by handle_spawn_request before the orx_spawn call clobbered
+	 * O3. Reload it into O1 (the SEND recipient slot) here.
+	 *   recipient = stashed reply_cap
+	 *   O2 = task ref (in O1 right now → move to O2 first)
 	 *   R4 = status */
 	asm volatile(
-		"omov   o2, o1\n"
-		"omov   o1, o3\n"
+		"omov   o2, o1\n"              /* O2 = task ref */
+		"orefld o1, %1(o12)\n"         /* O1 = stashed reply_cap */
 		"onull  o3\n"
 		"addu   r4, %0, r0\n"
 		"addiu  r5, r0, 0\n"
@@ -239,7 +270,7 @@ reply_to_requester(task_t t, int status)
 		"addiu  r7, r0, 0\n"
 		"send   o1\n"
 		:
-		: "r"(status)
+		: "r"(status), "i"(SUP_SCRATCH_SLOT_OFFSET)
 		: "r1", "r4", "r5", "r6", "r7"
 	);
 }
@@ -250,10 +281,22 @@ reply_to_requester(task_t t, int status)
  *   R4 = byte len
  *   O2 = bytes ref
  *   O3 = reply cap
+ *
+ * IMPORTANT: orx_spawn (called below) clobbers O1..O3 via its
+ * manifest restore path. We stash the reply_cap into
+ * SUP_SCRATCH_SLOT immediately so reply_to_requester can recover
+ * it; the bytes ref in O2 is consumed before the spawn so it
+ * doesn't need stashing.
  */
 static void
 handle_spawn_request(int len)
 {
+	asm volatile(
+		"orefst o3, %0(o12)"
+		:
+		: "i"(SUP_SCRATCH_SLOT_OFFSET)
+	);
+
 	int map_status = map_spawn_request(len);
 	if (map_status != 0) {
 		reply_to_requester(-1, map_status);
@@ -290,9 +333,13 @@ handle_spawn_request(int len)
 	if (t >= 0) (void)task_resume(t);
 }
 
-/* Dequeue one message from O9; returns 0 = OK, R3=op, R4=len,
- * with O2 (bytes ref) and O3 (reply_cap) populated. Status from
- * R2. */
+/* Dequeue one message from O9. Infinite timeout: the loop is
+ * fully event-driven — each spawn request is a SEND, and the shell
+ * SENDs an explicit op=2 (shutdown) on `exit` to break us out of
+ * the poll. (We can't poll-with-finite-timeout-then-check-shell-
+ * state because simorisc only ticks finite timeouts down on the
+ * task's current quantum, and a blocked supervisor never gets
+ * one once the shell starts running.) */
 static int
 poll_one_request(int *out_op, int *out_len)
 {
@@ -342,25 +389,33 @@ main(void)
 	 * task_init harvests our sub-cap. */
 	task_t shell = orx_spawn(SHELL_PATH, "", "/");
 	if (shell < 0) {
-		print_str("supervisor: failed to spawn shell: ");
-		print_int((int)shell);
-		print_str("\n");
+		SUP_PRINT("supervisor: failed to spawn shell: ");
+		SUP_PRINT_INT((int)shell);
+		SUP_PRINT("\n");
 		return 1;
 	}
 	if (task_resume(shell) != 0) {
-		print_str("supervisor: failed to resume shell\n");
+		SUP_PRINT("supervisor: failed to resume shell\n");
 		return 1;
 	}
 
-	/* Service spawn requests forever. The shell's lifetime is
-	 * bounded by user input; when the user types `exit`, the
-	 * shell TaskExits, but we keep running to service any
-	 * lingering bg tasks (or, in 45b, requests from remote CPUs).
+	/* Service spawn requests forever. Wake-up is event-driven:
+	 * each `run`/`edit` from the shell SENDs op=1 (spawn), and
+	 * the shell SENDs op=2 (sup_shutdown) right before its
+	 * TaskExit on `exit`/`quit`. The latter unblocks our poll
+	 * deterministically — without it, the supervisor would sit
+	 * in poll_one_request forever while the shell exited
+	 * underneath it (simorisc only ticks finite poll timeouts
+	 * down for the *current* task, and a blocked supervisor
+	 * isn't current once the shell starts running).
 	 *
-	 * For 45a we exit when the shell does, mirroring the
-	 * pre-extraction behaviour of "leader exits → system tears
-	 * down". A future PR can add a graceful "shutdown" op the
-	 * shell SENDs us before exiting. */
+	 * `shell` is intentionally unused here — we don't track its
+	 * state directly, op=2 is the wake signal. Phase 45c may
+	 * grow remote-CPU shells whose lifetimes are decoupled from
+	 * the local shell; today the supervisor's lifetime mirrors
+	 * the leader shell's. */
+	(void)shell;
+
 	for (;;) {
 		int op, len;
 		int status = poll_one_request(&op, &len);
@@ -368,16 +423,13 @@ main(void)
 
 		if (op == 1) {
 			handle_spawn_request(len);
-		} else {
-			print_str(unknown_op);
-		}
-
-		/* Check if the shell has exited; if so, we're done. */
-		struct task_info info;
-		if (task_query(shell, &info) == 0
-		    && info.state == TASK_STATE_EXITED) {
-			print_str(shell_done);
+		} else if (op == 2) {
+			/* Graceful shutdown — sup_shutdown() in libc, called
+			 * by the shell right before its TaskExit. No reply. */
+			SUP_PRINT(shell_done);
 			return 0;
+		} else {
+			SUP_PRINT(unknown_op);
 		}
 	}
 }
