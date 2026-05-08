@@ -1,13 +1,16 @@
 #!/bin/sh
 # boot.sh — start Ouroboros: the OS layer atop Object RISC.
 #
-# Phase 45a (this version): the shell is still CPU 0's direct
-# leader. The supervisor program exists in the tree
-# (ouroboros/supervisor.c, builds to build/supervisor.orx) and the
-# libc has the spawn-RPC client (sup.c::sup_spawn) but the boot
-# leader is still shell.orx so the existing test harnesses keep
-# passing on the fallback path. Phase 45b will flip the leader
-# once the wire-protocol edge cases are nailed down.
+# Phase 45b (this version): supervisor.orx is CPU 0's boot leader.
+# It allocates its own spawn-service mailbox at boot, TaskCreates
+# the shell as its first user task with the supervisor sub-cap
+# wired into O8 (so the shell's task_init harvests it into
+# SUP_SLOT). All `run`/`edit` from the shell go through sup_spawn
+# → SEND-RPC → supervisor's orx_spawn. The shell's `exit` SENDs
+# an op=2 (shutdown) before TaskExit so the supervisor can wind
+# down without polling. Existing single-CPU test harnesses still
+# launch shell.orx directly (no supervisor in O8 → sup_spawn
+# falls back to orx_spawn).
 #
 # Spawned processes by `make boot`:
 #   - oriscbar  (crossbar)
@@ -47,7 +50,7 @@ BANNER="Object RISC Shell ($PAST)"
 # the banner each boot.
 touch ouroboros/shell.c
 make -s shell SHELL_BUILD_BANNER="\"$BANNER\""
-make -s programs
+make -s all
 
 # The hostfsd jail expects programs at /programs/. We keep build
 # artefacts under build/, so symlink the built programs in.
@@ -60,11 +63,13 @@ fi
 #   O5  = oriscterm console  (16=1@9)
 #   O6  = oriscterm keyboard (16=2@9)
 #   O7  = oriscterm grid     (16=3@9)
-#   O8  = pad (supervisor sub-cap when 45b flips the leader; null today)
-#   O9  = pad
+#   O8  = pad (null — supervisor.c allocates its own mailbox in O9
+#        at boot and parks a sub-cap of it into ORX_SLOT_CHILD_O8
+#        so spawned children inherit it)
+#   O9  = pad (also null at boot; supervisor's own mailbox replaces it)
 #   O10 = hostfsd            (17=1@9)
 exec python3 tools/oriscrun \
     --terminal pid=16 \
     --hostfsd "pid=17,root=$ROOT" \
-    --cpu "pid=0:program=$ROOT/build/programs/shell.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=0@0,service=0=0@0,service=17=1@9" \
+    --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=0@0,service=0=0@0,service=17=1@9" \
     --leader 0 --leader-timeout 600

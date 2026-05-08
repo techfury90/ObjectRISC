@@ -305,4 +305,11 @@ int    orx_unload(task_t t);                           /* wait + deferred-free +
 
 task_t sup_spawn(const char *path, const char *args, const char *cwd);
 
+/* sup_shutdown — fire-and-forget op=2 SEND telling the supervisor
+ * "I'm about to TaskExit." The supervisor exits its main loop and
+ * TaskExits in turn, tearing down the CPU. No-op when the program
+ * wasn't launched under a supervisor. Call this RIGHT before
+ * returning from main() — once you've TaskExited it's too late. */
+void sup_shutdown(void);
+
 #endif /* LIBORISC_H */

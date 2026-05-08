@@ -1000,6 +1000,10 @@ main(void)
 		} else if (strcmp(line, "exit") == 0
 		           || strcmp(line, "quit") == 0) {
 			term_print("bye!\n");
+			/* Wake the supervisor (if any) out of its
+			 * spawn-request poll so it can wind down too.
+			 * No-op when run unsupervised. */
+			sup_shutdown();
 			return 0;
 		} else {
 			term_print("unknown command: '");
