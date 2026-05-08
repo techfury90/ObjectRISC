@@ -145,6 +145,34 @@ vfs_write(int fd, const char *buf, int count)
 	return hf_write(fd, buf, count);
 }
 
+/* vfs_mkdir / vfs_unlink — Phase 50: walk to find the backing
+ * filesystem, hand the remainder to hf_*. DIR-resolved paths (the
+ * /sys subtree managed by oriscdir) reject — those entries are
+ * managed by self-registering services, not user-creatable. */
+int
+vfs_mkdir(const char *path)
+{
+	int kind;
+	char rem[VFS_REM_BUF_SIZE];
+	int rc = dir_walk(path, &kind, rem, sizeof(rem));
+	if (rc == VFS_NO_DIRECTORY) return hf_mkdir(path);
+	if (rc < 0) return rc;
+	if (kind != DIR_KIND_MOUNT) return -1;
+	return hf_mkdir(rem);
+}
+
+int
+vfs_unlink(const char *path)
+{
+	int kind;
+	char rem[VFS_REM_BUF_SIZE];
+	int rc = dir_walk(path, &kind, rem, sizeof(rem));
+	if (rc == VFS_NO_DIRECTORY) return hf_unlink(path);
+	if (rc < 0) return rc;
+	if (kind != DIR_KIND_MOUNT) return -1;
+	return hf_unlink(rem);
+}
+
 /* vfs_list: enumerate `path`. Two regimes:
  *
  *   - DIR (oriscdir-managed, e.g. `/`, `/sys`, `/sys/cpu`):

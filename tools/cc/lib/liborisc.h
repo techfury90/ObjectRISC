@@ -82,6 +82,14 @@ int hf_opendir(const char *path);                   /* read returns "name\nname\
 int hf_close(int fd);
 int hf_read(int fd, char *buf, int count);          /* buf MUST be on the stack */
 int hf_write(int fd, const char *buf, int count);   /* buf may be stack or data */
+/* Phase 50: filesystem mutation. Both return 0 on success or a
+ * negative errno: -3 = ENOENT, -4 = EACCES, -7 = EEXIST (mkdir on
+ * existing entry; unlink on directory). hf_mkdir doesn't create
+ * intermediate parent directories — that's POSIX `mkdir`, not
+ * `mkdir -p`; if you need the latter, walk the path and call us
+ * once per component. */
+int hf_mkdir(const char *path);
+int hf_unlink(const char *path);
 
 /* ---- term.c — oriscterm interaction (console + keyboard) ------- *
  *
@@ -451,5 +459,11 @@ int vfs_close(int fd);
 int vfs_read(int fd, char *buf, int count);
 int vfs_write(int fd, const char *buf, int count);
 int vfs_list(const char *path, char *buf, int cap);
+/* Phase 50: filesystem mutation through the VFS. DIR-resolved paths
+ * (the /sys subtree owned by oriscdir) reject — those entries belong
+ * to self-registering services. MOUNT-resolved paths and the no-
+ * directory fallback both end at hf_mkdir / hf_unlink. */
+int vfs_mkdir(const char *path);
+int vfs_unlink(const char *path);
 
 #endif /* LIBORISC_H */

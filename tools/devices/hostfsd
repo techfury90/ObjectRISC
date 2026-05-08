@@ -52,6 +52,21 @@ Wire protocol (request: CPU SENDs to hostfsd at (pid, idx 1)):
                        writes them to the host file
                      → response: R3 = bytes written, negative on error
 
+  OP_MKDIR     = 6   (Phase 50) O2 = path buffer ref
+                     R5 = path offset within buffer
+                     R6 = path length (bytes)
+                     → response: R3 = 0 on success, negative errno
+                                 (E_EXIST = -7 if the entry already
+                                 exists; E_NOENT if a parent is missing)
+
+  OP_UNLINK    = 7   (Phase 50) O2 = path buffer ref
+                     R5 = path offset within buffer
+                     R6 = path length (bytes)
+                     → response: R3 = 0 on success, negative errno
+                                 Files only; OP_RMDIR for directories
+                                 isn't implemented yet (the empty-check
+                                 semantics need their own design).
+
 All responses are SEND_DELIVERs aimed at the subscribed reply ref;
 the operation result lands in the receiver's R3 (after queue
 dispatch overlay). R4 carries the secondary value where applicable
@@ -59,10 +74,11 @@ dispatch overlay). R4 carries the secondary value where applicable
 
 Errors:  -1 = EBADF (bad fd / not subscribed)
          -2 = EINVAL (bad args / unknown op)
-         -3 = ENOENT (file not found)
+         -3 = ENOENT (file not found / parent dir missing)
          -4 = EACCES (path escapes --root jail; permission denied)
          -5 = EIO    (host I/O error)
          -6 = ENOMEM (per-CPU fd table full — limit is 64)
+         -7 = EEXIST (mkdir target already exists; unlink on a directory)
 """
 
 import argparse
@@ -123,6 +139,15 @@ OP_READ       = 2
 OP_WRITE      = 3
 OP_SUBSCRIBE  = 4
 OP_OPENDIR    = 5
+OP_MKDIR      = 6   # Phase 50: create directory at path. O2 = path
+                    # buffer ref, R5 = offset, R6 = length. Reply: R3 = 0
+                    # on success or negative errno (E_EXIST if the entry
+                    # already exists, E_NOENT if a parent component is
+                    # missing).
+OP_UNLINK     = 7   # Phase 50: remove file at path. Same shape as
+                    # MKDIR. Files only — directory removal would need
+                    # a separate OP_RMDIR with empty-check semantics
+                    # we haven't designed yet. Reply: R3 = 0 / negative.
 
 # ---- Error codes (negative R3 in responses) ------------------------------
 
@@ -132,6 +157,8 @@ E_NOENT  = -3
 E_ACCES  = -4
 E_IO     = -5
 E_NOMEM  = -6
+E_EXIST  = -7   # Phase 50: target already exists (mkdir over an
+                # existing entry; or unlink-on-directory).
 
 MAX_FDS_PER_CPU = 64
 MAX_INFLIGHT_PER_CPU = 32
@@ -517,6 +544,10 @@ class HostFSD:
             self._do_read(sess, int_payload, or_payload)
         elif op == OP_WRITE:
             self._do_write(sess, int_payload, or_payload)
+        elif op == OP_MKDIR:
+            self._do_path_op(sess, int_payload, or_payload, "mkdir")
+        elif op == OP_UNLINK:
+            self._do_path_op(sess, int_payload, or_payload, "unlink")
         else:
             self._log(f"unknown op {op} from pid={sender_pid}")
             self._reply(sess, E_INVAL, 0)
@@ -588,6 +619,81 @@ class HostFSD:
         req = build_obj_read_req(self.my_pid, ref_home(path_ref), trans,
                                  path_ref, path_off, path_len)
         self.send_packet(req)
+
+    def _do_path_op(self, sess: Session, int_payload, or_payload,
+                    kind: str) -> None:
+        """Phase 50: shared scaffolding for OP_MKDIR / OP_UNLINK. Both
+        ops have the same wire shape (path-only payload) and only
+        differ in what we run after fetching the path bytes — encode
+        the choice in `kind`, route on response."""
+        path_ref = or_payload[1]
+        path_off = int_payload[1]
+        path_len = int_payload[2]
+        if path_ref == 0 or path_len == 0:
+            return self._reply(sess, E_INVAL, 0)
+        if path_len > 4096:
+            return self._reply(sess, E_INVAL, 0)
+        # Reuse the pending-request struct: stash the op identity in
+        # `op` so _handle_read_resp picks the right finisher.
+        trans = self._next_trans()
+        self.pending[trans] = PendingRequest(
+            op=(OP_MKDIR if kind == "mkdir" else OP_UNLINK),
+            session=sess, flags=0,
+            bytes_remaining=path_len)
+        req = build_obj_read_req(self.my_pid, ref_home(path_ref), trans,
+                                 path_ref, path_off, path_len)
+        self.send_packet(req)
+
+    def _mkdir_path(self, sess: Session, path_bytes: bytes) -> None:
+        try:
+            path_str = path_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            return self._reply(sess, E_INVAL, 0)
+        path_obj = self._resolve_path(path_str)
+        if path_obj is None:
+            return self._reply(sess, E_ACCES, 0)
+        try:
+            os.mkdir(str(path_obj), 0o755)
+        except FileExistsError:
+            return self._reply(sess, E_EXIST, 0)
+        except FileNotFoundError:
+            return self._reply(sess, E_NOENT, 0)
+        except PermissionError:
+            return self._reply(sess, E_ACCES, 0)
+        except OSError as e:
+            self._log(f"mkdir({path_str!r}) failed: {e}")
+            return self._reply(sess, E_IO, 0)
+        self._log(f"mkdir → {path_str!r}")
+        self._reply(sess, 0, 0)
+
+    def _unlink_path(self, sess: Session, path_bytes: bytes) -> None:
+        try:
+            path_str = path_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            return self._reply(sess, E_INVAL, 0)
+        path_obj = self._resolve_path(path_str)
+        if path_obj is None:
+            return self._reply(sess, E_ACCES, 0)
+        # Check directory-ness explicitly: os.unlink on a directory
+        # raises IsADirectoryError on Linux but PermissionError on
+        # macOS (EISDIR vs EPERM). We want a stable "this is a dir,
+        # use rmdir" signal across both, so check first via os.path.
+        if path_obj.is_symlink():
+            # Allow unlinking symlinks even when they point to dirs.
+            pass
+        elif path_obj.is_dir():
+            return self._reply(sess, E_EXIST, 0)
+        try:
+            os.unlink(str(path_obj))
+        except FileNotFoundError:
+            return self._reply(sess, E_NOENT, 0)
+        except PermissionError:
+            return self._reply(sess, E_ACCES, 0)
+        except OSError as e:
+            self._log(f"unlink({path_str!r}) failed: {e}")
+            return self._reply(sess, E_IO, 0)
+        self._log(f"unlink → {path_str!r}")
+        self._reply(sess, 0, 0)
 
     def _open_file(self, sess: Session, path_bytes: bytes, flags: int) -> None:
         try:
@@ -772,6 +878,10 @@ class HostFSD:
             self._open_file(pr.session, data, pr.flags)
         elif pr.op == OP_OPENDIR:
             self._open_dir(pr.session, data)
+        elif pr.op == OP_MKDIR:
+            self._mkdir_path(pr.session, data)
+        elif pr.op == OP_UNLINK:
+            self._unlink_path(pr.session, data)
         elif pr.op == OP_WRITE:
             of = pr.session.open_files.get(pr.fd)
             if of is None:

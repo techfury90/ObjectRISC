@@ -283,6 +283,106 @@ hf_opendir(const char *path)
 	return fd;
 }
 
+/* --- hf_mkdir — Phase 50: create a directory at `path`. Returns 0
+ *     on success, negative errno on failure (E_EXIST if the entry
+ *     already exists, E_NOENT if a parent component is missing).
+ *     Same wire shape as hf_opendir minus the fd-return. */
+
+int
+hf_mkdir(const char *path)
+{
+	int path_off, path_len;
+	const char *p;
+	for (p = path, path_len = 0; *p; p++, path_len++) ;
+	if ((unsigned int)path >= STACK_BOTTOM
+	    && (unsigned int)path < STACK_TOP) {
+		path_off = (int)((unsigned int)path - STACK_BOTTOM);
+		asm volatile(
+			"omov  o1, o10\n"
+			"omov  o2, o11\n"
+			"omov  o3, o8\n"
+			"addiu r4, r0, 6\n"          /* OP_MKDIR */
+			"addu  r5, %0, r0\n"
+			"addu  r6, %1, r0\n"
+			"addiu r7, r0, 0\n"
+			"send  o1"
+			:
+			: "r"(path_off), "r"(path_len)
+			: "r1", "r4", "r5", "r6", "r7"
+		);
+	} else {
+		path_off = (int)((unsigned int)path - DATA_VA);
+		asm volatile(
+			"omov  o1, o10\n"
+			"omov  o2, o15\n"
+			"omov  o3, o8\n"
+			"addiu r4, r0, 6\n"
+			"addu  r5, %0, r0\n"
+			"addu  r6, %1, r0\n"
+			"addiu r7, r0, 0\n"
+			"send  o1"
+			:
+			: "r"(path_off), "r"(path_len)
+			: "r1", "r4", "r5", "r6", "r7"
+		);
+	}
+	hf_restore_or();
+	{
+		int discard;
+		return hf_wait(&discard);
+	}
+}
+
+/* --- hf_unlink — Phase 50: remove the file at `path`. Returns 0 on
+ *     success, negative errno (E_NOENT if missing, E_EXIST when the
+ *     target is a directory — POSIX-style "use rmdir for that").
+ *     Same shape as hf_mkdir. */
+
+int
+hf_unlink(const char *path)
+{
+	int path_off, path_len;
+	const char *p;
+	for (p = path, path_len = 0; *p; p++, path_len++) ;
+	if ((unsigned int)path >= STACK_BOTTOM
+	    && (unsigned int)path < STACK_TOP) {
+		path_off = (int)((unsigned int)path - STACK_BOTTOM);
+		asm volatile(
+			"omov  o1, o10\n"
+			"omov  o2, o11\n"
+			"omov  o3, o8\n"
+			"addiu r4, r0, 7\n"          /* OP_UNLINK */
+			"addu  r5, %0, r0\n"
+			"addu  r6, %1, r0\n"
+			"addiu r7, r0, 0\n"
+			"send  o1"
+			:
+			: "r"(path_off), "r"(path_len)
+			: "r1", "r4", "r5", "r6", "r7"
+		);
+	} else {
+		path_off = (int)((unsigned int)path - DATA_VA);
+		asm volatile(
+			"omov  o1, o10\n"
+			"omov  o2, o15\n"
+			"omov  o3, o8\n"
+			"addiu r4, r0, 7\n"
+			"addu  r5, %0, r0\n"
+			"addu  r6, %1, r0\n"
+			"addiu r7, r0, 0\n"
+			"send  o1"
+			:
+			: "r"(path_off), "r"(path_len)
+			: "r1", "r4", "r5", "r6", "r7"
+		);
+	}
+	hf_restore_or();
+	{
+		int discard;
+		return hf_wait(&discard);
+	}
+}
+
 /* --- hf_close ---------------------------------------------------------- */
 
 int
