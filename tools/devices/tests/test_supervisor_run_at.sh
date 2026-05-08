@@ -122,9 +122,18 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# Type:  run @1 /programs/hello.orx<RET>  exit<RET>
+# Type:  ls<RET>                         (Phase 45g: exercises the
+#                                          lazy-bootstrap path —
+#                                          shell's first vfs_* call
+#                                          SENDs op=4 SUP_OP_GET_DIR
+#                                          to the supervisor; without
+#                                          a handler the shell would
+#                                          hang here)
+#        run @1 /programs/hello.orx<RET>
+#        exit<RET>
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
+    --event key:l --event key:s --event key:0x10D \
     --event key:r --event key:u --event key:n --event key:0x20 \
     --event key:0x40 --event key:0x31 --event key:0x20 \
     --event key:0x2f --event key:p --event key:r --event key:o --event key:g --event key:r --event key:a --event key:m --event key:s \
@@ -199,5 +208,34 @@ true
 # 3) Leader supervisor wound down on shell exit.
 grep -q "supervisor: shell exited; halting" "$TMP/cpu0.out" \
     || { echo "FAIL: leader didn't shut down" >&2; exit 1; }
+
+# 4) Phase 45g regression check: the shell's post-spawn term_prints
+#    must actually land on the terminal. The shell prints "[exited N]"
+#    after a foreground sup_spawn returns, and "[task N done CODE]"
+#    when the auto-reaper notices an exit. If sup_spawn clobbers O15
+#    (task.c's boot-data save), term.c's _term_restore_or feeds the
+#    wrong source ref to oriscterm and these prints fail silently.
+#    Without this assertion the bug shipped — fake_terminal drops
+#    BOUNDS-failed prints quietly, so earlier 45f/g tests passed even
+#    when the shell couldn't print after a spawn under `make boot`.
+sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term.out" \
+    | grep -q "exited 0" \
+    || { echo "FAIL: shell didn't print [exited 0] after run @1 — sup_spawn likely clobbered a boot OR slot" >&2; exit 1; }
+
+# 5) Phase 45g regression check: lazy bootstrap. The first `ls` from
+#    the shell triggers vfs_list → dir_walk → dir_init's
+#    SUP_OP_GET_DIR (op=4) to the supervisor. Without an op=4 handler
+#    the shell hangs forever waiting for a reply (and the supervisor
+#    prints "supervisor: unknown op"). With the handler the shell
+#    receives the directory ref, populates DIR_SLOT, and dir_walks
+#    the root — which has `programs/` registered as a MOUNT and
+#    `sys/` as a DIR. So `ls` should produce a listing containing
+#    "programs".
+sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term.out" \
+    | grep -q "programs" \
+    || { echo "FAIL: ls didn't list 'programs' — lazy bootstrap (op=4) likely broken" >&2; exit 1; }
+grep -q "supervisor: unknown op" "$TMP/cpu0.out" \
+    && { echo "FAIL: supervisor logged 'unknown op' — op=4 handler missing" >&2; exit 1; }
+true
 
 echo "PASS"

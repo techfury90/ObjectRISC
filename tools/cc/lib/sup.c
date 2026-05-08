@@ -59,6 +59,17 @@
 #define SUP_SLOT_OFFSET       544
 #define REPLY_MB_SLOT_OFFSET  552
 
+/* Stash for derived reply sub-caps. Mirrors dir.c's
+ * DIR_REPLY_SCRATCH_OFFSET (and shares the same physical slot —
+ * sup.c and dir.c are both synchronous SEND-and-poll clients that
+ * never have a reply outstanding simultaneously, so they're safe
+ * to share). Replaces the 45a-era pattern of parking the derived
+ * reply sub-cap in O15: that slot is task.c's boot data ref save,
+ * and term.c's _term_restore_or relies on it being intact for
+ * any subsequent term_print of a data-segment string. Phase 45g
+ * bugfix. */
+#define SUP_REPLY_SCRATCH_OFFSET  608
+
 /* Test whether the supervisor sub-cap was provided at boot.
  * The "0=0@0" pad service-spec produces a literal-zero ref
  * (Phase 45a tweak in simorisc), so OISN works directly. */
@@ -240,16 +251,24 @@ sup_spawn_at(int target_pid, const char *path,
 	);
 	if (status != 0) return status;
 
-	/* Derive R+S sub-cap from our reply mailbox. */
+	/* Derive R+S sub-cap from our reply mailbox. Park into
+	 * SUP_REPLY_SCRATCH (a slot in O12) rather than O15 — O15 is
+	 * task.c's boot data ref save, which term.c restores from on
+	 * every print. Stomping it here would corrupt every subsequent
+	 * term_print of a data-segment string (manifests as
+	 * "[read failed: flags=0x02]" — RESP_BOUNDS — at the terminal
+	 * because oriscterm's OBJ_READ_REQ now reads from a tiny
+	 * service mailbox instead of the real data segment). Phase 45g
+	 * bugfix. */
 	asm volatile(
 		"orefld o1, 552(o12)\n"        /* full mailbox ref */
 		"addiu r4, r0, 9\n"            /* R|S */
 		"call  #0x103\n"               /* ObjDerive → O1 */
 		"nop\n"
-		"omov  o15, o1\n"              /* park in O15 briefly */
+		"orefst o1, %1(o12)\n"         /* SUP_REPLY_SCRATCH */
 		"addu  %0, r2, r0"
 		: "=r"(status)
-		:
+		: "i"(SUP_REPLY_SCRATCH_OFFSET)
 		: "r1", "r2", "r4"
 	);
 	if (status != 0) return status;
@@ -258,8 +277,8 @@ sup_spawn_at(int target_pid, const char *path,
 	 *   O1 = supervisor sub-cap (recipient — the LOCAL supervisor;
 	 *        if target_pid names a different CPU, the supervisor
 	 *        relays to its peer)
-	 *   O2 = bytes ref (request payload)
-	 *   O3 = reply sub-cap
+	 *   O2 = bytes ref (request payload, parked in O14)
+	 *   O3 = reply sub-cap (loaded from SUP_REPLY_SCRATCH)
 	 *   R4 = op = 1 (spawn)
 	 *   R5 = payload length
 	 *   R6 = target_pid (Phase 45e — SUP_TARGET_LOCAL or a literal
@@ -268,13 +287,14 @@ sup_spawn_at(int target_pid, const char *path,
 	asm volatile(
 		"orefld o1, 544(o12)\n"        /* supervisor sub-cap */
 		"omov   o2, o14\n"
-		"omov   o3, o15\n"
+		"orefld o3, %2(o12)\n"         /* SUP_REPLY_SCRATCH */
 		"addiu  r4, r0, 1\n"
 		"addu   r5, %0, r0\n"
 		"addu   r6, %1, r0\n"
 		"addiu  r7, r0, 0\n"
 		"send   o1\n"
-		: : "r"(payload_len), "r"(target_pid)
+		: : "r"(payload_len), "r"(target_pid),
+		    "i"(SUP_REPLY_SCRATCH_OFFSET)
 		: "r1", "r4", "r5", "r6", "r7"
 	);
 
