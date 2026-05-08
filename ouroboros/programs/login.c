@@ -62,6 +62,15 @@ main(void)
 	                     * loader uses hf for opening shell.orx. */
 
 	for (;;) {
+		/* Iteration trace, useful for diagnosing whether login's
+		 * task_wait properly returned after a shell session ended.
+		 * O3 is the boot data ref here either at first entry (we
+		 * just task_init'd) or after term_resubscribe's _term_
+		 * restore_or, so print_str works.
+		 *
+		 * test_shell_logout.sh keys off "login: top of loop"
+		 * appearing twice (boot + post-logout) — keep this print. */
+		print_str("login: top of loop\n");
 		/* Wipe both panes. Phase 48: term_clear sends 0x0C which
 		 * oriscterm + fake_terminal both interpret as text-pane
 		 * clear; grid_clear blanks the canvas. */
@@ -117,6 +126,17 @@ main(void)
 		 * frees, so it's safe — and it gives us the standard
 		 * "release the local handle" path. */
 		(void)orx_unload(shell);
+		/* Trace: shell session ended cleanly (logout / return 0).
+		 * test_shell_logout.sh keys off this to confirm the task_
+		 * wait path actually woke (vs. being task_kill'd by the
+		 * supervisor's op=2 cascade — that path bypasses login's
+		 * loop entirely).
+		 *
+		 * orx_unload's manifest_load clobbered O3 with manifest[t]
+		 * .data (which is null for sup_spawn'd kids), so restore O3
+		 * = boot data ref before the print. */
+		asm volatile("omov o3, o15");
+		print_str("login: shell exited cleanly\n");
 
 		/* Re-attach to keyboard for the next welcome cycle. We
 		 * use term_resubscribe (NOT term_init) because term_init

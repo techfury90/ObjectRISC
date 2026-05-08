@@ -2733,10 +2733,6 @@ def primitive_TaskWait(cpu: CPU, faulting_pc: int) -> None:
     cur = cpu.current_task
     if cur is None or cur is target:
         cpu.set_gpr(2, ERR_EINVAL); return
-    nxt = pick_next_runnable(cpu)
-    if nxt is None:
-        # Nothing else can run — waiting would deadlock the CPU.
-        cpu.set_gpr(2, ERR_EBUSY); return
     # The waiter resumes at the instruction after the CALL. R2/R3 will
     # be overwritten by _wake_waiters when the target exits, so we don't
     # set them here. Bump PC before save so that's where it lands on
@@ -2745,7 +2741,49 @@ def primitive_TaskWait(cpu: CPU, faulting_pc: int) -> None:
     cpu.next_pc = (cpu.pc + 4)      & 0xFFFFFFFF
     cur.state = TASK_STATE_BLOCKED
     target.waiters.append(cur)
-    context_switch(cpu, nxt)
+    nxt = pick_next_runnable(cpu)
+    if nxt is not None:
+        context_switch(cpu, nxt)
+        return
+    # No other runnable task — but the target itself, or some other
+    # task, may yet wake on an external event (a wire packet, a key,
+    # a remote response). Park the CPU idle: save `cur`'s state to
+    # its Task struct (so when the target's eventual TaskExit fires
+    # _wake_waiters, the gpr[2]=OK / gpr[3]=exit_code writes land in
+    # the right place to be loaded back), set current_task=None to
+    # signal "no task is running," and arm BlockedOnExitWait so the
+    # run loop's idle-with-blocked-tasks branch keeps the CPU alive
+    # to service in-flight wire requests.
+    #
+    # When `cur` later becomes RUNNABLE (added to cpu.runnable by
+    # _wake_waiters), the run loop's blocked-but-runnable branch
+    # picks it up: cur was None so the "nxt is not cur" condition
+    # triggers a clean load_task_to_cpu, which paints cur's saved
+    # gpr/pc/blocked_on (=None at save time, before we armed the
+    # sentinel) onto the CPU and resumes past the CALL.
+    #
+    # (Phase 48 bugfix: the previous "return EBUSY when no other
+    # runnable" policy was incorrect — TaskWait isn't deadlocked just
+    # because the CPU is currently idle. login.orx hit this when its
+    # task_wait(shell) ran AFTER the shell had already blocked in
+    # term_getkey: pick_next_runnable was empty because shell was
+    # BLOCKED, so login got EBUSY back, fell through orx_unload, and
+    # spun the welcome-banner loop instead of waiting for shell to
+    # exit.)
+    has_blocked = any(t.state == TASK_STATE_BLOCKED for t in cpu.tasks.values())
+    if has_blocked:
+        save_cpu_to_task(cpu, cur)
+        cpu.current_task = None
+        cpu.blocked_on = BlockedOnExitWait()
+        return
+    # Genuinely nothing can wake — preserve the original EBUSY
+    # semantics so a single-task program waiting on a never-runnable
+    # peer gets a useful error.
+    target.waiters.remove(cur)
+    cur.state = TASK_STATE_RUNNING
+    cpu.pc      = faulting_pc & 0xFFFFFFFF
+    cpu.next_pc = (faulting_pc + 4) & 0xFFFFFFFF
+    cpu.set_gpr(2, ERR_EBUSY)
 
 def primitive_ReadCycles(cpu: CPU) -> None:
     cpu.set_gpr(2, 0)
