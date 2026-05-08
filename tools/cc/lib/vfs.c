@@ -191,12 +191,24 @@ vfs_list(const char *path, char *buf, int cap)
 	if (kind == DIR_KIND_DIR) {
 		int count = dir_list(path, buf, cap);
 		if (count < 0) return count;
-		/* Compute byte length: dir_list packs entries as
-		 * "name1\0name2\0..."; walk to the trailing run of NULs. */
+		/* dir_list packs `count` entries as "name1\0name2\0..." —
+		 * machine-friendly but useless for a `ls` print: oriscterm
+		 * eats embedded NULs, so the names visually collide
+		 * ("programs/sys/" instead of two lines). Walk through the
+		 * buffer, translate each NUL into a newline (matches
+		 * hostfsd's listing format), and stop once we've seen
+		 * `count` separators — at which point `n` is the total
+		 * byte length to return. Empty directory: count == 0,
+		 * loop exits immediately, return 0. */
 		int n = 0;
-		while (n < cap && (buf[n] != '\0' || (n + 1 < cap && buf[n + 1] != '\0')))
+		int found = 0;
+		while (found < count && n < cap) {
+			if (buf[n] == '\0') {
+				buf[n] = '\n';
+				found++;
+			}
 			n++;
-		if (n < cap && buf[n] == '\0') n++;
+		}
 		return n;
 	}
 

@@ -231,11 +231,21 @@ sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term.out" \
 #    the root — which has `programs/` registered as a MOUNT and
 #    `sys/` as a DIR. So `ls` should produce a listing containing
 #    "programs".
-sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term.out" \
-    | grep -q "programs" \
+RENDER=$(sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term.out")
+echo "$RENDER" | grep -q "programs" \
     || { echo "FAIL: ls didn't list 'programs' — lazy bootstrap (op=4) likely broken" >&2; exit 1; }
 grep -q "supervisor: unknown op" "$TMP/cpu0.out" \
     && { echo "FAIL: supervisor logged 'unknown op' — op=4 handler missing" >&2; exit 1; }
 true
+
+# 6) Phase 45g regression check: ls output is newline-separated, not
+#    NUL-collapsed. oriscdir's dir_list returns NUL-separated names;
+#    vfs_list translates NULs to newlines for display so each entry
+#    lands on its own line. Without that translation the terminal
+#    eats NULs and renders "programs/sys/" instead of one-per-line.
+#    Match an exact "programs/" line — anchored to a line boundary —
+#    so the assertion fails if entries glom together.
+echo "$RENDER" | grep -qE '^programs/$' \
+    || { echo "FAIL: 'programs/' not on its own line — ls entries collapsed (vfs_list NUL→\\n translation broken)" >&2; exit 1; }
 
 echo "PASS"
