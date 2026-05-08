@@ -4536,6 +4536,89 @@ What's deferred to 45d/e:
   shell, CPU 1 sits in its dispatch loop, `exit` tears
   everything down cleanly.
 
+## Phase 45d — Remote Task primitives in simorisc (Ouroboros, day 24)
+
+The wire-protocol prerequisite for Phase 45e (cross-CPU spawn
+delegation): TaskWait, TaskQuery, and TaskKill now work on
+references whose home isn't the calling CPU. Same calling
+convention as the local case (R2 = status, R3 = exit code or
+packed state, O1 = task ref) — the dispatch decision is invisible
+to user code.
+
+Six new packet types model the wire round-trip:
+
+    PKT_TASK_WAIT_REQ   = 0x40    payload: ref (2 words)
+    PKT_TASK_WAIT_RESP  = 0x41    payload: status, exit_code
+    PKT_TASK_QUERY_REQ  = 0x42    payload: ref
+    PKT_TASK_QUERY_RESP = 0x43    payload: status, packed_state
+    PKT_TASK_KILL_REQ   = 0x44    payload: ref, exit_code
+    PKT_TASK_KILL_RESP  = 0x45    payload: status
+
+Status travels in the response *payload* (rather than the flags
+byte used for OL/OS responses) because the architectural Task API
+returns ERR_* codes that don't all map cleanly into the 6-bit
+RESP_* fault namespace.
+
+The pattern mirrors remote OL/OS:
+
+- **Issuer side** — when O1's home isn't this CPU, the primitive
+  builds the REQ packet, raises a new `BlockedOn{TaskWait,
+  TaskQuery, TaskKill}` signal, and the CALL site holds PC. When
+  the matching RESP arrives in `cpu.responses`, a unified
+  `_try_unblock_task_resp` delivers status into R2 (and the
+  secondary word into R3 for Wait/Query — Kill is R2-only),
+  advances PC, and clears `blocked_on`. The
+  blocked-but-not-current preemption path
+  (`_wake_blocked_tasks`) treats all four BlockedOn* response
+  signals identically — match by trans_id, promote to RUNNABLE,
+  let the scheduler context-switch back for the actual delivery.
+- **Home side** — `_process_requests` drains REQs from
+  `cpu.requests` (the same queue OBJ_READ_REQ uses) and calls
+  one of three new handlers. Each runs `_resolve_remote_task` —
+  ref non-null + home matches + descriptor live + generation
+  matches + tagged TAG_TASK + present in `cpu.tasks` — and
+  either returns the appropriate ERR_* or performs the local
+  side of the operation. For `TaskWait`, an "already EXITED"
+  target gets an immediate response; otherwise the request is
+  appended to the task's new `remote_waiters` list, drained by
+  `_wake_waiters` when the task transitions to EXITED (whether
+  via local TaskExit or via remote TaskKill).
+
+One subtle point on remote TaskKill: the local `primitive_TaskKill`
+rejects "kill yourself" with EINVAL, but for the remote path the
+caller is on a different CPU, so killing the home CPU's *current*
+task is legitimate (and exactly what you want when you're
+externally terminating a task that happens to be running). The
+home-side handler now allows it: drop the task off `cpu.runnable`
+if it was there, mark it EXITED, drain waiters, and — if the
+victim was `cpu.current_task` — clear `cpu.current_task`,
+`cpu.active`, and either context-switch into the next runnable or
+park the CPU on `BlockedOnExitWait` (mirroring `primitive_TaskExit`'s
+"nothing to run, but don't tear the CPU down yet" behaviour).
+
+### Tests
+
+Six new validation tests in `tools/sim/tests/validation/11_multicpu/`:
+
+- `14_remote_taskquery_einval` — TaskQuery on a non-task remote
+  ref (the other CPU's service object) returns ERR_EINVAL via
+  the wire.
+- `15_remote_taskwait_einval` — same shape for TaskWait.
+- `16_remote_taskkill_einval` — same shape for TaskKill.
+- `17_remote_taskwait_blocks` — CPU 1 creates a child that exits
+  0x42, SENDs the ref to CPU 0, CPU 0's handler TaskWaits,
+  blocks on the wire, child exits, `_wake_waiters` drains the
+  remote_waiters list, response unblocks CPU 0 with R3 = 0x42.
+- `18_remote_taskquery_state` — CPU 0 polls TaskQuery on a
+  remote child until state == EXITED, recovers the exit code
+  from the upper 16 bits of the packed state word.
+- `19_remote_taskkill_then_query` — CPU 0 kills a remote
+  busy-spinning child, then TaskQuerys to confirm EXITED state +
+  the kill-supplied exit code propagated.
+
+All 144 sim validation tests pass (was 138). All 20 device tests
+still pass — no Ouroboros-side changes in this PR.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

@@ -270,6 +270,11 @@ class Task:
     # cleared (waiters can't double-collect).
     waiters: List['Task'] = field(default_factory=list)
 
+    # Phase 45d: remote callers waiting on this task via TASK_WAIT_REQ.
+    # Each entry is (waiter_pid, trans_id); on EXITED we send a
+    # TASK_WAIT_RESP back to each. Cleared after the responses go out.
+    remote_waiters: List[Tuple[int, int]] = field(default_factory=list)
+
     # IPC blocked_on saved with this task. When the current task hits
     # a blocking primitive (ReceiveQueuePoll on an empty queue, remote
     # OL/OS waiting on a response) and there's another runnable task
@@ -349,6 +354,30 @@ class BlockedOnExitWait(BlockedSignal):
     pass
 
 
+class BlockedOnTaskWait(BlockedSignal):
+    """Phase 45d. Raised by primitive_TaskWait when the target ref's
+    home is a different CPU. The caller queues a TASK_WAIT_REQ on the
+    home and parks here until the matching TASK_WAIT_RESP arrives;
+    on resume R2 receives the status word, R3 the exit code (when
+    status == OK), and PC advances past the CALL."""
+    def __init__(self, trans_id: int):
+        self.trans_id = trans_id
+
+
+class BlockedOnTaskQuery(BlockedSignal):
+    """Phase 45d. Raised by primitive_TaskQuery for remote refs. On
+    response R2 = status, R3 = packed state word; PC advances."""
+    def __init__(self, trans_id: int):
+        self.trans_id = trans_id
+
+
+class BlockedOnTaskKill(BlockedSignal):
+    """Phase 45d. Raised by primitive_TaskKill for remote refs. On
+    response R2 = status; no other GPRs touched; PC advances."""
+    def __init__(self, trans_id: int):
+        self.trans_id = trans_id
+
+
 # ---------------------------------------------------------------------------
 # Wire-level packet format (Volume IV §3, §4)
 # ---------------------------------------------------------------------------
@@ -377,6 +406,18 @@ PKT_DESC_REQ        = 0x30
 PKT_DESC_RESP       = 0x31
 PKT_DESC_FORWARD    = 0x32
 PKT_DESC_INVALIDATE = 0x33
+# Phase 45d — remote task primitives. The home CPU is the source of truth
+# for a task's state; remote callers exchange these request/response
+# packets to invoke TaskWait/Query/Kill across CPU boundaries. Status
+# travels in the response payload (rather than the flags byte) because
+# the architectural Task API uses ERR_* codes that don't all map to the
+# 6-bit RESP_* fault codes used by OL/OS responses.
+PKT_TASK_WAIT_REQ   = 0x40
+PKT_TASK_WAIT_RESP  = 0x41
+PKT_TASK_QUERY_REQ  = 0x42
+PKT_TASK_QUERY_RESP = 0x43
+PKT_TASK_KILL_REQ   = 0x44
+PKT_TASK_KILL_RESP  = 0x45
 PKT_LINK_FLOW_CREDIT= 0xF0
 PKT_LINK_ERROR      = 0xF1
 PKT_LINK_HEARTBEAT  = 0xFE
@@ -520,6 +561,52 @@ def build_obj_write_req(src_pid: int, dst_pid: int, trans_id: int,
 def build_obj_write_resp(src_pid: int, dst_pid: int, trans_id: int,
                          flags: int) -> bytes:
     return pack_packet(src_pid, dst_pid, PKT_OBJ_WRITE_RESP, flags, trans_id, [])
+
+
+# Phase 45d — remote Task primitive packets. Each REQ carries the target
+# task ref (2 words, low-half first per Vol IV §4.1); the corresponding
+# RESP carries an ERR_* status word plus any primitive-specific result
+# words. flags is unused in these packet types.
+
+def build_task_wait_req(src_pid: int, dst_pid: int, trans_id: int,
+                        ref: int) -> bytes:
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_TASK_WAIT_REQ, 0, trans_id, payload)
+
+
+def build_task_wait_resp(src_pid: int, dst_pid: int, trans_id: int,
+                         status: int, exit_code: int) -> bytes:
+    """status = ERR_*; exit_code is meaningful only when status == ERR_OK."""
+    payload = [status & 0xFFFFFFFF, exit_code & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_TASK_WAIT_RESP, 0, trans_id, payload)
+
+
+def build_task_query_req(src_pid: int, dst_pid: int, trans_id: int,
+                         ref: int) -> bytes:
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_TASK_QUERY_REQ, 0, trans_id, payload)
+
+
+def build_task_query_resp(src_pid: int, dst_pid: int, trans_id: int,
+                          status: int, packed: int) -> bytes:
+    """status = ERR_*; packed is the architectural Vol VI #0x008 packed
+    state word (state | proc<<8 | exit_code<<16) — meaningful only when
+    status == ERR_OK."""
+    payload = [status & 0xFFFFFFFF, packed & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_TASK_QUERY_RESP, 0, trans_id, payload)
+
+
+def build_task_kill_req(src_pid: int, dst_pid: int, trans_id: int,
+                        ref: int, exit_code: int) -> bytes:
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF,
+               exit_code & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_TASK_KILL_REQ, 0, trans_id, payload)
+
+
+def build_task_kill_resp(src_pid: int, dst_pid: int, trans_id: int,
+                         status: int) -> bytes:
+    payload = [status & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_TASK_KILL_RESP, 0, trans_id, payload)
 
 
 # Map response-flag fault codes to architectural trap causes for the
@@ -764,6 +851,12 @@ class InProcessCrossbar(Crossbar):
             PKT_OBJ_WRITE_REQ:   "OBJ_WRITE_REQ",
             PKT_OBJ_WRITE_RESP:  "OBJ_WRITE_RESP",
             PKT_SEND_DELIVER:    "SEND_DELIVER",
+            PKT_TASK_WAIT_REQ:   "TASK_WAIT_REQ",
+            PKT_TASK_WAIT_RESP:  "TASK_WAIT_RESP",
+            PKT_TASK_QUERY_REQ:  "TASK_QUERY_REQ",
+            PKT_TASK_QUERY_RESP: "TASK_QUERY_RESP",
+            PKT_TASK_KILL_REQ:   "TASK_KILL_REQ",
+            PKT_TASK_KILL_RESP:  "TASK_KILL_RESP",
         }.get(pkt["type"], f"type=0x{pkt['type']:02x}")
         print(f"  ; CROSSBAR CPU{pkt['src_pid']} -> CPU{pkt['dst_pid']} "
               f"{type_name} trans={pkt['trans_id']} len={len(pkt['payload'])}w "
@@ -925,9 +1018,16 @@ class CPU(Port):
                 desc.queue.append(packet)
             else:
                 self.inbox.append(packet)
-        elif t in (PKT_OBJ_READ_REQ, PKT_OBJ_WRITE_REQ):
+        elif t in (PKT_OBJ_READ_REQ, PKT_OBJ_WRITE_REQ,
+                   PKT_TASK_WAIT_REQ, PKT_TASK_QUERY_REQ, PKT_TASK_KILL_REQ):
+            # All home-side request packets land in `requests` and get
+            # serviced by _process_requests on the home CPU's tick.
             self.requests.append(packet)
-        elif t in (PKT_OBJ_READ_RESP, PKT_OBJ_WRITE_RESP):
+        elif t in (PKT_OBJ_READ_RESP, PKT_OBJ_WRITE_RESP,
+                   PKT_TASK_WAIT_RESP, PKT_TASK_QUERY_RESP, PKT_TASK_KILL_RESP):
+            # All issuer-side response packets land in `responses` and
+            # get matched against cpu.blocked_on (or task.blocked_on for
+            # parked tasks) by trans_id.
             self.responses.append(packet)
         # Other packet types currently dropped silently (e.g., DESC_*,
         # LINK_*); future revisions may dispatch them here too.
@@ -1290,6 +1390,12 @@ class System:
                 self._handle_obj_read_req(cpu, pkt)
             elif pkt["type"] == PKT_OBJ_WRITE_REQ:
                 self._handle_obj_write_req(cpu, pkt)
+            elif pkt["type"] == PKT_TASK_WAIT_REQ:
+                self._handle_task_wait_req(cpu, pkt)
+            elif pkt["type"] == PKT_TASK_QUERY_REQ:
+                self._handle_task_query_req(cpu, pkt)
+            elif pkt["type"] == PKT_TASK_KILL_REQ:
+                self._handle_task_kill_req(cpu, pkt)
 
     def _validate_at_home(self, cpu: CPU, ref: int, offset: int, width: int,
                           required_cap: int, expect_objstore: bool = False
@@ -1350,6 +1456,131 @@ class System:
         response = build_obj_write_resp(cpu.pid, issuer, pkt["trans_id"], fault)
         self.crossbar.send_packet(response)
 
+    # ---- Phase 45d: remote Task primitive request handlers -----------------
+    #
+    # All three look up the target task from a 64-bit ref payload and
+    # validate against this CPU's descriptor table. Validation uses the
+    # same checks as _resolve_task_arg (descriptor exists, live,
+    # generation matches, tagged TAG_TASK, present in cpu.tasks). On
+    # validation failure we send the matching ERR_* in the response and
+    # return immediately. On success the primitive logic runs locally.
+    #
+    # _resolve_remote_task returns (task, status). status == ERR_OK means
+    # the task lookup succeeded; non-OK means we should return that
+    # status without performing the operation.
+
+    def _resolve_remote_task(self, cpu: CPU, ref: int) -> Tuple[Optional['Task'], int]:
+        if ref == 0:
+            return None, ERR_EFAULT
+        if ref_home(ref) != cpu.pid:
+            # Shouldn't happen — the originator wouldn't have routed
+            # the request here if home didn't match cpu.pid. Treat as
+            # ESTALE (nothing for us to find).
+            return None, ERR_ESTALE
+        idx = ref_index(ref)
+        if idx <= 0 or idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+            return None, ERR_ESTALE
+        desc = cpu.descriptors[idx]
+        if not desc.live or desc.generation != ref_generation(ref):
+            return None, ERR_ESTALE
+        if desc.type_tag != TAG_TASK or idx not in cpu.tasks:
+            return None, ERR_EINVAL
+        return cpu.tasks[idx], ERR_OK
+
+    def _handle_task_wait_req(self, cpu: CPU, pkt: Dict) -> None:
+        p = pkt["payload"]
+        ref = p[0] | (p[1] << 32)
+        issuer = pkt["src_pid"]
+        trans_id = pkt["trans_id"]
+        task, status = self._resolve_remote_task(cpu, ref)
+        if status != ERR_OK:
+            self.crossbar.send_packet(build_task_wait_resp(
+                cpu.pid, issuer, trans_id, status, 0))
+            return
+        if task.state == TASK_STATE_EXITED:
+            # Already exited — reply immediately with the exit code.
+            self.crossbar.send_packet(build_task_wait_resp(
+                cpu.pid, issuer, trans_id, ERR_OK, task.exit_code & 0xFF))
+            return
+        # Park the request as a remote waiter. _wake_waiters will pump
+        # the response when this task transitions to EXITED (via either
+        # primitive_TaskExit on the task itself or primitive_TaskKill
+        # from anywhere).
+        task.remote_waiters.append((issuer, trans_id))
+
+    def _handle_task_query_req(self, cpu: CPU, pkt: Dict) -> None:
+        p = pkt["payload"]
+        ref = p[0] | (p[1] << 32)
+        issuer = pkt["src_pid"]
+        trans_id = pkt["trans_id"]
+        task, status = self._resolve_remote_task(cpu, ref)
+        if status != ERR_OK:
+            self.crossbar.send_packet(build_task_query_resp(
+                cpu.pid, issuer, trans_id, status, 0))
+            return
+        # Build the same packed state word primitive_TaskQuery does
+        # (Vol VI #0x008): low 8 bits = state, next 8 = proc, upper
+        # 16 = exit_code (only meaningful for EXITED).
+        state = task.state & 0xFF
+        proc  = cpu.pid & 0xFF
+        code  = (task.exit_code or 0) & 0xFFFF \
+                if task.state == TASK_STATE_EXITED else 0
+        packed = state | (proc << 8) | (code << 16)
+        self.crossbar.send_packet(build_task_query_resp(
+            cpu.pid, issuer, trans_id, ERR_OK, packed))
+
+    def _handle_task_kill_req(self, cpu: CPU, pkt: Dict) -> None:
+        p = pkt["payload"]
+        ref = p[0] | (p[1] << 32)
+        exit_code = p[2] & 0xFF
+        issuer = pkt["src_pid"]
+        trans_id = pkt["trans_id"]
+        task, status = self._resolve_remote_task(cpu, ref)
+        if status != ERR_OK:
+            self.crossbar.send_packet(build_task_kill_resp(
+                cpu.pid, issuer, trans_id, status))
+            return
+        # Local primitive_TaskKill rejects "kill yourself"; remote
+        # callers can't BE the target (different CPU), so the only
+        # protective check that still applies is "kill of an already-
+        # EXITED task is a no-op (idempotent)" — same as the local path.
+        if task.state == TASK_STATE_EXITED:
+            self.crossbar.send_packet(build_task_kill_resp(
+                cpu.pid, issuer, trans_id, ERR_OK))
+            return
+        # Drop the target from anywhere it might be parked, mirroring
+        # primitive_TaskKill.
+        if task.state == TASK_STATE_RUNNABLE:
+            try:
+                cpu.runnable.remove(task)
+            except ValueError:
+                pass
+        was_current = (task is cpu.current_task)
+        task.blocked_on = None
+        task.state      = TASK_STATE_EXITED
+        task.exit_code  = exit_code
+        if was_current:
+            # The home CPU was running this task at the moment we
+            # killed it. Step it off the CPU now: pick another
+            # runnable, context-switch, and (if there's nothing
+            # else to run) park on BlockedOnExitWait so the CPU
+            # stays alive to answer in-flight requests until the
+            # scheduler finds something else to schedule. This
+            # mirrors what primitive_TaskExit does when a task
+            # exits itself, except triggered by a remote SEND
+            # rather than a local CALL.
+            cpu.current_task = None
+            cpu.active = False
+            nxt = pick_next_runnable(cpu)
+            if nxt is not None:
+                context_switch(cpu, nxt)
+            elif any(t.state == TASK_STATE_BLOCKED
+                     for t in cpu.tasks.values()):
+                cpu.blocked_on = BlockedOnExitWait()
+        _wake_waiters(cpu, task)
+        self.crossbar.send_packet(build_task_kill_resp(
+            cpu.pid, issuer, trans_id, ERR_OK))
+
     # ---- blocked-CPU resume ------------------------------------------------
 
     def _wake_blocked_tasks(self, cpu: 'CPU') -> None:
@@ -1372,7 +1603,13 @@ class System:
             if b is None:
                 continue
             ready = False
-            if isinstance(b, BlockedOnResponse):
+            if isinstance(b, (BlockedOnResponse, BlockedOnTaskWait,
+                              BlockedOnTaskQuery, BlockedOnTaskKill)):
+                # All four "wait for a response packet by trans_id"
+                # signals share the same readiness condition: a matching
+                # packet sitting in cpu.responses. The actual delivery
+                # (R2/R3 fill, PC advance) happens in _try_unblock once
+                # this task is current again.
                 for packet in cpu.responses:
                     try:
                         pkt = unpack_packet(packet)
@@ -1406,6 +1643,15 @@ class System:
             return self._try_unblock_queue(cpu, b)
         if isinstance(b, BlockedOnResponse):
             return self._try_unblock_response(cpu, b)
+        if isinstance(b, BlockedOnTaskWait):
+            return self._try_unblock_task_resp(cpu, b, PKT_TASK_WAIT_RESP,
+                                                deliver_r3=True)
+        if isinstance(b, BlockedOnTaskQuery):
+            return self._try_unblock_task_resp(cpu, b, PKT_TASK_QUERY_RESP,
+                                                deliver_r3=True)
+        if isinstance(b, BlockedOnTaskKill):
+            return self._try_unblock_task_resp(cpu, b, PKT_TASK_KILL_RESP,
+                                                deliver_r3=False)
         return False
 
     def _try_unblock_queue(self, cpu: CPU, b: 'BlockedOnQueue') -> bool:
@@ -1464,6 +1710,40 @@ class System:
                 if b.signed and v & (1 << (b.width*8 - 1)):
                     v -= 1 << (b.width*8)
                 cpu.set_gpr(b.target_reg, to_u32(v))
+            cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.blocked_on = None
+            return True
+        return False  # no matching response yet
+
+    def _try_unblock_task_resp(self, cpu: CPU, b: 'BlockedSignal',
+                                expected_type: int, deliver_r3: bool) -> bool:
+        """Phase 45d. Unified handler for the three new
+        BlockedOnTask{Wait,Query,Kill} signals — they share a wire
+        layout (status word in payload[0], optional secondary word in
+        payload[1]). Match by trans_id, deliver R2 = status, R3 =
+        secondary (when `deliver_r3`), advance PC, clear blocked_on.
+
+        For TASK_KILL_RESP `deliver_r3` is False — the architectural
+        TaskKill returns only a status in R2 (Vol VI #0x00A) and we
+        don't want to clobber R3 from whatever the program had there.
+        """
+        for i, packet in enumerate(cpu.responses):
+            try:
+                pkt = unpack_packet(packet)
+            except ValueError:
+                continue
+            if pkt["type"] != expected_type:
+                continue
+            if pkt["trans_id"] != b.trans_id:
+                continue
+            cpu.responses.pop(i)
+            payload = pkt["payload"]
+            status = payload[0] if payload else ERR_EFAULT
+            cpu.set_gpr(2, status & 0xFFFFFFFF)
+            if deliver_r3:
+                secondary = payload[1] if len(payload) >= 2 else 0
+                cpu.set_gpr(3, secondary & 0xFFFFFFFF)
             cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
             cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
             cpu.blocked_on = None
@@ -2200,7 +2480,13 @@ def _wake_waiters(cpu: CPU, exiting: 'Task') -> None:
     """Move every task parked on `exiting` from BLOCKED to RUNNABLE,
     seeding its R2/R3 (visible after context-switch back) with the
     TaskWait return values. Called from primitive_TaskExit before
-    pick_next_runnable so wakeups are first-class scheduler citizens."""
+    pick_next_runnable so wakeups are first-class scheduler citizens.
+
+    Phase 45d: also drains exiting.remote_waiters by sending a
+    TASK_WAIT_RESP (status=ERR_OK, exit_code) for each pending
+    remote TaskWait request. The originating CPU's
+    _try_unblock_task_wait will deliver into its waiter's R2/R3 and
+    advance PC."""
     for w in exiting.waiters:
         if w.state != TASK_STATE_BLOCKED:
             continue
@@ -2209,6 +2495,17 @@ def _wake_waiters(cpu: CPU, exiting: 'Task') -> None:
         w.state  = TASK_STATE_RUNNABLE
         cpu.runnable.append(w)
     exiting.waiters = []
+    # Remote waiters: build + send a TASK_WAIT_RESP for each. The
+    # exit_code is what the local waiters got above. cpu.system is
+    # always non-None for tasks that arrived via TASK_WAIT_REQ
+    # (single-CPU sim has no crossbar route in), but guard anyway
+    # for forward compatibility / unit tests.
+    if exiting.remote_waiters and cpu.system is not None:
+        for (waiter_pid, trans_id) in exiting.remote_waiters:
+            cpu.system.crossbar.send_packet(build_task_wait_resp(
+                cpu.pid, waiter_pid, trans_id,
+                ERR_OK, exiting.exit_code & 0xFF))
+        exiting.remote_waiters = []
 
 
 def primitive_TaskExit(cpu: CPU) -> None:
@@ -2252,7 +2549,19 @@ def primitive_TaskKill(cpu: CPU) -> None:
     Killing the calling task itself is rejected with EINVAL — that's
     what TaskExit is for. Killing an already-EXITED task is a no-op
     (idempotent, so a shell can `kill` a task that just finished racing
-    a `wait` without erroring)."""
+    a `wait` without erroring).
+
+    Phase 45d: remote refs route via TASK_KILL_REQ — see
+    _try_unblock_task_kill for the response side."""
+    o1 = cpu.get_opr(1)
+    if o1 != 0 and cpu.system is not None and ref_home(o1) != cpu.pid:
+        code = cpu.get_gpr(4) & 0xFF
+        trans_id = cpu.next_trans_id & 0xFFFF
+        cpu.next_trans_id = (cpu.next_trans_id + 1) & 0xFFFF
+        cpu.system.crossbar.send_packet(build_task_kill_req(
+            cpu.pid, ref_home(o1), trans_id, o1, code))
+        raise BlockedOnTaskKill(trans_id)
+
     target = _resolve_task_arg(cpu)
     if target is None:
         return
@@ -2281,7 +2590,10 @@ def primitive_TaskKill(cpu: CPU) -> None:
 def primitive_TaskQuery(cpu: CPU) -> None:
     """Volume VI §4.2 #0x008. Return summary information about a task:
     its state, the processor it lives on, and its exit code if it
-    terminated. Non-blocking; suitable for polling.
+    terminated. Non-blocking from the caller's POV in the local case;
+    in the remote case the CPU still suspends at the CALL while the
+    home formulates the response (typically a single tick), but
+    architecturally it's still a one-shot query.
 
     Args:
       O1: task object reference (no V cap required, like TaskWait).
@@ -2290,7 +2602,18 @@ def primitive_TaskQuery(cpu: CPU) -> None:
       R2: status (OK / EFAULT / EREMOTE / EPERM / ESTALE / EINVAL).
       R3: packed state word (low 8 bits = state per TASK_STATE_*,
           next 8 bits = processor id, upper 16 bits = exit code if
-          state == TASK_STATE_EXITED, else 0)."""
+          state == TASK_STATE_EXITED, else 0).
+
+    Phase 45d: remote refs route via TASK_QUERY_REQ — see
+    _try_unblock_task_query for the response side."""
+    o1 = cpu.get_opr(1)
+    if o1 != 0 and cpu.system is not None and ref_home(o1) != cpu.pid:
+        trans_id = cpu.next_trans_id & 0xFFFF
+        cpu.next_trans_id = (cpu.next_trans_id + 1) & 0xFFFF
+        cpu.system.crossbar.send_packet(build_task_query_req(
+            cpu.pid, ref_home(o1), trans_id, o1))
+        raise BlockedOnTaskQuery(trans_id)
+
     target = _resolve_task_arg(cpu, require_v=False)
     if target is None:
         return
@@ -2306,7 +2629,24 @@ def primitive_TaskQuery(cpu: CPU) -> None:
 def primitive_TaskWait(cpu: CPU, faulting_pc: int) -> None:
     """Block the calling task until O1 has terminated. The exit code is
     returned in R3 (Volume VI §4.1). If O1 is already EXITED the call
-    returns immediately."""
+    returns immediately.
+
+    Phase 45d: when O1's home isn't this CPU, queue a TASK_WAIT_REQ on
+    the home and raise BlockedOnTaskWait — the CALL stays at PC until
+    the matching TASK_WAIT_RESP arrives, then _try_unblock_task_wait
+    delivers status into R2 and exit_code into R3 and advances PC."""
+    o1 = cpu.get_opr(1)
+    if o1 != 0 and cpu.system is not None and ref_home(o1) != cpu.pid:
+        # Remote target. Issuer-side fast-fail: ref must have V cap?
+        # No — TaskWait is require_v=False per Vol VI §4.1, same as the
+        # local path. Home does the descriptor check via
+        # _resolve_remote_task. Issue the request and block.
+        trans_id = cpu.next_trans_id & 0xFFFF
+        cpu.next_trans_id = (cpu.next_trans_id + 1) & 0xFFFF
+        cpu.system.crossbar.send_packet(build_task_wait_req(
+            cpu.pid, ref_home(o1), trans_id, o1))
+        raise BlockedOnTaskWait(trans_id)
+
     target = _resolve_task_arg(cpu, require_v=False)
     if target is None:
         return
