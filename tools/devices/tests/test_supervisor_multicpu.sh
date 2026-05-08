@@ -103,10 +103,13 @@ python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
 CPU0=$!
 
 # CPU 1 (worker) — same supervisor binary, branches to "no shell"
-# at boot via the PROCID check. Same service refs as CPU 0.
+# at boot. Phase 46: the gate is now has_terminal (= O5 non-null),
+# not procid — so we wire null terminal slots here to opt this CPU
+# out of shell-spawn while leaving it available for relayed spawn
+# requests via /sys/cpu/1/supervisor (registered from boot O8).
 python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
-    --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu1.out" 2>"$TMP/cpu1.err" &
 CPU1=$!

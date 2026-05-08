@@ -333,6 +333,25 @@ reply_to_requester(task_t t, int status)
 	);
 }
 
+/* Append a small decimal integer (0..255) to buf at offset p,
+ * returning the new offset. Shared by render_peer_path and
+ * render_term_path — both want "/sys/.../<n>/..." path renders. */
+static int
+append_decimal(int n, char *buf, int p)
+{
+	if (n >= 100) {
+		buf[p++] = '0' + (n / 100);
+		buf[p++] = '0' + ((n / 10) % 10);
+		buf[p++] = '0' + (n % 10);
+	} else if (n >= 10) {
+		buf[p++] = '0' + (n / 10);
+		buf[p++] = '0' + (n % 10);
+	} else {
+		buf[p++] = '0' + n;
+	}
+	return p;
+}
+
 /* Render a fixed-format peer-supervisor path into the supplied
  * buffer: "/sys/cpu/<n>/supervisor". Returns the byte length
  * (excluding the NUL terminator) which the caller passes to
@@ -345,16 +364,23 @@ render_peer_path(int n, char *buf)
 	const char suffix[] = "/supervisor";
 	int i, p = 0;
 	for (i = 0; prefix[i]; i++) buf[p++] = prefix[i];
-	if (n >= 100) {
-		buf[p++] = '0' + (n / 100);
-		buf[p++] = '0' + ((n / 10) % 10);
-		buf[p++] = '0' + (n % 10);
-	} else if (n >= 10) {
-		buf[p++] = '0' + (n / 10);
-		buf[p++] = '0' + (n % 10);
-	} else {
-		buf[p++] = '0' + n;
-	}
+	p = append_decimal(n, buf, p);
+	for (i = 0; suffix[i]; i++) buf[p++] = suffix[i];
+	buf[p] = '\0';
+	return p;
+}
+
+/* Render "/sys/term/<n>/" + suffix into buf — used by the per-CPU
+ * terminal-registration block in main() to publish each CPU's
+ * boot O5/O6/O7 under its own procid. Returns byte length. */
+static int
+render_term_path(int n, const char *suffix, char *buf)
+{
+	const char prefix[] = "/sys/term/";
+	int i, p = 0;
+	for (i = 0; prefix[i]; i++) buf[p++] = prefix[i];
+	p = append_decimal(n, buf, p);
+	buf[p++] = '/';
 	for (i = 0; suffix[i]; i++) buf[p++] = suffix[i];
 	buf[p] = '\0';
 	return p;
@@ -661,63 +687,67 @@ main(void)
 		}
 	}
 
-	/* Phase 45h: leader publishes the boot devices into the directory
-	 * tree as service-discovery LEAF nodes. Programs that want to
-	 * find a terminal or hostfsd handle can dir_walk the path and
-	 * pull the ref out of DIR_RESULT_SLOT — instead of (or alongside)
-	 * the existing boot-O5/O6/O7/O10 wiring.
+	/* Phase 46: per-CPU terminal registration. If this CPU has a
+	 * terminal in O5 (boot.sh wired oriscterm services for it),
+	 * publish the three component refs under /sys/term/<procid>/...
+	 * with my own procid as the instance index. Each CPU registers
+	 * ITS OWN terminal — different CPUs see different oriscterm
+	 * processes (boot.sh launches multiple), so the directory ends
+	 * up with /sys/term/0/*, /sys/term/1/*, ... one subtree per
+	 * terminal-bearing CPU.
 	 *
-	 * The supervisor is the natural place to do this because:
-	 *   - It's a real CPU program with ObjAlloc / SEND, unlike the
-	 *     Python device daemons (oriscterm, hostfsd) which can't
-	 *     allocate the TAG_DATA path-bytes object dir_register
-	 *     needs as O2.
-	 *   - It already has every device's full ref in its boot OPRs;
-	 *     no extra wire-discovery round-trip needed.
-	 *   - It already self-registers (/sys/cpu/<N>/supervisor) and
-	 *     mounts (/programs), so this is the same code shape.
+	 * This generalizes Phase 45h's hardcoded "/sys/term/0" — that
+	 * was leader-only because there was only one terminal anyway.
+	 * Now any CPU with terminal refs registers them under its own
+	 * procid. CPUs without a terminal (e.g., the workers in
+	 * test_supervisor_multicpu.sh / test_supervisor_run_at.sh,
+	 * which wire null O5/O6/O7) skip the registration entirely.
 	 *
-	 * Path conventions:
-	 *   /sys/term/0/console     ← O5  (oriscterm console object)
-	 *   /sys/term/0/keyboard    ← O6  (oriscterm keyboard object)
-	 *   /sys/term/0,grid        ← O7  (oriscterm grid canvas)
-	 *   /sys/hostfsd/0          ← O10 (host filesystem service)
-	 *
-	 * The "/0" instance suffix is forward-looking — Phase 46 wants
-	 * multi-terminal, so /sys/term/N for N > 0 is the natural way
-	 * to extend.
-	 *
-	 * Failure handling: dir_register returns -6 when no directory
-	 * is wired (single-CPU test harnesses without oriscdir); we
-	 * bail silently so the shell still comes up. In a normal boot
-	 * with a directory we expect every register to succeed. */
-	if (is_leader) {
+	 * The has_terminal probe via OISN tells us whether boot.sh
+	 * wired a real oriscterm console into O5 (zeroed out by the
+	 * "0=0@0" pad spec produces a literal-zero ref → OISN = 1). */
+	int has_terminal;
+	asm volatile("oisn %0, o5" : "=r"(has_terminal));
+	has_terminal = !has_terminal;     /* OISN sets 1 when null */
+
+	if (has_terminal) {
+		char path[PEER_PATH_BUF_SIZE];
 		int reg_status;
 
+		render_term_path(procid, "console", path);
 		asm volatile("omov o1, o5");
-		reg_status = dir_register("/sys/term/0/console");
+		reg_status = dir_register(path);
 		if (reg_status != 0) {
-			SUP_PRINT("supervisor: dir_register /sys/term/0/console failed (");
+			SUP_PRINT("supervisor: dir_register console failed (");
 			SUP_PRINT_INT(reg_status);
 			SUP_PRINT(") — continuing\n");
 		}
 
+		render_term_path(procid, "keyboard", path);
 		asm volatile("omov o1, o6");
-		reg_status = dir_register("/sys/term/0/keyboard");
+		reg_status = dir_register(path);
 		if (reg_status != 0) {
-			SUP_PRINT("supervisor: dir_register /sys/term/0/keyboard failed (");
+			SUP_PRINT("supervisor: dir_register keyboard failed (");
 			SUP_PRINT_INT(reg_status);
 			SUP_PRINT(") — continuing\n");
 		}
 
+		render_term_path(procid, "grid", path);
 		asm volatile("omov o1, o7");
-		reg_status = dir_register("/sys/term/0/grid");
+		reg_status = dir_register(path);
 		if (reg_status != 0) {
-			SUP_PRINT("supervisor: dir_register /sys/term/0/grid failed (");
+			SUP_PRINT("supervisor: dir_register grid failed (");
 			SUP_PRINT_INT(reg_status);
 			SUP_PRINT(") — continuing\n");
 		}
+	}
 
+	/* /sys/hostfsd/0 stays leader-only — there's only one hostfsd
+	 * daemon today and procid==0 is the canonical owner of singleton
+	 * resources. (When we want multiple hostfsd instances, this
+	 * generalizes the same way as terminals do.) */
+	if (is_leader) {
+		int reg_status;
 		asm volatile("omov o1, o10");
 		reg_status = dir_register("/sys/hostfsd/0");
 		if (reg_status != 0) {
@@ -727,15 +757,21 @@ main(void)
 		}
 	}
 
-	/* Phase 45c: only the leader (PROCID 0) spawns the shell. Worker
-	 * supervisors sit in the dispatch loop ready to service spawn
-	 * requests from peers — today nothing SENDs to them, but the
-	 * mailbox is allocated, the dispatch loop is running, and the
-	 * sub-cap is ready in ORX_SLOT_CHILD_O8 so any task this
-	 * supervisor *does* eventually create inherits the right
-	 * boot ABI. Phase 45e wires up supervisor-to-supervisor SENDs
-	 * for cross-CPU spawn placement. */
-	if (is_leader) {
+	/* Phase 46: any CPU with a terminal spawns its own shell, bound
+	 * to its own boot O5/O6/O7. Multiple oriscterm instances + per-
+	 * CPU terminal wiring (boot.sh launches term pid=16 for CPU 0,
+	 * term pid=19 for CPU 1, etc.) gives users one shell per Tk
+	 * window, all sharing the same /programs mount and supervisor-
+	 * mediated spawn machinery.
+	 *
+	 * Pre-Phase-46 boots had the shell-spawn gated on `is_leader`
+	 * (procid==0). Now it's gated on `has_terminal`: CPUs without
+	 * a terminal stay in the dispatch loop as before (servicing
+	 * relayed spawn requests but doing no UI), CPUs with a terminal
+	 * become shell hosts. In a single-terminal config (existing test
+	 * harnesses that wire term to procid 0 only, null pads for procid
+	 * 1) that collapses to the prior behaviour. */
+	if (has_terminal) {
 		task_t shell = orx_spawn(SHELL_PATH, "", "/");
 		if (shell < 0) {
 			SUP_PRINT("supervisor: failed to spawn shell: ");
@@ -770,11 +806,13 @@ main(void)
 
 		if (op == 1) {
 			handle_spawn_request(len, target_pid, procid);
-		} else if (op == 2 && is_leader) {
+		} else if (op == 2 && has_terminal) {
 			/* Graceful shutdown — sup_shutdown() in libc, called
-			 * by the leader's shell right before its TaskExit.
-			 * No reply. Workers ignore op=2 (no shell to halt
-			 * on); they wait for the external teardown signal. */
+			 * by the host's shell right before its TaskExit.
+			 * Phase 46: any CPU running a shell (= has_terminal)
+			 * accepts op=2 from that shell. CPUs without a shell
+			 * ignore op=2 (no shell to halt on); they wait for
+			 * the external teardown signal from oriscrun. */
 			SUP_PRINT(shell_done);
 			return 0;
 		} else if (op == 4) {

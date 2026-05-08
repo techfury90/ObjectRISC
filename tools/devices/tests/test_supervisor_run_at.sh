@@ -198,9 +198,13 @@ python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
     "$TMP/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
 
+# CPU 1 (peer worker) — Phase 46: terminal slots wired null so this
+# CPU opts out of shell-spawn (the has_terminal gate). Still wired
+# for the directory (O8) and hostfsd (O10) so it can service relay
+# spawn requests from CPU 0's shell.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
-    --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "18=1@9" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu1.out" 2>"$TMP/cpu1.err" &
 CPU1=$!

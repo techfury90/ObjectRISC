@@ -75,9 +75,9 @@ if [ ! -L "$ROOT/programs" ]; then
 fi
 
 # --service slot order (each spec lands at the next free O5..O15):
-#   O5  = oriscterm console  (16=1@9)
-#   O6  = oriscterm keyboard (16=2@9)
-#   O7  = oriscterm grid     (16=3@9)
+#   O5  = oriscterm console  (16=1@9 on CPU 0; 19=1@9 on CPU 1 — Phase 46)
+#   O6  = oriscterm keyboard (16=2@9 / 19=2@9)
+#   O7  = oriscterm grid     (16=3@9 / 19=3@9)
 #   O8  = directory mailbox sub-cap (Phase 45f). oriscdir's primary
 #        mailbox lives at descriptor idx 1, generation 1 (its first
 #        ObjAlloc) — synthesize the cap as `18=1@9`. supervisor.c
@@ -91,15 +91,22 @@ fi
 #        spawn mailbox replaces this slot via `omov o9, o1`)
 #   O10 = hostfsd            (17=1@9)
 #
-# Both CPUs get the same console/keyboard/grid/hostfsd/directory refs
-# — they're refs to objects on the device PIDs (16, 17, 18), and the
-# device daemons all handle multiple subscribers. CPU 0 (PROCID 0)
-# is the leader and spawns a shell; CPU 1 stays in the dispatch loop
-# ready to service relayed spawn requests.
+# Phase 46 — multi-terminal: each CPU is wired to its OWN oriscterm
+# instance. CPU 0 → terminal pid 16, CPU 1 → terminal pid 19. Each
+# CPU's supervisor checks O5 at boot (has_terminal probe), spawns a
+# shell if non-null, and registers /sys/term/<procid>/{console,
+# keyboard,grid} as service-discovery LEAFs. Result: two Tk windows,
+# two independent shells, both sharing /programs and the same
+# directory tree.
+#
+# hostfsd (17) and oriscdir (18) stay shared singletons — both CPUs
+# see the same ones. /sys/hostfsd/0 is registered by CPU 0 only
+# (procid==0 owns singletons today).
 exec python3 tools/oriscrun \
     --terminal pid=16 \
+    --terminal pid=19 \
     --hostfsd "pid=17,root=$ROOT" \
     --directory pid=18 \
     --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=18=1@9,service=0=0@0,service=17=1@9" \
-    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=18=1@9,service=0=0@0,service=17=1@9" \
+    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=19=1@9,service=19=2@9,service=19=3@9,service=18=1@9,service=0=0@0,service=17=1@9" \
     --leader 0 --leader-timeout 600
