@@ -42,7 +42,10 @@ CCOM="$PCC_BUILD/cc/ccom/orisc-unknown-none-ccom"
 
 mkdir -p "$TMP/jail/programs"
 
-# --- shell (leader-only first task) ----------------------------------
+# --- shell + login + sysinit (Phase 48: login.orx is the supervisor's
+# first user task; the leader additionally spawns sysinit.orx for the
+# /programs MOUNT setup before login). All three live in /programs/
+# inside the jail so the supervisor can hostfsd-load them.
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
     -DBUILD_BANNER='"Object RISC Shell (TEST)"' \
     ouroboros/shell.c > "$TMP/shell.i"
@@ -53,6 +56,18 @@ python3 tools/asm/asmorisc -r "$TMP/shell.s"                   -o "$TMP/shell.or
 python3 tools/ld/orld -o "$TMP/jail/programs/shell.orx" \
     "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/shell.oro" \
     build/liborisc.ora
+
+build_orx() {
+    src="$1"; out="$2"
+    "$CPP"  -I tools/cc/arch/orisc -I tools/cc/lib "$src" > "$TMP/__pp.i"
+    "$CCOM" < "$TMP/__pp.i" > "$TMP/__pp.s"
+    python3 tools/asm/asmorisc -r "$TMP/__pp.s"                     -o "$TMP/__main.oro"
+    python3 tools/ld/orld -o "$out" \
+        "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/__main.oro" \
+        build/liborisc.ora
+}
+build_orx "ouroboros/programs/login.c"   "$TMP/jail/programs/login.orx"
+build_orx "ouroboros/programs/sysinit.c" "$TMP/jail/programs/sysinit.orx"
 
 # --- supervisor (boot leader on every CPU) ---------------------------
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
@@ -79,14 +94,18 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# Type:  exit<RET>  — drives the leader's shell to TaskExit, which
-# triggers sup_shutdown → leader supervisor halts. The worker stays
-# blocked in poll until we kill it after the test.
+# Type:  <RET>             (Phase 48: dismiss login.orx welcome banner)
+#        exit<RET>          — drives the spawned shell to TaskExit,
+#                             which calls sup_shutdown → leader
+#                             supervisor halts. The worker stays
+#                             blocked in poll until we kill it after
+#                             the test.
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
+    --event key:0x10D \
     --event key:e --event key:x --event key:i --event key:t \
     --event key:0x10D \
-    --linger 5.0 --delay 0.20 \
+    --linger 8.0 --delay 0.20 \
     > "$TMP/term.out" 2>&1 &
 TERM_PID=$!
 for _ in $(seq 50); do

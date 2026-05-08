@@ -73,7 +73,8 @@ build_guest() {
 
 build_guest "$TMP/hello.c" "$TMP/jail/programs/hello.orx"
 
-# --- shell --------------------------------------------------------------
+# --- shell + login + sysinit (Phase 48: login.orx is the supervisor's
+# first user task; sysinit.orx does the leader-only /programs MOUNT.) -----
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
     -DBUILD_BANNER='"Object RISC Shell (TEST)"' \
     ouroboros/shell.c > "$TMP/shell.i"
@@ -84,6 +85,18 @@ python3 tools/asm/asmorisc -r "$TMP/shell.s"                   -o "$TMP/shell.or
 python3 tools/ld/orld -o "$TMP/jail/programs/shell.orx" \
     "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/shell.oro" \
     build/liborisc.ora
+
+build_orx() {
+    src="$1"; out="$2"
+    "$CPP"  -I tools/cc/arch/orisc -I tools/cc/lib "$src" > "$TMP/__pp.i"
+    "$CCOM" < "$TMP/__pp.i" > "$TMP/__pp.s"
+    python3 tools/asm/asmorisc -r "$TMP/__pp.s" -o "$TMP/__main.oro"
+    python3 tools/ld/orld -o "$out" \
+        "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/__main.oro" \
+        build/liborisc.ora
+}
+build_orx "ouroboros/programs/login.c"   "$TMP/jail/programs/login.orx"
+build_orx "ouroboros/programs/sysinit.c" "$TMP/jail/programs/sysinit.orx"
 
 # --- supervisor ---------------------------------------------------------
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
@@ -163,6 +176,7 @@ done
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
     --directory-pid 18 --instance 0 \
+    --event key:0x10D \
     --event key:l --event key:s --event key:0x10D \
     --event key:c --event key:d --event key:0x20 --event key:p --event key:r --event key:o --event key:g --event key:r --event key:a --event key:m --event key:s --event key:0x10D \
     --event key:l --event key:s --event key:0x10D \

@@ -58,7 +58,19 @@
 
 #include "liborisc.h"
 
-#define SHELL_PATH "/programs/shell.orx"
+/* Phase 48: the supervisor doesn't spawn /programs/shell.orx
+ * directly anymore — each terminal-equipped CPU spawns
+ * /programs/login.orx as its first user task instead, and
+ * login.orx is the one that brings up shell sessions on demand
+ * (welcome banner → press-Enter → spawn shell → on shell exit,
+ * loop back).
+ *
+ * The leader (procid 0) additionally spawns /programs/sysinit.orx
+ * BEFORE its login.orx — sysinit installs the /programs MOUNT in
+ * oriscdir and exits, having done the singleton system setup the
+ * supervisor used to do leader-only inline. */
+#define LOGIN_PATH   "/programs/login.orx"
+#define SYSINIT_PATH "/programs/sysinit.orx"
 
 #define TAG_SERVICE 0x4103
 #define CAP_R 0x01
@@ -392,13 +404,14 @@ render_term_path(int n, const char *suffix, char *buf)
  * directory is wired (caller should keep the existing OPR), or
  * other negative codes on real errors.
  *
- * Retries on -2 (NOT_FOUND): device daemons self-register at
- * startup but the registration packet may still be in flight when
- * the supervisor's first walk lands. Each retry is naturally
+ * Retries briefly on -2 (NOT_FOUND): device daemons self-register
+ * at startup but the registration packet may still be in flight
+ * when the supervisor's first walk lands. Each retry is naturally
  * spaced by the wire round-trip of the failed walk (~ms scale),
- * so 50 attempts give the orchestrator plenty of slack to deliver
- * the registration. NO_DIRECTORY (-6) doesn't retry — the absence
- * of an oriscdir is structural, not a race.
+ * so 5 attempts cover any reasonable launch-order race without
+ * stalling boot when the path won't ever exist (e.g. workers
+ * with no terminal in test_supervisor_run_at). NO_DIRECTORY (-6)
+ * doesn't retry — the absence of an oriscdir is structural.
  *
  * The CALLER follows up with `orefld oN, 616(o12)` to load the
  * resolved ref into the target OPR — we can't index OPRs at
@@ -410,7 +423,7 @@ sup_walk_for_opr(const char *path)
 	int kind;
 	char rem[16];          /* unused for LEAFs, just satisfies the API */
 	int attempt;
-	for (attempt = 0; attempt < 50; attempt++) {
+	for (attempt = 0; attempt < 5; attempt++) {
 		int rc = dir_walk(path, &kind, rem, sizeof(rem));
 		if (rc == -6)               return -6;       /* no directory */
 		if (rc == -2) {                              /* not found yet */
@@ -745,33 +758,45 @@ main(void)
 		}
 	}
 
-	/* Phase 45g: only the leader installs the /programs mount, since
-	 * oriscdir is a single shared daemon and a duplicate dir_mount
-	 * from a worker would just fail with EEXISTS. The mount routes
-	 * walks under "/programs" to a hostfsd backend rooted at
-	 * "/programs" inside the jail (boot.sh symlinks build/programs
-	 * to $ROOT/programs so the path resolves identically inside and
-	 * outside the supervisor).
+	/* Phase 48 leader-only setup. The /programs MOUNT has to happen
+	 * inline here BEFORE we spawn sysinit — sysinit lives at
+	 * /programs/sysinit.orx, so we need that path resolvable to
+	 * load it. (We tried hosting the mount inside sysinit; the
+	 * resulting chicken-and-egg made the supervisor unable to
+	 * orx_spawn any /programs/* file.)
 	 *
-	 * We publish O10 (boot hostfsd) directly rather than ObjDerive-ing
-	 * a sub-cap: the boot ref arrives with caps R|S, no C cap, so
-	 * ObjDerive would EPERM. Storing O10 verbatim is fine — peers
-	 * walking the mount get a ref equivalent to their own boot O10
-	 * (same home + index), and they don't need to derive further to
-	 * SEND OP_OPEN/READ/CLOSE; S cap is enough. */
+	 * After the mount is installed, we spawn sysinit as a one-shot
+	 * "system setup" task that the user wanted in front of the
+	 * shell. It currently has nothing required to do — we may
+	 * add late-boot setup work to it in future phases. Fire-and-
+	 * forget: blocking on task_wait would deadlock against
+	 * sysinit's own dir_init lazy-bootstrap (op=4 SEND to us).
+	 *
+	 * The mount publishes O10 (boot hostfsd) directly. Boot ref
+	 * has caps R|S — no C — so ObjDerive would EPERM; storing O10
+	 * verbatim is fine, peers walking the mount get a ref
+	 * equivalent to their own boot O10. */
 	if (is_leader) {
 		asm volatile("omov o1, o10");
 		int mount_status = dir_mount("/programs", "/programs");
 		if (mount_status != 0) {
 			/* Non-fatal: in test harnesses without a directory the
-			 * mount returns -6 (EIO from the absent daemon). The
-			 * shell still needs to come up so single-CPU tests
-			 * (test_supervisor.sh) can exercise the spawn round-trip
-			 * via direct hf_open paths. Workers don't reach this
-			 * branch (gated on is_leader). */
+			 * mount returns -6. orx_spawn's vfs_open will fall
+			 * back to direct hf_open in that case; the system
+			 * keeps coming up as long as the relevant .orx files
+			 * exist at literal hostfsd paths. */
 			SUP_PRINT("supervisor: dir_mount /programs failed (");
 			SUP_PRINT_INT(mount_status);
 			SUP_PRINT(") — continuing\n");
+		}
+
+		task_t sysinit = orx_spawn(SYSINIT_PATH, "", "/");
+		if (sysinit < 0) {
+			SUP_PRINT("supervisor: failed to spawn sysinit: ");
+			SUP_PRINT_INT((int)sysinit);
+			SUP_PRINT(" — continuing\n");
+		} else if (task_resume(sysinit) != 0) {
+			SUP_PRINT("supervisor: failed to resume sysinit\n");
 		}
 	}
 
@@ -808,16 +833,18 @@ main(void)
 	 * harnesses that wire term to procid 0 only, null pads for procid
 	 * 1) that collapses to the prior behaviour. */
 	if (has_terminal) {
-		/* Phase 47: workers race the leader's /programs mount. If we
-		 * try to spawn the shell before /programs is mounted in
-		 * oriscdir, vfs_open returns NOT_FOUND → orx_spawn returns
-		 * -1. Wait for the mount by walking it; only proceed once
-		 * the leader has installed it. The leader (procid==0) just
-		 * mounted above, so its first walk succeeds immediately.
+		/* Phase 47: workers race the leader's /programs mount (now
+		 * done by sysinit.orx — see the leader-only block above).
+		 * If we try to spawn login before /programs is mounted in
+		 * oriscdir, orx_spawn → vfs_open returns NOT_FOUND → -1.
+		 * Wait for the mount by walking it; only proceed once
+		 * sysinit has installed it. On the leader the previous
+		 * task_wait on sysinit guarantees this without waiting; on
+		 * workers we may need a few retries.
 		 *
 		 * 50 attempts × ~ms-scale wire round-trips ≈ tens of ms; in
-		 * practice the leader's mount lands well before the workers
-		 * reach this point under any reasonable boot ordering. */
+		 * practice sysinit lands well before any worker reaches
+		 * this point under any reasonable boot ordering. */
 		{
 			int kind, attempt;
 			char rem[16];
@@ -828,19 +855,22 @@ main(void)
 				task_yield();
 			}
 		}
-		task_t shell = orx_spawn(SHELL_PATH, "", "/");
-		if (shell < 0) {
-			SUP_PRINT("supervisor: failed to spawn shell: ");
-			SUP_PRINT_INT((int)shell);
+		task_t login = orx_spawn(LOGIN_PATH, "", "/");
+		if (login < 0) {
+			SUP_PRINT("supervisor: failed to spawn login: ");
+			SUP_PRINT_INT((int)login);
 			SUP_PRINT("\n");
 			return 1;
 		}
-		if (task_resume(shell) != 0) {
-			SUP_PRINT("supervisor: failed to resume shell\n");
+		if (task_resume(login) != 0) {
+			SUP_PRINT("supervisor: failed to resume login\n");
 			return 1;
 		}
-		(void)shell;   /* shell-exit detection is via op=2 SEND
-		                * below, not task_query. */
+		(void)login;   /* login-/shell-exit detection is via op=2 SEND
+		                * below, not task_query. login.orx loops the
+		                * welcome-banner / shell-spawn cycle; only
+		                * the shell's `exit`/`quit` (which calls
+		                * sup_shutdown) actually halts us. */
 	}
 
 	/* Dispatch loop. Wake-up is event-driven: each `run`/`edit`
@@ -865,40 +895,52 @@ main(void)
 		} else if (op == 2 && has_terminal) {
 			/* Graceful shutdown — sup_shutdown() in libc, called
 			 * by the host's shell right before its TaskExit.
-			 * Phase 46: any CPU running a shell (= has_terminal)
-			 * accepts op=2 from that shell. CPUs without a shell
-			 * ignore op=2 (no shell to halt on); they wait for
-			 * the external teardown signal from oriscrun. */
+			 * Phase 48: kill every task we own before returning.
+			 * Login.orx sits in a welcome-banner loop that would
+			 * otherwise outlive us forever. Iterate
+			 * task_active_mask + task_kill. Sysinit is already
+			 * EXITED so its task_kill is a no-op. */
+			unsigned int mask = task_active_mask();
+			int t;
+			for (t = 0; t < TASK_MAX_CONCURRENT; t++) {
+				if (mask & (1u << t))
+					(void)task_kill((task_t)t, 137);
+			}
 			SUP_PRINT(shell_done);
 			return 0;
 		} else if (op == 4) {
 			/* SUP_OP_GET_DIR (Phase 45g): a child program's dir.c
 			 * is asking us for the directory mailbox so it can
 			 * populate its own DIR_SLOT. Reply with our DIR_SLOT
-			 * in O2 (the value we copied from BOOT_PARENT_SLOT
-			 * at boot, = oriscdir's primary mailbox sub-cap).
-			 * R3 (request payload R3) was the dequeue's op = 4;
-			 * we don't read any other fields — O3 holds the
-			 * caller's reply_cap, sent verbatim into the SEND
-			 * recipient slot here.
+			 * in O2 (= oriscdir's primary mailbox sub-cap, copied
+			 * from BOOT_PARENT_SLOT at boot).
 			 *
-			 * Without this handler, child programs' first dir_*()
-			 * call hangs forever waiting for a reply. The shell
-			 * is the only such program today (it inherits its
-			 * BOOT_PARENT from the supervisor's child-O8 swap),
-			 * so this fix is what makes vfs_* under `make boot`
-			 * actually reach oriscdir. */
+			 * Phase 48: probe DIR_SLOT first. If it's null (no
+			 * oriscdir wired into this supervisor — degenerate
+			 * single-CPU test config), reply with status -6 (EIO)
+			 * so the child's dir_init bails cleanly instead of
+			 * happily caching a null DIR_SLOT and then trapping
+			 * on its first dir_walk's SEND-to-null. */
+			int dir_isn;
+			asm volatile(
+				"orefld o1, %1(o12)\n"
+				"oisn   %0, o1"
+				: "=r"(dir_isn)
+				: "i"(DIR_SLOT_OFFSET)
+				: "r1"
+			);
+			int reply_status = dir_isn ? -6 : 0;
 			asm volatile(
 				"omov   o1, o3\n"            /* recipient = caller's reply_cap */
-				"orefld o2, %0(o12)\n"       /* O2 = our DIR_SLOT */
+				"orefld o2, %1(o12)\n"       /* O2 = our DIR_SLOT (null on -6) */
 				"onull  o3\n"
-				"addiu  r4, r0, 0\n"         /* status OK */
+				"addu   r4, %0, r0\n"        /* status: 0 OK or -6 EIO */
 				"addiu  r5, r0, 0\n"
 				"addiu  r6, r0, 0\n"
 				"addiu  r7, r0, 0\n"
 				"send   o1\n"
 				:
-				: "i"(DIR_SLOT_OFFSET)
+				: "r"(reply_status), "i"(DIR_SLOT_OFFSET)
 				: "r1", "r4", "r5", "r6", "r7"
 			);
 		} else {
