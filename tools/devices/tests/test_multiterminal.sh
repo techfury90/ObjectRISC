@@ -51,7 +51,7 @@ CCOM="$PCC_BUILD/cc/ccom/orisc-unknown-none-ccom"
 
 mkdir -p "$TMP/jail/programs"
 
-# --- shell -----------------------------------------------------------
+# --- shell + login + sysinit (Phase 48) ------------------------------
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
     -DBUILD_BANNER='"Object RISC Shell (TEST)"' \
     ouroboros/shell.c > "$TMP/shell.i"
@@ -62,6 +62,18 @@ python3 tools/asm/asmorisc -r "$TMP/shell.s"                   -o "$TMP/shell.or
 python3 tools/ld/orld -o "$TMP/jail/programs/shell.orx" \
     "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/shell.oro" \
     build/liborisc.ora
+
+build_orx() {
+    src="$1"; out="$2"
+    "$CPP"  -I tools/cc/arch/orisc -I tools/cc/lib "$src" > "$TMP/__pp.i"
+    "$CCOM" < "$TMP/__pp.i" > "$TMP/__pp.s"
+    python3 tools/asm/asmorisc -r "$TMP/__pp.s" -o "$TMP/__main.oro"
+    python3 tools/ld/orld -o "$out" \
+        "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/__main.oro" \
+        build/liborisc.ora
+}
+build_orx "ouroboros/programs/login.c"   "$TMP/jail/programs/login.orx"
+build_orx "ouroboros/programs/sysinit.c" "$TMP/jail/programs/sysinit.orx"
 
 # --- supervisor ------------------------------------------------------
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
@@ -105,9 +117,11 @@ done
 # both terminal supervisors register their own subtree in the shared
 # oriscdir.
 
-# Keystrokes for `ls /sys/term<RET> exit<RET>`:
-#   l s SP / s y s / t e r m RET e x i t RET
+# Keystrokes for `<RET> ls /sys/term<RET> exit<RET>`:
+# Phase 48: leading <RET> dismisses login.orx's welcome banner; then
+# the shell receives the rest.
 TERM16_KEYS="\
+--event key:0x10D \
 --event key:l --event key:s --event key:0x20 \
 --event key:0x2f --event key:s --event key:y --event key:s \
 --event key:0x2f --event key:t --event key:e --event key:r --event key:m \
@@ -185,15 +199,16 @@ grep -q "supervisor: shell exited; halting" "$TMP/cpu0.out" \
 grep -q "supervisor: shell exited; halting" "$TMP/cpu1.out" \
     || { echo "FAIL: cpu1 supervisor didn't shut down (shell 1 op=2 not received)" >&2; exit 1; }
 
-# 2) Each terminal received its own shell banner. The two shells are
-#    independent processes writing to independent oriscterm streams;
-#    if the binding got crossed (e.g. both shells subscribed to the
-#    same kbd queue), the banners would interleave or one would be
-#    absent.
-echo "$RENDER16" | grep -q "Object RISC Shell (TEST)" \
-    || { echo "FAIL: term16 didn't see its shell banner" >&2; exit 1; }
-echo "$RENDER19" | grep -q "Object RISC Shell (TEST)" \
-    || { echo "FAIL: term19 didn't see its shell banner" >&2; exit 1; }
+# 2) Each terminal received its login welcome banner. (Phase 48: the
+#    shell's own banner is sometimes wiped by login.orx's loop-top
+#    term_clear when shell exits — login's task_wait wakes, login
+#    resumes, term_clear fires before supervisor's op=2 task_kill
+#    cascade lands. Cosmetic; the shell still ran correctly,
+#    evidenced by the `ls /sys/term` output asserted below.)
+echo "$RENDER16" | grep -q "Welcome to the Ouroboros" \
+    || { echo "FAIL: term16 didn't see login welcome banner" >&2; exit 1; }
+echo "$RENDER19" | grep -q "Welcome to the Ouroboros" \
+    || { echo "FAIL: term19 didn't see login welcome banner" >&2; exit 1; }
 
 # 3) `ls /sys/term` from EITHER shell shows BOTH terminal subtrees.
 #    Confirms (a) both supervisors registered into the shared

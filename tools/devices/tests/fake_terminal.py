@@ -313,14 +313,19 @@ class FakeTerminal:
                     if 0 <= c < GRID_COLS:
                         self.grid[row][c] = b
             return
-        # Default: console rendering. Mirror oriscterm's \b handling:
-        # byte 0x08 deletes the previous byte from the rendered
-        # stream, no-op at start. Without this the shell's backspace
-        # echo shows up as raw \x08 bytes in test transcripts.
+        # Default: console rendering. Mirror oriscterm's control-byte
+        # handling:
+        #   - 0x08 (\b): delete the previous byte from the stream
+        #     (shell's read_line uses this for backspace-erase).
+        #   - 0x0C (\f): clear the entire rendered stream (login.orx
+        #     fires one before each welcome banner so the new
+        #     session starts on a blank canvas).
         for b in raw[:n]:
             if b == 0x08:
                 if self.console_render:
                     del self.console_render[-1]
+            elif b == 0x0C:
+                self.console_render = bytearray()
             else:
                 self.console_render.append(b)
         if reply_cap:
@@ -364,8 +369,20 @@ class FakeTerminal:
             self.send_key(0x10E, 0)   # KEY_FOCUS_IN — see oriscterm
 
     def send_key(self, code, mods=0):
+        # Phase 48: when one program (e.g. login.orx) unsubscribes
+        # and the next (e.g. the shell it just spawned) hasn't
+        # subscribed yet, the kbd subscriber list goes briefly
+        # empty. Loading shell.orx via hostfsd takes ~15+ chunked
+        # reads + TaskCreate + term_init, easily 5-10s of wall
+        # clock under simulator pace. Wait up to 30s for a new
+        # subscriber to arrive before declaring failure.
         if not self.kbd_subs:
-            sys.exit("fake_terminal: no kbd subscriber for key event")
+            deadline = time.time() + 30.0
+            while not self.kbd_subs and time.time() < deadline:
+                self.drain_pending_subs(0.05)
+            if not self.kbd_subs:
+                sys.exit("fake_terminal: no kbd subscriber for key event "
+                         "(waited 30s — handoff stalled?)")
         idx = self.kbd_focus if self.kbd_focus < len(self.kbd_subs) else 0
         sub = self.kbd_subs[idx]
         pkt = build_send_deliver(

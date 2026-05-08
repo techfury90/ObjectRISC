@@ -67,7 +67,13 @@ build_guest() {
         build/liborisc.ora
 }
 
-build_guest "$TMP/hello.c" "$TMP/jail/programs/hello.orx"
+build_guest "$TMP/hello.c"                "$TMP/jail/programs/hello.orx"
+# Phase 48: each terminal-equipped supervisor spawns login.orx as its
+# first user task; login.orx waits for Enter and then sup_spawns the
+# shell. The leader additionally spawns sysinit.orx (one-shot) for
+# the /programs MOUNT setup that used to live inline in supervisor.c.
+build_guest "ouroboros/programs/login.c"   "$TMP/jail/programs/login.orx"
+build_guest "ouroboros/programs/sysinit.c" "$TMP/jail/programs/sysinit.orx"
 
 # --- shell (lives in /programs/ inside the jail) ---------------------
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
@@ -106,9 +112,15 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# Type:  run /programs/hello.orx<RET>  exit<RET>
+# Type:  <RET>                              (Phase 48: dismiss
+#                                            login.orx's welcome
+#                                            banner — Enter spawns
+#                                            the shell)
+#        run /programs/hello.orx<RET>
+#        exit<RET>
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
+    --event key:0x10D \
     --event key:r --event key:u --event key:n --event key:0x20 \
     --event key:0x2f --event key:p --event key:r --event key:o --event key:g --event key:r --event key:a --event key:m --event key:s \
     --event key:0x2f --event key:h --event key:e --event key:l --event key:l --event key:o \

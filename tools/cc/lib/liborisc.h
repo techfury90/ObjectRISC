@@ -116,6 +116,24 @@ void term_print_char(char c);
 void term_print_int(int n);
 void term_print_hex(unsigned int n);
 
+/* term_clear — wipe the text pane. Phase 48: login.orx fires this
+ * before each welcome banner so the new session starts on a blank
+ * canvas. Implemented by sending a single 0x0C (form feed) byte
+ * through the normal console-write path — oriscterm and
+ * fake_terminal both interpret it as a clear directive (same
+ * shape as `\b` for backspace). Pair with grid_clear() to wipe
+ * the canvas pane too. */
+void term_clear(void);
+
+/* term_resubscribe — re-attach a previously term_shutdown'd
+ * keyboard subscription, reusing the existing mailbox in O9.
+ * Phase 48: login.orx pairs term_shutdown / sup_spawn(shell) /
+ * task_wait / term_resubscribe so the shell takes keyboard focus
+ * during its session and login takes it back when the shell
+ * exits. Avoids the boot-OR-resave hazard of calling term_init
+ * a second time. */
+void term_resubscribe(void);
+
 /* ---- grid.c — oriscterm grid (idx 3) client ----------------------
  *
  * Paint byte sequences at character-cell positions (col, row) on

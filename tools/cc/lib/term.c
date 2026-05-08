@@ -259,6 +259,45 @@ term_init(void)
  * problem (a wire-level NACK from the home CPU when a SEND target
  * is stale would let oriscterm prune dynamically). */
 
+/* term_resubscribe — re-attach a previously term_shutdown'd
+ * keyboard subscription. Derives a fresh R+S sub-cap from O9
+ * (our existing mailbox, alive across the unsubscribe) and SENDs
+ * it to the keyboard service.
+ *
+ * Phase 48: login.orx uses this to take its keyboard subscription
+ * back after a shell session ends. We can't just call term_init
+ * again — that re-saves O2/O3/O4 into the boot-OR slots
+ * (O11/O14/O15), and by mid-loop those have been clobbered by
+ * sup_spawn / hf_init / etc., so the second save would capture
+ * wrong values and break subsequent term_print of data-segment
+ * strings (same shape as the 45g sup.c O15 bug).
+ *
+ * Pre-condition: O9 holds the program's mailbox (from a prior
+ * term_init that hasn't been undone). O6 holds the keyboard
+ * service ref (boot OPR). */
+void
+term_resubscribe(void)
+{
+	asm volatile(
+		"omov  o1, o9\n"               /* O1 = our mailbox */
+		"addiu r4, r0, 9\n"            /* R|S */
+		"call  #0x103\n"               /* ObjDerive → O1 = sub-cap */
+		"nop\n"
+		"omov  o2, o1\n"               /* O2 = sub-cap to subscribe */
+		"omov  o1, o6\n"               /* O1 = keyboard service */
+		"onull o3\n"
+		"addiu r4, r0, 0\n"            /* R4 = 0 → subscribe */
+		"addiu r5, r0, 0\n"
+		"addiu r6, r0, 0\n"
+		"addiu r7, r0, 0\n"
+		"send  o1"
+		:
+		:
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+	_term_restore_or();
+}
+
 void
 term_shutdown(void)
 {
@@ -408,6 +447,19 @@ term_print_char(char c)
 	 * _term_single_char_table for why a stack buffer doesn't work. */
 	const char *src = &_term_single_char_table[(unsigned char)c];
 	_term_console_write(0, (int)((unsigned int)src - DATA_VA), 1);
+}
+
+/* Phase 48: emit form-feed (0x0C) to clear the text pane. oriscterm
+ * and fake_terminal both interpret \f in the console byte stream as
+ * "wipe the entire pane" — same shape as `\b` for backspace. Pairs
+ * with grid_clear() for a fully-blanked terminal (login.orx does
+ * both before each welcome banner). Sends one byte through the
+ * normal console-write path so the receive side sees it inline
+ * with any pending pre-clear writes. */
+void
+term_clear(void)
+{
+	term_print_char('\f');
 }
 
 void

@@ -973,13 +973,15 @@ class Terminal:
     # ---- UI helpers --------------------------------------------------------
 
     def _append(self, s: str) -> None:
-        """Insert s at end of the text widget, with one piece of
-        terminal-style processing: a `\\b` byte (0x08) deletes the
-        character immediately before it. Programs (the shell's
-        read_line in particular) lean on this for backspace-to-erase
-        without us needing a full cursor-positioning escape grammar.
-        \\b at the start of an empty widget is a no-op (the inserted
-        prompt is the floor)."""
+        """Insert s at end of the text widget, with terminal-style
+        processing of two control bytes:
+          - `\\b` (0x08) deletes the character immediately before it;
+            the shell's read_line uses this for backspace-to-erase.
+          - `\\f` (0x0C, form feed, Phase 48) clears the entire text
+            pane. login.orx fires one before each welcome banner so
+            the new session starts on a blank canvas. (Mirrors the
+            grid pane's existing VEC_CLEAR / col=row=-1 semantics.)
+        Other bytes are inserted verbatim."""
         self.text.configure(state="normal")
         i = 0
         while i < len(s):
@@ -990,9 +992,13 @@ class Terminal:
                 if self.text.index("end-2c") != self.text.index("1.0"):
                     self.text.delete("end-2c", "end-1c")
                 i += 1
+            elif s[i] == '\f':
+                # Form feed → clear the text pane entirely.
+                self.text.delete("1.0", "end")
+                i += 1
             else:
                 seg_start = i
-                while i < len(s) and s[i] != '\b':
+                while i < len(s) and s[i] != '\b' and s[i] != '\f':
                     i += 1
                 self.text.insert("end", s[seg_start:i])
         self.text.see("end")

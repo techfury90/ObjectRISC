@@ -88,7 +88,8 @@ const char help_msg[] =
     "  jobs            — list backgrounded tasks and their state\n"
     "  cycles          — print the CPU's cycle counter\n"
     "  time            — print microseconds since boot (wall clock)\n"
-    "  exit | quit     — leave the shell\n";
+    "  logout          — end this session; login.orx welcomes the next user\n"
+    "  exit | quit     — halt this CPU's supervisor (system shutdown)\n";
 
 const char run_done_pre[] = "[exited ";
 const char run_done_post[] = "]\n";
@@ -1032,12 +1033,28 @@ main(void)
 			cmd_cycles();
 		} else if (strcmp(line, "time") == 0) {
 			cmd_time();
+		} else if (strcmp(line, "logout") == 0) {
+			/* Phase 48: end this shell session, but DON'T halt
+			 * the supervisor. login.orx (our parent) sees us
+			 * exit cleanly via task_wait and loops back to its
+			 * welcome banner, ready for another session. The
+			 * supervisor stays up, oriscdir stays up, /programs
+			 * stays mounted — it's just THIS shell that ends.
+			 *
+			 * term_shutdown unsubscribes our mailbox from the
+			 * keyboard service so login.orx can take focus
+			 * cleanly when it re-subscribes; without it,
+			 * oriscterm would keep our dead sub-cap at idx 0
+			 * and login's keystrokes would silently disappear
+			 * into a stale queue. (exit/quit doesn't bother —
+			 * sup_shutdown is about to halt everything.) */
+			term_print("logged out\n");
+			term_shutdown();
+			return 0;
 		} else if (strcmp(line, "exit") == 0
 		           || strcmp(line, "quit") == 0) {
 			term_print("bye!\n");
-			/* Wake the supervisor (if any) out of its
-			 * spawn-request poll so it can wind down too.
-			 * No-op when run unsupervised. */
+			term_shutdown();
 			sup_shutdown();
 			return 0;
 		} else {
