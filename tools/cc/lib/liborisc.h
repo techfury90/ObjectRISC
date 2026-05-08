@@ -390,4 +390,41 @@ int dir_mount(const char *path, const char *prefix);
  * trailing-NUL-terminator runs`), negative on error. */
 int dir_list(const char *path, char *buf, int cap);
 
+/* ----- VFS helpers (Phase 45g) ----------------------------------------
+ *
+ * `vfs.c` is the path-aware front door programs should prefer over
+ * the bare `hf_*` calls. Each operation walks the directory tree
+ * (via `dir_walk`) to translate the user-visible path into the
+ * remainder a backend service understands, then dispatches to the
+ * underlying service. For Phase 45g the only backend is hostfsd —
+ * `vfs_open` / `vfs_opendir` / `vfs_close` / `vfs_read` / `vfs_write`
+ * forward to the corresponding `hf_*` against the program's boot
+ * O10 (which `hf_init` has already subscribed). Multi-backend
+ * dispatch (using the resolved service ref directly as the SEND
+ * recipient) is deferred to a later phase.
+ *
+ * Required pre-conditions for callers:
+ *   - `task_init()` has been called (so DIR_RESULT_SLOT etc. exist)
+ *   - `hf_init()` has been called (so O10 + reply mailbox are ready)
+ *   - DIR_SLOT is populated (supervisor populates from BOOT_PARENT_SLOT
+ *     at boot; other programs lazily SEND op=4 SUP_OP_GET_DIR to their
+ *     parent supervisor on the first dir_*() call)
+ *
+ * Path semantics:
+ *   - vfs_open / vfs_opendir succeed only on MOUNT-resolved paths.
+ *     A pure DIR (e.g. `/sys/cpu/0`) has no underlying file backend,
+ *     so opening it returns -1; use `vfs_list` to enumerate children.
+ *   - LEAF paths (services registered via `dir_register`, e.g.
+ *     `/sys/cpu/0/supervisor`) are not file-readable; open returns -1.
+ *   - vfs_list works on BOTH DIR and MOUNT — for DIR it dispatches to
+ *     `dir_list`, for MOUNT it streams the backend's `hf_opendir`
+ *     output into `buf` until short-read or capacity exhaustion. */
+int vfs_walk_kind(const char *path, int *kind_out);
+int vfs_open(const char *path, int flags);
+int vfs_opendir(const char *path);
+int vfs_close(int fd);
+int vfs_read(int fd, char *buf, int count);
+int vfs_write(int fd, const char *buf, int count);
+int vfs_list(const char *path, char *buf, int cap);
+
 #endif /* LIBORISC_H */

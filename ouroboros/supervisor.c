@@ -631,6 +631,36 @@ main(void)
 		}
 	}
 
+	/* Phase 45g: only the leader installs the /programs mount, since
+	 * oriscdir is a single shared daemon and a duplicate dir_mount
+	 * from a worker would just fail with EEXISTS. The mount routes
+	 * walks under "/programs" to a hostfsd backend rooted at
+	 * "/programs" inside the jail (boot.sh symlinks build/programs
+	 * to $ROOT/programs so the path resolves identically inside and
+	 * outside the supervisor).
+	 *
+	 * We publish O10 (boot hostfsd) directly rather than ObjDerive-ing
+	 * a sub-cap: the boot ref arrives with caps R|S, no C cap, so
+	 * ObjDerive would EPERM. Storing O10 verbatim is fine — peers
+	 * walking the mount get a ref equivalent to their own boot O10
+	 * (same home + index), and they don't need to derive further to
+	 * SEND OP_OPEN/READ/CLOSE; S cap is enough. */
+	if (is_leader) {
+		asm volatile("omov o1, o10");
+		int mount_status = dir_mount("/programs", "/programs");
+		if (mount_status != 0) {
+			/* Non-fatal: in test harnesses without a directory the
+			 * mount returns -6 (EIO from the absent daemon). The
+			 * shell still needs to come up so single-CPU tests
+			 * (test_supervisor.sh) can exercise the spawn round-trip
+			 * via direct hf_open paths. Workers don't reach this
+			 * branch (gated on is_leader). */
+			SUP_PRINT("supervisor: dir_mount /programs failed (");
+			SUP_PRINT_INT(mount_status);
+			SUP_PRINT(") — continuing\n");
+		}
+	}
+
 	/* Phase 45c: only the leader (PROCID 0) spawns the shell. Worker
 	 * supervisors sit in the dispatch loop ready to service spawn
 	 * requests from peers — today nothing SENDs to them, but the

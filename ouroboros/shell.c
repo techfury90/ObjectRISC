@@ -360,7 +360,7 @@ cmd_cat(const char *cwd, const char *arg)
 	char path[PATH_MAX];
 	char buf[READ_BUF];
 	resolve_path(cwd, arg, path);
-	int fd = hf_open(path, HF_O_RDONLY);
+	int fd = vfs_open(path, HF_O_RDONLY);
 	int n;
 	if (fd < 0) {
 		term_print("cat: cannot open '");
@@ -371,12 +371,12 @@ cmd_cat(const char *cwd, const char *arg)
 	/* term_print_n_sync blocks until the receiver has pulled the
 	 * bytes — safe to reuse `buf` immediately after. With the
 	 * async term_print_n we needed double-buffering to give the
-	 * receiver a window before our next hf_read overwrote things;
+	 * receiver a window before our next vfs_read overwrote things;
 	 * the sync variant closes that race entirely. */
-	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
+	while ((n = vfs_read(fd, buf, sizeof(buf))) > 0) {
 		term_print_n_sync(buf, n);
 	}
-	hf_close(fd);
+	vfs_close(fd);
 }
 
 static void
@@ -386,7 +386,7 @@ cmd_more(const char *cwd, const char *arg)
 	char buf[READ_BUF];
 	int line_count = 0;
 	resolve_path(cwd, arg, path);
-	int fd = hf_open(path, HF_O_RDONLY);
+	int fd = vfs_open(path, HF_O_RDONLY);
 	int n;
 	if (fd < 0) {
 		term_print("more: cannot open '");
@@ -394,12 +394,12 @@ cmd_more(const char *cwd, const char *arg)
 		term_print("'\n");
 		return;
 	}
-	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
+	while ((n = vfs_read(fd, buf, sizeof(buf))) > 0) {
 		/* Print the chunk in newline-bounded slices so we can
 		 * paginate at line boundaries without splitting bytes.
 		 * Each slice goes through term_print_n_sync so the
 		 * receiver drains before we overwrite the buffer on the
-		 * next hf_read. */
+		 * next vfs_read. */
 		int seg_start = 0;
 		int i;
 		for (i = 0; i < n; i++) {
@@ -409,7 +409,7 @@ cmd_more(const char *cwd, const char *arg)
 				line_count++;
 				if (line_count >= PAGE_LINES) {
 					if (pause_for_key()) {
-						hf_close(fd);
+						vfs_close(fd);
 						return;
 					}
 					line_count = 0;
@@ -418,45 +418,51 @@ cmd_more(const char *cwd, const char *arg)
 		}
 		if (i > seg_start) term_print_n_sync(buf + seg_start, i - seg_start);
 	}
-	hf_close(fd);
+	vfs_close(fd);
 }
+
+/* Sized for vfs_list — has to hold the full directory listing in
+ * one buffer (vfs_list doesn't stream). 1 KiB is plenty for the
+ * current /programs and /sys/cpu listings; bumping it is free
+ * until we start eating into the 64 KiB shell stack. */
+#define LIST_BUF 1024
 
 static void
 cmd_ls(const char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
-	char buf[READ_BUF];
+	char buf[LIST_BUF];
 	resolve_path(cwd, arg, path);
-	int fd = hf_opendir(path);
-	int n;
-	if (fd < 0) {
-		term_print("ls: cannot open '");
+	int n = vfs_list(path, buf, sizeof(buf));
+	if (n < 0) {
+		term_print("ls: cannot list '");
 		term_print(arg);
 		term_print("'\n");
 		return;
 	}
-	while ((n = hf_read(fd, buf, sizeof(buf))) > 0) {
-		term_print_n_sync(buf, n);
-	}
-	hf_close(fd);
+	if (n > 0) term_print_n_sync(buf, n);
 }
 
 static void
 cmd_cd(char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
+	int kind;
 	resolve_path(cwd, arg, path);
-	/* Verify the new directory exists by opening + closing it.
-	 * Avoids the trap of cd'ing into a non-existent path and only
-	 * finding out on the next ls / cat. */
-	int fd = hf_opendir(path);
-	if (fd < 0) {
+	/* Verify the path resolves to a navigable node. DIR (in-memory
+	 * oriscdir tree, e.g. `/sys/cpu`) and MOUNT (path-translated to
+	 * a backend, e.g. `/programs`) are both valid cwd targets;
+	 * LEAF (a service ref like `/sys/cpu/0/supervisor`) and
+	 * NOT_FOUND are not. vfs_walk_kind avoids the hostfsd
+	 * round-trip the old hf_opendir+close did for pure DIRs. */
+	int rc = vfs_walk_kind(path, &kind);
+	if (rc < 0
+	    || (kind != DIR_KIND_DIR && kind != DIR_KIND_MOUNT)) {
 		term_print("cd: cannot enter '");
 		term_print(arg);
 		term_print("'\n");
 		return;
 	}
-	hf_close(fd);
 	int i = 0;
 	while (path[i] && i < PATH_MAX - 1) {
 		cwd[i] = path[i];
@@ -742,7 +748,7 @@ cmd_view(const char *cwd, const char *arg)
 	int  max_top;
 
 	resolve_path(cwd, arg, path);
-	fd = hf_open(path, HF_O_RDONLY);
+	fd = vfs_open(path, HF_O_RDONLY);
 	if (fd < 0) {
 		term_print("view: cannot open '");
 		term_print(arg);
@@ -750,11 +756,11 @@ cmd_view(const char *cwd, const char *arg)
 		return;
 	}
 	while (buf_len < VIEW_BUF_BYTES
-	       && (n = hf_read(fd, buf + buf_len,
-	                       VIEW_BUF_BYTES - buf_len)) > 0) {
+	       && (n = vfs_read(fd, buf + buf_len,
+	                        VIEW_BUF_BYTES - buf_len)) > 0) {
 		buf_len += n;
 	}
-	hf_close(fd);
+	vfs_close(fd);
 	/* Best-effort detection of "we capped out": if a final read filled
 	 * us to the brim, the file MIGHT be longer. We don't know without
 	 * another read; mark truncated to be honest about it. */
