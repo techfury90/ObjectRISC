@@ -711,6 +711,36 @@ main(void)
 			 * on); they wait for the external teardown signal. */
 			SUP_PRINT(shell_done);
 			return 0;
+		} else if (op == 4) {
+			/* SUP_OP_GET_DIR (Phase 45g): a child program's dir.c
+			 * is asking us for the directory mailbox so it can
+			 * populate its own DIR_SLOT. Reply with our DIR_SLOT
+			 * in O2 (the value we copied from BOOT_PARENT_SLOT
+			 * at boot, = oriscdir's primary mailbox sub-cap).
+			 * R3 (request payload R3) was the dequeue's op = 4;
+			 * we don't read any other fields — O3 holds the
+			 * caller's reply_cap, sent verbatim into the SEND
+			 * recipient slot here.
+			 *
+			 * Without this handler, child programs' first dir_*()
+			 * call hangs forever waiting for a reply. The shell
+			 * is the only such program today (it inherits its
+			 * BOOT_PARENT from the supervisor's child-O8 swap),
+			 * so this fix is what makes vfs_* under `make boot`
+			 * actually reach oriscdir. */
+			asm volatile(
+				"omov   o1, o3\n"            /* recipient = caller's reply_cap */
+				"orefld o2, %0(o12)\n"       /* O2 = our DIR_SLOT */
+				"onull  o3\n"
+				"addiu  r4, r0, 0\n"         /* status OK */
+				"addiu  r5, r0, 0\n"
+				"addiu  r6, r0, 0\n"
+				"addiu  r7, r0, 0\n"
+				"send   o1\n"
+				:
+				: "i"(DIR_SLOT_OFFSET)
+				: "r1", "r4", "r5", "r6", "r7"
+			);
 		} else {
 			SUP_PRINT(unknown_op);
 		}
