@@ -138,6 +138,13 @@ done
 #                                          would return the wrong byte
 #                                          count and bleed leftover
 #                                          /programs entries through)
+#        ls /sys<RET>                     (Phase 45h: verify
+#                                          self-registered devices
+#                                          show up — should list
+#                                          cpu/, term/, hostfsd/)
+#        ls /sys/term/0<RET>              (Phase 45h: verify per-term
+#                                          objects — console,
+#                                          keyboard, grid LEAFs)
 #        run @1 /programs/hello.orx &<RET>  (BACKGROUND relayed spawn —
 #                                          Phase 45g hotfix: task_free
 #                                          must clear the local slot
@@ -157,6 +164,8 @@ python3 tools/devices/tests/fake_terminal.py \
     --event key:l --event key:s --event key:0x10D \
     --event key:c --event key:d --event key:0x20 --event key:0x2f --event key:0x10D \
     --event key:l --event key:s --event key:0x10D \
+    --event key:l --event key:s --event key:0x20 --event key:0x2f --event key:s --event key:y --event key:s --event key:0x10D \
+    --event key:l --event key:s --event key:0x20 --event key:0x2f --event key:s --event key:y --event key:s --event key:0x2f --event key:t --event key:e --event key:r --event key:m --event key:0x2f --event key:0x30 --event key:0x10D \
     --event key:r --event key:u --event key:n --event key:0x20 \
     --event key:0x40 --event key:0x31 --event key:0x20 \
     --event key:0x2f --event key:p --event key:r --event key:o --event key:g --event key:r --event key:a --event key:m --event key:s \
@@ -310,5 +319,25 @@ if [ "$DONE_COUNT" -lt 1 ]; then
     echo "FAIL: bg task never reaped — auto-reaper or task_query likely broken" >&2
     exit 1
 fi
+
+# 9) Phase 45h regression check: the leader supervisor publishes
+#    its boot devices into the directory tree as service-discovery
+#    LEAFs. /sys should list cpu/, hostfsd/, term/ as subdirs;
+#    /sys/term/0 should list console, grid, keyboard as LEAFs (no
+#    trailing slash). If the leader's dir_register block is broken
+#    or skipped, /sys would only contain cpu/ from the supervisor's
+#    own self-registration and these checks fail.
+echo "$RENDER" | grep -qE '^cpu/$' \
+    || { echo "FAIL: /sys missing 'cpu/' — supervisor self-register broken?" >&2; exit 1; }
+echo "$RENDER" | grep -qE '^hostfsd/$' \
+    || { echo "FAIL: /sys missing 'hostfsd/' — Phase 45h device-register broken" >&2; exit 1; }
+echo "$RENDER" | grep -qE '^term/$' \
+    || { echo "FAIL: /sys missing 'term/' — Phase 45h device-register broken" >&2; exit 1; }
+echo "$RENDER" | grep -qE '^console$' \
+    || { echo "FAIL: /sys/term/0 missing 'console' LEAF — Phase 45h device-register broken" >&2; exit 1; }
+echo "$RENDER" | grep -qE '^keyboard$' \
+    || { echo "FAIL: /sys/term/0 missing 'keyboard' LEAF — Phase 45h device-register broken" >&2; exit 1; }
+echo "$RENDER" | grep -qE '^grid$' \
+    || { echo "FAIL: /sys/term/0 missing 'grid' LEAF — Phase 45h device-register broken" >&2; exit 1; }
 
 echo "PASS"
