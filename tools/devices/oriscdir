@@ -72,6 +72,32 @@ Wire protocol (request: program SENDs to oriscdir at (pid, idx 1)):
                                  R4 = entry count
                                  R5 = bytes written
 
+  OP_REG_INLINE = 5  Phase 47: a path-inline variant of OP_REGISTER
+                     for callers that can't allocate a TAG_DATA bytes
+                     object on a CPU (Python device daemons —
+                     oriscterm, hostfsd — speak the wire protocol but
+                     have no ObjAlloc primitive). The path bytes ride
+                     in the int_payload + or_payload slots, packed
+                     little-endian into the spare 64-bit fields:
+
+                          int_payload[0] = op (5)
+                          int_payload[1] = path length (1..32)
+                          int_payload[2..3] = path bytes 0..7
+                          or_payload[0]    = ref to register
+                          or_payload[1..3] = path bytes 8..31
+
+                     Total inline path budget: 32 bytes — sufficient
+                     for every system path we mint today
+                     ("/sys/cpu/255/supervisor" = 23 bytes,
+                     "/sys/term/255/keyboard" = 23 bytes,
+                     "/sys/hostfsd/255" = 16 bytes). Fire-and-forget;
+                     no reply, no reply_cap. Failures (E_EXISTS, etc.)
+                     surface only in the daemon's stderr log — for
+                     boot-time registration that's the right tradeoff
+                     (the system is broken anyway if registration
+                     fails, and asynchronous walks will discover the
+                     missing entry quickly).
+
 All responses are SEND_DELIVERs aimed at the caller-supplied
 reply_cap; the result lands in the receiver's R3..R5 / O2 (after
 queue-dispatch overlay shifts caller's R4..R7 → R3..R6 and the
@@ -128,10 +154,11 @@ SERVICE_MAX_CAPS   = 0x5B   # R|W|S|V|C — what oriscrun synthesizes refs with
 
 # ---- Operation codes -----------------------------------------------------
 
-OP_REGISTER = 1
-OP_MOUNT    = 2
-OP_WALK     = 3
-OP_LIST     = 4
+OP_REGISTER     = 1
+OP_MOUNT        = 2
+OP_WALK         = 3
+OP_LIST         = 4
+OP_REG_INLINE   = 5     # Phase 47: inline-path register (no ObjAlloc needed)
 
 # ---- Node-kind codes (returned in R4 of OP_WALK responses) ---------------
 
@@ -440,6 +467,16 @@ class OriscDir:
             self._log(f"SEND to unknown obj idx={ref_index(recipient_ref)}")
             return
         op = int_payload[0]
+
+        # Phase 47: OP_REG_INLINE packs the path into the spare bytes
+        # of int_payload + or_payload (32 bytes total) so callers
+        # without ObjAlloc — Python device daemons — can self-register.
+        # Fire-and-forget: no reply, no reply_cap. Dispatched here
+        # before the path-bytes-via-OBJ_READ machinery below.
+        if op == OP_REG_INLINE:
+            self._do_register_inline(pkt["src_pid"], int_payload, or_payload)
+            return
+
         reply_cap = or_payload[2]   # caller's O3
         if reply_cap == 0:
             self._log(f"op {op} from pid={pkt['src_pid']} with null reply_cap; "
@@ -520,6 +557,77 @@ class OriscDir:
         self._reply(pr.reply_cap, status, secondary, tertiary, ref)
 
     # ---- the actual operations ------------------------------------------
+
+    def _decode_inline_path(self, int_payload, or_payload, path_len):
+        """Reassemble a path packed into int_payload[2..3] (8 bytes
+        low-to-high) followed by or_payload[1..3] (24 bytes) — the
+        wire format of OP_REG_INLINE. Returns the path bytes
+        (may include trailing garbage past path_len; caller slices)."""
+        # int_payload[2] is the low 32 bits of bytes 0..3, int_payload[3]
+        # is bytes 4..7; both are little-endian 32-bit values.
+        b = bytearray()
+        b += struct.pack("<I", int_payload[2] & 0xFFFFFFFF)
+        b += struct.pack("<I", int_payload[3] & 0xFFFFFFFF)
+        # or_payload entries are 64-bit; pack each as little-endian.
+        for i in range(1, 4):
+            b += struct.pack("<Q", or_payload[i] & 0xFFFFFFFFFFFFFFFF)
+        return bytes(b[:path_len])
+
+    def _do_register_inline(self, src_pid, int_payload, or_payload) -> None:
+        """Phase 47: fire-and-forget register variant for callers
+        without ObjAlloc. Path packed inline, ref to register lives in
+        or_payload[0]. No reply — failures only surface in this log."""
+        path_len = int_payload[1] & 0xFFFFFFFF
+        if path_len == 0 or path_len > 32:
+            self._log(f"REG_INLINE from pid={src_pid}: bad path_len={path_len}")
+            return
+        ref_to_register = or_payload[0]
+        if ref_to_register == 0:
+            self._log(f"REG_INLINE from pid={src_pid}: null ref to register")
+            return
+        path_bytes = self._decode_inline_path(int_payload, or_payload, path_len)
+        try:
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            self._log(f"REG_INLINE from pid={src_pid}: non-utf-8 path bytes")
+            return
+        comps = normalize_path(path)
+        if comps is None:
+            self._log(f"REG_INLINE from pid={src_pid}: relative path {path!r}")
+            return
+        # Walk-or-create — same shape as _do_register, just no reply
+        # at the end.
+        node = self.root
+        for c in comps[:-1]:
+            if node.kind() == KIND_LEAF or node.kind() == KIND_MOUNT:
+                self._log(f"REG_INLINE {path!r}: traverses through "
+                          f"non-dir at {c!r}")
+                return
+            if c not in node.children:
+                node.children[c] = Node(name=c, parent=node)
+            node = node.children[c]
+        last = comps[-1] if comps else ""
+        if not last:
+            self._log(f"REG_INLINE {path!r}: refusing to register root")
+            return
+        if node.kind() == KIND_LEAF or node.kind() == KIND_MOUNT:
+            self._log(f"REG_INLINE {path!r}: parent isn't a dir")
+            return
+        if last in node.children:
+            existing = node.children[last]
+            if existing.kind() != KIND_DIR or existing.children:
+                self._log(f"REG_INLINE {path!r}: already populated "
+                          f"(kind={existing.kind()})")
+                return
+            existing.leaf_ref = ref_to_register
+            self._log(f"register-inline {path!r} → 0x{ref_to_register:016x} "
+                      f"(promoted from empty dir, src=pid{src_pid})")
+            return
+        node.children[last] = Node(
+            name=last, parent=node, leaf_ref=ref_to_register
+        )
+        self._log(f"register-inline {path!r} → 0x{ref_to_register:016x} "
+                  f"(src=pid{src_pid})")
 
     def _do_register(self, pr: PendingRequest, path_bytes: bytes) -> None:
         try:

@@ -386,6 +386,44 @@ render_term_path(int n, const char *suffix, char *buf)
 	return p;
 }
 
+/* Phase 47: walk a path in oriscdir; if it resolves to a LEAF, the
+ * resolved ref is in DIR_RESULT_SLOT (offset 616) per dir_walk's
+ * contract. Returns 0 on a successful LEAF resolution, -6 when no
+ * directory is wired (caller should keep the existing OPR), or
+ * other negative codes on real errors.
+ *
+ * Retries on -2 (NOT_FOUND): device daemons self-register at
+ * startup but the registration packet may still be in flight when
+ * the supervisor's first walk lands. Each retry is naturally
+ * spaced by the wire round-trip of the failed walk (~ms scale),
+ * so 50 attempts give the orchestrator plenty of slack to deliver
+ * the registration. NO_DIRECTORY (-6) doesn't retry — the absence
+ * of an oriscdir is structural, not a race.
+ *
+ * The CALLER follows up with `orefld oN, 616(o12)` to load the
+ * resolved ref into the target OPR — we can't index OPRs at
+ * runtime, so per-target OREFLDs live in main() right after each
+ * call. */
+static int
+sup_walk_for_opr(const char *path)
+{
+	int kind;
+	char rem[16];          /* unused for LEAFs, just satisfies the API */
+	int attempt;
+	for (attempt = 0; attempt < 50; attempt++) {
+		int rc = dir_walk(path, &kind, rem, sizeof(rem));
+		if (rc == -6)               return -6;       /* no directory */
+		if (rc == -2) {                              /* not found yet */
+			task_yield();           /* let other CPUs / devices run */
+			continue;
+		}
+		if (rc < 0)                 return rc;       /* real error */
+		if (kind != DIR_KIND_LEAF)  return -1;
+		return 0;
+	}
+	return -2;     /* timed out waiting for registration */
+}
+
 /* Relay an op=1 spawn request to the peer supervisor for
  * `target_pid`. Phase 45f: we look up the peer's spawn-mailbox
  * sub-cap via dir_walk("/sys/cpu/<N>/supervisor") rather than
@@ -609,6 +647,59 @@ main(void)
 		: "r1"
 	);
 
+	/* Read PROCID early — Phase 47's directory walks need it to
+	 * select /sys/term/<procid>/{console,keyboard,grid}, and the
+	 * later self-register / banner / leader-only blocks read it
+	 * too. */
+	int procid    = read_procid();
+	int is_leader = (procid == 0);
+
+	/* Phase 47: walk the directory for our boot service refs. After
+	 * 45h+47, devices self-register at /sys/term/<N>/* and
+	 * /sys/hostfsd/0 (oriscterm and hostfsd both do an inline-register
+	 * SEND at startup). The supervisor's job here is to pick up those
+	 * refs from the directory and stash them in O5/O6/O7/O10 — the
+	 * boot OPR slots that hf_init reads, and that orx_task_create
+	 * inherits to spawned children.
+	 *
+	 * In a fully directory-driven boot, the only --service wire each
+	 * CPU needs is O8 = oriscdir. The walks below populate everything
+	 * else from there. In a legacy boot with --service-wired O5/O6/O7/
+	 * O10, the walks return -6 (no directory) and we keep the wired
+	 * boot OPRs unchanged — same effective state, no breakage.
+	 *
+	 * Each walk publishes the resolved ref into DIR_RESULT_SLOT (616).
+	 * We OREFLD it into the target OPR via inline asm. pcc treats
+	 * O5/O6/O7/O10 as caller-save scratch but doesn't actually use
+	 * them in the supervisor's main(), so the values survive until
+	 * orx_spawn / hf_init consume them.
+	 *
+	 * Procid-aware: each CPU walks ITS OWN /sys/term/<procid>/*
+	 * subtree, so a multi-terminal boot (Phase 46) with a real
+	 * terminal per CPU lands the right binding without configuration. */
+	{
+		char path[PEER_PATH_BUF_SIZE];
+
+		render_term_path(procid, "console", path);
+		if (sup_walk_for_opr(path) == 0)
+			asm volatile("orefld o5, %0(o12)"
+			             :: "i"(DIR_RESULT_SLOT_OFFSET));
+
+		render_term_path(procid, "keyboard", path);
+		if (sup_walk_for_opr(path) == 0)
+			asm volatile("orefld o6, %0(o12)"
+			             :: "i"(DIR_RESULT_SLOT_OFFSET));
+
+		render_term_path(procid, "grid", path);
+		if (sup_walk_for_opr(path) == 0)
+			asm volatile("orefld o7, %0(o12)"
+			             :: "i"(DIR_RESULT_SLOT_OFFSET));
+
+		if (sup_walk_for_opr("/sys/hostfsd/0") == 0)
+			asm volatile("orefld o10, %0(o12)"
+			             :: "i"(DIR_RESULT_SLOT_OFFSET));
+	}
+
 	hf_init();
 	orx_init();
 
@@ -616,9 +707,6 @@ main(void)
 	 * of our mailbox in O8. orx_task_create reads
 	 * ORX_SLOT_CHILD_O8 and does the swap transparently. */
 	install_child_o8_override();
-
-	int procid    = read_procid();
-	int is_leader = (procid == 0);
 
 	print_str(is_leader ? banner_leader : banner_worker);
 
@@ -687,75 +775,23 @@ main(void)
 		}
 	}
 
-	/* Phase 46: per-CPU terminal registration. If this CPU has a
-	 * terminal in O5 (boot.sh wired oriscterm services for it),
-	 * publish the three component refs under /sys/term/<procid>/...
-	 * with my own procid as the instance index. Each CPU registers
-	 * ITS OWN terminal — different CPUs see different oriscterm
-	 * processes (boot.sh launches multiple), so the directory ends
-	 * up with /sys/term/0/*, /sys/term/1/*, ... one subtree per
-	 * terminal-bearing CPU.
+	/* Phase 47: device registration is no longer the supervisor's job —
+	 * oriscterm and hostfsd self-register at /sys/term/<N>/* and
+	 * /sys/hostfsd/<N> respectively via the inline-register wire op
+	 * (DIR_OP_REG_INLINE = 5; see tools/devices/oriscdir's docstring).
+	 * The supervisor walked the directory above to populate its own
+	 * O5/O6/O7/O10 working OPRs; those are the boot ABI for spawned
+	 * children, not registry inputs.
 	 *
-	 * This generalizes Phase 45h's hardcoded "/sys/term/0" — that
-	 * was leader-only because there was only one terminal anyway.
-	 * Now any CPU with terminal refs registers them under its own
-	 * procid. CPUs without a terminal (e.g., the workers in
-	 * test_supervisor_multicpu.sh / test_supervisor_run_at.sh,
-	 * which wire null O5/O6/O7) skip the registration entirely.
-	 *
-	 * The has_terminal probe via OISN tells us whether boot.sh
-	 * wired a real oriscterm console into O5 (zeroed out by the
-	 * "0=0@0" pad spec produces a literal-zero ref → OISN = 1). */
+	 * has_terminal is now a property of the directory walk: O5
+	 * non-null after the walks-above means we have a console to
+	 * spawn a shell against. The OISN probe matches the wired-boot
+	 * fallback case too (boot.sh that still wires --service for O5
+	 * lands the same value via boot wiring; the walk fails -6, the
+	 * orefld doesn't run, and O5 keeps the wired value). */
 	int has_terminal;
 	asm volatile("oisn %0, o5" : "=r"(has_terminal));
 	has_terminal = !has_terminal;     /* OISN sets 1 when null */
-
-	if (has_terminal) {
-		char path[PEER_PATH_BUF_SIZE];
-		int reg_status;
-
-		render_term_path(procid, "console", path);
-		asm volatile("omov o1, o5");
-		reg_status = dir_register(path);
-		if (reg_status != 0) {
-			SUP_PRINT("supervisor: dir_register console failed (");
-			SUP_PRINT_INT(reg_status);
-			SUP_PRINT(") — continuing\n");
-		}
-
-		render_term_path(procid, "keyboard", path);
-		asm volatile("omov o1, o6");
-		reg_status = dir_register(path);
-		if (reg_status != 0) {
-			SUP_PRINT("supervisor: dir_register keyboard failed (");
-			SUP_PRINT_INT(reg_status);
-			SUP_PRINT(") — continuing\n");
-		}
-
-		render_term_path(procid, "grid", path);
-		asm volatile("omov o1, o7");
-		reg_status = dir_register(path);
-		if (reg_status != 0) {
-			SUP_PRINT("supervisor: dir_register grid failed (");
-			SUP_PRINT_INT(reg_status);
-			SUP_PRINT(") — continuing\n");
-		}
-	}
-
-	/* /sys/hostfsd/0 stays leader-only — there's only one hostfsd
-	 * daemon today and procid==0 is the canonical owner of singleton
-	 * resources. (When we want multiple hostfsd instances, this
-	 * generalizes the same way as terminals do.) */
-	if (is_leader) {
-		int reg_status;
-		asm volatile("omov o1, o10");
-		reg_status = dir_register("/sys/hostfsd/0");
-		if (reg_status != 0) {
-			SUP_PRINT("supervisor: dir_register /sys/hostfsd/0 failed (");
-			SUP_PRINT_INT(reg_status);
-			SUP_PRINT(") — continuing\n");
-		}
-	}
 
 	/* Phase 46: any CPU with a terminal spawns its own shell, bound
 	 * to its own boot O5/O6/O7. Multiple oriscterm instances + per-
@@ -772,6 +808,26 @@ main(void)
 	 * harnesses that wire term to procid 0 only, null pads for procid
 	 * 1) that collapses to the prior behaviour. */
 	if (has_terminal) {
+		/* Phase 47: workers race the leader's /programs mount. If we
+		 * try to spawn the shell before /programs is mounted in
+		 * oriscdir, vfs_open returns NOT_FOUND → orx_spawn returns
+		 * -1. Wait for the mount by walking it; only proceed once
+		 * the leader has installed it. The leader (procid==0) just
+		 * mounted above, so its first walk succeeds immediately.
+		 *
+		 * 50 attempts × ~ms-scale wire round-trips ≈ tens of ms; in
+		 * practice the leader's mount lands well before the workers
+		 * reach this point under any reasonable boot ordering. */
+		{
+			int kind, attempt;
+			char rem[16];
+			for (attempt = 0; attempt < 50; attempt++) {
+				int rc = dir_walk("/programs", &kind, rem, sizeof(rem));
+				if (rc >= 0 && kind == DIR_KIND_MOUNT) break;
+				if (rc == -6) break;     /* no directory; legacy boot */
+				task_yield();
+			}
+		}
 		task_t shell = orx_spawn(SHELL_PATH, "", "/");
 		if (shell < 0) {
 			SUP_PRINT("supervisor: failed to spawn shell: ");

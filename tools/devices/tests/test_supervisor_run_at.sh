@@ -101,24 +101,27 @@ python3 tools/sim/oriscbar --socket "$SOCK" >/dev/null 2>&1 &
 BAR=$!
 for _ in $(seq 50); do [ -S "$SOCK" ] && break; sleep 0.05; done
 
-python3 tools/devices/hostfsd \
-    --socket "$SOCK" --pid 17 --root "$TMP/jail" \
-    > "$TMP/hf.out" 2>&1 &
-HF=$!
-for _ in $(seq 50); do
-    grep -q "hostfsd READY" "$TMP/hf.out" 2>/dev/null && break
-    sleep 0.05
-done
-
-# Phase 45f: launch the directory daemon. Both supervisors will
-# register themselves at /sys/cpu/<procid>/supervisor and the
-# leader looks up its peer via dir_walk on the same path.
+# Phase 47: launch oriscdir BEFORE other devices, so their
+# self-registration packets find a live target. With Phase 47's
+# inline-register op, hostfsd and fake_terminal both SEND a
+# DIR_OP_REG_INLINE during startup; if oriscdir isn't connected
+# yet, oriscbar drops the packet and the supervisor's later
+# directory walk finds nothing.
 python3 tools/devices/oriscdir \
     --socket "$SOCK" --pid 18 -v \
     > "$TMP/dir.out" 2>&1 &
 DIR=$!
 for _ in $(seq 50); do
     grep -q "oriscdir READY" "$TMP/dir.out" 2>/dev/null && break
+    sleep 0.05
+done
+
+python3 tools/devices/hostfsd --directory-pid 18 --instance 0 \
+    --socket "$SOCK" --pid 17 --root "$TMP/jail" \
+    > "$TMP/hf.out" 2>&1 &
+HF=$!
+for _ in $(seq 50); do
+    grep -q "hostfsd READY" "$TMP/hf.out" 2>/dev/null && break
     sleep 0.05
 done
 
@@ -159,6 +162,7 @@ done
 #        exit<RET>
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
+    --directory-pid 18 --instance 0 \
     --event key:l --event key:s --event key:0x10D \
     --event key:c --event key:d --event key:0x20 --event key:p --event key:r --event key:o --event key:g --event key:r --event key:a --event key:m --event key:s --event key:0x10D \
     --event key:l --event key:s --event key:0x10D \

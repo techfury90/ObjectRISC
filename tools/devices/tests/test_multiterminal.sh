@@ -79,21 +79,23 @@ python3 tools/sim/oriscbar --socket "$SOCK" >/dev/null 2>&1 &
 BAR=$!
 for _ in $(seq 50); do [ -S "$SOCK" ] && break; sleep 0.05; done
 
-python3 tools/devices/hostfsd \
-    --socket "$SOCK" --pid 17 --root "$TMP/jail" \
-    > "$TMP/hf.out" 2>&1 &
-HF=$!
-for _ in $(seq 50); do
-    grep -q "hostfsd READY" "$TMP/hf.out" 2>/dev/null && break
-    sleep 0.05
-done
-
+# Phase 47: oriscdir first, then everything else. Devices' inline
+# self-registration packets need a live oriscdir to land at.
 python3 tools/devices/oriscdir \
     --socket "$SOCK" --pid 18 -v \
     > "$TMP/dir.out" 2>&1 &
 DIR=$!
 for _ in $(seq 50); do
     grep -q "oriscdir READY" "$TMP/dir.out" 2>/dev/null && break
+    sleep 0.05
+done
+
+python3 tools/devices/hostfsd --directory-pid 18 --instance 0 \
+    --socket "$SOCK" --pid 17 --root "$TMP/jail" \
+    > "$TMP/hf.out" 2>&1 &
+HF=$!
+for _ in $(seq 50); do
+    grep -q "hostfsd READY" "$TMP/hf.out" 2>/dev/null && break
     sleep 0.05
 done
 
@@ -115,6 +117,7 @@ TERM16_KEYS="\
 
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
+    --directory-pid 18 --instance 0 \
     $TERM16_KEYS \
     --linger 12.0 --delay 0.20 \
     > "$TMP/term16.out" 2>&1 &
@@ -122,6 +125,7 @@ TERM16_PID=$!
 
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 19 \
+    --directory-pid 18 --instance 1 \
     $TERM16_KEYS \
     --linger 12.0 --delay 0.20 \
     > "$TMP/term19.out" 2>&1 &

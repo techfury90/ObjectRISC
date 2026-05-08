@@ -105,6 +105,13 @@ CAP_C = 0x40
 # ---- Service constants ---------------------------------------------------
 
 FS_SERVICE_INDEX = 1
+
+# Phase 47: oriscdir's wire-protocol op for inline self-registration.
+# Path packed into int_payload[2..3] (8 bytes) + or_payload[1..3]
+# (24 bytes); or_payload[0] carries the ref to register;
+# fire-and-forget (no reply). See tools/devices/oriscdir docstring.
+DIR_SERVICE_INDEX = 1
+OP_REG_INLINE = 5
 SERVICE_GENERATION = 1
 SERVICE_MAX_CAPS = 0x5B   # R|W|S|V|C — what the launcher will mint refs with
 
@@ -268,10 +275,14 @@ class PendingRequest:
 
 class HostFSD:
     def __init__(self, sock_path: str, my_pid: int,
-                 root: Optional[Path] = None, verbose: bool = False):
+                 root: Optional[Path] = None, verbose: bool = False,
+                 dir_pid: Optional[int] = None,
+                 instance: int = 0):
         self.my_pid = my_pid
         self.root = root.resolve() if root else None
         self.verbose = verbose
+        self.dir_pid = dir_pid
+        self.instance = instance
         self.next_trans_id = 0
 
         # subscriber_ref → Session
@@ -342,9 +353,66 @@ class HostFSD:
         if self.verbose:
             print(f"hostfsd: {msg}", file=sys.stderr, flush=True)
 
+    # ---- Phase 47: directory self-registration ----------------------------
+
+    def _send_self_register(self, path: str) -> None:
+        """Send a DIR_OP_REG_INLINE packet to oriscdir publishing this
+        daemon's primary mailbox at `path`. Fire-and-forget — no reply
+        is awaited; failures only surface in oriscdir's stderr log.
+
+        The path is packed inline (max 32 bytes) into int_payload[2..3]
+        + or_payload[1..3]; the ref to register lives in or_payload[0].
+        See tools/devices/oriscdir's wire-protocol docstring."""
+        if self.dir_pid is None:
+            return
+        path_bytes = path.encode("utf-8")
+        if not 0 < len(path_bytes) <= 32:
+            self._log(f"register-self: path {path!r} length "
+                      f"{len(path_bytes)} not in 1..32")
+            return
+
+        # The ref to publish: a R+S sub-cap of our primary mailbox.
+        # R+S is the minimum a peer needs to SEND to us; no C cap so
+        # peers can't derive further sub-caps (that's the daemon's
+        # privilege).
+        my_ref = make_ref(generation=SERVICE_GENERATION, home=self.my_pid,
+                          index=FS_SERVICE_INDEX, caps=CAP_R | CAP_S)
+        # oriscdir's primary mailbox.
+        dir_ref = make_ref(generation=SERVICE_GENERATION, home=self.dir_pid,
+                           index=DIR_SERVICE_INDEX, caps=CAP_R | CAP_S)
+
+        # Pack 32 bytes of path data into the int_payload + or_payload
+        # spare fields. Pad with NULs out to 32 bytes so the packing
+        # is uniform regardless of path length.
+        padded = path_bytes + b'\x00' * (32 - len(path_bytes))
+        (b0_3,)  = struct.unpack("<I", padded[0:4])
+        (b4_7,)  = struct.unpack("<I", padded[4:8])
+        (b8_15,)  = struct.unpack("<Q", padded[8:16])
+        (b16_23,) = struct.unpack("<Q", padded[16:24])
+        (b24_31,) = struct.unpack("<Q", padded[24:32])
+
+        int_payload = [OP_REG_INLINE, len(path_bytes), b0_3, b4_7]
+        or_payload  = [my_ref, b8_15, b16_23, b24_31]
+
+        pkt = build_send_deliver(self.my_pid, self.dir_pid,
+                                 self._next_trans(), dir_ref,
+                                 int_payload, or_payload)
+        self.send_packet(pkt)
+        self._log(f"register-self: {path!r} via oriscdir pid={self.dir_pid}")
+
     # ---- main loop --------------------------------------------------------
 
     def run(self) -> None:
+        # Phase 47: self-register at /sys/hostfsd/<instance> BEFORE
+        # READY. The orchestrator waits for READY and immediately
+        # launches CPUs whose supervisors walk the directory at boot
+        # — racing the registration if we send it after READY. By
+        # putting the SEND first, we guarantee the bytes are at
+        # least in oriscbar's queue (and by the time the orchestrator
+        # has launched a CPU and the CPU has booted enough to walk,
+        # oriscbar has long since dispatched the register packet).
+        if self.dir_pid is not None:
+            self._send_self_register(f"/sys/hostfsd/{self.instance}")
         print(f"hostfsd READY pid={self.my_pid}", flush=True)
         sel = selectors.DefaultSelector()
         sel.register(self.sock, selectors.EVENT_READ)
@@ -759,6 +827,15 @@ def main(argv) -> int:
     ap.add_argument("--root", type=Path, default=None,
                     help="restrict file access to this directory "
                          "(default: full host filesystem access)")
+    ap.add_argument("--directory-pid", type=int, default=None,
+                    help="oriscdir's pid; if set, this daemon will "
+                         "self-register at /sys/hostfsd/<instance> "
+                         "via the inline-register wire op (Phase 47)")
+    ap.add_argument("--instance", type=int, default=0,
+                    help="hostfsd instance number for the directory "
+                         "path; defaults to 0 (the first hostfsd in "
+                         "the system). Only consulted when "
+                         "--directory-pid is set.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -766,7 +843,9 @@ def main(argv) -> int:
         sys.exit(f"hostfsd: --root {args.root}: not a directory")
 
     server = HostFSD(args.socket, args.pid, root=args.root,
-                     verbose=args.verbose)
+                     verbose=args.verbose,
+                     dir_pid=args.directory_pid,
+                     instance=args.instance)
 
     def _signal(_signo, _frame):
         server.shutdown_requested = True

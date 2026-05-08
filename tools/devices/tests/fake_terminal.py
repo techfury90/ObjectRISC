@@ -87,6 +87,49 @@ def build_obj_read_req(src_pid, dst_pid, trans, ref, offset, width):
 def ref_home(r): return (r >> 40) & 0xFF
 def ref_index(r): return (r >> 16) & 0xFFFFFF
 
+def make_ref(generation, home, index, caps):
+    return ((generation & 0xFFFF) << 48) | \
+           ((home       & 0xFF)   << 40) | \
+           ((index      & 0xFFFFFF) << 16) | \
+           ((caps       & 0xFF)   << 8)
+
+# Phase 47: oriscdir's wire-protocol op for inline self-registration.
+# Mirrors the real oriscterm: fake_terminal must publish its own
+# console/keyboard/grid sub-caps under /sys/term/<instance>/* so the
+# supervisor's directory-walk-init finds them (no boot --service
+# wiring on multi-terminal-aware CPUs).
+DIR_SERVICE_INDEX  = 1
+SERVICE_GENERATION = 1
+OP_REG_INLINE      = 5
+CAP_R = 0x01
+CAP_S = 0x08
+
+CONSOLE_INDEX  = 1
+KEYBOARD_INDEX = 2
+GRID_INDEX     = 3
+
+def send_inline_register(sock, my_pid, dir_pid, my_index, path):
+    """Send a single DIR_OP_REG_INLINE packet that publishes a R+S
+    sub-cap of (my_pid, my_index) at `path`. Path is packed inline
+    into int_payload[2..3] + or_payload[1..3] (32-byte budget) per
+    oriscdir's docstring. Fire-and-forget — no reply awaited."""
+    path_bytes = path.encode("utf-8")
+    if not 0 < len(path_bytes) <= 32:
+        return
+    my_ref  = make_ref(SERVICE_GENERATION, my_pid,  my_index,        CAP_R | CAP_S)
+    dir_ref = make_ref(SERVICE_GENERATION, dir_pid, DIR_SERVICE_INDEX, CAP_R | CAP_S)
+    padded = path_bytes + b'\x00' * (32 - len(path_bytes))
+    (b0_3,)   = struct.unpack("<I", padded[0:4])
+    (b4_7,)   = struct.unpack("<I", padded[4:8])
+    (b8_15,)  = struct.unpack("<Q", padded[8:16])
+    (b16_23,) = struct.unpack("<Q", padded[16:24])
+    (b24_31,) = struct.unpack("<Q", padded[24:32])
+    int_payload = [OP_REG_INLINE, len(path_bytes), b0_3, b4_7]
+    or_payload  = [my_ref, b8_15, b16_23, b24_31]
+    pkt = build_send_deliver(my_pid, dir_pid, 0, dir_ref,
+                             int_payload, or_payload)
+    sock.sendall(struct.pack(">I", len(pkt)) + pkt)
+
 
 class FakeTerminal:
     def __init__(self, sock, pid):
@@ -406,6 +449,13 @@ def main():
                     help="seconds to keep the connection open after the "
                          "last event (default 0.3)")
     ap.add_argument("--subscribe-timeout", type=float, default=10.0)
+    ap.add_argument("--directory-pid", type=int, default=None,
+                    help="oriscdir pid; if set, fake_terminal "
+                         "self-registers at /sys/term/<instance>/* "
+                         "via the inline-register wire op (Phase 47)")
+    ap.add_argument("--instance", type=int, default=0,
+                    help="terminal instance number for the directory "
+                         "path; defaults to 0")
     args = ap.parse_args()
 
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -415,6 +465,20 @@ def main():
     if magic != HELLO_MAGIC or status != 0:
         sys.exit(f"fake_terminal: handshake failed magic={magic:#x} "
                  f"status={status:#x}")
+
+    # Phase 47: self-register console/keyboard/grid in oriscdir
+    # before printing READY so any supervisor that boots after we
+    # do can find us via dir_walk. This must happen on the blocking
+    # socket — once we go non-blocking the bytes might not flush.
+    if args.directory_pid is not None:
+        base = f"/sys/term/{args.instance}"
+        send_inline_register(s, args.pid, args.directory_pid,
+                             CONSOLE_INDEX,  f"{base}/console")
+        send_inline_register(s, args.pid, args.directory_pid,
+                             KEYBOARD_INDEX, f"{base}/keyboard")
+        send_inline_register(s, args.pid, args.directory_pid,
+                             GRID_INDEX,     f"{base}/grid")
+
     print(f"fake_terminal READY pid={args.pid}", flush=True)
     s.setblocking(False)
 
