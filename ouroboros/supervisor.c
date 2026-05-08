@@ -661,6 +661,72 @@ main(void)
 		}
 	}
 
+	/* Phase 45h: leader publishes the boot devices into the directory
+	 * tree as service-discovery LEAF nodes. Programs that want to
+	 * find a terminal or hostfsd handle can dir_walk the path and
+	 * pull the ref out of DIR_RESULT_SLOT — instead of (or alongside)
+	 * the existing boot-O5/O6/O7/O10 wiring.
+	 *
+	 * The supervisor is the natural place to do this because:
+	 *   - It's a real CPU program with ObjAlloc / SEND, unlike the
+	 *     Python device daemons (oriscterm, hostfsd) which can't
+	 *     allocate the TAG_DATA path-bytes object dir_register
+	 *     needs as O2.
+	 *   - It already has every device's full ref in its boot OPRs;
+	 *     no extra wire-discovery round-trip needed.
+	 *   - It already self-registers (/sys/cpu/<N>/supervisor) and
+	 *     mounts (/programs), so this is the same code shape.
+	 *
+	 * Path conventions:
+	 *   /sys/term/0/console     ← O5  (oriscterm console object)
+	 *   /sys/term/0/keyboard    ← O6  (oriscterm keyboard object)
+	 *   /sys/term/0,grid        ← O7  (oriscterm grid canvas)
+	 *   /sys/hostfsd/0          ← O10 (host filesystem service)
+	 *
+	 * The "/0" instance suffix is forward-looking — Phase 46 wants
+	 * multi-terminal, so /sys/term/N for N > 0 is the natural way
+	 * to extend.
+	 *
+	 * Failure handling: dir_register returns -6 when no directory
+	 * is wired (single-CPU test harnesses without oriscdir); we
+	 * bail silently so the shell still comes up. In a normal boot
+	 * with a directory we expect every register to succeed. */
+	if (is_leader) {
+		int reg_status;
+
+		asm volatile("omov o1, o5");
+		reg_status = dir_register("/sys/term/0/console");
+		if (reg_status != 0) {
+			SUP_PRINT("supervisor: dir_register /sys/term/0/console failed (");
+			SUP_PRINT_INT(reg_status);
+			SUP_PRINT(") — continuing\n");
+		}
+
+		asm volatile("omov o1, o6");
+		reg_status = dir_register("/sys/term/0/keyboard");
+		if (reg_status != 0) {
+			SUP_PRINT("supervisor: dir_register /sys/term/0/keyboard failed (");
+			SUP_PRINT_INT(reg_status);
+			SUP_PRINT(") — continuing\n");
+		}
+
+		asm volatile("omov o1, o7");
+		reg_status = dir_register("/sys/term/0/grid");
+		if (reg_status != 0) {
+			SUP_PRINT("supervisor: dir_register /sys/term/0/grid failed (");
+			SUP_PRINT_INT(reg_status);
+			SUP_PRINT(") — continuing\n");
+		}
+
+		asm volatile("omov o1, o10");
+		reg_status = dir_register("/sys/hostfsd/0");
+		if (reg_status != 0) {
+			SUP_PRINT("supervisor: dir_register /sys/hostfsd/0 failed (");
+			SUP_PRINT_INT(reg_status);
+			SUP_PRINT(") — continuing\n");
+		}
+	}
+
 	/* Phase 45c: only the leader (PROCID 0) spawns the shell. Worker
 	 * supervisors sit in the dispatch loop ready to service spawn
 	 * requests from peers — today nothing SENDs to them, but the
