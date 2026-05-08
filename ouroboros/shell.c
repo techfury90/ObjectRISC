@@ -80,6 +80,9 @@ const char help_msg[] =
     "  ls [<path>]     — list a host directory (default: cwd)\n"
     "  cd [<path>]     — change working directory (no arg → '/')\n"
     "  pwd             — print the current working directory\n"
+    "  mkdir <path>    — create a directory (parents must already exist)\n"
+    "  rm <path>       — remove a file (refuses on directories)\n"
+    "  touch <path>    — create an empty file or no-op if it exists\n"
     "  echo <text>     — print the rest of the line\n"
     "  run <path>[&]   — load + run another .orx as a child task ('&' = background)\n"
     "  edit [<path>]   — shorthand for `run /programs/edit.orx <path> &`\n"
@@ -353,6 +356,83 @@ static void
 cmd_help(void)
 {
 	print_paginated(help_msg);
+}
+
+/* Phase 50: filesystem mutation builtins. All three take a single
+ * path argument, run a one-shot vfs_* call, and print a short error
+ * line on failure. No -p / -r flags — those would push us toward a
+ * proper getopt-style parser, out of scope here.
+ *
+ * Errors we surface explicitly (vs. a generic "failed (-N)"):
+ *   -3 (E_NOENT) = parent missing  → "no such file or directory"
+ *   -4 (E_ACCES) = path escapes jail / no perm
+ *                                   → "permission denied"
+ *   -7 (E_EXIST) = entry exists (mkdir) / target is a directory
+ *                  (rm)             → "file exists" / "is a directory" */
+static void
+cmd_print_fs_error(const char *cmd, const char *arg, int rc)
+{
+	term_print(cmd);
+	term_print(": ");
+	if      (rc == -3) term_print("no such file or directory: '");
+	else if (rc == -4) term_print("permission denied: '");
+	else if (rc == -7) term_print("file exists: '");
+	else               term_print("error: '");
+	term_print(arg);
+	term_print("'");
+	if (rc != -3 && rc != -4 && rc != -7) {
+		term_print(" (");
+		term_print_int(rc);
+		term_print(")");
+	}
+	term_print("\n");
+}
+
+static void
+cmd_mkdir(const char *cwd, const char *arg)
+{
+	char path[PATH_MAX];
+	if (!*arg) { term_print("mkdir: missing operand\n"); return; }
+	resolve_path(cwd, arg, path);
+	int rc = vfs_mkdir(path);
+	if (rc < 0) cmd_print_fs_error("mkdir", arg, rc);
+}
+
+static void
+cmd_rm(const char *cwd, const char *arg)
+{
+	char path[PATH_MAX];
+	if (!*arg) { term_print("rm: missing operand\n"); return; }
+	resolve_path(cwd, arg, path);
+	int rc = vfs_unlink(path);
+	if (rc < 0) {
+		/* Use a different label for "is a directory" — vfs_unlink
+		 * returns E_EXIST in that case, but the user-facing message
+		 * is more natural as "is a directory" since they're trying
+		 * to delete it, not create it. */
+		if (rc == -7) {
+			term_print("rm: '");
+			term_print(arg);
+			term_print("' is a directory\n");
+		} else {
+			cmd_print_fs_error("rm", arg, rc);
+		}
+	}
+}
+
+static void
+cmd_touch(const char *cwd, const char *arg)
+{
+	char path[PATH_MAX];
+	if (!*arg) { term_print("touch: missing operand\n"); return; }
+	resolve_path(cwd, arg, path);
+	/* O_WRONLY | O_CREAT — create if missing, succeed if exists.
+	 * No O_TRUNC: don't clobber existing content. The fd we get
+	 * back is immediately closed; the side-effect is the file's
+	 * existence with mtime updated by hostfsd's open. */
+	int fd = vfs_open(path, HF_O_WRONLY | HF_O_CREAT);
+	if (fd < 0) { cmd_print_fs_error("touch", arg, fd); return; }
+	vfs_close(fd);
 }
 
 static void
@@ -1015,6 +1095,12 @@ main(void)
 			cmd_cd(cwd, *arg ? arg : "/");
 		} else if (strcmp(line, "pwd") == 0) {
 			cmd_pwd(cwd);
+		} else if (strcmp(line, "mkdir") == 0) {
+			cmd_mkdir(cwd, arg);
+		} else if (strcmp(line, "rm") == 0) {
+			cmd_rm(cwd, arg);
+		} else if (strcmp(line, "touch") == 0) {
+			cmd_touch(cwd, arg);
 		} else if (strcmp(line, "echo") == 0) {
 			cmd_echo(arg);
 		} else if (strcmp(line, "run") == 0) {
