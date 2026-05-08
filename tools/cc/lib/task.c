@@ -135,8 +135,19 @@
  *          run — both of those internally clobber O1 (via oisn checks
  *          and ObjAlloc on first call), and the entry-saved value
  *          would otherwise be lost. The SEND that emits the wire op
- *          OREFLDs from this slot directly into O4. Phase 45f bugfix.) */
-#define ORX_STATE_BYTES   504
+ *          OREFLDs from this slot directly into O4. Phase 45f bugfix.)
+ *     + 8 (ORX_SLOT_CHILD_O5: terminal-pass-through console sub-cap
+ *          to inject into the child's O5 around TaskCreate. Set by
+ *          the supervisor when servicing a relayed spawn whose source
+ *          CPU's terminal differs from ours. Null = no override; child
+ *          inherits parent's O5 as before. Phase 49.)
+ *     + 8 (ORX_SLOT_O5_SAVE: transient stash for parent's O5 across
+ *          the override swap, mirror of ORX_SLOT_O8_SAVE.)
+ *     + 8 (ORX_SLOT_CHILD_O6: terminal-pass-through keyboard sub-cap.)
+ *     + 8 (ORX_SLOT_O6_SAVE: transient parent-O6 stash.)
+ *     + 8 (ORX_SLOT_CHILD_O7: terminal-pass-through grid sub-cap.)
+ *     + 8 (ORX_SLOT_O7_SAVE: transient parent-O7 stash.) */
+#define ORX_STATE_BYTES   552
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8
