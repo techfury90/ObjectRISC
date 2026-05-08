@@ -129,10 +129,23 @@ done
 #                                          to the supervisor; without
 #                                          a handler the shell would
 #                                          hang here)
+#        cd programs<RET>
+#        ls<RET>                         (MOUNT-backed listing — fills
+#                                          cmd_ls's stack LIST_BUF with
+#                                          a much larger hostfsd dump)
+#        cd /<RET>
+#        ls<RET>                         (back to DIR — a buggy vfs_list
+#                                          would return the wrong byte
+#                                          count and bleed leftover
+#                                          /programs entries through)
 #        run @1 /programs/hello.orx<RET>
 #        exit<RET>
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
+    --event key:l --event key:s --event key:0x10D \
+    --event key:c --event key:d --event key:0x20 --event key:p --event key:r --event key:o --event key:g --event key:r --event key:a --event key:m --event key:s --event key:0x10D \
+    --event key:l --event key:s --event key:0x10D \
+    --event key:c --event key:d --event key:0x20 --event key:0x2f --event key:0x10D \
     --event key:l --event key:s --event key:0x10D \
     --event key:r --event key:u --event key:n --event key:0x20 \
     --event key:0x40 --event key:0x31 --event key:0x20 \
@@ -142,7 +155,7 @@ python3 tools/devices/tests/fake_terminal.py \
     --event key:0x10D \
     --event key:e --event key:x --event key:i --event key:t \
     --event key:0x10D \
-    --linger 12.0 --delay 0.20 \
+    --linger 15.0 --delay 0.20 \
     > "$TMP/term.out" 2>&1 &
 TERM_PID=$!
 for _ in $(seq 50); do
@@ -247,5 +260,24 @@ true
 #    so the assertion fails if entries glom together.
 echo "$RENDER" | grep -qE '^programs/$' \
     || { echo "FAIL: 'programs/' not on its own line — ls entries collapsed (vfs_list NUL→\\n translation broken)" >&2; exit 1; }
+
+# 7) Phase 45g regression check: vfs_list's DIR branch must return
+#    the EXACT byte count of the listing, not walk past the end into
+#    leftover stack from a previous MOUNT-backed listing. Repro:
+#    `ls` (DIR) → `cd programs` → `ls` (MOUNT, fills LIST_BUF with
+#    file names) → `cd /` → `ls` (DIR again, only writes 15 bytes,
+#    leftover is everything past). A buggy length calculation prints
+#    the leftover too. Verify by counting occurrences of "hello.orx"
+#    in the rendering — it should appear EXACTLY ONCE (the
+#    `/programs` ls + the `run` line both count as the same string?
+#    no: "hello.orx" only appears in the file listing and the run
+#    command echo. Count "shell.orx" instead, which is unique to
+#    the file listing and would appear a second time if leftover
+#    leaked into the second root ls. */
+SHELL_ORX_COUNT=$(echo "$RENDER" | grep -c "shell.orx" || true)
+if [ "$SHELL_ORX_COUNT" -gt 1 ]; then
+    echo "FAIL: 'shell.orx' appears $SHELL_ORX_COUNT times — vfs_list DIR branch is leaking leftover MOUNT-listing bytes" >&2
+    exit 1
+fi
 
 echo "PASS"
