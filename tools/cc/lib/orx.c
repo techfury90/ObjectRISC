@@ -508,16 +508,29 @@ orx_init(void)
 }
 
 /* Byte offsets within O12 of the slots orx_task_create reads to
- * inject a custom O8 into the child (used by the supervisor in
- * Phase 45a so the spawned task's task_init harvests its sub-cap).
+ * inject custom OPRs into the child.
  *
- * ORX_SLOT_CHILD_O8 — the cap to put in O8 just before TaskCreate.
- *   Null in the common case (no override; child inherits parent's
- *   O8 as before).
- * ORX_SLOT_O8_SAVE — transient stash for the parent's O8 across
- *   TaskCreate when an override IS active. */
+ * ORX_SLOT_CHILD_O8 (Phase 45a) — the cap to put in O8 just before
+ *   TaskCreate (used by the supervisor so spawned tasks' task_init
+ *   harvests its sub-cap).
+ * ORX_SLOT_CHILD_O5/O6/O7 (Phase 49) — terminal-pass-through:
+ *   console/keyboard/grid sub-caps, set by the supervisor when
+ *   servicing a relayed spawn whose source CPU's terminal differs
+ *   from ours. Null = no override; child inherits parent's OPRs as
+ *   before. The receiver dir-walks /sys/term/<source>/* to populate
+ *   these, so a `run cmd` from a shell on CPU 0 round-robin'd to
+ *   CPU 1 still routes its term_print/term_getkey to terminal 0.
+ *
+ * Each CHILD_O* has a paired O*_SAVE slot — transient stash for the
+ * parent's OPR across the swap window inside orx_task_create. */
 #define ORX_SLOT_CHILD_O8_OFFSET 560
 #define ORX_SLOT_O8_SAVE_OFFSET  568
+#define ORX_SLOT_CHILD_O5_OFFSET 632
+#define ORX_SLOT_O5_SAVE_OFFSET  640
+#define ORX_SLOT_CHILD_O6_OFFSET 648
+#define ORX_SLOT_O6_SAVE_OFFSET  656
+#define ORX_SLOT_CHILD_O7_OFFSET 664
+#define ORX_SLOT_O7_SAVE_OFFSET  672
 
 /* TaskCreate(O1=code, O2=stack, O3=data, O4=args, R4=entry, R5=0)
  * — leave the resulting task ref in O1 for the caller to register
@@ -534,7 +547,7 @@ static int
 orx_task_create(unsigned int entry, int has_data)
 {
 	int status;
-	int o8_isn;
+	int o8_isn, o5_isn, o6_isn, o7_isn;
 
 	/* Probe ORX_SLOT_CHILD_O8 — non-null means we need the
 	 * O8-swap dance around TaskCreate. */
@@ -551,6 +564,49 @@ orx_task_create(unsigned int entry, int has_data)
 		asm volatile(
 			"orefst o8, 568(o12)\n"
 			"omov   o8, o14"
+		);
+	}
+
+	/* Phase 49: terminal-pass-through. Mirror the O8 swap dance for
+	 * O5/O6/O7 (console/keyboard/grid). The supervisor populates
+	 * these slots when a relayed spawn carries a foreign terminal
+	 * hint; for local-origin spawns the slots stay null and we skip.
+	 *
+	 * We probe each independently because a relay may resolve only
+	 * a subset (e.g., terminal has console+keyboard but no grid).
+	 * Probing via O14 is safe — orx_setup_args already clobbered
+	 * O14 above and we re-load it inside each probe block. */
+	asm volatile(
+		"orefld o14, 632(o12)\n"      /* ORX_SLOT_CHILD_O5 */
+		"oisn   %0, o14"
+		: "=r"(o5_isn) :: "r1"
+	);
+	if (!o5_isn) {
+		asm volatile(
+			"orefst o5, 640(o12)\n"   /* save parent's O5 */
+			"omov   o5, o14"          /* O5 = override */
+		);
+	}
+	asm volatile(
+		"orefld o14, 648(o12)\n"      /* ORX_SLOT_CHILD_O6 */
+		"oisn   %0, o14"
+		: "=r"(o6_isn) :: "r1"
+	);
+	if (!o6_isn) {
+		asm volatile(
+			"orefst o6, 656(o12)\n"
+			"omov   o6, o14"
+		);
+	}
+	asm volatile(
+		"orefld o14, 664(o12)\n"      /* ORX_SLOT_CHILD_O7 */
+		"oisn   %0, o14"
+		: "=r"(o7_isn) :: "r1"
+	);
+	if (!o7_isn) {
+		asm volatile(
+			"orefst o7, 672(o12)\n"
+			"omov   o7, o14"
 		);
 	}
 
@@ -603,6 +659,16 @@ orx_task_create(unsigned int entry, int has_data)
 	 * the parent's O8 from ORX_SLOT_O8_SAVE. */
 	if (!o8_isn) {
 		asm volatile("orefld o8, 568(o12)");
+	}
+	/* Phase 49: same for O5/O6/O7 if we swapped them. */
+	if (!o5_isn) {
+		asm volatile("orefld o5, 640(o12)");
+	}
+	if (!o6_isn) {
+		asm volatile("orefld o6, 656(o12)");
+	}
+	if (!o7_isn) {
+		asm volatile("orefld o7, 672(o12)");
 	}
 	return status;
 }

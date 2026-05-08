@@ -85,6 +85,17 @@
  * to the rest of orx_spawn. */
 #define ORX_SLOT_CHILD_O8_OFFSET 560
 
+/* Phase 49: terminal-pass-through. Mirror slots for O5/O6/O7
+ * (console/keyboard/grid). The supervisor sets these PER-SPAWN
+ * when servicing a relayed request that named a foreign terminal,
+ * then orx_task_create swaps them around TaskCreate (same dance
+ * as ORX_SLOT_CHILD_O8). We always clear them after orx_spawn so
+ * a subsequent local spawn doesn't accidentally inherit a stale
+ * override. */
+#define ORX_SLOT_CHILD_O5_OFFSET 632
+#define ORX_SLOT_CHILD_O6_OFFSET 648
+#define ORX_SLOT_CHILD_O7_OFFSET 664
+
 /* Byte offset within O12 of the supervisor's scratch slot — used
  * to stash the per-request reply_cap (sender's O3) across the
  * orx_spawn call, which clobbers O1..O3 via its manifest restore.
@@ -453,7 +464,7 @@ sup_walk_for_opr(const char *path)
  *      reply_cap rides along unchanged so the peer's eventual
  *      response goes straight back to the original requester. */
 static int
-relay_spawn_request(int len, int target_pid)
+relay_spawn_request(int len, int target_pid, int term_hint_plus_one)
 {
 	/* 1. Stash O2 and O3. */
 	asm volatile(
@@ -493,15 +504,22 @@ relay_spawn_request(int len, int target_pid)
 		  "i"(DIR_RESULT_SLOT_OFFSET)
 	);
 
-	/* 4. SEND. */
+	/* 4. SEND.
+	 *
+	 * R7 carries terminal_hint+1 (Phase 49). Encoding: 0 = "no
+	 * terminal," N+1 = "child should run with terminal index N's
+	 * console/keyboard/grid" — receiver dir_walks /sys/term/<N>/*
+	 * and injects via ORX_SLOT_CHILD_O5/O6/O7. The +1 bias keeps a
+	 * sender that doesn't know about Phase 49 (R7=0) from accidentally
+	 * naming terminal 0 as the override. */
 	asm volatile(
 		"addiu  r4, r0, 1\n"        /* op = spawn */
 		"addu   r5, %0, r0\n"       /* forward length */
 		"addiu  r6, r0, %1\n"       /* mark as no-further-relay */
-		"addiu  r7, r0, 0\n"
+		"addu   r7, %2, r0\n"       /* terminal hint (+1 biased) */
 		"send   o1\n"
 		:
-		: "r"(len), "i"(TARGET_PID_LOCAL)
+		: "r"(len), "i"(TARGET_PID_LOCAL), "r"(term_hint_plus_one)
 		: "r4", "r5", "r6", "r7"
 	);
 	return 0;
@@ -549,17 +567,95 @@ relay_shutdown_to_leader(void)
 	return 0;
 }
 
+/* Phase 49: populate ORX_SLOT_CHILD_O5/O6/O7 from
+ * /sys/term/<term_idx>/{console,keyboard,grid}. orx_task_create
+ * inside the upcoming orx_spawn swaps these into the child's OPR
+ * file just before TaskCreate. After the spawn returns, the caller
+ * MUST clear these slots (clear_child_term_slots) so a subsequent
+ * local spawn doesn't accidentally inherit a stale terminal.
+ *
+ * Best-effort: missing services (a partial /sys/term/<N> subtree)
+ * leave the corresponding slot null and the child inherits this
+ * supervisor's own boot OPR for that service. The supervisor's
+ * boot O5/O6/O7 are wired to ITS terminal, which is the wrong one
+ * — but it's better than null for programs that never use the
+ * service in question (e.g., a CPU-bound background task). */
+static void
+populate_child_term_slots(int term_idx)
+{
+	char path[PEER_PATH_BUF_SIZE];
+
+	render_term_path(term_idx, "console", path);
+	if (sup_walk_for_opr(path) == 0) {
+		asm volatile(
+			"orefld o14, %0(o12)\n"
+			"orefst o14, %1(o12)"
+			:
+			: "i"(DIR_RESULT_SLOT_OFFSET),
+			  "i"(ORX_SLOT_CHILD_O5_OFFSET)
+		);
+	}
+	render_term_path(term_idx, "keyboard", path);
+	if (sup_walk_for_opr(path) == 0) {
+		asm volatile(
+			"orefld o14, %0(o12)\n"
+			"orefst o14, %1(o12)"
+			:
+			: "i"(DIR_RESULT_SLOT_OFFSET),
+			  "i"(ORX_SLOT_CHILD_O6_OFFSET)
+		);
+	}
+	render_term_path(term_idx, "grid", path);
+	if (sup_walk_for_opr(path) == 0) {
+		asm volatile(
+			"orefld o14, %0(o12)\n"
+			"orefst o14, %1(o12)"
+			:
+			: "i"(DIR_RESULT_SLOT_OFFSET),
+			  "i"(ORX_SLOT_CHILD_O7_OFFSET)
+		);
+	}
+}
+
+static void
+clear_child_term_slots(void)
+{
+	asm volatile(
+		"orefst o0, %0(o12)\n"
+		"orefst o0, %1(o12)\n"
+		"orefst o0, %2(o12)"
+		:
+		: "i"(ORX_SLOT_CHILD_O5_OFFSET),
+		  "i"(ORX_SLOT_CHILD_O6_OFFSET),
+		  "i"(ORX_SLOT_CHILD_O7_OFFSET)
+	);
+}
+
 /* Service one spawn request that just landed on our queue. The
  * dequeue has filled:
  *   R3 = op          (1 = spawn)
  *   R4 = byte len
  *   R5 = target_pid  (TARGET_PID_LOCAL or a literal PROCID; Phase 45e)
+ *   R6 = term_hint+1 (Phase 49: 0 = "no override," N+1 = "child runs
+ *                     with terminal index N's services")
  *   O2 = bytes ref
  *   O3 = reply cap
  *
- * If target_pid is set and != self.procid, we relay to the peer
- * (the peer will read bytes, spawn, and reply directly to O3 —
- * we don't enter the response path). Otherwise we spawn locally:
+ * Phase 49 placement logic:
+ *   target_pid != LOCAL && != self  -> existing relay path (peer
+ *                                      spawns; we don't track the
+ *                                      child).
+ *   target_pid == self              -> local spawn.
+ *   target_pid == LOCAL && term_hint set
+ *                                   -> we received a relayed local-
+ *                                      pinned spawn. Spawn locally
+ *                                      with terminal-pass-through.
+ *   target_pid == LOCAL && no hint  -> shell-originated. Round-robin
+ *                                      to spread load. If pick == self,
+ *                                      spawn locally. Else relay (with
+ *                                      our own terminal index as hint
+ *                                      so the child still talks to the
+ *                                      shell's terminal).
  *
  * IMPORTANT: orx_spawn clobbers O1..O3 via its manifest restore
  * path. We stash the reply_cap into SUP_SCRATCH_SLOT immediately
@@ -567,16 +663,23 @@ relay_shutdown_to_leader(void)
  * before the spawn so the bytes ref doesn't need stashing.
  */
 static void
-handle_spawn_request(int len, int target_pid, int self_procid)
+handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 {
 	if (target_pid != TARGET_PID_LOCAL && target_pid != self_procid) {
-		/* O3 still holds the original reply_cap from the dequeue.
-		 * relay_spawn_request stashes it before dir_walk and
-		 * restores it before SEND-ing to the peer. On failure
-		 * (no peer registered for this PROCID) we restore O3
-		 * ourselves and reply with an error so the requester
-		 * isn't left blocking. */
-		if (relay_spawn_request(len, target_pid) == 0)
+		/* Explicit `run @N cmd` to a different CPU. relay_spawn_
+		 * request expects O2 (bytes) and O3 (reply_cap) intact; the
+		 * dequeue left them that way, so just call it. We forward
+		 * `term_hint` if non-zero (a relay arriving here from
+		 * another supervisor that already injected a terminal hint
+		 * — rare, but harmless), or our own terminal index + 1 so
+		 * the peer's spawn lands the requester's terminal services
+		 * into the child's O5/O6/O7. self_procid IS the terminal
+		 * index in the current model (Phase 49 leaves the procid-
+		 * = terminal-index assumption in place; a future phase that
+		 * decouples them will look up the actual terminal-index
+		 * from a dedicated slot.) */
+		int hint = (term_hint > 0) ? term_hint : (self_procid + 1);
+		if (relay_spawn_request(len, target_pid, hint) == 0)
 			return;
 		/* Stash O3 into SUP_SCRATCH so reply_to_requester can
 		 * find the reply_cap. (The local-spawn path below would
@@ -590,6 +693,8 @@ handle_spawn_request(int len, int target_pid, int self_procid)
 		return;
 	}
 
+	/* Local spawn path: stash O3 for the reply, fetch bytes,
+	 * spawn. O2 (bytes ref) is still in place from the dequeue. */
 	asm volatile(
 		"orefst o3, %0(o12)"
 		:
@@ -617,8 +722,30 @@ handle_spawn_request(int len, int target_pid, int self_procid)
 	copy_cstr_from(&p, args, sizeof(args));
 	copy_cstr_from(&p, cwd,  sizeof(cwd));
 
+	/* Phase 49: terminal-pass-through. If the relay arrived with
+	 * `term_hint` set, dir-walk /sys/term/<N>/{console,keyboard,
+	 * grid} and stash the resolved refs into ORX_SLOT_CHILD_O5/O6/
+	 * O7. orx_task_create's swap dance picks them up around the
+	 * upcoming TaskCreate and the child wakes up with the
+	 * requester's terminal services in O5/O6/O7 — its term_print/
+	 * term_getkey route to the right oriscterm regardless of
+	 * which CPU is hosting it.
+	 *
+	 * No hint = locally-originated spawn (a child program called
+	 * sup_spawn on us directly). The child inherits THIS
+	 * supervisor's boot O5/O6/O7, which is also the requester's
+	 * terminal — same effective result, no walk needed. */
+	if (term_hint > 0) {
+		populate_child_term_slots(term_hint - 1);
+	}
+
 	task_t t = orx_spawn(path, args, cwd);
 	int status = (t < 0) ? (int)t : 0;
+
+	/* Always clear the child slots after orx_spawn so a
+	 * subsequent local spawn (no hint) doesn't pick up a stale
+	 * override. */
+	if (term_hint > 0) clear_child_term_slots();
 
 	reply_to_requester(t, status);
 
@@ -637,11 +764,19 @@ handle_spawn_request(int len, int target_pid, int self_procid)
  *
  * Phase 45e: also returns target_pid (R5 in the dequeued payload,
  * = sender's R6). Sender packs TARGET_PID_LOCAL when it has no
- * preference, or a literal PROCID for explicit `run @N` placement. */
+ * preference, or a literal PROCID for explicit `run @N` placement.
+ *
+ * Phase 49: also returns terminal_hint (R6 in the dequeued payload
+ * = sender's R7). Encoding: 0 = "no override; child inherits this
+ * supervisor's boot OPRs," N+1 = "child runs with terminal index N's
+ * console/keyboard/grid (we dir_walk /sys/term/<N>/* before spawn)."
+ * Set when a peer relays a spawn from a foreign-terminal'd shell,
+ * unset when a child program calls sup_spawn directly. */
 static int
-poll_one_request(int *out_op, int *out_len, int *out_target_pid)
+poll_one_request(int *out_op, int *out_len, int *out_target_pid,
+                 int *out_term_hint)
 {
-	int status, op, len, target_pid;
+	int status, op, len, target_pid, term_hint;
 	asm volatile(
 		"omov  o1, o9\n"               /* mailbox */
 		"addiu r4, r0, -1\n"           /* infinite */
@@ -650,14 +785,17 @@ poll_one_request(int *out_op, int *out_len, int *out_target_pid)
 		"addu  %0, r2, r0\n"
 		"addu  %1, r3, r0\n"
 		"addu  %2, r4, r0\n"
-		"addu  %3, r5, r0"
-		: "=r"(status), "=r"(op), "=r"(len), "=r"(target_pid)
+		"addu  %3, r5, r0\n"
+		"addu  %4, r6, r0"
+		: "=r"(status), "=r"(op), "=r"(len),
+		  "=r"(target_pid), "=r"(term_hint)
 		:
-		: "r1", "r2", "r3", "r4", "r5"
+		: "r1", "r2", "r3", "r4", "r5", "r6"
 	);
 	*out_op = op;
 	*out_len = len;
 	*out_target_pid = target_pid;
+	*out_term_hint = term_hint;
 	return status;
 }
 
@@ -928,12 +1066,13 @@ main(void)
 	 * would block in poll_one_request forever waiting for a SEND
 	 * that never comes. */
 	for (;;) {
-		int op, len, target_pid;
-		int status = poll_one_request(&op, &len, &target_pid);
+		int op, len, target_pid, term_hint;
+		int status = poll_one_request(&op, &len, &target_pid,
+		                              &term_hint);
 		if (status != 0) continue;
 
 		if (op == 1) {
-			handle_spawn_request(len, target_pid, procid);
+			handle_spawn_request(len, target_pid, term_hint, procid);
 		} else if (op == 2 && has_terminal) {
 			/* Cascade-kill every task we own before halting.
 			 * Phase 48: login.orx is parked in task_wait on
