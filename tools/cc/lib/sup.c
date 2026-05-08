@@ -165,14 +165,22 @@ sup_pack_request(unsigned int va, const char *path,
 task_t
 sup_spawn(const char *path, const char *args, const char *cwd)
 {
+	/* Default placement: spawn on whichever CPU this caller's
+	 * supervisor is on. The shell's `run cmd` path takes this. */
+	return sup_spawn_at(SUP_TARGET_LOCAL, path, args, cwd);
+}
+
+task_t
+sup_spawn_at(int target_pid, const char *path,
+             const char *args, const char *cwd)
+{
 	int status;
 
 	/* Fallback path: caller wasn't launched by a supervisor (boot
 	 * O8 was null → SUP_SLOT is null). Hand off to orx_spawn
-	 * directly — same code that orx_run uses. This is the only
-	 * exercised path through 45a; the SEND-RPC branch below is
-	 * the wire protocol the supervisor will speak in 45b once
-	 * boot.sh actually launches supervisor.orx as the leader. */
+	 * directly — same code that orx_run uses. The target_pid
+	 * argument is irrelevant in this mode (there's no supervisor
+	 * to relay to); the spawn happens on the caller's CPU. */
 	if (!sup_have_supervisor())
 		return orx_spawn(path, args, cwd);
 
@@ -247,21 +255,26 @@ sup_spawn(const char *path, const char *args, const char *cwd)
 	if (status != 0) return status;
 
 	/* SEND to the supervisor.
-	 *   O1 = supervisor sub-cap (recipient)
+	 *   O1 = supervisor sub-cap (recipient — the LOCAL supervisor;
+	 *        if target_pid names a different CPU, the supervisor
+	 *        relays to its peer)
 	 *   O2 = bytes ref (request payload)
 	 *   O3 = reply sub-cap
 	 *   R4 = op = 1 (spawn)
-	 *   R5 = payload length */
+	 *   R5 = payload length
+	 *   R6 = target_pid (Phase 45e — SUP_TARGET_LOCAL or a literal
+	 *        PROCID; the supervisor checks against its own PROCID
+	 *        and relays via op=1 SEND to a peer when they differ) */
 	asm volatile(
 		"orefld o1, 544(o12)\n"        /* supervisor sub-cap */
 		"omov   o2, o14\n"
 		"omov   o3, o15\n"
 		"addiu  r4, r0, 1\n"
-		"addu   r5, %1, r0\n"
-		"addiu  r6, r0, 0\n"
+		"addu   r5, %0, r0\n"
+		"addu   r6, %1, r0\n"
 		"addiu  r7, r0, 0\n"
 		"send   o1\n"
-		: : "i"(0), "r"(payload_len)
+		: : "r"(payload_len), "r"(target_pid)
 		: "r1", "r4", "r5", "r6", "r7"
 	);
 

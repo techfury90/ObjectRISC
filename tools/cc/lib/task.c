@@ -66,7 +66,7 @@
  * none of them have to re-allocate (and don't have to claim
  * their own OPR slot).
  *
- * 456 = 24 (orx scratch: code/data/stack)
+ * 464 = 24 (orx scratch: code/data/stack)
  *     + 384 (16 × 24-byte orx manifest entries)
  *     + 8 (ORX_SLOT_ARGV: long-lived ref to the shared argv buffer)
  *     + 8 (SUP_SLOT: supervisor sub-cap harvested from O8 at
@@ -86,8 +86,13 @@
  *          OR refs across orx_spawn (which clobbers O1..O3 via the
  *          manifest restore path). Phase 45b uses this to hold the
  *          incoming reply_cap so handle_spawn_request can call
- *          orx_spawn and still SEND back to the requester.) */
-#define ORX_STATE_BYTES   456
+ *          orx_spawn and still SEND back to the requester.)
+ *     + 8 (PEER_SUP_SLOT: supervisor-only — sub-cap of a peer
+ *          supervisor's spawn mailbox, used for op=1 relay when a
+ *          spawn request specifies target_pid != self. Phase 45e
+ *          MVP supports a single peer; future revisions may grow
+ *          this into a per-PROCID table.) */
+#define ORX_STATE_BYTES   464
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the supervisor sub-cap parked from O8

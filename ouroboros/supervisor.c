@@ -80,20 +80,38 @@
  * task.c's ORX_STATE_BYTES comment). */
 #define SUP_SCRATCH_SLOT_OFFSET  576
 
-/* console_write reads O3 to find the data section. orx_spawn /
- * sup_spawn / ObjDerive all clobber O3 along the way. task_init
- * parked the boot data ref in O15 — restore O3 from O15 before
- * any print_str call that follows a primitive that touches O3.
+/* Byte offset within O12 of the peer supervisor sub-cap — used by
+ * the op=1 relay path when a spawn request specifies target_pid !=
+ * self.procid. Phase 45e wires a single peer in; null when the
+ * supervisor was launched without a peer (or is the only CPU). */
+#define PEER_SUP_SLOT_OFFSET     584
+
+/* Sentinel target_pid passed in R5 of an op=1 SEND meaning "spawn
+ * on whatever CPU this supervisor is on" (the historical 45a/b/c
+ * behaviour). Any other value < 0xFF is taken as a literal PROCID
+ * and triggers the relay path when it doesn't match self.procid. */
+#define TARGET_PID_LOCAL         0xFF
+
+/* console_write picks O2 (stack ref) for VAs in [0x1f0000, 0x200000)
+ * and O3 (data ref) for VAs in [0x40000, 0x1f0000). Both get
+ * clobbered routinely:
+ *   - O3 by orx_spawn / sup_spawn / ObjDerive (manifest restore,
+ *     etc.)
+ *   - O2 by ReceiveQueuePoll's _deliver_queue_msg, which fills
+ *     O1..O4 with the dequeued message's OR payload (so after a
+ *     poll, O2 holds the request bytes ref, not the boot stack)
  *
- * We wrap print_str / print_int via these macros so the rest of
- * the file reads naturally; "sup_" prefix to avoid colliding
- * with the libc symbols. */
-static void sup_restore_data_ref(void)
+ * task_init parks the boot stack in O11 and the boot data in O15;
+ * SUP_PRINT_RESTORE puts both back into O2/O3 so print_str (data)
+ * AND print_int (which uses a stack-resident buffer) both work.
+ *
+ * The "sup_" prefix avoids colliding with the libc symbols. */
+static void sup_restore_boot_or(void)
 {
-	asm volatile("omov o3, o15");
+	asm volatile("omov o2, o11\nomov o3, o15");
 }
-#define SUP_PRINT(s)    do { sup_restore_data_ref(); print_str(s); } while (0)
-#define SUP_PRINT_INT(n) do { sup_restore_data_ref(); print_int(n); } while (0)
+#define SUP_PRINT(s)    do { sup_restore_boot_or(); print_str(s); } while (0)
+#define SUP_PRINT_INT(n) do { sup_restore_boot_or(); print_int(n); } while (0)
 
 /* Read the firmware PROCID control register (Vol V §2.10, ctrl 7).
  * Phase 45c: every CPU runs the same supervisor.orx; only the
@@ -165,60 +183,60 @@ install_child_o8_override(void)
 	);
 }
 
-/* Read the spawn request bytes from the sender's TAG_DATA object
- * via byte-load through a temporary mapping, then call
- * supervisor_spawn with the unpacked path/args/cwd.
- *
- * O2 (the bytes ref) is in the dequeued message's OR slot; we map
- * it R-only at SPAWN_REQ_VA, parse, unmap. */
-#define SPAWN_REQ_VA      0x00700000
+/* Maximum spawn-request payload size. Matches sup.c's
+ * SPAWN_REQ_BUF_SIZE. Used both as the destination buffer size
+ * for ObjFetchBytes and as a sanity cap on incoming `len`. */
 #define SPAWN_REQ_MAX     256
 
-/* Bring O2 (the bytes ref from the dequeued message) up into O1
- * for MapObject, since MapObject reads its target from O1. */
-static int
-map_spawn_request(int len)
-{
-	int status;
-	asm volatile(
-		"omov   o1, o2\n"
-		"lui    r4, 0x70\n"            /* va = 0x700000 */
-		"addu   r5, r0, r0\n"          /* offset = 0 */
-		"addiu  r6, r0, %1\n"          /* prot = R */
-		"addu   r7, %2, r0\n"          /* length */
-		"call   #0x110\n"
-		"nop\n"
-		"addu   %0, r2, r0"
-		: "=r"(status)
-		: "i"(CAP_R), "r"(len)
-		: "r1", "r2", "r4", "r5", "r6", "r7"
-	);
-	return status;
-}
+/* Phase 45e — replaced map_spawn_request / unmap_spawn_request /
+ * copy_cstr_from with a single ObjFetchBytes call. The new
+ * primitive (#0x108) copies bytes between two object refs and
+ * works transparently for local AND remote sources, so the same
+ * code path serves both:
+ *   - Direct spawn from a local shell: O2 is a TAG_DATA bytes
+ *     object on this CPU; ObjFetchBytes does an in-process bytes
+ *     copy.
+ *   - Relayed spawn from a peer supervisor: O2 is a remote bytes
+ *     object on the originating CPU; ObjFetchBytes issues an
+ *     OBJ_READ_REQ over the wire and writes the response into
+ *     our local destination.
+ *
+ * The destination is the boot stack object (O11, parked there by
+ * task_init) at the byte offset of a stack-local scratch buffer.
+ * No need for a long-lived MapObject — the boot stack is already
+ * R+W mapped, so once ObjFetchBytes has filled the buffer we
+ * parse it via ordinary VA-based reads.
+ *
+ * STACK_BOTTOM matches CONTRACT.md §2's default stack layout
+ * (STACK_TOP - DEFAULT_STACK_SIZE = 0x200000 - 0x10000). */
+#define STACK_BOTTOM      0x001f0000
 
 static int
-unmap_spawn_request(int len)
+read_spawn_request(unsigned char *dst, int len)
 {
 	int status;
+	int dst_offset = (int)((unsigned int)dst - STACK_BOTTOM);
 	asm volatile(
-		"lui    r4, 0x70\n"
-		"addu   r5, %1, r0\n"
-		"call   #0x111\n"
+		"omov  o1, o2\n"            /* source = request bytes ref */
+		"omov  o2, o11\n"           /* destination = boot stack */
+		"addiu r4, r0, 0\n"         /* src offset */
+		"addu  r5, %1, r0\n"        /* dst offset */
+		"addu  r6, %2, r0\n"        /* byte count */
+		"call  #0x108\n"            /* ObjFetchBytes */
 		"nop\n"
-		"addu   %0, r2, r0"
+		"addu  %0, r2, r0"
 		: "=r"(status)
-		: "r"(len)
-		: "r2", "r3", "r4", "r5"
+		: "r"(dst_offset), "r"(len)
+		: "r1", "r2", "r4", "r5", "r6"
 	);
 	return status;
 }
 
 /* Copy a NUL-terminated string from *p into dst (capacity cap).
- * Updates *p past the NUL. Returns dst (or empty-string pointer if
- * the source was zero-length). hf_open needs paths in stack or
- * data segments — not in the request-buffer mapping at 0x700000 —
- * so we copy out before unmapping rather than alias into the
- * mapping. */
+ * Updates *p past the NUL. The source `*p` walks through the
+ * stack-resident scratch buffer just filled by ObjFetchBytes;
+ * destination is a separate stack array used downstream by
+ * hf_open / orx_spawn. */
 static void
 copy_cstr_from(const char **p, char *dst, int cap)
 {
@@ -288,53 +306,84 @@ reply_to_requester(task_t t, int status)
 	);
 }
 
+/* Relay an op=1 spawn request to the peer supervisor (held in
+ * PEER_SUP_SLOT). The local supervisor doesn't read the bytes —
+ * it just forwards the SEND. The bytes ref in O2 stays as-is;
+ * the peer's read_spawn_request will OBJ_READ_REQ it across the
+ * wire when it actually services the spawn. The reply_cap in O3
+ * also stays as-is, so the peer's reply goes directly back to
+ * the original requester (we drop out of the response path).
+ *
+ * R6 in the relayed SEND is set to TARGET_PID_LOCAL so the peer
+ * doesn't try to relay again — bounded one-hop topology for now,
+ * matches the single-peer PEER_SUP_SLOT model. */
+static void
+relay_spawn_request(int len)
+{
+	asm volatile(
+		"orefld o1, %0(o12)\n"     /* recipient = peer's mailbox sub-cap */
+		"addiu  r4, r0, 1\n"       /* op = spawn */
+		"addu   r5, %1, r0\n"      /* forward length */
+		"addiu  r6, r0, %2\n"      /* mark as no-further-relay */
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		:
+		: "i"(PEER_SUP_SLOT_OFFSET), "r"(len), "i"(TARGET_PID_LOCAL)
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+}
+
 /* Service one spawn request that just landed on our queue. The
  * dequeue has filled:
- *   R3 = op       (1 = spawn)
+ *   R3 = op          (1 = spawn)
  *   R4 = byte len
+ *   R5 = target_pid  (TARGET_PID_LOCAL or a literal PROCID; Phase 45e)
  *   O2 = bytes ref
  *   O3 = reply cap
  *
- * IMPORTANT: orx_spawn (called below) clobbers O1..O3 via its
- * manifest restore path. We stash the reply_cap into
- * SUP_SCRATCH_SLOT immediately so reply_to_requester can recover
- * it; the bytes ref in O2 is consumed before the spawn so it
- * doesn't need stashing.
+ * If target_pid is set and != self.procid, we relay to the peer
+ * (the peer will read bytes, spawn, and reply directly to O3 —
+ * we don't enter the response path). Otherwise we spawn locally:
+ *
+ * IMPORTANT: orx_spawn clobbers O1..O3 via its manifest restore
+ * path. We stash the reply_cap into SUP_SCRATCH_SLOT immediately
+ * so reply_to_requester can recover it; ObjFetchBytes consumes O2
+ * before the spawn so the bytes ref doesn't need stashing.
  */
 static void
-handle_spawn_request(int len)
+handle_spawn_request(int len, int target_pid, int self_procid)
 {
+	if (target_pid != TARGET_PID_LOCAL && target_pid != self_procid) {
+		relay_spawn_request(len);
+		return;
+	}
+
 	asm volatile(
 		"orefst o3, %0(o12)"
 		:
 		: "i"(SUP_SCRATCH_SLOT_OFFSET)
 	);
 
-	int map_status = map_spawn_request(len);
-	if (map_status != 0) {
-		reply_to_requester(-1, map_status);
+	if (len <= 0 || len > SPAWN_REQ_MAX) {
+		reply_to_requester(-1, -1);
 		return;
 	}
 
-	/* Synthesize (const char *)SPAWN_REQ_VA via lui+ori — pcc's
-	 * literal-cast lowering emits an `la r,N` pseudo and asmorisc
-	 * rejects it. Same workaround program_args() uses. */
-	const char *p;
-	asm volatile(
-		"lui  %0, 0x70\n"
-		"ori  %0, %0, 0"
-		: "=r"(p)
-	);
+	unsigned char buf[SPAWN_REQ_MAX];
+	int fetch_status = read_spawn_request(buf, len);
+	if (fetch_status != 0) {
+		reply_to_requester(-1, fetch_status);
+		return;
+	}
 
-	/* Copy path/args/cwd onto our stack so hf_open / orx machinery
-	 * can dispatch them via O11 (stack ref) — they don't know
-	 * about the request-buffer mapping. */
+	/* Parse buf as path\0args\0cwd\0. Copy onto our stack so
+	 * hf_open / orx machinery can dispatch them via O11 (the
+	 * boot stack ref). */
 	char path[128], args[128], cwd[128];
+	const char *p = (const char *)buf;
 	copy_cstr_from(&p, path, sizeof(path));
 	copy_cstr_from(&p, args, sizeof(args));
 	copy_cstr_from(&p, cwd,  sizeof(cwd));
-
-	(void)unmap_spawn_request(len);
 
 	task_t t = orx_spawn(path, args, cwd);
 	int status = (t < 0) ? (int)t : 0;
@@ -347,16 +396,20 @@ handle_spawn_request(int len)
 }
 
 /* Dequeue one message from O9. Infinite timeout: the loop is
- * fully event-driven — each spawn request is a SEND, and the shell
- * SENDs an explicit op=2 (shutdown) on `exit` to break us out of
- * the poll. (We can't poll-with-finite-timeout-then-check-shell-
- * state because simorisc only ticks finite timeouts down on the
- * task's current quantum, and a blocked supervisor never gets
- * one once the shell starts running.) */
+ * fully event-driven — each spawn request is a SEND, and the
+ * leader's shell SENDs an explicit op=2 (shutdown) on `exit` to
+ * break us out of the poll. (We can't poll-with-finite-timeout-
+ * then-check-shell-state because simorisc only ticks finite
+ * timeouts down on the task's current quantum, and a blocked
+ * supervisor never gets one once the shell starts running.)
+ *
+ * Phase 45e: also returns target_pid (R5 in the dequeued payload,
+ * = sender's R6). Sender packs TARGET_PID_LOCAL when it has no
+ * preference, or a literal PROCID for explicit `run @N` placement. */
 static int
-poll_one_request(int *out_op, int *out_len)
+poll_one_request(int *out_op, int *out_len, int *out_target_pid)
 {
-	int status, op, len;
+	int status, op, len, target_pid;
 	asm volatile(
 		"omov  o1, o9\n"               /* mailbox */
 		"addiu r4, r0, -1\n"           /* infinite */
@@ -364,13 +417,15 @@ poll_one_request(int *out_op, int *out_len)
 		"nop\n"
 		"addu  %0, r2, r0\n"
 		"addu  %1, r3, r0\n"
-		"addu  %2, r4, r0"
-		: "=r"(status), "=r"(op), "=r"(len)
+		"addu  %2, r4, r0\n"
+		"addu  %3, r5, r0"
+		: "=r"(status), "=r"(op), "=r"(len), "=r"(target_pid)
 		:
-		: "r1", "r2", "r3", "r4"
+		: "r1", "r2", "r3", "r4", "r5"
 	);
 	*out_op = op;
 	*out_len = len;
+	*out_target_pid = target_pid;
 	return status;
 }
 
@@ -382,14 +437,41 @@ const char unknown_op[]      = "supervisor: unknown op\n";
 int
 main(void)
 {
-	task_init();
-	hf_init();
-	orx_init();
-
+	/* Phase 45e: allocate the spawn mailbox FIRST — before
+	 * task_init / hf_init / orx_init touch the descriptor table
+	 * with their own allocations — so it lands at a deterministic
+	 * descriptor index across boots. In socket mode (the boot.sh
+	 * configuration) init_cpu reserves 1=code, 2=stack, 3=data,
+	 * 4=bootstrap task, then simorisc's populate_self_service
+	 * reserves idx 5 (the per-CPU "self" service installed in O4).
+	 * The supervisor's first ObjAlloc therefore lands at idx 6.
+	 * Static `--service "PEER_PID=6@9"` lines in scripts/boot.sh
+	 * synthesize a working sub-cap to any peer supervisor without
+	 * runtime discovery. */
 	if (allocate_service_mailbox() != 0) {
 		print_str("supervisor: failed to allocate spawn mailbox\n");
 		return 1;
 	}
+
+	task_init();
+
+	/* Harvest boot O8 into PEER_SUP_SLOT BEFORE hf_init runs —
+	 * hf_init clobbers O8 with the hostfsd reply mailbox, and
+	 * the boot-time peer supervisor sub-cap (wired in by
+	 * scripts/boot.sh's `--service "PEER=5@9"` on the O8 slot)
+	 * would be lost. task_init already copied O8 to SUP_SLOT on
+	 * its way past, so we don't need to also harvest it for the
+	 * supervisor's own use — the supervisor doesn't call
+	 * sup_spawn — but PEER_SUP_SLOT carries the supervisor-side
+	 * peer-relay view, which is a different concern. */
+	asm volatile(
+		"orefst o8, %0(o12)"
+		:
+		: "i"(PEER_SUP_SLOT_OFFSET)
+	);
+
+	hf_init();
+	orx_init();
 
 	/* Make every subsequent TaskCreate inherit a fresh sub-cap
 	 * of our mailbox in O8. orx_task_create reads
@@ -438,12 +520,12 @@ main(void)
 	 * would block in poll_one_request forever waiting for a SEND
 	 * that never comes. */
 	for (;;) {
-		int op, len;
-		int status = poll_one_request(&op, &len);
+		int op, len, target_pid;
+		int status = poll_one_request(&op, &len, &target_pid);
 		if (status != 0) continue;
 
 		if (op == 1) {
-			handle_spawn_request(len);
+			handle_spawn_request(len, target_pid, procid);
 		} else if (op == 2 && is_leader) {
 			/* Graceful shutdown — sup_shutdown() in libc, called
 			 * by the leader's shell right before its TaskExit.
