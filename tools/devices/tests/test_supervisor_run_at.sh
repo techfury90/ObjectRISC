@@ -138,7 +138,17 @@ done
 #                                          would return the wrong byte
 #                                          count and bleed leftover
 #                                          /programs entries through)
-#        run @1 /programs/hello.orx<RET>
+#        run @1 /programs/hello.orx &<RET>  (BACKGROUND relayed spawn —
+#                                          Phase 45g hotfix: task_free
+#                                          must clear the local slot
+#                                          on ERR_EREMOTE so the auto-
+#                                          reaper doesn't repeat
+#                                          [task N done CODE] forever)
+#        <RET> <RET> <RET>               (empty lines — give the
+#                                          auto-reaper multiple
+#                                          opportunities to fire; with
+#                                          the bug each empty ENTER
+#                                          re-prints the reap notice)
 #        exit<RET>
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
@@ -152,7 +162,9 @@ python3 tools/devices/tests/fake_terminal.py \
     --event key:0x2f --event key:p --event key:r --event key:o --event key:g --event key:r --event key:a --event key:m --event key:s \
     --event key:0x2f --event key:h --event key:e --event key:l --event key:l --event key:o \
     --event key:0x2e --event key:o --event key:r --event key:x \
+    --event key:0x20 --event key:0x26 \
     --event key:0x10D \
+    --event key:0x10D --event key:0x10D --event key:0x10D \
     --event key:e --event key:x --event key:i --event key:t \
     --event key:0x10D \
     --linger 15.0 --delay 0.20 \
@@ -223,17 +235,16 @@ grep -q "supervisor: shell exited; halting" "$TMP/cpu0.out" \
     || { echo "FAIL: leader didn't shut down" >&2; exit 1; }
 
 # 4) Phase 45g regression check: the shell's post-spawn term_prints
-#    must actually land on the terminal. The shell prints "[exited N]"
-#    after a foreground sup_spawn returns, and "[task N done CODE]"
-#    when the auto-reaper notices an exit. If sup_spawn clobbers O15
+#    must actually land on the terminal. The shell prints "[bg task N]"
+#    after a backgrounded sup_spawn returns. If sup_spawn clobbers O15
 #    (task.c's boot-data save), term.c's _term_restore_or feeds the
 #    wrong source ref to oriscterm and these prints fail silently.
 #    Without this assertion the bug shipped — fake_terminal drops
 #    BOUNDS-failed prints quietly, so earlier 45f/g tests passed even
 #    when the shell couldn't print after a spawn under `make boot`.
 sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term.out" \
-    | grep -q "exited 0" \
-    || { echo "FAIL: shell didn't print [exited 0] after run @1 — sup_spawn likely clobbered a boot OR slot" >&2; exit 1; }
+    | grep -q "bg task" \
+    || { echo "FAIL: shell didn't print [bg task N] after run @1 & — sup_spawn likely clobbered a boot OR slot" >&2; exit 1; }
 
 # 5) Phase 45g regression check: lazy bootstrap. The first `ls` from
 #    the shell triggers vfs_list → dir_walk → dir_init's
@@ -277,6 +288,26 @@ echo "$RENDER" | grep -qE '^programs/$' \
 SHELL_ORX_COUNT=$(echo "$RENDER" | grep -c "shell.orx" || true)
 if [ "$SHELL_ORX_COUNT" -gt 1 ]; then
     echo "FAIL: 'shell.orx' appears $SHELL_ORX_COUNT times — vfs_list DIR branch is leaking leftover MOUNT-listing bytes" >&2
+    exit 1
+fi
+
+# 8) Phase 45g regression check: the auto-reaper must clear the local
+#    libc task-table slot for relayed background tasks. ObjFree on
+#    a remote-home task ref returns ERR_EREMOTE; if task_free
+#    treated that as a failure (and left the slot bit set), every
+#    subsequent prompt iteration would re-detect the EXITED task
+#    and re-print "[task N done CODE]" forever. The keystroke
+#    sequence above types `run @1 cmd &` followed by THREE empty
+#    ENTERs — with the bug each empty ENTER would emit another
+#    reap notice, so we'd see [task 0 done 0] four+ times. With
+#    the fix it appears exactly once.
+DONE_COUNT=$(echo "$RENDER" | grep -c '\[task 0 done 0\]' || true)
+if [ "$DONE_COUNT" -gt 1 ]; then
+    echo "FAIL: '[task 0 done 0]' appears $DONE_COUNT times — task_free not clearing slot on ERR_EREMOTE" >&2
+    exit 1
+fi
+if [ "$DONE_COUNT" -lt 1 ]; then
+    echo "FAIL: bg task never reaped — auto-reaper or task_query likely broken" >&2
     exit 1
 fi
 

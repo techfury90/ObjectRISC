@@ -490,7 +490,21 @@ task_free(task_t t)
 		:
 		: "r2"
 	);
-	if (status == 0) {
+	/* Clear the local libc slot on success, OR on EREMOTE (11) —
+	 * Phase 45g bugfix. ObjFree refuses to free a remote-home ref
+	 * (the simorisc primitive returns ERR_EREMOTE); the actual task
+	 * descriptor lives on the remote CPU and is its supervisor's
+	 * responsibility to reap. From the caller's perspective the
+	 * libc slot IS the local handle, so dropping the bookkeeping
+	 * bit here is the right "release my handle" semantic.
+	 *
+	 * Without this, relayed background spawns (`run @1 cmd &`)
+	 * trigger a reap loop in the shell: the task exits on the peer,
+	 * task_query keeps returning EXITED, orx_unload calls
+	 * task_free → ObjFree returns EREMOTE → slot bit untouched →
+	 * reap_exited_tasks fires `[task N done CODE]` again on every
+	 * subsequent prompt iteration forever. */
+	if (status == 0 || status == 11 /* ERR_EREMOTE */) {
 		/* Clear the slot — overwrite with the null ref so any stale
 		 * reuse via task_load_to_o1 reads back as null, and free up
 		 * the bit for the next task_spawn. */
