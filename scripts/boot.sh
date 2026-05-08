@@ -69,19 +69,30 @@ fi
 #   O5  = oriscterm console  (16=1@9)
 #   O6  = oriscterm keyboard (16=2@9)
 #   O7  = oriscterm grid     (16=3@9)
-#   O8  = pad (null — supervisor.c allocates its own mailbox in O9
-#        at boot and parks a sub-cap of it into ORX_SLOT_CHILD_O8
-#        so spawned children inherit it)
-#   O9  = pad (also null at boot; supervisor's own mailbox replaces it)
+#   O8  = peer supervisor's spawn-mailbox sub-cap (Phase 45e). Each
+#        supervisor's spawn mailbox is ObjAlloc'd FIRST in main(),
+#        and lands at descriptor index 6 in socket-mode boots:
+#        init_cpu reserves 1=code, 2=stack, 3=data, 4=bootstrap-task;
+#        simorisc's populate_self_service reserves idx 5 (the
+#        per-CPU "self" service installed in O4); the supervisor's
+#        first ObjAlloc is therefore idx 6. Stable across boots —
+#        `--service "PEER=6@9"` synthesizes a working sub-cap
+#        without runtime discovery. The leader (CPU 0) gets CPU 1's
+#        mailbox in O8; CPU 1 gets CPU 0's. The supervisor harvests
+#        this into PEER_SUP_SLOT at boot and uses it for op=1 relay
+#        when a `run @N` request specifies target_pid != self.procid.
+#   O9  = pad (null at boot; the supervisor's own freshly-allocated
+#        mailbox replaces this slot via `omov o9, o1`)
 #   O10 = hostfsd            (17=1@9)
 #
-# Both CPUs get the same service refs — they're refs to objects on
-# the device PIDs (16, 17), and the device daemons handle multiple
-# subscribers. CPU 0 (PROCID 0) is the leader and spawns a shell;
-# CPU 1 stays in the dispatch loop until 45e gives it work to do.
+# Both CPUs get the same console/keyboard/grid/hostfsd refs — they're
+# refs to objects on the device PIDs (16, 17), and the device daemons
+# handle multiple subscribers. CPU 0 (PROCID 0) is the leader and
+# spawns a shell; CPU 1 stays in the dispatch loop ready to service
+# relayed spawn requests.
 exec python3 tools/oriscrun \
     --terminal pid=16 \
     --hostfsd "pid=17,root=$ROOT" \
-    --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=0@0,service=0=0@0,service=17=1@9" \
-    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=0@0,service=0=0@0,service=17=1@9" \
+    --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=1=6@9,service=0=0@0,service=17=1@9" \
+    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=6@9,service=0=0@0,service=17=1@9" \
     --leader 0 --leader-timeout 600

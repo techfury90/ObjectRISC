@@ -305,6 +305,24 @@ int    orx_unload(task_t t);                           /* wait + deferred-free +
 
 task_t sup_spawn(const char *path, const char *args, const char *cwd);
 
+/* SUP_TARGET_LOCAL — the sentinel target_pid value passed to
+ * sup_spawn_at meaning "spawn on whatever CPU my supervisor is
+ * on" (the same behaviour plain sup_spawn gives). Distinct from
+ * any literal PROCID (PROCIDs are 0..254). */
+#define SUP_TARGET_LOCAL 0xFF
+
+/* sup_spawn_at — Phase 45e: like sup_spawn, but with explicit
+ * target-CPU placement. target_pid is either SUP_TARGET_LOCAL
+ * (delegates to the caller's local supervisor; identical to
+ * sup_spawn) or a literal PROCID. The local supervisor relays
+ * to its peer (PEER_SUP_SLOT) when target_pid != self.procid;
+ * the peer spawns locally and replies directly to the caller's
+ * reply mailbox. The returned task_t carries a ref whose home is
+ * the spawning CPU — task_wait/task_query/task_kill on it route
+ * correctly via the Phase 45d remote Task primitives. */
+task_t sup_spawn_at(int target_pid, const char *path,
+                    const char *args, const char *cwd);
+
 /* sup_shutdown — fire-and-forget op=2 SEND telling the supervisor
  * "I'm about to TaskExit." The supervisor exits its main loop and
  * TaskExits in turn, tearing down the CPU. No-op when the program

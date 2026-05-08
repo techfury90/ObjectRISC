@@ -492,6 +492,33 @@ cmd_run(const char *cwd, const char *arg)
 	char path[PATH_MAX];
 	int  background = 0;
 
+	/* Phase 45e: parse a leading `@N ` (any single decimal digit
+	 * 0-9) as an explicit target-CPU specifier for the spawn. The
+	 * rest of `arg` proceeds through the existing path/args split
+	 * unchanged. Without `@`, target_pid stays SUP_TARGET_LOCAL
+	 * and sup_spawn_at hands off to the local supervisor as before. */
+	int target_pid = SUP_TARGET_LOCAL;
+	int p = 0;
+	while (arg[p] == ' ' || arg[p] == '\t') p++;
+	if (arg[p] == '@') {
+		int q = p + 1;
+		int n = 0, digits = 0;
+		while (arg[q] >= '0' && arg[q] <= '9') {
+			n = n * 10 + (arg[q] - '0');
+			q++; digits++;
+		}
+		if (digits == 0
+		    || (arg[q] != ' ' && arg[q] != '\t' && arg[q] != '\0')
+		    || n > 254) {
+			term_print("usage: run [@N] <path> [args] [&]\n");
+			return;
+		}
+		target_pid = n;
+		p = q;
+		while (arg[p] == ' ' || arg[p] == '\t') p++;
+	}
+	arg = arg + p;     /* arg now points past the @N specifier */
+
 	int alen = (int)strlen(arg);
 	while (alen > 0 && (arg[alen - 1] == ' ' || arg[alen - 1] == '\t'))
 		alen--;
@@ -527,7 +554,8 @@ cmd_run(const char *cwd, const char *arg)
 	resolve_path(cwd, arg_copy, path);
 
 	if (background) {
-		task_t t = sup_spawn(path, arg_copy + args_start, cwd);
+		task_t t = sup_spawn_at(target_pid, path,
+		                        arg_copy + args_start, cwd);
 		if (t < 0) {
 			term_print("spawn failed: ");
 			term_print_int(t);
@@ -543,7 +571,8 @@ cmd_run(const char *cwd, const char *arg)
 		 * shell blocks again on the next keystroke. */
 		task_yield();
 	} else {
-		task_t t = sup_spawn(path, arg_copy + args_start, cwd);
+		task_t t = sup_spawn_at(target_pid, path,
+		                        arg_copy + args_start, cwd);
 		if (t < 0) {
 			term_print("spawn failed: ");
 			term_print_int(t);

@@ -4619,6 +4619,166 @@ Six new validation tests in `tools/sim/tests/validation/11_multicpu/`:
 All 144 sim validation tests pass (was 138). All 20 device tests
 still pass — no Ouroboros-side changes in this PR.
 
+## Phase 45e — Cross-CPU spawn delegation (Ouroboros, day 25)
+
+The payoff. `run @N <path>` in the shell now runs the program on
+CPU N, not CPU 0. Ties together every piece of the 45 series:
+the per-CPU supervisors from 45c, the wire-protocol Task primitives
+from 45d, plus a new firmware primitive that bridges the
+last gap.
+
+What goes through the wire when the shell on CPU 0 does
+`run @1 /programs/hello.orx`:
+
+1. Shell parses `@1`, calls `sup_spawn_at(1, path, "", "/")`. The
+   libc packs target_pid=1 into the SEND's R6 (caller's R6 →
+   receiver's R5 after the dequeue shift) and SENDs op=1 to the
+   shell's local supervisor (CPU 0's, found at SUP_SLOT).
+2. CPU 0's supervisor dequeues, sees `target_pid (1) !=
+   self_procid (0)`, calls `relay_spawn_request(len)`. The relay
+   issues a fresh op=1 SEND to the peer supervisor's mailbox
+   (loaded from PEER_SUP_SLOT — see "bootstrap" below) with
+   target_pid set to TARGET_PID_LOCAL so the peer doesn't loop.
+   The original O2 (bytes ref) and O3 (reply_cap) ride along
+   unchanged — the peer's reply will go straight back to the
+   shell, not via the relaying supervisor.
+3. CPU 1's supervisor dequeues. `target_pid == LOCAL → spawn
+   locally`. It calls the new `read_spawn_request()` helper,
+   which uses **ObjFetchBytes (#0x108)** to copy the bytes
+   object's contents — currently sitting on CPU 0 — into a
+   stack-resident scratch buffer on CPU 1. (More on that
+   primitive below.) Parses `path\0args\0cwd\0`, calls
+   `orx_spawn(...)` locally; the new task lives on CPU 1.
+4. CPU 1 SENDs the reply (R4=status, O2=task_ref, recipient=O3
+   reply_cap) directly to the shell. The shell's
+   `sup_spawn_at` receives, registers the task ref (home=1)
+   in its libc task table, returns a `task_t`.
+5. The shell's `cmd_run` calls `orx_unload(t)` → `task_wait(t)`.
+   The task ref's home is CPU 1, so 45d's remote TaskWait
+   machinery kicks in: TASK_WAIT_REQ to CPU 1's home, block,
+   wait for the child to TaskExit, response packet, unblock,
+   exit code in R3.
+
+### What changed
+
+- **`tools/sim/simorisc`** — new firmware primitive
+  **ObjFetchBytes (#0x108)**: copies a configurable byte range
+  between two object refs. Source ref can be remote (issues
+  OBJ_READ_REQ over the wire and blocks at the CALL until the
+  matching response arrives, then writes the payload into the
+  local destination descriptor). Destination ref must be local
+  and non-objstore (we'd otherwise corrupt OR refs in slot
+  storage). Bridges the OL-immediate-offset gap for cross-CPU
+  bulk reads — the wire protocol already supported arbitrary
+  widths, but no instruction or primitive previously exposed
+  that to programs. New `BlockedOnObjFetch` signal and a unified
+  unblock handler that maps RESP_* fault flags to ERR_*.
+
+- **`ouroboros/supervisor.c`** —
+  - allocate_service_mailbox() runs FIRST in `main()`, before
+    `task_init()`. After init_cpu's reservations and
+    populate_self_service's idx-5 grab, this lands the spawn
+    mailbox at deterministic descriptor idx 6, which is what
+    boot.sh's `--service "PEER=6@9"` lines reference.
+  - Boot O8 (peer supervisor sub-cap) gets harvested into
+    PEER_SUP_SLOT immediately after task_init — BEFORE
+    hf_init runs and clobbers O8 with the hostfsd reply
+    mailbox. (This was a fun half-hour bug.)
+  - `read_spawn_request()` replaces map_spawn_request /
+    unmap_spawn_request / copy_cstr_from-via-mapping. Single
+    ObjFetchBytes copies the request bytes into a stack
+    buffer; parsing then uses ordinary VA-based reads. Drops
+    the MapObject/Unmap dance entirely — and works
+    transparently for both local and remote source refs.
+  - `handle_spawn_request(len, target_pid, self_procid)`
+    grew the relay branch: when target_pid is a literal
+    PROCID and != self.procid, forward to PEER_SUP_SLOT and
+    return; otherwise local spawn as before.
+  - `relay_spawn_request(len)` builds the relayed SEND.
+    Recipient = PEER_SUP_SLOT, R6 = TARGET_PID_LOCAL (so the
+    peer doesn't try to relay further — bounded one-hop
+    topology).
+  - `poll_one_request` now also returns target_pid (R5 in the
+    dequeued payload, = sender's R6).
+  - `sup_restore_boot_or` (was `sup_restore_data_ref`) now
+    restores both O2 and O3 from O11/O15, since
+    ReceiveQueuePoll's _deliver_queue_msg fills O2 with the
+    request bytes ref — clobbering the boot stack ref that
+    print_int's stack-resident buffer needs.
+
+- **`tools/cc/lib/sup.c`** + **`tools/cc/lib/liborisc.h`** —
+  new `sup_spawn_at(target_pid, path, args, cwd)` API.
+  Plain `sup_spawn` is now a thin wrapper around
+  `sup_spawn_at(SUP_TARGET_LOCAL, ...)`. The `target_pid`
+  rides in caller's R6 → supervisor's R5.
+
+- **`tools/cc/lib/task.c`** — bumped `ORX_STATE_BYTES` 456→464
+  to add `PEER_SUP_SLOT` at libc-managed O12 offset 584.
+
+- **`ouroboros/shell.c`** — `cmd_run` parses an optional
+  leading `@N` (single decimal `0..254`) before the path.
+  When present, target_pid is N; otherwise SUP_TARGET_LOCAL.
+  Backgrounded variant `run @1 cmd &` works too.
+
+- **`scripts/boot.sh`** — `--service "PEER=6@9"` lines wire
+  each CPU's O8 to its peer's spawn mailbox. CPU 0's O8 =
+  CPU 1's mailbox; CPU 1's O8 = CPU 0's. Two-CPU MVP — the
+  single-peer PEER_SUP_SLOT scales to 2 CPUs cleanly. For
+  N>2 we'll need a per-PROCID table (a future PR).
+
+- **`tools/devices/tests/test_supervisor_run_at.sh`** — new
+  end-to-end test typing `run @1 /programs/hello.orx<RET>
+  exit<RET>` and asserting that "hello-from-supervised-spawn"
+  prints on **CPU 1** (peer) but NOT on CPU 0 (proves the
+  relay actually fires), and that the leader's supervisor
+  shuts down cleanly on shell exit.
+
+- **Validation tests** — `05_oreg/13_objfetchbytes_local.s`
+  and `11_multicpu/20_objfetchbytes_remote.s` cover the new
+  primitive's local + wire round-trip paths.
+
+### The half-hour bug
+
+Worth memorializing because it's the kind of thing that bites
+silently. boot.sh originally wired `--service "PEER=5@9"` —
+matching what looked like the obvious deterministic descriptor
+index for the supervisor's first ObjAlloc. The relay SEND
+flowed cleanly to CPU 1, but CPU 1's queue was always empty:
+`receive_packet` saw `recip_idx=5 desc_gen=1 live=True
+queue=none` and routed the packet to the inbox (where
+nothing ever consumed it). Turns out simorisc's
+`populate_self_service` allocates a 64-byte service object at
+idx 5 BEFORE the program's main runs, in socket mode. So the
+supervisor's first `ObjAlloc` actually lands at idx 6. Once
+the boot.sh service refs were updated to `=6@9`, the round
+trip worked. The supervisor.c comment now explicitly
+documents the indexing accounting for future archaeologists.
+
+### Tests
+
+- All 21 device tests pass, including the new
+  `test_supervisor_run_at.sh`.
+- All 146 sim validation tests pass (was 144), including the
+  two new ObjFetchBytes tests.
+- `make boot` brings up two supervisor CPUs; the shell on
+  CPU 0 routes `run @1 cmd` to CPU 1 transparently and gets
+  the exit code back via remote TaskWait.
+
+### What's still ahead
+
+- N>2 CPUs: PEER_SUP_SLOT is a single slot. A per-PROCID
+  table (in O12 like SUP_SLOT etc.) is the obvious next step;
+  no architectural change needed.
+- Directory service: with peers wired statically, no runtime
+  discovery is needed in 2-CPU configurations. The directory
+  becomes worth building when we add named user services
+  beyond the supervisor (file servers, network endpoints,
+  etc.) or when we want shells on >2 CPUs without N²
+  `--service` lines in boot.sh.
+- Shell affordances: `jobs` showing per-task home pid;
+  `kill @N task` to externally terminate; round-robin for
+  `run cmd &` if no @ specified.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

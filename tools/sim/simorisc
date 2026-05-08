@@ -378,6 +378,22 @@ class BlockedOnTaskKill(BlockedSignal):
         self.trans_id = trans_id
 
 
+class BlockedOnObjFetch(BlockedSignal):
+    """Phase 45e. Raised by primitive_ObjFetchBytes when the source ref
+    is remote. The CALL holds PC until the matching OBJ_READ_RESP
+    arrives; on resume the response data is copied into the local
+    destination descriptor at (dst_idx, dst_off..dst_off+byte_count),
+    R2 = ERR_OK or remote-fault-derived ERR_*, R3 = bytes copied,
+    PC advances. On a remote-side fault flag we never end up writing
+    the destination — caller sees R3 = 0."""
+    def __init__(self, trans_id: int, dst_idx: int, dst_off: int,
+                 byte_count: int):
+        self.trans_id = trans_id
+        self.dst_idx = dst_idx
+        self.dst_off = dst_off
+        self.byte_count = byte_count
+
+
 # ---------------------------------------------------------------------------
 # Wire-level packet format (Volume IV §3, §4)
 # ---------------------------------------------------------------------------
@@ -1604,7 +1620,8 @@ class System:
                 continue
             ready = False
             if isinstance(b, (BlockedOnResponse, BlockedOnTaskWait,
-                              BlockedOnTaskQuery, BlockedOnTaskKill)):
+                              BlockedOnTaskQuery, BlockedOnTaskKill,
+                              BlockedOnObjFetch)):
                 # All four "wait for a response packet by trans_id"
                 # signals share the same readiness condition: a matching
                 # packet sitting in cpu.responses. The actual delivery
@@ -1652,6 +1669,8 @@ class System:
         if isinstance(b, BlockedOnTaskKill):
             return self._try_unblock_task_resp(cpu, b, PKT_TASK_KILL_RESP,
                                                 deliver_r3=False)
+        if isinstance(b, BlockedOnObjFetch):
+            return self._try_unblock_obj_fetch(cpu, b)
         return False
 
     def _try_unblock_queue(self, cpu: CPU, b: 'BlockedOnQueue') -> bool:
@@ -1715,6 +1734,63 @@ class System:
             cpu.blocked_on = None
             return True
         return False  # no matching response yet
+
+    def _try_unblock_obj_fetch(self, cpu: CPU, b: 'BlockedOnObjFetch') -> bool:
+        """Phase 45e. Handler for ObjFetchBytes responses. The response
+        is a regular OBJ_READ_RESP (we reuse the existing wire packet
+        instead of inventing a new type — it already carries the bytes
+        in its payload), matched by trans_id. On RESP_OK we copy the
+        payload into the local destination descriptor at the offset
+        the primitive recorded; on a fault flag we map RESP_* to ERR_*
+        and leave the destination untouched. R2 = status, R3 = bytes
+        copied (== b.byte_count on OK, 0 on fault), PC advances."""
+        for i, packet in enumerate(cpu.responses):
+            try:
+                pkt = unpack_packet(packet)
+            except ValueError:
+                continue
+            if pkt['type'] != PKT_OBJ_READ_RESP:
+                continue
+            if pkt['trans_id'] != b.trans_id:
+                continue
+            cpu.responses.pop(i)
+            flags = pkt['flags'] & 0x3F
+            if flags != RESP_OK:
+                # Map RESP_* fault to ERR_* status; same translation
+                # OL/OS uses to raise an architectural Trap, but here
+                # we surface it as an ordinary primitive return code
+                # so the caller can recover (it's a polled bulk read,
+                # not a CPU-instruction load).
+                err_map = {
+                    RESP_STALE:     ERR_ESTALE,
+                    RESP_BOUNDS:    ERR_EINVAL,
+                    RESP_CAP:       ERR_EPERM,
+                    RESP_BUS_ERROR: ERR_EFAULT,
+                }
+                cpu.set_gpr(2, err_map.get(flags, ERR_EFAULT))
+                cpu.set_gpr(3, 0)
+            else:
+                payload = pkt['payload']
+                raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF)
+                               for w in payload)
+                raw = raw[:b.byte_count]
+                # Re-validate the destination descriptor — the caller
+                # may have ObjFreed it between issuing the request and
+                # the response arriving (unlikely but possible if a
+                # signal handler runs in between).
+                desc = cpu.descriptors[b.dst_idx] \
+                       if 0 < b.dst_idx < len(cpu.descriptors) else None
+                if desc is None or not desc.live:
+                    cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0)
+                else:
+                    desc.storage[b.dst_off:b.dst_off+b.byte_count] = raw
+                    cpu.set_gpr(2, ERR_OK)
+                    cpu.set_gpr(3, b.byte_count)
+            cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.blocked_on = None
+            return True
+        return False
 
     def _try_unblock_task_resp(self, cpu: CPU, b: 'BlockedSignal',
                                 expected_type: int, deliver_r3: bool) -> bool:
@@ -2849,6 +2925,92 @@ def primitive_ObjDerive(cpu: CPU) -> None:
     cpu.set_opr(1, derived)
     cpu.set_gpr(2, ERR_OK)
 
+
+def primitive_ObjFetchBytes(cpu: CPU) -> None:
+    """Vol VI #0x108 (Phase 45e). Copy R6 bytes from O1+R4 to O2+R5.
+    Source O1 may be local or remote; destination O2 must be local
+    and non-objstore (we'd otherwise corrupt OR refs). Bridges the
+    OL-immediate-offset gap for cross-CPU bulk reads — OBJ_READ_REQ
+    already supports arbitrary widths on the wire, but no instruction
+    or primitive previously exposed that to programs.
+
+    Args:
+      O1: source object ref (CAP_R required)
+      O2: destination object ref (CAP_W required, must be local,
+          must not be objstore)
+      R4: source offset (signed 32-bit)
+      R5: destination offset (signed 32-bit)
+      R6: byte count (unsigned 32-bit)
+
+    Returns:
+      R2: status (OK / EFAULT / EREMOTE / EPERM / ESTALE / EINVAL)
+      R3: bytes actually copied (R6 on success, 0 on error)
+
+    Wire behaviour: when ref_home(O1) != cpu.pid, issues a single
+    OBJ_READ_REQ for the full range and raises BlockedOnObjFetch.
+    The handler at response time writes payload bytes into the
+    local destination descriptor. RESP_* fault flags map to ERR_*
+    (STALE/BOUNDS/CAP/BUS_ERROR) — same mapping OL/OS uses.
+    """
+    src = cpu.get_opr(1)
+    dst = cpu.get_opr(2)
+    src_off = cpu.get_gpr(4)
+    if src_off & 0x80000000: src_off -= 0x100000000
+    dst_off = cpu.get_gpr(5)
+    if dst_off & 0x80000000: dst_off -= 0x100000000
+    n = cpu.get_gpr(6) & 0xFFFFFFFF
+
+    if src == 0 or dst == 0:
+        cpu.set_gpr(2, ERR_EFAULT); cpu.set_gpr(3, 0); return
+    if (ref_caps(src) & CAP_R) == 0:
+        cpu.set_gpr(2, ERR_EPERM); cpu.set_gpr(3, 0); return
+    if (ref_caps(dst) & CAP_W) == 0:
+        cpu.set_gpr(2, ERR_EPERM); cpu.set_gpr(3, 0); return
+    if ref_home(dst) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); cpu.set_gpr(3, 0); return
+
+    # Validate destination locally.
+    dst_idx = ref_index(dst)
+    if dst_idx <= 0 or dst_idx >= len(cpu.descriptors) \
+            or cpu.descriptors[dst_idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+    dst_desc = cpu.descriptors[dst_idx]
+    if not dst_desc.live or dst_desc.generation != ref_generation(dst):
+        cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+    if dst_desc.objstore:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+    if n == 0:
+        cpu.set_gpr(2, ERR_OK); cpu.set_gpr(3, 0); return
+    if dst_off < 0 or dst_off + n > dst_desc.length:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+
+    if cpu.system is None or ref_home(src) == cpu.pid:
+        # Local source: validate, then bytes copy.
+        src_idx = ref_index(src)
+        if src_idx <= 0 or src_idx >= len(cpu.descriptors) \
+                or cpu.descriptors[src_idx] is None:
+            cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+        src_desc = cpu.descriptors[src_idx]
+        if not src_desc.live or src_desc.generation != ref_generation(src):
+            cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+        if src_off < 0 or src_off + n > src_desc.length:
+            cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+        dst_desc.storage[dst_off:dst_off+n] = \
+            src_desc.storage[src_off:src_off+n]
+        cpu.set_gpr(2, ERR_OK)
+        cpu.set_gpr(3, n)
+        return
+
+    # Remote source: issue OBJ_READ_REQ, block. Home does the
+    # validation and answers with the bytes (or a fault flag).
+    trans_id = cpu.next_trans_id & 0xFFFF
+    cpu.next_trans_id = (cpu.next_trans_id + 1) & 0xFFFF
+    packet = build_obj_read_req(cpu.pid, ref_home(src), trans_id,
+                                src, src_off, n)
+    cpu.system.crossbar.send_packet(packet)
+    raise BlockedOnObjFetch(trans_id, dst_idx, dst_off, n)
+
+
 def primitive_ReceiveQueueAttach(cpu: CPU) -> None:
     """Replace handler-dispatch behaviour on a target object with a
     queue. Subsequent SENDs to the object are appended to the queue
@@ -3193,6 +3355,7 @@ PRIMITIVE_MIN_MODE = {
     0x107: MODE_USER,        # ObjFreeDeferred — drain-window wrapper
     0x103: MODE_USER,        # ObjDerive
     0x106: MODE_USER,        # ObjAllocStore
+    0x108: MODE_USER,        # ObjFetchBytes (Phase 45e)
     0x110: MODE_SUPERVISOR,  # MapObject        — manipulates VA layout
     0x111: MODE_SUPERVISOR,  # Unmap            — manipulates VA layout
     0x200: MODE_SUPERVISOR,  # InstallHandler   — registers trap-like callback
@@ -3246,6 +3409,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjDerive(cpu)
     elif prim == 0x106:
         primitive_ObjAllocStore(cpu)
+    elif prim == 0x108:
+        primitive_ObjFetchBytes(cpu)
     elif prim == 0x110:
         primitive_MapObject(cpu)
     elif prim == 0x111:
