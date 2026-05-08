@@ -1,23 +1,29 @@
 #!/bin/sh
 # boot.sh — start Ouroboros: the OS layer atop Object RISC.
 #
-# Phase 45b (this version): supervisor.orx is CPU 0's boot leader.
-# It allocates its own spawn-service mailbox at boot, TaskCreates
-# the shell as its first user task with the supervisor sub-cap
-# wired into O8 (so the shell's task_init harvests it into
-# SUP_SLOT). All `run`/`edit` from the shell go through sup_spawn
-# → SEND-RPC → supervisor's orx_spawn. The shell's `exit` SENDs
-# an op=2 (shutdown) before TaskExit so the supervisor can wind
-# down without polling. Existing single-CPU test harnesses still
-# launch shell.orx directly (no supervisor in O8 → sup_spawn
-# falls back to orx_spawn).
+# Phase 45c (this version): every CPU boots the same supervisor.orx,
+# but only PROCID 0 (the leader) spawns a shell as its first user
+# task — workers sit in their dispatch loop ready to service spawn
+# requests. The leader's shell drives all visible activity; workers
+# are quiet until later phases (45e+) wire supervisor-to-supervisor
+# SENDs for cross-CPU spawn placement. When the leader exits,
+# oriscrun's `--leader 0` tears down the workers via SIGTERM.
+#
+# Phase 45b lineage: supervisor.orx allocates its own spawn-service
+# mailbox at boot, derives a sub-cap into ORX_SLOT_CHILD_O8 so every
+# TaskCreate it does injects the cap into the child's O8 (the libc
+# task_init then harvests it into SUP_SLOT). All `run`/`edit` from
+# a shell go through sup_spawn → SEND-RPC → its local supervisor's
+# orx_spawn. The shell's `exit` SENDs op=2 (shutdown) so the
+# leader supervisor can wind down without polling. Existing
+# single-CPU test harnesses still launch shell.orx directly (no
+# supervisor in O8 → sup_spawn falls back to orx_spawn).
 #
 # Spawned processes by `make boot`:
 #   - oriscbar  (crossbar)
 #   - oriscterm (Tk terminal, pid 16)
 #   - hostfsd   (host FS access, pid 17, jailed to repo root)
-#   - the shell CPU (pid 0; the leader — when it exits, everything
-#                    else tears down)
+#   - 2 supervisor CPUs (pid 0 = leader with shell; pid 1 = worker)
 #
 # The shell announces itself with the current real-world date minus
 # 40 years (alternate-history conceit) — computed here, passed via
@@ -68,8 +74,14 @@ fi
 #        so spawned children inherit it)
 #   O9  = pad (also null at boot; supervisor's own mailbox replaces it)
 #   O10 = hostfsd            (17=1@9)
+#
+# Both CPUs get the same service refs — they're refs to objects on
+# the device PIDs (16, 17), and the device daemons handle multiple
+# subscribers. CPU 0 (PROCID 0) is the leader and spawns a shell;
+# CPU 1 stays in the dispatch loop until 45e gives it work to do.
 exec python3 tools/oriscrun \
     --terminal pid=16 \
     --hostfsd "pid=17,root=$ROOT" \
     --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=0@0,service=0=0@0,service=17=1@9" \
+    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=0@0,service=0=0@0,service=17=1@9" \
     --leader 0 --leader-timeout 600
