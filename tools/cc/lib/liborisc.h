@@ -330,4 +330,64 @@ task_t sup_spawn_at(int target_pid, const char *path,
  * returning from main() — once you've TaskExited it's too late. */
 void sup_shutdown(void);
 
+/* ----- Directory service (Phase 45f) ----------------------------------
+ *
+ * `oriscdir` is a small daemon that holds a hierarchical name → ref
+ * tree. Programs can:
+ *   - register a leaf (a name → OR ref binding)
+ *   - mount a service (a name → service ref + path-prefix
+ *     binding; walks descending past the mount return early with
+ *     the service ref + the remaining path, so e.g. `/programs/`
+ *     can route to a hostfsd jail at "/build/programs")
+ *   - walk a path to resolve it
+ *   - list a directory's children
+ *
+ * The directory's mailbox is bootstrapped via the boot ABI: oriscrun
+ * synthesizes a sub-cap of oriscdir's primary mailbox into each
+ * CPU's boot O8, which task_init harvests into BOOT_PARENT_SLOT.
+ * Supervisors (whose parent IS the directory) copy this directly
+ * into DIR_SLOT at boot. Other programs (shells, etc.) get their
+ * directory ref by querying their parent supervisor lazily on the
+ * first dir_walk call (see dir.c's dir_init).
+ *
+ * Node kinds returned by dir_walk: */
+#define DIR_KIND_NOT_FOUND  0
+#define DIR_KIND_DIR        1
+#define DIR_KIND_LEAF       2
+#define DIR_KIND_MOUNT      3
+
+/* Walk `path` against the directory tree.
+ *
+ * On success returns the remainder length (>=0): 0 for DIR/LEAF,
+ *   >0 for MOUNT with a non-empty remainder.
+ * On error returns negative: -1 EINVAL, -2 ENOENT, -3 EEXISTS,
+ *   -4 ENOTDIR, -5 ETOOBIG, -6 EIO.
+ *
+ * In all success cases *kind_out is filled with DIR_KIND_DIR /
+ * LEAF / MOUNT. For LEAF and MOUNT, O1 holds the resolved ref —
+ * caller MUST `omov` it out before any other libc call clobbers
+ * it. (For DIR, O1 is left null.) For MOUNT, remainder_buf is
+ * filled with the prefix-and-leftover path bytes (NUL-terminated
+ * within remainder_cap). For other kinds remainder_buf is left
+ * untouched. */
+int dir_walk(const char *path, int *kind_out,
+             char *remainder_buf, int remainder_cap);
+
+/* Register the ref currently in O1 as a leaf at `path`. Fails with
+ * EEXISTS if the path already has a non-empty node. */
+int dir_register(const char *path);
+
+/* Mount: register the service ref currently in O1 at `path`, with
+ * `prefix` as the root within the mounted service (passed back to
+ * walk callers as part of their remainder). */
+int dir_mount(const char *path, const char *prefix);
+
+/* List children of `path` (must be a DIR — for MOUNTs the caller
+ * resolves via dir_walk and talks to the mount's service directly).
+ * Children are written into `buf` as NUL-separated UTF-8 names,
+ * directories/mounts get a trailing '/'. Returns the entry count
+ * on success (the byte length is recoverable as `strlen(buf) +
+ * trailing-NUL-terminator runs`), negative on error. */
+int dir_list(const char *path, char *buf, int cap);
+
 #endif /* LIBORISC_H */

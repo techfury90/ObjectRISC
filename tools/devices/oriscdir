@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+"""oriscdir — Object RISC directory service / namespace router.
+
+A non-CPU participant on the crossbar that maintains a hierarchical
+name → ref tree, the way Plan 9's /-namespaces or any Unix VFS
+does. Three node types:
+
+  DIR    — pure directory; has children, no value of its own
+  LEAF   — terminal; carries one OR ref (a service mailbox sub-cap,
+           a task ref, whatever the registrant wanted to publish)
+  MOUNT  — terminal-as-far-as-the-tree-goes; carries (service_ref,
+           prefix). Walks descending into a MOUNT node return early
+           with `kind=MOUNT, ref=service, remainder=prefix+leftover`.
+           The caller forwards the remainder to the mounted service
+           (typically hostfsd) using whatever protocol that service
+           speaks. This gives us a single namespace where /programs
+           can resolve to one hostfsd jail and /home to another
+           (or the same hostfsd at a different prefix), without the
+           directory daemon having to understand file semantics.
+
+Usage:
+    tools/devices/oriscdir --socket /tmp/oriscbar.sock --pid 18
+
+Wire protocol (request: program SENDs to oriscdir at (pid, idx 1)):
+
+  R4 = op code, others depend on op:
+
+  OP_REGISTER  = 1   O2 = path bytes ref (TAG_DATA on caller's CPU)
+                     O3 = reply_cap (R+S sub-cap of caller's mailbox)
+                     O4 = ref to register
+                     R5 = path length (bytes)
+                     → response: R3 = 0 OK, negative on error
+                     Fails with E_EXISTS if the path is already
+                     populated.
+
+  OP_MOUNT     = 2   O2 = path-and-prefix bytes ref. The buffer
+                          holds `path\\0prefix\\0` packed; both are
+                          UTF-8 strings without a leading slash on
+                          `prefix` (the prefix is the path within
+                          the mounted service, e.g. "/build/programs"
+                          for hostfsd).
+                     O3 = reply_cap
+                     O4 = service ref to mount (typically hostfsd's
+                          mailbox sub-cap)
+                     R5 = path length
+                     R6 = prefix length
+                     → response: R3 = 0 OK, negative on error
+
+  OP_WALK      = 3   O2 = path bytes ref
+                     O3 = reply_cap
+                     O4 = remainder dest buffer ref (R+W; only used
+                          when the walk lands in a MOUNT and we need
+                          to write the remainder back)
+                     R5 = path length
+                     R6 = remainder buffer capacity (bytes)
+                     → response: R3 = status (0 OK, negative on err)
+                                 R4 = kind (0=NOT_FOUND, 1=DIR,
+                                            2=LEAF, 3=MOUNT)
+                                 R5 = remainder length (MOUNT only)
+                                 O2 = the resolved ref (LEAF target
+                                       or MOUNT service ref); null
+                                       for DIR
+
+  OP_LIST      = 4   O2 = path bytes ref
+                     O3 = reply_cap
+                     O4 = entries dest buffer ref (R+W). The daemon
+                          writes a NUL-separated UTF-8 list of child
+                          names into it.
+                     R5 = path length
+                     R6 = entries buffer capacity
+                     → response: R3 = status
+                                 R4 = entry count
+                                 R5 = bytes written
+
+All responses are SEND_DELIVERs aimed at the caller-supplied
+reply_cap; the result lands in the receiver's R3..R5 / O2 (after
+queue-dispatch overlay shifts caller's R4..R7 → R3..R6 and the
+sender's O1..O4 land verbatim in the receiver's O1..O4, with O1
+of the dispatched message being the recipient's own
+self-reference).
+
+Errors (negative R3 in responses):
+
+  -1  E_INVAL       bad arguments / unknown op
+  -2  E_NOENT       path does not exist
+  -3  E_EXISTS      path already populated (for register/mount)
+  -4  E_NOTDIR      path traverses through a LEAF
+  -5  E_TOOBIG      result wouldn't fit in caller's destination buffer
+  -6  E_IO          internal / protocol error
+"""
+
+import argparse
+import errno
+import selectors
+import signal
+import socket
+import struct
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+# ---- Wire-format constants — must match simorisc / oriscbar / etc. --------
+
+HELLO_MAGIC      = 0xC0FFEEAA
+HELLO_OK         = 0x00000000
+
+PKT_OBJ_READ_REQ   = 0x10
+PKT_OBJ_READ_RESP  = 0x11
+PKT_OBJ_WRITE_REQ  = 0x12
+PKT_OBJ_WRITE_RESP = 0x13
+PKT_SEND_DELIVER   = 0x20
+
+RESP_OK     = 0x00
+
+# ---- Capability bits -----------------------------------------------------
+
+CAP_R = 0x01
+CAP_W = 0x02
+CAP_S = 0x08
+CAP_V = 0x10
+CAP_C = 0x40
+
+# ---- Service constants ---------------------------------------------------
+
+DIR_SERVICE_INDEX  = 1
+SERVICE_GENERATION = 1
+SERVICE_MAX_CAPS   = 0x5B   # R|W|S|V|C — what oriscrun synthesizes refs with
+
+# ---- Operation codes -----------------------------------------------------
+
+OP_REGISTER = 1
+OP_MOUNT    = 2
+OP_WALK     = 3
+OP_LIST     = 4
+
+# ---- Node-kind codes (returned in R4 of OP_WALK responses) ---------------
+
+KIND_NOT_FOUND = 0
+KIND_DIR       = 1
+KIND_LEAF      = 2
+KIND_MOUNT     = 3
+
+# ---- Error codes (negative R3 in responses) ------------------------------
+
+E_INVAL  = -1
+E_NOENT  = -2
+E_EXISTS = -3
+E_NOTDIR = -4
+E_TOOBIG = -5
+E_IO     = -6
+
+MAX_PATH_BYTES = 1024
+
+
+# ---- Wire helpers (duplicated from hostfsd; the user has flagged that we
+#      should grow a shared library — that's a follow-up). ----------------
+
+def make_ref(generation: int, home: int, index: int, caps: int) -> int:
+    return (((generation & 0xFFFF) << 48)
+            | ((home       & 0xFF)   << 40)
+            | ((index      & 0xFFFFFF) << 16)
+            | ((caps       & 0xFF)   << 8))
+
+
+def ref_home(r: int)       -> int: return (r >> 40) & 0xFF
+def ref_index(r: int)      -> int: return (r >> 16) & 0xFFFFFF
+def ref_generation(r: int) -> int: return (r >> 48) & 0xFFFF
+def ref_caps(r: int)       -> int: return (r >>  8) & 0xFF
+
+
+def pack_packet(src_pid: int, dst_pid: int, msg_type: int, flags: int,
+                trans_id: int, payload_words) -> bytes:
+    header = struct.pack(">BBBBHH",
+                         src_pid & 0xFF, dst_pid & 0xFF,
+                         msg_type & 0xFF, flags & 0xFF,
+                         trans_id & 0xFFFF, len(payload_words) & 0xFFFF)
+    payload = b''.join(struct.pack(">I", w & 0xFFFFFFFF)
+                       for w in payload_words)
+    h0, h1 = struct.unpack(">II", header)
+    chk = h0 ^ h1
+    for w in payload_words:
+        chk ^= w & 0xFFFFFFFF
+    return header + payload + struct.pack(">I", chk & 0xFFFFFFFF)
+
+
+def unpack_packet(data: bytes) -> Dict:
+    if len(data) < 12:
+        raise ValueError("packet too short")
+    src, dst, mtype, flags, trans_id, length_words = \
+        struct.unpack(">BBBBHH", data[:8])
+    payload_bytes = data[8:8 + length_words * 4]
+    words = list(struct.unpack(f">{length_words}I", payload_bytes)) \
+        if length_words else []
+    h0, h1 = struct.unpack(">II", data[:8])
+    chk = h0 ^ h1
+    for w in words:
+        chk ^= w
+    expected_chk = struct.unpack(">I", data[-4:])[0]
+    if chk != expected_chk:
+        raise ValueError("checksum mismatch")
+    return {"src_pid": src, "dst_pid": dst, "type": mtype,
+            "flags": flags, "trans_id": trans_id, "payload": words}
+
+
+def parse_send_deliver(pkt):
+    p = pkt["payload"]
+    if len(p) != 14:
+        raise ValueError(f"SEND_DELIVER payload must be 14 words, got {len(p)}")
+    recipient_ref = p[0] | (p[1] << 32)
+    int_payload = list(p[2:6])
+    or_payload = []
+    for i in range(4):
+        or_payload.append(p[6 + 2*i] | (p[7 + 2*i] << 32))
+    return recipient_ref, int_payload, or_payload
+
+
+def build_send_deliver(src_pid, dst_pid, trans_id, recipient_ref,
+                       int_payload, or_payload):
+    payload = [recipient_ref & 0xFFFFFFFF,
+               (recipient_ref >> 32) & 0xFFFFFFFF]
+    for i in range(4):
+        payload.append(int_payload[i] & 0xFFFFFFFF if i < len(int_payload) else 0)
+    for i in range(4):
+        ref = or_payload[i] if i < len(or_payload) else 0
+        payload.append(ref & 0xFFFFFFFF)
+        payload.append((ref >> 32) & 0xFFFFFFFF)
+    return pack_packet(src_pid, dst_pid, PKT_SEND_DELIVER, 0, trans_id, payload)
+
+
+def build_obj_read_req(src_pid, dst_pid, trans_id, ref, offset, width):
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF,
+               offset & 0xFFFFFFFF, width & 0xFFFFFFFF]
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_REQ, 0, trans_id, payload)
+
+
+def build_obj_write_req(src_pid, dst_pid, trans_id, ref, offset, width, data):
+    pad = (-len(data)) % 4
+    padded = data + bytes(pad)
+    data_words = list(struct.unpack(f">{len(padded)//4}I", padded)) \
+        if padded else []
+    payload = [ref & 0xFFFFFFFF, (ref >> 32) & 0xFFFFFFFF,
+               offset & 0xFFFFFFFF, width & 0xFFFFFFFF]
+    payload.extend(data_words)
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_WRITE_REQ, 0, trans_id, payload)
+
+
+# ---- The directory tree -------------------------------------------------
+
+@dataclass
+class Node:
+    """One vertex in the directory tree. Exactly one of {leaf_ref,
+    mount_ref, children-non-empty-or-not} is "active" — though a
+    fresh DIR node can also be empty. We disambiguate via .kind()."""
+    name: str
+    parent: Optional["Node"] = None
+    children: Dict[str, "Node"] = field(default_factory=dict)
+    leaf_ref: int = 0
+    mount_ref: int = 0
+    mount_prefix: str = ""
+
+    def kind(self) -> int:
+        if self.leaf_ref:  return KIND_LEAF
+        if self.mount_ref: return KIND_MOUNT
+        return KIND_DIR
+
+
+def normalize_path(path: str) -> List[str]:
+    """Split an absolute path into a list of components, dropping
+    empty segments (from leading/trailing/duplicate slashes). Does
+    NOT collapse `..` — the directory service is a flat namespace,
+    not a filesystem; relative-path resolution is the caller's job."""
+    if not path.startswith("/"):
+        # All paths must be absolute for now. Reject relative.
+        return None
+    return [p for p in path.split("/") if p]
+
+
+# ---- Per-CPU pending I/O state ------------------------------------------
+
+@dataclass
+class PendingRequest:
+    """A request that's waiting on some bytes to arrive from the
+    caller's CPU (path bytes, mostly). When the OBJ_READ_RESP for
+    `trans_id` lands, we resume the operation."""
+    op: int
+    reply_cap: int                       # SEND target for the eventual response
+    int_payload: List[int]               # caller's R4..R7 verbatim
+    or_payload:  List[int]               # caller's O1..O4 verbatim
+    src_pid: int                         # for issuing dest-buffer writes
+    bytes_remaining: int = 0
+
+
+# ---- The server ---------------------------------------------------------
+
+class OriscDir:
+    def __init__(self, sock_path: str, my_pid: int, verbose: bool = False):
+        self.my_pid = my_pid
+        self.verbose = verbose
+        self.next_trans_id = 0
+        self.root = Node(name="")            # the "/" node
+        self.pending: Dict[int, PendingRequest] = {}
+
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.connect(sock_path)
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            raise SystemExit(f"oriscdir: connect to {sock_path}: {e}")
+        self.sock.sendall(struct.pack(">II", HELLO_MAGIC, my_pid))
+        reply = self._recv_exact(8)
+        magic, status = struct.unpack(">II", reply)
+        if magic != HELLO_MAGIC or status != HELLO_OK:
+            raise SystemExit(f"oriscdir: handshake failed "
+                             f"(magic={magic:#x}, status={status:#x})")
+        self.sock.setblocking(False)
+        self.recv_buf = bytearray()
+        self.shutdown_requested = False
+
+        self._log(f"online · pid={my_pid} · service idx={DIR_SERVICE_INDEX}")
+
+    # ---- network ---------------------------------------------------------
+
+    def _recv_exact(self, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise SystemExit("oriscdir: crossbar closed during handshake")
+            out.extend(chunk)
+        return bytes(out)
+
+    def send_packet(self, packet: bytes) -> None:
+        # Same backpressure dance as hostfsd: sendall on a non-blocking
+        # socket raises BlockingIOError when the kernel buffer fills.
+        import select
+        data = struct.pack(">I", len(packet)) + packet
+        sent = 0
+        while sent < len(data):
+            try:
+                n = self.sock.send(data[sent:])
+                if n == 0:
+                    self.shutdown_requested = True
+                    return
+                sent += n
+            except BlockingIOError:
+                _, w, _ = select.select([], [self.sock], [], 5.0)
+                if not w:
+                    self._log("send blocked >5s; giving up")
+                    self.shutdown_requested = True
+                    return
+            except OSError as e:
+                self._log(f"send failed: {e}")
+                self.shutdown_requested = True
+                return
+
+    def _next_trans(self) -> int:
+        t = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        return t
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"oriscdir: {msg}", file=sys.stderr, flush=True)
+
+    # ---- main loop -------------------------------------------------------
+
+    def run(self) -> None:
+        print(f"oriscdir READY pid={self.my_pid}", flush=True)
+        sel = selectors.DefaultSelector()
+        sel.register(self.sock, selectors.EVENT_READ)
+        try:
+            while not self.shutdown_requested:
+                events = sel.select(timeout=0.25)
+                if not events:
+                    continue
+                if not self._drain():
+                    self._log("crossbar closed")
+                    break
+                while True:
+                    pkt = self._take_packet()
+                    if pkt is None:
+                        break
+                    self._handle_packet(pkt)
+        finally:
+            sel.close()
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    def _drain(self) -> bool:
+        try:
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    return False
+                self.recv_buf.extend(chunk)
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError as e:
+            if e.errno in (errno.ECONNRESET, errno.EPIPE):
+                return False
+            raise
+
+    def _take_packet(self) -> Optional[bytes]:
+        if len(self.recv_buf) < 4:
+            return None
+        (length,) = struct.unpack(">I", bytes(self.recv_buf[:4]))
+        if len(self.recv_buf) < 4 + length:
+            return None
+        pkt = bytes(self.recv_buf[4:4 + length])
+        del self.recv_buf[:4 + length]
+        return pkt
+
+    def _handle_packet(self, raw: bytes) -> None:
+        try:
+            pkt = unpack_packet(raw)
+        except ValueError as e:
+            self._log(f"malformed packet: {e}")
+            return
+        t = pkt["type"]
+        if t == PKT_SEND_DELIVER:
+            self._handle_send(pkt)
+        elif t == PKT_OBJ_READ_RESP:
+            self._handle_read_resp(pkt)
+        elif t == PKT_OBJ_WRITE_RESP:
+            self._handle_write_resp(pkt)
+        else:
+            self._log(f"unhandled packet type 0x{t:02x} from "
+                      f"pid={pkt['src_pid']}")
+
+    # ---- request dispatch ------------------------------------------------
+
+    def _handle_send(self, pkt) -> None:
+        try:
+            recipient_ref, int_payload, or_payload = parse_send_deliver(pkt)
+        except ValueError as e:
+            self._log(f"bad SEND_DELIVER: {e}")
+            return
+        if ref_index(recipient_ref) != DIR_SERVICE_INDEX:
+            self._log(f"SEND to unknown obj idx={ref_index(recipient_ref)}")
+            return
+        op = int_payload[0]
+        reply_cap = or_payload[2]   # caller's O3
+        if reply_cap == 0:
+            self._log(f"op {op} from pid={pkt['src_pid']} with null reply_cap; "
+                      f"dropping")
+            return
+        path_ref = or_payload[1]    # caller's O2
+        path_len = int_payload[1]   # caller's R5
+        if path_ref == 0 or path_len <= 0 or path_len > MAX_PATH_BYTES:
+            self._reply(reply_cap, E_INVAL, 0, 0, 0)
+            return
+        # OP_MOUNT packs path\0prefix\0 in a single bytes object;
+        # we need to read all of it. R6 (int_payload[2]) names the
+        # prefix length. For other ops just read path_len bytes.
+        if op == OP_MOUNT:
+            prefix_len = int_payload[2]
+            if prefix_len < 0 or prefix_len > MAX_PATH_BYTES:
+                self._reply(reply_cap, E_INVAL, 0, 0, 0)
+                return
+            read_len = path_len + 1 + prefix_len + 1
+        else:
+            read_len = path_len
+        trans = self._next_trans()
+        self.pending[trans] = PendingRequest(
+            op=op, reply_cap=reply_cap,
+            int_payload=int_payload, or_payload=or_payload,
+            src_pid=pkt["src_pid"],
+            bytes_remaining=read_len,
+        )
+        req = build_obj_read_req(self.my_pid, ref_home(path_ref), trans,
+                                 path_ref, 0, read_len)
+        self.send_packet(req)
+
+    def _handle_read_resp(self, pkt) -> None:
+        trans = pkt["trans_id"]
+        pr = self.pending.pop(trans, None)
+        if pr is None:
+            self._log(f"unexpected OBJ_READ_RESP trans={trans}")
+            return
+        flags = pkt["flags"] & 0x3F
+        if flags != 0:
+            self._reply(pr.reply_cap, E_IO, 0, 0, 0)
+            return
+        words = pkt["payload"]
+        raw = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in words)
+        path_bytes = raw[:pr.bytes_remaining]
+
+        if pr.op == OP_REGISTER:
+            self._do_register(pr, path_bytes)
+        elif pr.op == OP_MOUNT:
+            self._do_mount(pr, path_bytes)
+        elif pr.op == OP_WALK:
+            self._do_walk(pr, path_bytes)
+        elif pr.op == OP_LIST:
+            self._do_list(pr, path_bytes)
+        else:
+            self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+
+    def _handle_write_resp(self, pkt) -> None:
+        # We use OBJ_WRITE_REQ for op=walk's remainder buffer write
+        # and op=list's entries buffer write. The pending state
+        # carries the final reply parameters; complete the original
+        # request now.
+        trans = pkt["trans_id"]
+        pr = self.pending.pop(trans, None)
+        if pr is None:
+            self._log(f"unexpected OBJ_WRITE_RESP trans={trans}")
+            return
+        flags = pkt["flags"] & 0x3F
+        if flags != 0:
+            self._reply(pr.reply_cap, E_IO, 0, 0, 0)
+            return
+        # The final reply was stashed in pr.int_payload as
+        # [status, secondary, tertiary, ref_lo, ref_hi]. Pluck and
+        # send.
+        status, secondary, tertiary = pr.int_payload[:3]
+        ref = (pr.int_payload[3] | (pr.int_payload[4] << 32)) \
+            if len(pr.int_payload) >= 5 else 0
+        self._reply(pr.reply_cap, status, secondary, tertiary, ref)
+
+    # ---- the actual operations ------------------------------------------
+
+    def _do_register(self, pr: PendingRequest, path_bytes: bytes) -> None:
+        try:
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        comps = normalize_path(path)
+        if comps is None:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        ref_to_register = pr.or_payload[3]   # caller's O4
+        if ref_to_register == 0:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        # Walk-or-create down to the final component.
+        node = self.root
+        for c in comps[:-1]:
+            if node.kind() == KIND_LEAF or node.kind() == KIND_MOUNT:
+                return self._reply(pr.reply_cap, E_NOTDIR, 0, 0, 0)
+            if c not in node.children:
+                node.children[c] = Node(name=c, parent=node)
+            node = node.children[c]
+        last = comps[-1] if comps else ""
+        if not last:
+            # Registering at "/" — refuse (root is always a DIR).
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        if node.kind() == KIND_LEAF or node.kind() == KIND_MOUNT:
+            return self._reply(pr.reply_cap, E_NOTDIR, 0, 0, 0)
+        if last in node.children:
+            existing = node.children[last]
+            if existing.kind() != KIND_DIR or existing.children:
+                return self._reply(pr.reply_cap, E_EXISTS, 0, 0, 0)
+            # Empty DIR — promote to LEAF.
+            existing.leaf_ref = ref_to_register
+            self._log(f"register {path!r} → 0x{ref_to_register:016x} "
+                      f"(promoted from empty dir)")
+            return self._reply(pr.reply_cap, 0, 0, 0, 0)
+        new_node = Node(name=last, parent=node, leaf_ref=ref_to_register)
+        node.children[last] = new_node
+        self._log(f"register {path!r} → 0x{ref_to_register:016x}")
+        self._reply(pr.reply_cap, 0, 0, 0, 0)
+
+    def _do_mount(self, pr: PendingRequest, path_and_prefix: bytes) -> None:
+        # The buffer holds path + NUL + prefix + NUL (cleanly packed
+        # by the libc client). path_len in R5 names the path length
+        # not counting its NUL. prefix sits right after.
+        path_len = pr.int_payload[1]
+        prefix_len = pr.int_payload[2]
+        if path_len + 1 + prefix_len > len(path_and_prefix):
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        try:
+            path = path_and_prefix[:path_len].decode("utf-8")
+            prefix = path_and_prefix[path_len + 1:
+                                     path_len + 1 + prefix_len].decode("utf-8")
+        except UnicodeDecodeError:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        comps = normalize_path(path)
+        if comps is None or not comps:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        service_ref = pr.or_payload[3]   # caller's O4
+        if service_ref == 0:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        node = self.root
+        for c in comps[:-1]:
+            if node.kind() != KIND_DIR:
+                return self._reply(pr.reply_cap, E_NOTDIR, 0, 0, 0)
+            if c not in node.children:
+                node.children[c] = Node(name=c, parent=node)
+            node = node.children[c]
+        last = comps[-1]
+        if node.kind() != KIND_DIR:
+            return self._reply(pr.reply_cap, E_NOTDIR, 0, 0, 0)
+        if last in node.children:
+            existing = node.children[last]
+            if existing.kind() != KIND_DIR or existing.children:
+                return self._reply(pr.reply_cap, E_EXISTS, 0, 0, 0)
+            existing.mount_ref = service_ref
+            existing.mount_prefix = prefix
+            self._log(f"mount {path!r} → ref=0x{service_ref:016x} "
+                      f"prefix={prefix!r} (promoted)")
+            return self._reply(pr.reply_cap, 0, 0, 0, 0)
+        new_node = Node(name=last, parent=node,
+                        mount_ref=service_ref, mount_prefix=prefix)
+        node.children[last] = new_node
+        self._log(f"mount {path!r} → ref=0x{service_ref:016x} prefix={prefix!r}")
+        self._reply(pr.reply_cap, 0, 0, 0, 0)
+
+    def _do_walk(self, pr: PendingRequest, path_bytes: bytes) -> None:
+        try:
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        self._log(f"walk request: {path!r}")
+        comps = normalize_path(path)
+        if comps is None:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        node = self.root
+        for i, c in enumerate(comps):
+            if node.kind() == KIND_LEAF:
+                # Path tries to descend into a leaf — error.
+                return self._reply(pr.reply_cap, E_NOTDIR, 0, 0, 0)
+            if node.kind() == KIND_MOUNT:
+                # Hit a mount partway through — return remainder
+                # (= mount_prefix joined with leftover components).
+                leftover = "/".join(comps[i:])
+                remainder = self._build_remainder(node.mount_prefix, leftover)
+                return self._send_walk_mount(pr, node.mount_ref, remainder)
+            if c not in node.children:
+                return self._reply(pr.reply_cap, E_NOENT, 0, 0, 0)
+            node = node.children[c]
+        # Arrived at the target node.
+        if node.kind() == KIND_DIR:
+            return self._reply(pr.reply_cap, 0, KIND_DIR, 0, 0)
+        if node.kind() == KIND_LEAF:
+            return self._reply(pr.reply_cap, 0, KIND_LEAF, 0, node.leaf_ref)
+        # MOUNT at the target itself: remainder = the prefix only.
+        return self._send_walk_mount(pr, node.mount_ref, node.mount_prefix)
+
+    @staticmethod
+    def _build_remainder(prefix: str, leftover: str) -> str:
+        """Concatenate the mount prefix and any leftover path
+        components from the original walk. Both pieces may or may
+        not have leading/trailing slashes; we want exactly one
+        slash between them, and the result starts with '/' so it
+        looks like an absolute path inside the mounted service."""
+        if not leftover:
+            return prefix or "/"
+        if not prefix:
+            return "/" + leftover
+        if prefix.endswith("/"):
+            return prefix + leftover
+        return prefix + "/" + leftover
+
+    def _send_walk_mount(self, pr: PendingRequest, service_ref: int,
+                         remainder: str) -> None:
+        """Walk landed in a MOUNT. Write the remainder string into
+        the caller's destination buffer (passed in O4) and reply
+        with kind=MOUNT, ref=service_ref, R5=remainder_len."""
+        dest_ref = pr.or_payload[3]
+        dest_cap = pr.int_payload[2]   # caller's R6
+        rem_bytes = remainder.encode("utf-8")
+        if dest_ref == 0:
+            # Caller didn't provide a destination — they don't need
+            # the remainder. Return everything else.
+            return self._reply(pr.reply_cap, 0, KIND_MOUNT,
+                               len(rem_bytes), service_ref)
+        if len(rem_bytes) > dest_cap:
+            return self._reply(pr.reply_cap, E_TOOBIG, 0, 0, 0)
+        if (ref_caps(dest_ref) & CAP_W) == 0:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        # Stash the eventual reply in pending; the OBJ_WRITE_RESP
+        # handler picks it up.
+        trans = self._next_trans()
+        pending = PendingRequest(
+            op=OP_WALK, reply_cap=pr.reply_cap,
+            int_payload=[0, KIND_MOUNT, len(rem_bytes),
+                         service_ref & 0xFFFFFFFF,
+                         (service_ref >> 32) & 0xFFFFFFFF],
+            or_payload=[],
+            src_pid=pr.src_pid,
+            bytes_remaining=len(rem_bytes),
+        )
+        self.pending[trans] = pending
+        req = build_obj_write_req(self.my_pid, ref_home(dest_ref), trans,
+                                  dest_ref, 0, len(rem_bytes), rem_bytes)
+        self.send_packet(req)
+
+    def _do_list(self, pr: PendingRequest, path_bytes: bytes) -> None:
+        try:
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        comps = normalize_path(path)
+        if comps is None:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        node = self.root
+        for c in comps:
+            if node.kind() != KIND_DIR:
+                return self._reply(pr.reply_cap, E_NOTDIR, 0, 0, 0)
+            if c not in node.children:
+                return self._reply(pr.reply_cap, E_NOENT, 0, 0, 0)
+            node = node.children[c]
+        if node.kind() != KIND_DIR:
+            return self._reply(pr.reply_cap, E_NOTDIR, 0, 0, 0)
+        # NUL-separated names. Append a trailing '/' to entries that
+        # are directories or mounts (visual hint for `ls`).
+        names = sorted(node.children.keys())
+        chunks = []
+        for n in names:
+            child = node.children[n]
+            if child.kind() == KIND_DIR or child.kind() == KIND_MOUNT:
+                chunks.append((n + "/").encode("utf-8"))
+            else:
+                chunks.append(n.encode("utf-8"))
+        listing = b"\0".join(chunks)
+        if names and not listing.endswith(b"\0"):
+            listing += b"\0"        # trailing NUL for the last entry
+        dest_ref = pr.or_payload[3]
+        dest_cap = pr.int_payload[2]
+        if len(listing) > dest_cap:
+            return self._reply(pr.reply_cap, E_TOOBIG, 0, 0, 0)
+        if not listing:
+            # Empty directory — reply directly with count=0.
+            return self._reply(pr.reply_cap, 0, 0, 0, 0)
+        if dest_ref == 0:
+            # Caller didn't provide a buffer (just probing). Reply
+            # with the count anyway.
+            return self._reply(pr.reply_cap, 0, len(names), 0, 0)
+        if (ref_caps(dest_ref) & CAP_W) == 0:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        trans = self._next_trans()
+        pending = PendingRequest(
+            op=OP_LIST, reply_cap=pr.reply_cap,
+            int_payload=[0, len(names), len(listing), 0, 0],
+            or_payload=[],
+            src_pid=pr.src_pid,
+            bytes_remaining=len(listing),
+        )
+        self.pending[trans] = pending
+        req = build_obj_write_req(self.my_pid, ref_home(dest_ref), trans,
+                                  dest_ref, 0, len(listing), listing)
+        self.send_packet(req)
+
+    # ---- response back to the caller -------------------------------------
+
+    def _reply(self, reply_cap: int, status: int, secondary: int,
+               tertiary: int, ref_payload: int) -> None:
+        """SEND a reply back to the caller's reply_cap.
+            R4 = status   (lands in receiver's R3)
+            R5 = secondary (kind / count) → receiver's R4
+            R6 = tertiary  (remainder len / bytes written) → receiver's R5
+            O2 = ref_payload (the resolved ref for OP_WALK) → receiver's O2
+        Uses unsigned 32-bit packing for the int slots so negative
+        statuses come through as their two's-complement form, which
+        the libc-side handler reinterprets as signed."""
+        trans = self._next_trans()
+        pkt = build_send_deliver(
+            src_pid=self.my_pid,
+            dst_pid=ref_home(reply_cap),
+            trans_id=trans,
+            recipient_ref=reply_cap,
+            int_payload=[status & 0xFFFFFFFF,
+                         secondary & 0xFFFFFFFF,
+                         tertiary & 0xFFFFFFFF,
+                         0],
+            or_payload=[reply_cap, ref_payload, 0, 0],
+        )
+        self.send_packet(pkt)
+
+
+# ---- CLI ----------------------------------------------------------------
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="oriscdir",
+        description="Object RISC directory service / namespace router")
+    ap.add_argument("--socket", required=True,
+                    help="path to oriscbar's UNIX domain socket")
+    ap.add_argument("--pid", type=int, required=True,
+                    help="processor identifier this server presents to "
+                         "the crossbar")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    server = OriscDir(args.socket, args.pid, verbose=args.verbose)
+
+    def _signal(_signo, _frame):
+        server.shutdown_requested = True
+    signal.signal(signal.SIGINT,  _signal)
+    signal.signal(signal.SIGTERM, _signal)
+
+    server.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
