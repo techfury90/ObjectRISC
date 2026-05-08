@@ -110,6 +110,18 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
+# Phase 45f: launch the directory daemon. Both supervisors will
+# register themselves at /sys/cpu/<procid>/supervisor and the
+# leader looks up its peer via dir_walk on the same path.
+python3 tools/devices/oriscdir \
+    --socket "$SOCK" --pid 18 -v \
+    > "$TMP/dir.out" 2>&1 &
+DIR=$!
+for _ in $(seq 50); do
+    grep -q "oriscdir READY" "$TMP/dir.out" 2>/dev/null && break
+    sleep 0.05
+done
+
 # Type:  run @1 /programs/hello.orx<RET>  exit<RET>
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
@@ -129,22 +141,23 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# CPU 0 (leader) — supervisor mailbox at idx 6 (deterministic in
-# socket mode: init_cpu's 4 reserved descriptors + simorisc's
-# populate_self_service at idx 5 + the supervisor's allocate-first
-# yields idx 6). Each --service slot maps to O5..O10 in order:
-# term-cons, term-kbd, term-grid, peer-mailbox (CPU 1's), pad, hostfsd.
+# Phase 45f: both CPUs have an identical service map. O8 carries
+# the directory daemon's primary mailbox sub-cap ("18=1@9") rather
+# than a static peer ref — peer discovery is now via dir_walk on
+# /sys/cpu/<N>/supervisor. The supervisor harvests O8 into
+# DIR_SLOT at boot and uses dir_register to publish its own
+# mailbox under /sys/cpu/<procid>/supervisor; relay_spawn_request
+# does dir_walk for the peer's ref.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
     --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "1=6@9" --service "0=0@0" \
+    --service "16=3@9" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
 
-# CPU 1 (worker) — same supervisor binary, but its O8 = CPU 0's mailbox.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
     --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "0=6@9" --service "0=0@0" \
+    --service "16=3@9" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu1.out" 2>"$TMP/cpu1.err" &
 CPU1=$!
@@ -154,9 +167,11 @@ sleep 0.5
 wait $CPU0 2>/dev/null || true
 kill -KILL $CPU1 2>/dev/null || true
 wait $CPU1 2>/dev/null || true
-for p in $HF $BAR; do kill -KILL $p 2>/dev/null || true; done
-for p in $HF $BAR; do wait $p 2>/dev/null || true; done
+for p in $DIR $HF $BAR; do kill -KILL $p 2>/dev/null || true; done
+for p in $DIR $HF $BAR; do wait $p 2>/dev/null || true; done
 
+echo "--- oriscdir log ---"
+cat "$TMP/dir.out"
 echo "--- cpu0 stdout ---"
 cat "$TMP/cpu0.out"
 echo "--- cpu0 stderr ---"

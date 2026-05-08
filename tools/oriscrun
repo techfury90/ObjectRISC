@@ -40,6 +40,7 @@ SIMORISC  = ROOT / "tools" / "sim"     / "simorisc"
 ORISCTERM = ROOT / "tools" / "devices" / "oriscterm"
 HOSTFSD   = ROOT / "tools" / "devices" / "hostfsd"
 LINKBOOTD = ROOT / "tools" / "devices" / "linkbootd"
+ORISCDIR  = ROOT / "tools" / "devices" / "oriscdir"
 
 
 def parse_cpu_spec(spec: str) -> dict:
@@ -89,6 +90,24 @@ def parse_terminal_spec(spec: str) -> dict:
             raise SystemExit(f"oriscrun: unknown --terminal field {part!r}")
     if out["pid"] is None:
         raise SystemExit(f"oriscrun: --terminal spec missing pid=N: {spec!r}")
+    return out
+
+
+def parse_directory_spec(spec: str) -> dict:
+    """Parse 'pid=N[,verbose]' into a dict. Phase 45f."""
+    out = {"pid": None, "verbose": False}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("pid="):
+            out["pid"] = int(part[len("pid="):])
+        elif part == "verbose":
+            out["verbose"] = True
+        else:
+            raise SystemExit(f"oriscrun: unknown --directory field {part!r}")
+    if out["pid"] is None:
+        raise SystemExit(f"oriscrun: --directory spec missing pid=N: {spec!r}")
     return out
 
 
@@ -189,6 +208,12 @@ def main(argv) -> int:
                          "(PIDs that may issue spawn requests, and PIDs "
                          "in the chunkboot loader pool, respectively). "
                          "image=PATH preloads a single boot image (legacy)")
+    ap.add_argument("--directory", action="append", default=[],
+                    metavar="pid=N",
+                    help="spawn an oriscdir at the given pid (Phase 45f). "
+                         "The directory daemon hosts a hierarchical "
+                         "name → ref tree; CPUs find it via boot O8 "
+                         "wired to its primary mailbox at idx=1.")
     ap.add_argument("--cpu", action="append", default=[], required=True,
                     metavar="SPEC",
                     help="spawn a simorisc CPU; SPEC is "
@@ -210,6 +235,7 @@ def main(argv) -> int:
     term_specs = [parse_terminal_spec(s) for s in args.terminal]
     hf_specs   = [parse_hostfsd_spec(s) for s in args.hostfsd]
     lb_specs   = [parse_linkbootd_spec(s) for s in args.linkbootd]
+    dir_specs  = [parse_directory_spec(s) for s in args.directory]
     if not any(c["pid"] == args.leader for c in cpu_specs):
         sys.exit(f"oriscrun: --leader pid {args.leader} has no matching --cpu")
 
@@ -351,6 +377,31 @@ def main(argv) -> int:
         sys.stdout.write(f"[lb{lbspec['pid']}] "
                          f"{line.decode('utf-8', errors='replace')}")
         _attach_forwarders(f"lb{lbspec['pid']}", lb)
+
+    for dspec in dir_specs:
+        cmd = [sys.executable, str(ORISCDIR),
+               "--socket", sock_path, "--pid", str(dspec["pid"])]
+        if dspec["verbose"]:
+            cmd.append("-v")
+        d = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        procs.append((f"dir{dspec['pid']}", d))
+        deadline = time.time() + 5.0
+        line = b''
+        while time.time() < deadline:
+            rd, _, _ = select.select([d.stdout], [], [], 0.1)
+            if d.stdout in rd:
+                line = d.stdout.readline()
+                if b"READY" in line:
+                    break
+        if b"READY" not in line:
+            sys.stderr.write(f"oriscrun: oriscdir pid={dspec['pid']} "
+                             f"failed to start\n")
+            return cleanup_and_exit(1)
+        sys.stdout.write(f"[dir{dspec['pid']}] "
+                         f"{line.decode('utf-8', errors='replace')}")
+        _attach_forwarders(f"dir{dspec['pid']}", d)
 
     # ---- 3. Spawn CPUs ----------------------------------------------------
     leader_proc = None

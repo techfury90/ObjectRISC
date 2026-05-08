@@ -80,17 +80,44 @@
  * task.c's ORX_STATE_BYTES comment). */
 #define SUP_SCRATCH_SLOT_OFFSET  576
 
-/* Byte offset within O12 of the peer supervisor sub-cap — used by
- * the op=1 relay path when a spawn request specifies target_pid !=
- * self.procid. Phase 45e wires a single peer in; null when the
- * supervisor was launched without a peer (or is the only CPU). */
-#define PEER_SUP_SLOT_OFFSET     584
+/* Byte offset within O12 of the boot-parent slot (the directory
+ * mailbox sub-cap on the supervisor's own boot). task.c renames
+ * this BOOT_PARENT_SLOT in 45f; mirror the constant locally so the
+ * supervisor doesn't need to pull task.c's libc header in. */
+#define BOOT_PARENT_SLOT_OFFSET  544
+
+/* Byte offset within O12 of DIR_SLOT — the directory mailbox
+ * sub-cap, which dir.c reads on every dir_*() call. Phase 45e's
+ * static PEER_SUP_SLOT lived at the same offset; 45f repurposes
+ * it: peer discovery is now via dir_walk("/sys/cpu/<N>/supervisor"),
+ * so the static-peer slot retires and the offset becomes DIR_SLOT.
+ * The supervisor copies BOOT_PARENT_SLOT → DIR_SLOT at boot since
+ * the supervisor's own boot O8 IS the directory mailbox. */
+#define DIR_SLOT_OFFSET          584
 
 /* Sentinel target_pid passed in R5 of an op=1 SEND meaning "spawn
  * on whatever CPU this supervisor is on" (the historical 45a/b/c
  * behaviour). Any other value < 0xFF is taken as a literal PROCID
  * and triggers the relay path when it doesn't match self.procid. */
 #define TARGET_PID_LOCAL         0xFF
+
+/* Path-component buffer size for /sys/cpu/<N>/supervisor renders.
+ * "/sys/cpu/255/supervisor" is 23 chars + NUL = 24; round up. */
+#define PEER_PATH_BUF_SIZE       64
+
+/* Phase 45f relay scratch slots. dir_walk's reply-mailbox poll
+ * clobbers O1..O4, so we stash the dequeued bytes-ref (O2) and
+ * reply_cap (O3) here before invoking the directory and pull
+ * them back to populate the relayed SEND.
+ *
+ * Mirror task.c's RELAY_SCRATCH region. */
+#define RELAY_BYTES_SLOT_OFFSET   592
+#define RELAY_REPLY_SLOT_OFFSET   600
+
+/* dir_walk publishes its resolved ref here on return. We OREFLD
+ * from this slot rather than relying on O1 being preserved across
+ * the function-call boundary. Mirror task.c's DIR_RESULT_SLOT. */
+#define DIR_RESULT_SLOT_OFFSET    616
 
 /* console_write picks O2 (stack ref) for VAs in [0x1f0000, 0x200000)
  * and O3 (data ref) for VAs in [0x40000, 0x1f0000). Both get
@@ -306,31 +333,101 @@ reply_to_requester(task_t t, int status)
 	);
 }
 
-/* Relay an op=1 spawn request to the peer supervisor (held in
- * PEER_SUP_SLOT). The local supervisor doesn't read the bytes —
- * it just forwards the SEND. The bytes ref in O2 stays as-is;
- * the peer's read_spawn_request will OBJ_READ_REQ it across the
- * wire when it actually services the spawn. The reply_cap in O3
- * also stays as-is, so the peer's reply goes directly back to
- * the original requester (we drop out of the response path).
- *
- * R6 in the relayed SEND is set to TARGET_PID_LOCAL so the peer
- * doesn't try to relay again — bounded one-hop topology for now,
- * matches the single-peer PEER_SUP_SLOT model. */
-static void
-relay_spawn_request(int len)
+/* Render a fixed-format peer-supervisor path into the supplied
+ * buffer: "/sys/cpu/<n>/supervisor". Returns the byte length
+ * (excluding the NUL terminator) which the caller passes to
+ * dir_walk via strlen-equivalent — but since we know the layout
+ * we just compute it here. n must be 0..255. */
+static int
+render_peer_path(int n, char *buf)
 {
+	const char prefix[] = "/sys/cpu/";
+	const char suffix[] = "/supervisor";
+	int i, p = 0;
+	for (i = 0; prefix[i]; i++) buf[p++] = prefix[i];
+	if (n >= 100) {
+		buf[p++] = '0' + (n / 100);
+		buf[p++] = '0' + ((n / 10) % 10);
+		buf[p++] = '0' + (n % 10);
+	} else if (n >= 10) {
+		buf[p++] = '0' + (n / 10);
+		buf[p++] = '0' + (n % 10);
+	} else {
+		buf[p++] = '0' + n;
+	}
+	for (i = 0; suffix[i]; i++) buf[p++] = suffix[i];
+	buf[p] = '\0';
+	return p;
+}
+
+/* Relay an op=1 spawn request to the peer supervisor for
+ * `target_pid`. Phase 45f: we look up the peer's spawn-mailbox
+ * sub-cap via dir_walk("/sys/cpu/<N>/supervisor") rather than
+ * relying on a static --service slot.
+ *
+ * Sequence:
+ *   1. Stash O2 (bytes ref) and O3 (reply_cap) into scratch slots
+ *      because dir_walk's queue-poll clobbers O1..O4.
+ *   2. Render the peer path and dir_walk it. On LEAF success,
+ *      O1 holds the peer mailbox sub-cap.
+ *   3. Restore O2 and O3 from the scratch slots.
+ *   4. SEND the relayed spawn request to O1, with R6 =
+ *      TARGET_PID_LOCAL so the peer doesn't relay again. The
+ *      reply_cap rides along unchanged so the peer's eventual
+ *      response goes straight back to the original requester. */
+static int
+relay_spawn_request(int len, int target_pid)
+{
+	/* 1. Stash O2 and O3. */
 	asm volatile(
-		"orefld o1, %0(o12)\n"     /* recipient = peer's mailbox sub-cap */
-		"addiu  r4, r0, 1\n"       /* op = spawn */
-		"addu   r5, %1, r0\n"      /* forward length */
-		"addiu  r6, r0, %2\n"      /* mark as no-further-relay */
+		"orefst o2, %0(o12)\n"
+		"orefst o3, %1(o12)"
+		:
+		: "i"(RELAY_BYTES_SLOT_OFFSET), "i"(RELAY_REPLY_SLOT_OFFSET)
+	);
+
+	/* 2. Resolve the peer. */
+	char path[PEER_PATH_BUF_SIZE];
+	render_peer_path(target_pid, path);
+	int kind;
+	char remainder[16];
+	int rc = dir_walk(path, &kind, remainder, sizeof(remainder));
+	if (rc < 0 || kind != DIR_KIND_LEAF) {
+		/* No peer registered for this PROCID. Restore O3 for the
+		 * error reply and bail. */
+		asm volatile(
+			"orefld o3, %0(o12)"
+			: : "i"(RELAY_REPLY_SLOT_OFFSET) : "r1"
+		);
+		return -1;
+	}
+
+	/* 3. Restore O2 (bytes) and O3 (reply_cap), and load O1 from
+	 * DIR_RESULT_SLOT (where dir_walk parked the resolved peer
+	 * mailbox sub-cap). Three OREFLDs in a single asm so pcc
+	 * can't intersperse anything that touches OPRs. */
+	asm volatile(
+		"orefld o2, %0(o12)\n"
+		"orefld o3, %1(o12)\n"
+		"orefld o1, %2(o12)"
+		:
+		: "i"(RELAY_BYTES_SLOT_OFFSET),
+		  "i"(RELAY_REPLY_SLOT_OFFSET),
+		  "i"(DIR_RESULT_SLOT_OFFSET)
+	);
+
+	/* 4. SEND. */
+	asm volatile(
+		"addiu  r4, r0, 1\n"        /* op = spawn */
+		"addu   r5, %0, r0\n"       /* forward length */
+		"addiu  r6, r0, %1\n"       /* mark as no-further-relay */
 		"addiu  r7, r0, 0\n"
 		"send   o1\n"
 		:
-		: "i"(PEER_SUP_SLOT_OFFSET), "r"(len), "i"(TARGET_PID_LOCAL)
-		: "r1", "r4", "r5", "r6", "r7"
+		: "r"(len), "i"(TARGET_PID_LOCAL)
+		: "r4", "r5", "r6", "r7"
 	);
+	return 0;
 }
 
 /* Service one spawn request that just landed on our queue. The
@@ -354,7 +451,23 @@ static void
 handle_spawn_request(int len, int target_pid, int self_procid)
 {
 	if (target_pid != TARGET_PID_LOCAL && target_pid != self_procid) {
-		relay_spawn_request(len);
+		/* O3 still holds the original reply_cap from the dequeue.
+		 * relay_spawn_request stashes it before dir_walk and
+		 * restores it before SEND-ing to the peer. On failure
+		 * (no peer registered for this PROCID) we restore O3
+		 * ourselves and reply with an error so the requester
+		 * isn't left blocking. */
+		if (relay_spawn_request(len, target_pid) == 0)
+			return;
+		/* Stash O3 into SUP_SCRATCH so reply_to_requester can
+		 * find the reply_cap. (The local-spawn path below would
+		 * do this for us, but we're skipping past it.) */
+		asm volatile(
+			"orefst o3, %0(o12)"
+			:
+			: "i"(SUP_SCRATCH_SLOT_OFFSET)
+		);
+		reply_to_requester(-1, -1);
 		return;
 	}
 
@@ -440,14 +553,7 @@ main(void)
 	/* Phase 45e: allocate the spawn mailbox FIRST — before
 	 * task_init / hf_init / orx_init touch the descriptor table
 	 * with their own allocations — so it lands at a deterministic
-	 * descriptor index across boots. In socket mode (the boot.sh
-	 * configuration) init_cpu reserves 1=code, 2=stack, 3=data,
-	 * 4=bootstrap task, then simorisc's populate_self_service
-	 * reserves idx 5 (the per-CPU "self" service installed in O4).
-	 * The supervisor's first ObjAlloc therefore lands at idx 6.
-	 * Static `--service "PEER_PID=6@9"` lines in scripts/boot.sh
-	 * synthesize a working sub-cap to any peer supervisor without
-	 * runtime discovery. */
+	 * descriptor index across boots. */
 	if (allocate_service_mailbox() != 0) {
 		print_str("supervisor: failed to allocate spawn mailbox\n");
 		return 1;
@@ -455,19 +561,26 @@ main(void)
 
 	task_init();
 
-	/* Harvest boot O8 into PEER_SUP_SLOT BEFORE hf_init runs —
-	 * hf_init clobbers O8 with the hostfsd reply mailbox, and
-	 * the boot-time peer supervisor sub-cap (wired in by
-	 * scripts/boot.sh's `--service "PEER=5@9"` on the O8 slot)
-	 * would be lost. task_init already copied O8 to SUP_SLOT on
-	 * its way past, so we don't need to also harvest it for the
-	 * supervisor's own use — the supervisor doesn't call
-	 * sup_spawn — but PEER_SUP_SLOT carries the supervisor-side
-	 * peer-relay view, which is a different concern. */
+	/* Phase 45f: boot O8 carries the directory mailbox sub-cap
+	 * (wired by scripts/boot.sh's `--service "DIR_PID=1@9"` on
+	 * the O8 slot). task_init has already copied O8 to
+	 * BOOT_PARENT_SLOT; we additionally publish it into DIR_SLOT
+	 * so dir.c finds it without going through the lazy
+	 * "ask my parent supervisor" bootstrap. The supervisor IS
+	 * a top-level program (oriscrun is its parent, not another
+	 * supervisor), so dir.c's lazy path doesn't apply.
+	 *
+	 * This must run BEFORE hf_init, which clobbers O8 with the
+	 * hostfsd reply mailbox — but BOOT_PARENT_SLOT is already
+	 * set by task_init so we read from there, not from O8
+	 * directly, and the order of OREFLD/OREFST relative to
+	 * hf_init doesn't matter. */
 	asm volatile(
-		"orefst o8, %0(o12)"
+		"orefld o1, %0(o12)\n"
+		"orefst o1, %1(o12)"
 		:
-		: "i"(PEER_SUP_SLOT_OFFSET)
+		: "i"(BOOT_PARENT_SLOT_OFFSET), "i"(DIR_SLOT_OFFSET)
+		: "r1"
 	);
 
 	hf_init();
@@ -482,6 +595,41 @@ main(void)
 	int is_leader = (procid == 0);
 
 	print_str(is_leader ? banner_leader : banner_worker);
+
+	/* Phase 45f: register self at /sys/cpu/<procid>/supervisor.
+	 * Peers find us via dir_walk on this path; relay_spawn_request
+	 * uses it to discover where to forward op=1 requests. The ref
+	 * we publish is a fresh R+S sub-cap of our spawn mailbox (O9
+	 * holds the full ref). */
+	{
+		char peer_path[PEER_PATH_BUF_SIZE];
+		render_peer_path(procid, peer_path);
+
+		/* Derive R+S sub-cap of our mailbox into O1, then call
+		 * dir_register which uses O1 as the ref to publish. */
+		int derive_status;
+		asm volatile(
+			"omov   o1, o9\n"
+			"addiu  r4, r0, 9\n"          /* R | S */
+			"call   #0x103\n"             /* ObjDerive */
+			"nop\n"
+			"addu   %0, r2, r0"
+			: "=r"(derive_status) : : "r1", "r2", "r4"
+		);
+		if (derive_status != 0) {
+			SUP_PRINT("supervisor: ObjDerive for self-register failed\n");
+			return 1;
+		}
+		int reg_status = dir_register(peer_path);
+		if (reg_status != 0) {
+			SUP_PRINT("supervisor: dir_register failed: ");
+			SUP_PRINT_INT(reg_status);
+			SUP_PRINT("\n");
+			/* Non-fatal in degenerate single-CPU configurations
+			 * where no directory is wired; fall through.
+			 * In multi-CPU we expect this to succeed. */
+		}
+	}
 
 	/* Phase 45c: only the leader (PROCID 0) spawns the shell. Worker
 	 * supervisors sit in the dispatch loop ready to service spawn

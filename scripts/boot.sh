@@ -1,19 +1,27 @@
 #!/bin/sh
 # boot.sh — start Ouroboros: the OS layer atop Object RISC.
 #
-# Phase 45c (this version): every CPU boots the same supervisor.orx,
-# but only PROCID 0 (the leader) spawns a shell as its first user
-# task — workers sit in their dispatch loop ready to service spawn
-# requests. The leader's shell drives all visible activity; workers
-# are quiet until later phases (45e+) wire supervisor-to-supervisor
-# SENDs for cross-CPU spawn placement. When the leader exits,
+# Phase 45f (this version): peer supervisors discover each other
+# through the directory daemon (oriscdir) rather than via static
+# --service slots. Each supervisor's boot O8 carries the directory
+# mailbox sub-cap; supervisor.c copies it into DIR_SLOT and registers
+# itself at /sys/cpu/<PROCID>/supervisor. Cross-CPU `run @N` walks
+# /sys/cpu/N/supervisor to find the relay target. Removing the static
+# wiring unblocks future hot-attached CPUs and self-registering
+# devices (no boot script edit required to add another node).
+#
+# Phase 45c lineage: every CPU boots the same supervisor.orx, but
+# only PROCID 0 (the leader) spawns a shell as its first user task —
+# workers sit in their dispatch loop ready to service spawn requests.
+# The leader's shell drives all visible activity; workers handle
+# relayed spawn requests from peers. When the leader exits,
 # oriscrun's `--leader 0` tears down the workers via SIGTERM.
 #
 # Phase 45b lineage: supervisor.orx allocates its own spawn-service
 # mailbox at boot, derives a sub-cap into ORX_SLOT_CHILD_O8 so every
 # TaskCreate it does injects the cap into the child's O8 (the libc
-# task_init then harvests it into SUP_SLOT). All `run`/`edit` from
-# a shell go through sup_spawn → SEND-RPC → its local supervisor's
+# task_init then harvests it into BOOT_PARENT_SLOT). All `run`/`edit`
+# from a shell go through sup_spawn → SEND-RPC → its local supervisor's
 # orx_spawn. The shell's `exit` SENDs op=2 (shutdown) so the
 # leader supervisor can wind down without polling. Existing
 # single-CPU test harnesses still launch shell.orx directly (no
@@ -23,6 +31,7 @@
 #   - oriscbar  (crossbar)
 #   - oriscterm (Tk terminal, pid 16)
 #   - hostfsd   (host FS access, pid 17, jailed to repo root)
+#   - oriscdir  (directory daemon, pid 18)
 #   - 2 supervisor CPUs (pid 0 = leader with shell; pid 1 = worker)
 #
 # The shell announces itself with the current real-world date minus
@@ -69,30 +78,28 @@ fi
 #   O5  = oriscterm console  (16=1@9)
 #   O6  = oriscterm keyboard (16=2@9)
 #   O7  = oriscterm grid     (16=3@9)
-#   O8  = peer supervisor's spawn-mailbox sub-cap (Phase 45e). Each
-#        supervisor's spawn mailbox is ObjAlloc'd FIRST in main(),
-#        and lands at descriptor index 6 in socket-mode boots:
-#        init_cpu reserves 1=code, 2=stack, 3=data, 4=bootstrap-task;
-#        simorisc's populate_self_service reserves idx 5 (the
-#        per-CPU "self" service installed in O4); the supervisor's
-#        first ObjAlloc is therefore idx 6. Stable across boots —
-#        `--service "PEER=6@9"` synthesizes a working sub-cap
-#        without runtime discovery. The leader (CPU 0) gets CPU 1's
-#        mailbox in O8; CPU 1 gets CPU 0's. The supervisor harvests
-#        this into PEER_SUP_SLOT at boot and uses it for op=1 relay
-#        when a `run @N` request specifies target_pid != self.procid.
+#   O8  = directory mailbox sub-cap (Phase 45f). oriscdir's primary
+#        mailbox lives at descriptor idx 1, generation 1 (its first
+#        ObjAlloc) — synthesize the cap as `18=1@9`. supervisor.c
+#        harvests this into BOOT_PARENT_SLOT (via task_init's O8
+#        snapshot) and copies it into DIR_SLOT directly at boot,
+#        then dir_register's itself at /sys/cpu/<PROCID>/supervisor
+#        so peer supervisors can dir_walk to it. Replaces 45e's
+#        static peer-supervisor wiring; the directory now mediates
+#        cross-CPU relay target discovery.
 #   O9  = pad (null at boot; the supervisor's own freshly-allocated
-#        mailbox replaces this slot via `omov o9, o1`)
+#        spawn mailbox replaces this slot via `omov o9, o1`)
 #   O10 = hostfsd            (17=1@9)
 #
-# Both CPUs get the same console/keyboard/grid/hostfsd refs — they're
-# refs to objects on the device PIDs (16, 17), and the device daemons
-# handle multiple subscribers. CPU 0 (PROCID 0) is the leader and
-# spawns a shell; CPU 1 stays in the dispatch loop ready to service
-# relayed spawn requests.
+# Both CPUs get the same console/keyboard/grid/hostfsd/directory refs
+# — they're refs to objects on the device PIDs (16, 17, 18), and the
+# device daemons all handle multiple subscribers. CPU 0 (PROCID 0)
+# is the leader and spawns a shell; CPU 1 stays in the dispatch loop
+# ready to service relayed spawn requests.
 exec python3 tools/oriscrun \
     --terminal pid=16 \
     --hostfsd "pid=17,root=$ROOT" \
-    --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=1=6@9,service=0=0@0,service=17=1@9" \
-    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=0=6@9,service=0=0@0,service=17=1@9" \
+    --directory pid=18 \
+    --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=18=1@9,service=0=0@0,service=17=1@9" \
+    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=18=1@9,service=0=0@0,service=17=1@9" \
     --leader 0 --leader-timeout 600

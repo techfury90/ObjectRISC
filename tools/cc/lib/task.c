@@ -61,19 +61,35 @@
 #define TABLE_BYTES (TASK_MAX_CONCURRENT * 8)
 
 /* The task-table objstore doubles as orx.c's persistent state and
- * (Phase 45a) sup.c's + supervisor.c's. orx picks up at byte offset
- * TABLE_BYTES; sup follows. We oversize the allocation here so
- * none of them have to re-allocate (and don't have to claim
- * their own OPR slot).
+ * (Phase 45a) sup.c's + supervisor.c's + dir.c's. orx picks up at
+ * byte offset TABLE_BYTES; the rest follow. We oversize the
+ * allocation here so none of them have to re-allocate (and don't
+ * have to claim their own OPR slot).
  *
  * 464 = 24 (orx scratch: code/data/stack)
  *     + 384 (16 × 24-byte orx manifest entries)
  *     + 8 (ORX_SLOT_ARGV: long-lived ref to the shared argv buffer)
- *     + 8 (SUP_SLOT: supervisor sub-cap harvested from O8 at
- *          task_init time; null when the program wasn't launched
- *          by a supervisor)
- *     + 8 (REPLY_MB_SLOT: long-lived ref to sup.c's reply mailbox,
- *          allocated lazily on first sup_spawn)
+ *     + 8 (BOOT_PARENT_SLOT: ref harvested from boot O8 at
+ *          task_init time. Different programs see different things
+ *          here:
+ *            - Shells / supervisor-spawned children: their
+ *              supervisor's mailbox sub-cap (set by orx_task_create's
+ *              ORX_SLOT_CHILD_O8 swap). sup.c reads this slot when
+ *              SENDing spawn requests.
+ *            - Supervisors themselves (top-level, launched by
+ *              oriscrun): the directory daemon's mailbox sub-cap,
+ *              wired via boot.sh's `--service "DIR_PID=1@9"` on
+ *              the O8 slot. supervisor.c copies this into DIR_SLOT
+ *              at boot.
+ *            - Programs launched directly without any parent: null.
+ *          The slot is generic by design — "the thing my parent /
+ *          oriscrun arranged for me to talk to" — and each program
+ *          interprets it according to its own role.)
+ *     + 8 (REPLY_MB_SLOT: long-lived ref to a per-program reply
+ *          mailbox, allocated lazily by sup.c's sup_reply_mailbox_init
+ *          and shared with dir.c. Both clients are synchronous
+ *          SEND-and-poll, so they never have a reply outstanding
+ *          simultaneously and can share the slot.)
  *     + 8 (ORX_SLOT_CHILD_O8: supervisor-only — the sub-cap to
  *          inject into the child's O8 around TaskCreate. orx.c's
  *          orx_task_create reads this and swaps O8 in/out
@@ -87,22 +103,53 @@
  *          manifest restore path). Phase 45b uses this to hold the
  *          incoming reply_cap so handle_spawn_request can call
  *          orx_spawn and still SEND back to the requester.)
- *     + 8 (PEER_SUP_SLOT: supervisor-only — sub-cap of a peer
- *          supervisor's spawn mailbox, used for op=1 relay when a
- *          spawn request specifies target_pid != self. Phase 45e
- *          MVP supports a single peer; future revisions may grow
- *          this into a per-PROCID table.) */
-#define ORX_STATE_BYTES   464
+ *     + 8 (DIR_SLOT: the directory mailbox sub-cap. Populated at
+ *          boot by supervisor.c (which copies BOOT_PARENT_SLOT →
+ *          DIR_SLOT) and lazily on first dir_*() call by other
+ *          programs (which SEND op=4 SUP_OP_GET_DIR to their
+ *          BOOT_PARENT_SLOT and cache the reply here). Phase 45f
+ *          replaces 45e's PEER_SUP_SLOT — the same offset 584,
+ *          repurposed: peer discovery is now via dir_lookup
+ *          rather than a static slot.)
+ *     + 16 (RELAY_SCRATCH: two 8-byte slots the supervisor uses
+ *          to stash O2 (the spawn-request bytes ref) and O3
+ *          (the original reply_cap) across dir_walk's
+ *          ReceiveQueuePoll, which clobbers O1..O4 with the
+ *          response payload. Only used in supervisor.c's
+ *          relay_spawn_request path; idle elsewhere. Phase 45f.)
+ *     + 8 (DIR_REPLY_SCRATCH: dir.c stashes its derived reply
+ *          sub-cap here (rather than parking it in O15, which
+ *          would clobber task.c's boot-data save and break any
+ *          subsequent print_str of a data-section string) and
+ *          OREFLDs it directly into O3 at SEND time. Phase 45f.)
+ *     + 8 (DIR_RESULT_SLOT: dir_walk publishes its resolved ref
+ *          here on return (LEAF target / MOUNT service ref / null
+ *          for DIR). Callers OREFLD from this slot rather than
+ *          relying on a particular OPR being preserved across the
+ *          dir_walk function-call boundary — pcc's calling
+ *          convention treats OPRs as scratch, so passing OR refs
+ *          via OPR returns is unreliable. Phase 45f.)
+ *     + 8 (DIR_INPUT_REF_SLOT: dir_register / dir_mount stash the
+ *          caller-supplied O1 (ref-to-register / service ref) here
+ *          at function entry, BEFORE dir_init / dir_reply_mailbox_init
+ *          run — both of those internally clobber O1 (via oisn checks
+ *          and ObjAlloc on first call), and the entry-saved value
+ *          would otherwise be lost. The SEND that emits the wire op
+ *          OREFLDs from this slot directly into O4. Phase 45f bugfix.) */
+#define ORX_STATE_BYTES   504
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
-/* Byte offset within O12 of the supervisor sub-cap parked from O8
- * by task_init. Programs launched by the supervisor see a valid
- * R+S sub-ref here; programs launched directly by oriscrun (the
- * supervisor itself, validation tests, the linkboot demos) see
- * null. sup.c reads this to find the supervisor for spawn requests.
+/* Byte offset within O12 of the boot-parent ref parked from O8
+ * by task_init. See the multi-line comment above for the per-
+ * program-role interpretations of this slot.
  *
- * = TABLE_BYTES + 24 (orx scratch) + 384 (manifest) + 8 (argv) = 544. */
-#define SUP_SLOT_OFFSET   544
+ * = TABLE_BYTES + 24 (orx scratch) + 384 (manifest) + 8 (argv) = 544.
+ *
+ * The legacy name `SUP_SLOT_OFFSET` is kept as an alias because
+ * sup.c references it directly; the slot's role generalizes in
+ * Phase 45f without changing the offset or harvest logic. */
+#define BOOT_PARENT_SLOT_OFFSET   544
+#define SUP_SLOT_OFFSET           BOOT_PARENT_SLOT_OFFSET
 
 /* Bit set when the corresponding table slot holds a live ref. Lives
  * in regular int memory; pcc treats it as a normal global. */
@@ -126,17 +173,16 @@ task_init(void)
 		"nop\n"
 		"omov  o12, o1\n"
 
-		/* Phase 45a: harvest the supervisor sub-cap from the boot
-		 * ABI's O8 slot and park it in O12 at SUP_SLOT_OFFSET, so
-		 * sup.c can find it after subsequent libc inits (term_init,
-		 * hf_init) reuse O8 for their own mailboxes. Programs that
-		 * weren't launched by a supervisor see O8 = null and the
-		 * slot ends up null too — sup_spawn checks for this and
-		 * returns an error rather than dispatching. */
+		/* Phase 45a/f: harvest boot O8 into BOOT_PARENT_SLOT, so
+		 * sup.c (and dir.c, in the supervisor-self case) can find
+		 * the relevant parent service after later libc inits
+		 * (term_init, hf_init) reuse O8 for their own mailboxes.
+		 * Programs without a parent see O8 = null; the slot ends
+		 * up null and downstream callers gate appropriately. */
 		"orefst o8, %3(o12)"
 		:
 		: "i"(ALLOC_BYTES), "i"(TAG_DATA), "i"(CAP_R | CAP_W),
-		  "i"(SUP_SLOT_OFFSET)
+		  "i"(BOOT_PARENT_SLOT_OFFSET)
 		: "r2", "r3", "r4", "r5", "r6"
 	);
 	task_slots_in_use = 0;
