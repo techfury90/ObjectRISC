@@ -348,6 +348,13 @@ task_t sup_spawn_at(int target_pid, const char *path,
  * returning from main() — once you've TaskExited it's too late. */
 void sup_shutdown(void);
 
+/* sup_have_supervisor — non-zero iff the BOOT_PARENT_SLOT carries a
+ * non-null supervisor sub-cap (i.e. this program was launched via
+ * sup_spawn / orx_spawn under a supervisor). Phase 48: shell.exit
+ * branches on this to choose between yield-forever (login race
+ * mitigation) and a clean return (no-supervisor test path). */
+int  sup_have_supervisor(void);
+
 /* ----- Directory service (Phase 45f) ----------------------------------
  *
  * `oriscdir` is a small daemon that holds a hierarchical name → ref

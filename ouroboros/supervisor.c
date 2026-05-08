@@ -507,6 +507,48 @@ relay_spawn_request(int len, int target_pid)
 	return 0;
 }
 
+/* Phase 48: forward an op=2 (shutdown) SEND to the leader supervisor.
+ * `exit`/`quit` from a worker's shell wakes its OWN supervisor with
+ * op=2, which would otherwise just halt the worker — the leader (and
+ * thus oriscrun's --leader watchdog) keeps running, leaving the
+ * simulator alive after the user asked it to shut down. By relaying
+ * op=2 to /sys/cpu/0/supervisor, the leader processes its own op=2
+ * cascade, exits CPU 0, and oriscrun tears down the workers via
+ * SIGTERM. (We still cascade-kill our own children before halting,
+ * keeping the worker-side teardown deterministic regardless of the
+ * leader's response time.) Returns 0 on success, negative on dir_walk
+ * failure (no leader registered — exotic, e.g. single-CPU workers
+ * built for a different scenario). */
+static int
+relay_shutdown_to_leader(void)
+{
+	char path[PEER_PATH_BUF_SIZE];
+	render_peer_path(0, path);
+	int kind;
+	char remainder[16];
+	int rc = dir_walk(path, &kind, remainder, sizeof(remainder));
+	if (rc < 0 || kind != DIR_KIND_LEAF)
+		return rc < 0 ? rc : -1;
+
+	/* dir_walk parked the leader's spawn-mailbox sub-cap into
+	 * DIR_RESULT_SLOT. Load it into O1 and SEND op=2 with no
+	 * payload — same shape as sup_shutdown's wire op. */
+	asm volatile(
+		"orefld o1, %0(o12)\n"
+		"onull  o2\n"
+		"onull  o3\n"
+		"addiu  r4, r0, 2\n"        /* op = shutdown */
+		"addiu  r5, r0, 0\n"
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		:
+		: "i"(DIR_RESULT_SLOT_OFFSET)
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+	return 0;
+}
+
 /* Service one spawn request that just landed on our queue. The
  * dequeue has filled:
  *   R3 = op          (1 = spawn)
@@ -893,18 +935,36 @@ main(void)
 		if (op == 1) {
 			handle_spawn_request(len, target_pid, procid);
 		} else if (op == 2 && has_terminal) {
-			/* Graceful shutdown — sup_shutdown() in libc, called
-			 * by the host's shell right before its TaskExit.
-			 * Phase 48: kill every task we own before returning.
-			 * Login.orx sits in a welcome-banner loop that would
-			 * otherwise outlive us forever. Iterate
-			 * task_active_mask + task_kill. Sysinit is already
-			 * EXITED so its task_kill is a no-op. */
+			/* Cascade-kill every task we own before halting.
+			 * Phase 48: login.orx is parked in task_wait on
+			 * shell, and a clean shell exit (logout) wakes it
+			 * naturally; but `exit`/`quit` SENDs us op=2 from
+			 * the shell and yield-loops, so login is still
+			 * BLOCKED here. Without this kill cascade, login
+			 * would resume after our halt-tear-down — too
+			 * late, but visibly racing the screen wipe in
+			 * real Tk timing. Killing it deterministically
+			 * before we return guarantees the supervisor's
+			 * task table is clean when oriscrun's leader
+			 * watchdog fires SIGTERM. */
 			unsigned int mask = task_active_mask();
 			int t;
 			for (t = 0; t < TASK_MAX_CONCURRENT; t++) {
-				if (mask & (1u << t))
+				if (mask & (1u << t)) {
 					(void)task_kill((task_t)t, 137);
+				}
+			}
+			/* Phase 48: workers relay op=2 to the leader so
+			 * the leader's exit (CPU 0) trips oriscrun's
+			 * --leader watchdog, which SIGTERMs the rest of
+			 * the process group. Without this, `exit` from a
+			 * worker terminal halts only that CPU, and the
+			 * simulator stays alive until --leader-timeout
+			 * (10 minutes by default in boot.sh) runs out.
+			 * Leader skips the relay — its own halt is the
+			 * trigger oriscrun is watching for. */
+			if (procid != 0) {
+				(void)relay_shutdown_to_leader();
 			}
 			SUP_PRINT(shell_done);
 			return 0;

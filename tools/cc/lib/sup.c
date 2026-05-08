@@ -73,7 +73,7 @@
 /* Test whether the supervisor sub-cap was provided at boot.
  * The "0=0@0" pad service-spec produces a literal-zero ref
  * (Phase 45a tweak in simorisc), so OISN works directly. */
-static int
+int
 sup_have_supervisor(void)
 {
 	int isn;

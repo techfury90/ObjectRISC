@@ -1055,7 +1055,27 @@ main(void)
 		           || strcmp(line, "quit") == 0) {
 			term_print("bye!\n");
 			term_shutdown();
+			/* Phase 48: SEND op=2 to halt the supervisor.
+			 * When a supervisor IS present, also yield
+			 * forever — returning would cause login.task_wait
+			 * (us) to wake, and login would race the
+			 * supervisor's op=2 task_kill cascade, running
+			 * its term_clear+banner once before being killed
+			 * and leaving the screen flickering. Yielding
+			 * keeps login BLOCKED in task_wait until the
+			 * supervisor processes op=2 and task_kills both
+			 * of us atomically.
+			 *
+			 * In the no-supervisor case (e.g. shell launched
+			 * directly by oriscrun for test_shell.sh), there's
+			 * no one to ever task_kill us — yielding forever
+			 * would hang the CPU. Just return cleanly so
+			 * TaskExit fires and the simulator unwinds. */
+			int have_sup = sup_have_supervisor();
 			sup_shutdown();
+			if (have_sup) {
+				for (;;) task_yield();
+			}
 			return 0;
 		} else {
 			term_print("unknown command: '");
