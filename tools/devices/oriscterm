@@ -60,6 +60,19 @@ SERVICE_GENERATION = 1
 # objects.
 SERVICE_MAX_CAPS = 0x5B   # R|W|S|V|C
 
+# Individual cap bits (Vol III §2.1) — used by the Phase 47
+# self-registration packing.
+CAP_R = 0x01
+CAP_S = 0x08
+
+# Phase 47: oriscdir's pid + service index, plus the inline-register op
+# code. The terminal synthesizes a SEND_DELIVER carrying its own
+# service ref(s) packed alongside the path so it can publish them at
+# /sys/term/<instance>/{console,keyboard,grid} without needing a CPU
+# to ObjAlloc a TAG_DATA bytes object on its behalf.
+DIR_SERVICE_INDEX = 1
+OP_REG_INLINE     = 5
+
 # ---- vector service command codes (R4 in the SEND payload) -----------------
 VEC_LINE         = 0x00
 VEC_RECT_FILL    = 0x01
@@ -171,6 +184,15 @@ def unpack_packet(data: bytes) -> Dict:
 def ref_home(ref: int)  -> int: return (ref >> 40) & 0xFF
 def ref_index(ref: int) -> int: return (ref >> 16) & 0xFFFFFF
 
+def make_ref(generation: int, home: int, index: int, caps: int) -> int:
+    """Pack a 64-bit OR — Vol III §2.1 layout. Phase 47 uses this to
+    synthesize sub-caps of our own service objects before sending
+    them to oriscdir for publishing."""
+    return ((generation & 0xFFFF) << 48) | \
+           ((home       & 0xFF)   << 40) | \
+           ((index      & 0xFFFFFF) << 16) | \
+           ((caps       & 0xFF)   << 8)
+
 
 def build_obj_read_req(src_pid: int, dst_pid: int, trans_id: int,
                        ref: int, offset: int, width: int) -> bytes:
@@ -212,10 +234,13 @@ def build_send_deliver(src_pid: int, dst_pid: int, trans_id: int,
 # ---------------------------------------------------------------------------
 
 class Terminal:
-    def __init__(self, sock_path: str, my_pid: int, verbose: bool = False):
+    def __init__(self, sock_path: str, my_pid: int, verbose: bool = False,
+                 dir_pid: Optional[int] = None, instance: int = 0):
         import socket
         self.my_pid = my_pid
         self.verbose = verbose
+        self.dir_pid = dir_pid          # Phase 47: oriscdir's pid; None disables self-register
+        self.instance = instance        # Phase 47: /sys/term/<instance>/...
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.recv_buf = bytearray()
         self.connected = True
@@ -380,6 +405,58 @@ class Terminal:
                 self._log(f"send failed: {e}")
                 self.connected = False
                 return
+
+    # ---- Phase 47: directory self-registration ---------------------------
+
+    def _send_inline_register(self, path: str, my_index: int) -> None:
+        """Send a DIR_OP_REG_INLINE packet publishing a sub-cap of one
+        of our service objects (CONSOLE_INDEX / KEYBOARD_INDEX /
+        GRID_INDEX) at `path` in oriscdir. Fire-and-forget; failures
+        only surface in oriscdir's log. See tools/devices/oriscdir's
+        wire-protocol docstring for the packing layout."""
+        if self.dir_pid is None:
+            return
+        path_bytes = path.encode("utf-8")
+        if not 0 < len(path_bytes) <= 32:
+            self._log(f"register-self: path {path!r} length "
+                      f"{len(path_bytes)} not in 1..32")
+            return
+
+        # The ref to publish: a R+S sub-cap of the named service.
+        # That's the minimum a peer needs to SEND a wire op at us.
+        my_ref = make_ref(generation=SERVICE_GENERATION, home=self.my_pid,
+                          index=my_index, caps=CAP_R | CAP_S)
+        dir_ref = make_ref(generation=SERVICE_GENERATION, home=self.dir_pid,
+                           index=DIR_SERVICE_INDEX, caps=CAP_R | CAP_S)
+
+        padded = path_bytes + b'\x00' * (32 - len(path_bytes))
+        (b0_3,)   = struct.unpack("<I", padded[0:4])
+        (b4_7,)   = struct.unpack("<I", padded[4:8])
+        (b8_15,)  = struct.unpack("<Q", padded[8:16])
+        (b16_23,) = struct.unpack("<Q", padded[16:24])
+        (b24_31,) = struct.unpack("<Q", padded[24:32])
+
+        int_payload = [OP_REG_INLINE, len(path_bytes), b0_3, b4_7]
+        or_payload  = [my_ref, b8_15, b16_23, b24_31]
+
+        trans = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        pkt = build_send_deliver(self.my_pid, self.dir_pid, trans,
+                                 dir_ref, int_payload, or_payload)
+        self.send_packet(pkt)
+        self._log(f"register-self: {path!r} → my idx={my_index}")
+
+    def _self_register_all(self) -> None:
+        """Publish console / keyboard / grid sub-caps under
+        /sys/term/<instance>/{console,keyboard,grid}. Called once at
+        startup right after the Tk window comes up but before we
+        enter the main loop."""
+        if self.dir_pid is None:
+            return
+        base = f"/sys/term/{self.instance}"
+        self._send_inline_register(f"{base}/console",  CONSOLE_INDEX)
+        self._send_inline_register(f"{base}/keyboard", KEYBOARD_INDEX)
+        self._send_inline_register(f"{base}/grid",     GRID_INDEX)
 
     def _poll(self) -> None:
         # Drain bytes from socket.
@@ -949,11 +1026,30 @@ def main(argv) -> int:
                     help="processor identifier this terminal presents to "
                          "the crossbar (typically 16+ to avoid clashing "
                          "with CPU pids)")
+    ap.add_argument("--directory-pid", type=int, default=None,
+                    help="oriscdir's pid; if set, this terminal will "
+                         "self-register its console/keyboard/grid "
+                         "service objects at "
+                         "/sys/term/<instance>/{console,keyboard,grid} "
+                         "via the inline-register wire op (Phase 47)")
+    ap.add_argument("--instance", type=int, default=0,
+                    help="terminal instance number for the directory "
+                         "path; defaults to 0. Two terminals on the "
+                         "same crossbar should use distinct instance "
+                         "numbers so their /sys/term/N/ subtrees don't "
+                         "collide. Only consulted when "
+                         "--directory-pid is set.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
-    term = Terminal(args.socket, args.pid, verbose=args.verbose)
+    term = Terminal(args.socket, args.pid, verbose=args.verbose,
+                    dir_pid=args.directory_pid, instance=args.instance)
     print(f"oriscterm READY pid={args.pid}", flush=True)
+    # Phase 47: announce ourselves to the directory before entering
+    # the Tk mainloop. The mainloop replaces the script's main thread
+    # so anything beyond this point is event-driven, but the inline
+    # register op is fire-and-forget so we don't need a response.
+    term._self_register_all()
     term.root.mainloop()
     return 0
 

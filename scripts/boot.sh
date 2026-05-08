@@ -74,39 +74,44 @@ if [ ! -L "$ROOT/programs" ]; then
     ln -s build/programs "$ROOT/programs"
 fi
 
-# --service slot order (each spec lands at the next free O5..O15):
-#   O5  = oriscterm console  (16=1@9 on CPU 0; 19=1@9 on CPU 1 — Phase 46)
-#   O6  = oriscterm keyboard (16=2@9 / 19=2@9)
-#   O7  = oriscterm grid     (16=3@9 / 19=3@9)
-#   O8  = directory mailbox sub-cap (Phase 45f). oriscdir's primary
-#        mailbox lives at descriptor idx 1, generation 1 (its first
-#        ObjAlloc) — synthesize the cap as `18=1@9`. supervisor.c
-#        harvests this into BOOT_PARENT_SLOT (via task_init's O8
-#        snapshot) and copies it into DIR_SLOT directly at boot,
-#        then dir_register's itself at /sys/cpu/<PROCID>/supervisor
-#        so peer supervisors can dir_walk to it. Replaces 45e's
-#        static peer-supervisor wiring; the directory now mediates
-#        cross-CPU relay target discovery.
-#   O9  = pad (null at boot; the supervisor's own freshly-allocated
-#        spawn mailbox replaces this slot via `omov o9, o1`)
-#   O10 = hostfsd            (17=1@9)
+# Phase 47 — directory-driven boot. The only OR ref each CPU's
+# firmware needs to wire is O8 = oriscdir's primary mailbox sub-cap.
+# Everything else (terminals, hostfsd) is discovered at runtime via
+# directory walks:
 #
-# Phase 46 — multi-terminal: each CPU is wired to its OWN oriscterm
-# instance. CPU 0 → terminal pid 16, CPU 1 → terminal pid 19. Each
-# CPU's supervisor checks O5 at boot (has_terminal probe), spawns a
-# shell if non-null, and registers /sys/term/<procid>/{console,
-# keyboard,grid} as service-discovery LEAFs. Result: two Tk windows,
-# two independent shells, both sharing /programs and the same
-# directory tree.
+#     /sys/cpu/<procid>/supervisor — registered by each supervisor
+#                                    at startup (Phase 45f)
+#     /sys/term/<instance>/console
+#                          /keyboard
+#                          /grid    — registered by oriscterm itself
+#                                    via the inline-register wire
+#                                    op (Phase 47)
+#     /sys/hostfsd/<instance>      — registered by hostfsd
+#     /programs                    — mounted by the leader supervisor
+#                                    (procid==0) onto hostfsd
 #
-# hostfsd (17) and oriscdir (18) stay shared singletons — both CPUs
-# see the same ones. /sys/hostfsd/0 is registered by CPU 0 only
-# (procid==0 owns singletons today).
+# --service slot semantics with the new boot ABI:
+#   O5..O7 = null pads. The supervisor's directory-walk-init populates
+#            them from /sys/term/<procid>/{console,keyboard,grid} once
+#            oriscterm has self-registered. has_terminal=true from the
+#            walk gates shell-spawn and op=2 acceptance.
+#   O8     = directory mailbox sub-cap (18=1@9). The single irreducible
+#            wire — without this the supervisor has nothing to walk.
+#            (A real implementation's firmware would inject this at
+#            CPU bring-up; in the simulator we synthesize it via
+#            simorisc's --service flag.)
+#   O9     = pad (supervisor allocates its own spawn mailbox here).
+#   O10    = null pad. Walked from /sys/hostfsd/0 by the supervisor.
+#
+# CPU 0 → terminal instance 0 → /sys/term/0/* → oriscterm pid 16
+# CPU 1 → terminal instance 1 → /sys/term/1/* → oriscterm pid 19
+# (the per-procid path means each CPU's walk lands on its own
+# terminal without any per-CPU configuration on the supervisor.)
 exec python3 tools/oriscrun \
-    --terminal pid=16 \
-    --terminal pid=19 \
-    --hostfsd "pid=17,root=$ROOT" \
     --directory pid=18 \
-    --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=16=1@9,service=16=2@9,service=16=3@9,service=18=1@9,service=0=0@0,service=17=1@9" \
-    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=19=1@9,service=19=2@9,service=19=3@9,service=18=1@9,service=0=0@0,service=17=1@9" \
+    --terminal "pid=16,instance=0" \
+    --terminal "pid=19,instance=1" \
+    --hostfsd "pid=17,instance=0,root=$ROOT" \
+    --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
+    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
     --leader 0 --leader-timeout 600

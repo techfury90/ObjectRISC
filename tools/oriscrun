@@ -74,16 +74,20 @@ def parse_cpu_spec(spec: str) -> dict:
 
 
 def parse_terminal_spec(spec: str) -> dict:
-    """Parse 'pid=N[,verbose]' into a dict. `verbose` opts the device
-    into its `-v` flag; without it the launcher's combined log
-    stays quiet during normal use."""
-    out = {"pid": None, "verbose": False}
+    """Parse 'pid=N[,instance=I][,verbose]' into a dict. `verbose` opts
+    the device into its `-v` flag; without it the launcher's combined
+    log stays quiet during normal use. `instance` is the per-terminal
+    index used for /sys/term/<instance>/{console,keyboard,grid} self-
+    registration (Phase 47); defaults to 0 for the first terminal."""
+    out = {"pid": None, "instance": 0, "verbose": False}
     for part in spec.split(","):
         part = part.strip()
         if not part:
             continue
         if part.startswith("pid="):
             out["pid"] = int(part[len("pid="):])
+        elif part.startswith("instance="):
+            out["instance"] = int(part[len("instance="):])
         elif part == "verbose":
             out["verbose"] = True
         else:
@@ -112,8 +116,10 @@ def parse_directory_spec(spec: str) -> dict:
 
 
 def parse_hostfsd_spec(spec: str) -> dict:
-    """Parse 'pid=N[,root=PATH][,verbose]' into a dict."""
-    out = {"pid": None, "root": None, "verbose": False}
+    """Parse 'pid=N[,root=PATH][,instance=I][,verbose]' into a dict.
+    `instance` is the per-hostfsd index used for /sys/hostfsd/<instance>
+    self-registration (Phase 47); defaults to 0."""
+    out = {"pid": None, "root": None, "instance": 0, "verbose": False}
     for part in spec.split(","):
         part = part.strip()
         if not part:
@@ -122,6 +128,8 @@ def parse_hostfsd_spec(spec: str) -> dict:
             out["pid"] = int(part[len("pid="):])
         elif part.startswith("root="):
             out["root"] = part[len("root="):]
+        elif part.startswith("instance="):
+            out["instance"] = int(part[len("instance="):])
         elif part == "verbose":
             out["verbose"] = True
         else:
@@ -290,9 +298,49 @@ def main(argv) -> int:
     _attach_forwarders("xbar", bar)
 
     # ---- 2. Spawn devices -------------------------------------------------
+    #
+    # Phase 47 launch ordering: oriscdir FIRST, then the other devices
+    # with `--directory-pid` set. oriscterm and hostfsd self-register
+    # at startup via the inline-register wire op (no ObjAlloc on a
+    # CPU needed); if they came up before oriscdir, the registration
+    # packets would land in oriscbar's queue with no destination and
+    # get dropped, leaving the directory empty when supervisors
+    # later walk for terminal/hostfsd refs. Single oriscdir per boot
+    # is the convention; we grab its pid below as the canonical
+    # directory pid for downstream devices.
+    canonical_dir_pid = dir_specs[0]["pid"] if dir_specs else None
+
+    for dspec in dir_specs:
+        cmd = [sys.executable, str(ORISCDIR),
+               "--socket", sock_path, "--pid", str(dspec["pid"])]
+        if dspec["verbose"]:
+            cmd.append("-v")
+        d = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        procs.append((f"dir{dspec['pid']}", d))
+        deadline = time.time() + 5.0
+        line = b''
+        while time.time() < deadline:
+            rd, _, _ = select.select([d.stdout], [], [], 0.1)
+            if d.stdout in rd:
+                line = d.stdout.readline()
+                if b"READY" in line:
+                    break
+        if b"READY" not in line:
+            sys.stderr.write(f"oriscrun: oriscdir pid={dspec['pid']} "
+                             f"failed to start\n")
+            return cleanup_and_exit(1)
+        sys.stdout.write(f"[dir{dspec['pid']}] "
+                         f"{line.decode('utf-8', errors='replace')}")
+        _attach_forwarders(f"dir{dspec['pid']}", d)
+
     for tspec in term_specs:
         cmd = [sys.executable, str(ORISCTERM),
                "--socket", sock_path, "--pid", str(tspec["pid"])]
+        if canonical_dir_pid is not None:
+            cmd.extend(["--directory-pid", str(canonical_dir_pid),
+                        "--instance", str(tspec["instance"])])
         if tspec["verbose"]:
             cmd.append("-v")
         term = subprocess.Popen(
@@ -321,6 +369,9 @@ def main(argv) -> int:
     for hspec in hf_specs:
         cmd = [sys.executable, str(HOSTFSD),
                "--socket", sock_path, "--pid", str(hspec["pid"])]
+        if canonical_dir_pid is not None:
+            cmd.extend(["--directory-pid", str(canonical_dir_pid),
+                        "--instance", str(hspec["instance"])])
         if hspec["verbose"]:
             cmd.append("-v")
         if hspec["root"] is not None:
@@ -377,31 +428,6 @@ def main(argv) -> int:
         sys.stdout.write(f"[lb{lbspec['pid']}] "
                          f"{line.decode('utf-8', errors='replace')}")
         _attach_forwarders(f"lb{lbspec['pid']}", lb)
-
-    for dspec in dir_specs:
-        cmd = [sys.executable, str(ORISCDIR),
-               "--socket", sock_path, "--pid", str(dspec["pid"])]
-        if dspec["verbose"]:
-            cmd.append("-v")
-        d = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        procs.append((f"dir{dspec['pid']}", d))
-        deadline = time.time() + 5.0
-        line = b''
-        while time.time() < deadline:
-            rd, _, _ = select.select([d.stdout], [], [], 0.1)
-            if d.stdout in rd:
-                line = d.stdout.readline()
-                if b"READY" in line:
-                    break
-        if b"READY" not in line:
-            sys.stderr.write(f"oriscrun: oriscdir pid={dspec['pid']} "
-                             f"failed to start\n")
-            return cleanup_and_exit(1)
-        sys.stdout.write(f"[dir{dspec['pid']}] "
-                         f"{line.decode('utf-8', errors='replace')}")
-        _attach_forwarders(f"dir{dspec['pid']}", d)
 
     # ---- 3. Spawn CPUs ----------------------------------------------------
     leader_proc = None
