@@ -346,7 +346,7 @@ orx_read_into_va(int fd, unsigned int temp_va, unsigned int size)
 	while (off < size) {
 		unsigned int want = size - off;
 		if (want > sizeof(buf)) want = sizeof(buf);
-		int got = hf_read(fd, buf, (int)want);
+		int got = vfs_read(fd, buf, (int)want);
 		if (got <= 0)
 			return -1;
 		memcpy((void *)(temp_va + off), buf, (unsigned int)got);
@@ -635,14 +635,14 @@ orx_spawn(const char *path, const char *args, const char *cwd)
 	if (orx_state_init() != 0)
 		return -4;
 
-	int fd = hf_open(path, HF_O_RDONLY);
+	int fd = vfs_open(path, HF_O_RDONLY);
 	if (fd < 0) { return -1; }
 
-	if (hf_read(fd, hdr, 32) != 32) {
-		hf_close(fd); return -2;
+	if (vfs_read(fd, hdr, 32) != 32) {
+		vfs_close(fd); return -2;
 	}
 	if (memcmp(hdr, "ORISC\x00\x00\x00", 8) != 0) {
-		hf_close(fd); return -2;
+		vfs_close(fd); return -2;
 	}
 	unsigned int version    = beu32(hdr + 0x08);
 	unsigned int entry      = beu32(hdr + 0x10);
@@ -651,7 +651,7 @@ orx_spawn(const char *path, const char *args, const char *cwd)
 	unsigned int stack_size = beu32(hdr + 0x1C);
 	(void)version;
 	if (version != 1 || (text_size & 3) != 0 || entry >= text_size) {
-		hf_close(fd); return -3;
+		vfs_close(fd); return -3;
 	}
 	if (stack_size == 0)
 		stack_size = DEFAULT_STACK_SIZE;
@@ -663,16 +663,16 @@ orx_spawn(const char *path, const char *args, const char *cwd)
 	if (orx_alloc_into_slot(code_alloc, TAG_CODE,
 				CAP_R | CAP_W | CAP_X | CAP_V | CAP_C,
 				SLOT_CODE) != 0) {
-		hf_close(fd); return -4;
+		vfs_close(fd); return -4;
 	}
 	if (orx_map_slot(SLOT_CODE, TEMP_CODE_VA, code_alloc) != 0) {
 		orx_free_slot(SLOT_CODE);
-		hf_close(fd); return -4;
+		vfs_close(fd); return -4;
 	}
 	if (orx_read_into_va(fd, TEMP_CODE_VA, text_size) != 0) {
 		orx_unmap(TEMP_CODE_VA, code_alloc);
 		orx_free_slot(SLOT_CODE);
-		hf_close(fd); return -4;
+		vfs_close(fd); return -4;
 	}
 	orx_unmap(TEMP_CODE_VA, code_alloc);
 
@@ -681,20 +681,20 @@ orx_spawn(const char *path, const char *args, const char *cwd)
 					CAP_R | CAP_W | CAP_V | CAP_C,
 					SLOT_DATA) != 0) {
 			orx_free_slot(SLOT_CODE);
-			hf_close(fd); return -4;
+			vfs_close(fd); return -4;
 		}
 		if (orx_map_slot(SLOT_DATA, TEMP_DATA_VA, data_alloc) != 0) {
 			orx_free_slot(SLOT_DATA); orx_free_slot(SLOT_CODE);
-			hf_close(fd); return -4;
+			vfs_close(fd); return -4;
 		}
 		if (orx_read_into_va(fd, TEMP_DATA_VA, data_size) != 0) {
 			orx_unmap(TEMP_DATA_VA, data_alloc);
 			orx_free_slot(SLOT_DATA); orx_free_slot(SLOT_CODE);
-			hf_close(fd); return -4;
+			vfs_close(fd); return -4;
 		}
 		orx_unmap(TEMP_DATA_VA, data_alloc);
 	}
-	hf_close(fd);
+	vfs_close(fd);
 
 	if (orx_alloc_into_slot(stack_size, TAG_STACK,
 				CAP_R | CAP_W | CAP_V | CAP_C,

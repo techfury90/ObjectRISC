@@ -224,21 +224,21 @@ edit_save(struct edit_state *es)
 	int i;
 	char nl = '\n';
 
-	fd = hf_open(es->path,
+	fd = vfs_open(es->path,
 	             HF_O_WRONLY | HF_O_CREAT | HF_O_TRUNC);
 	if (fd < 0) return -1;
 	for (i = 0; i < es->n_lines; i++) {
 		if (es->line_lens[i] > 0
-		    && hf_write(fd, es->lines[i], es->line_lens[i]) < 0) {
-			hf_close(fd);
+		    && vfs_write(fd, es->lines[i], es->line_lens[i]) < 0) {
+			vfs_close(fd);
 			return -1;
 		}
-		if (hf_write(fd, &nl, 1) < 0) {
-			hf_close(fd);
+		if (vfs_write(fd, &nl, 1) < 0) {
+			vfs_close(fd);
 			return -1;
 		}
 	}
-	hf_close(fd);
+	vfs_close(fd);
 	es->dirty = 0;
 	return 0;
 }
@@ -260,10 +260,10 @@ edit_load(struct edit_state *es)
 	es->dirty    = 0;
 	es->truncated = 0;
 
-	fd = hf_open(es->path, HF_O_RDONLY);
+	fd = vfs_open(es->path, HF_O_RDONLY);
 	if (fd < 0) return;
 
-	while ((n = hf_read(fd, rdbuf, sizeof(rdbuf))) > 0) {
+	while ((n = vfs_read(fd, rdbuf, sizeof(rdbuf))) > 0) {
 		for (i = 0; i < n; i++) {
 			if (es->n_lines > EDIT_MAX_LINES) {
 				es->truncated = 1;
@@ -289,7 +289,7 @@ edit_load(struct edit_state *es)
 	es->line_lens[es->n_lines - 1] = line_len;
 	if (es->n_lines > 1 && es->line_lens[es->n_lines - 1] == 0)
 		es->n_lines--;
-	hf_close(fd);
+	vfs_close(fd);
 }
 
 int
