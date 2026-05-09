@@ -778,6 +778,19 @@ clear_child_term_slots(void)
 #define HOT_ATTACH_LIST_BUF  256
 static unsigned int hot_attach_seen;
 
+/* Phase 54: tracking for kill-on-detach. terminal_login_task[idx]
+ * carries the task_t of the login bound to terminal index idx, or
+ * -1 if none. Populated when a login is spawned (either by the
+ * has_terminal boot block or by hot_attach_maybe_spawn), consulted
+ * when the periodic scan notices /sys/term/<idx> has disappeared
+ * — at which point we task_kill the bound login so it doesn't
+ * loop forever on ESTALE keyboard reads. */
+static task_t terminal_login_task[HOT_ATTACH_MAX_TERMS];
+
+/* Set by hot_attach_collect during the scan's first pass; consumed
+ * by hot_attach_scan in its second-pass diff. */
+static unsigned int hot_attach_present_mask;
+
 typedef void (*visit_fn)(int idx);
 
 /* Parse a leading run of decimal digits in `s` into `*out`. Returns
@@ -855,9 +868,63 @@ hot_attach_maybe_spawn(int idx)
 	}
 	(void)task_resume(t);
 	task_yield();    /* same race-fix discipline as handle_spawn_request */
+	terminal_login_task[idx] = t;     /* Phase 54: record for kill-on-detach */
 	SUP_PRINT("supervisor: hot-attached login for term=");
 	SUP_PRINT_INT(idx);
 	SUP_PRINT("\n");
+}
+
+/* Phase 54: a previously-seen terminal index is no longer present
+ * in /sys/term — its oriscterm exited and the directory entries
+ * went away. The bound login is still alive but its O5/O6/O7
+ * subcaps point at a dead service; its first term_getkey will
+ * return ESTALE and login's error path will spin. task_kill
+ * deterministically reaps it now. (The slot itself gets reclaimed
+ * by reap_exited_tasks on the next pass.) */
+static void
+hot_attach_detach(int idx)
+{
+	if (idx < 0 || idx >= HOT_ATTACH_MAX_TERMS) return;
+	task_t t = terminal_login_task[idx];
+	if (t >= 0) {
+		(void)task_kill(t, 137);
+		terminal_login_task[idx] = -1;
+	}
+	hot_attach_seen &= ~(1u << idx);
+	SUP_PRINT("supervisor: detached login for term=");
+	SUP_PRINT_INT(idx);
+	SUP_PRINT("\n");
+}
+
+/* First-pass collector for hot_attach_scan: record everything
+ * currently present in /sys/term. */
+static void
+hot_attach_collect(int idx)
+{
+	if (idx >= 0 && idx < HOT_ATTACH_MAX_TERMS)
+		hot_attach_present_mask |= (1u << idx);
+}
+
+/* Two-pass scan: walk /sys/term once into present_mask, then diff
+ * against hot_attach_seen and act on each transition.
+ *   present  + seen     → still alive, no-op
+ *   present  + !seen    → newly attached, spawn login
+ *   !present + seen     → detached, kill login
+ *   !present + !seen    → never was, no-op */
+static void
+hot_attach_scan(void)
+{
+	hot_attach_present_mask = 0;
+	hot_attach_walk(hot_attach_collect);
+
+	int t;
+	for (t = 0; t < HOT_ATTACH_MAX_TERMS; t++) {
+		unsigned int bit = 1u << t;
+		int present = (hot_attach_present_mask & bit) != 0;
+		int seen    = (hot_attach_seen         & bit) != 0;
+		if (present && !seen)       hot_attach_maybe_spawn(t);
+		else if (!present && seen)  hot_attach_detach(t);
+	}
 }
 
 /* dir_list /sys/term, walk the names, invoke `visit(idx)` for each
@@ -876,6 +943,51 @@ hot_attach_walk(visit_fn visit)
 		if (n > 0) visit(idx);
 		while (i < total && buf[i] != '\0') i++;
 		if (i < total) i++;
+	}
+}
+
+/* --- Phase 54: slot-table reaping ----------------------------------
+ *
+ * Every spawn the supervisor performs allocates a slot in its libc
+ * task table (16 slots total — see TASK_MAX_CONCURRENT in task.c).
+ * task_register_o1 finds the lowest-numbered free slot. Without
+ * reaping, EXITED tasks stay in their slots forever; after enough
+ * sessions / hot-attach cycles / `run` invocations, the table fills
+ * and orx_spawn returns -6 ("task table is full").
+ *
+ * shell.c has its own per-shell reap_exited_tasks (called once per
+ * prompt iteration); the supervisor needs the same hygiene. We call
+ * this from two places:
+ *
+ *   1. The top of handle_spawn_request — natural moment, since
+ *      the next thing we'll do is allocate a slot. Failing alloc
+ *      due to leaked EXITED slots would cascade into a confused
+ *      "spawn failed -6" reply to the shell.
+ *
+ *   2. Right before each hot_attach_walk pass — periodic backstop.
+ *      Even if no spawn requests come in, the leader's hot-attach
+ *      logic itself spawns logins for newly-attached terminals,
+ *      and those logins eventually exit (e.g., on `logout`).
+ *
+ * orx_unload internally task_waits (no-op for already-exited),
+ * ObjFreeDeferreds the manifest entries, and task_frees the slot.
+ * It swallows EFAULT on null-manifest entries (non-orx-spawn'd
+ * children, like our own task_init register) so it's safe to call
+ * on any EXITED slot. We also clear the per-task name stash so a
+ * subsequent `ps` shows the slot as empty rather than carrying a
+ * stale "shell.orx (exit 0)" line forever. */
+static void
+reap_exited_tasks(void)
+{
+	unsigned int mask = task_active_mask();
+	int t;
+	for (t = 0; t < TASK_NAME_SLOTS; t++) {
+		if (!(mask & (1u << t))) continue;
+		struct task_info info;
+		if (task_query((task_t)t, &info) != 0) continue;
+		if (info.state != TASK_STATE_EXITED) continue;
+		(void)orx_unload((task_t)t);
+		task_names[t * TASK_NAME_MAX] = '\0';
 	}
 }
 
@@ -905,6 +1017,9 @@ hot_attach_walk(visit_fn visit)
  * The shell adds a "CPU N:" header when printing. */
 
 #define SUP_OP_LIST_TASKS  5
+#define SUP_OP_DIR_NOTIFY  6   /* Phase 54: oriscdir SENDs this when
+                                * /sys/term mutates; supervisor reacts
+                                * by re-running the hot-attach scan. */
 #define LIST_REPLY_VA      0x00600000   /* matches sup_pack_request's
                                          * scratch VA — only one
                                          * MapObject lives there at a
@@ -1215,6 +1330,10 @@ handle_list_tasks_request(void)
 static void
 handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 {
+	/* Stash the dequeued O2 (bytes ref) and O3 (reply cap) FIRST,
+	 * before any code path that touches OPRs — including
+	 * reap_exited_tasks, whose orx_unload internally task_waits
+	 * via O1 and would silently drop the request payload. */
 	asm volatile(
 		"orefst o2, %0(o12)\n"
 		"orefst o3, %1(o12)"
@@ -1222,6 +1341,13 @@ handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 		: "i"(RELAY_BYTES_SLOT_OFFSET),
 		  "i"(SUP_SCRATCH_SLOT_OFFSET)
 	);
+
+	/* Phase 54: reap before alloc. Each successful op=1 grabs a
+	 * libc task-table slot; if previous spawns have exited but
+	 * weren't reaped, the table eventually fills and orx_spawn
+	 * returns -6. Sweep EXITED slots first so we hand the next
+	 * spawn a clean table. */
+	reap_exited_tasks();
 
 	if (target_pid != TARGET_PID_LOCAL
 	    && target_pid != TARGET_PID_ANY
@@ -1487,6 +1613,16 @@ main(void)
 	task_set_my_terminal_idx(procid);
 	next_cpu_counter = procid + 1;
 
+	/* Phase 54: initialise the kill-on-detach mapping. -1 means "no
+	 * login bound to that terminal slot." Populated below when a
+	 * boot login is spawned, and by hot_attach_maybe_spawn for
+	 * hot-attached terminals. */
+	{
+		int i;
+		for (i = 0; i < HOT_ATTACH_MAX_TERMS; i++)
+			terminal_login_task[i] = -1;
+	}
+
 	/* Phase 47: walk the directory for our boot service refs. After
 	 * 45h+47, devices self-register at /sys/term/<N>/* and
 	 * /sys/hostfsd/0 (oriscterm and hostfsd both do an inline-register
@@ -1575,6 +1711,40 @@ main(void)
 			/* Non-fatal in degenerate single-CPU configurations
 			 * where no directory is wired; fall through.
 			 * In multi-CPU we expect this to succeed. */
+		}
+	}
+
+	/* Phase 54: leader subscribes to /sys/term so hot-attach can
+	 * react to terminal add/remove events without polling. The
+	 * notify_cap is a fresh R+S sub-cap of our spawn mailbox (O9);
+	 * notifications arrive there with R3 = SUP_OP_DIR_NOTIFY,
+	 * which the dispatch loop routes to a fresh hot-attach scan.
+	 *
+	 * If the subscribe fails (e.g., no oriscdir wired in a
+	 * degenerate test config), the periodic-poll fallback in the
+	 * dispatch loop still picks up changes — just at the longer
+	 * HOT_ATTACH_POLL_TICKS cadence rather than the wire-round-trip
+	 * latency of subscriptions. */
+	if (is_leader) {
+		int derive_status;
+		asm volatile(
+			"omov   o1, o9\n"
+			"addiu  r4, r0, 9\n"          /* CAP_R | CAP_S */
+			"call   #0x103\n"             /* ObjDerive */
+			"nop\n"
+			"addu   %0, r2, r0"
+			: "=r"(derive_status) : : "r1", "r2", "r4"
+		);
+		if (derive_status == 0) {
+			int sub_status = dir_subscribe("/sys/term",
+			                               SUP_OP_DIR_NOTIFY);
+			if (sub_status != 0) {
+				SUP_PRINT("supervisor: /sys/term subscribe failed (");
+				SUP_PRINT_INT(sub_status);
+				SUP_PRINT(") — periodic poll fallback only\n");
+			} else {
+				SUP_PRINT("supervisor: /sys/term subscribed\n");
+			}
 		}
 	}
 
@@ -1691,6 +1861,16 @@ main(void)
 		                * welcome-banner / shell-spawn cycle; only
 		                * the shell's `exit`/`quit` (which calls
 		                * sup_shutdown) actually halts us. */
+
+		/* Phase 54: record this CPU's boot login so the
+		 * kill-on-detach scan can reap it if its terminal goes
+		 * away. The mapping is by terminal index — and our boot
+		 * terminal IS our procid (per the per-supervisor
+		 * /sys/term/<procid>/* dir-walks above), so the array
+		 * slot is procid. */
+		if (procid >= 0 && procid < HOT_ATTACH_MAX_TERMS) {
+			terminal_login_task[procid] = login;
+		}
 	}
 
 	/* Phase 52: seed hot_attach_seen with the terminals already
@@ -1728,10 +1908,13 @@ main(void)
 		                              &term_hint);
 		if (status != 0) {
 			/* Either ETIMEOUT (leader's hot-attach pulse fired)
-			 * or some other transient error. On the leader, run
-			 * the hot-attach scan; on workers, just try again. */
+			 * or some other transient error. On the leader, reap
+			 * any exited tasks (Phase 54) and run the hot-attach
+			 * scan (Phase 52: spawn for new, Phase 54: kill for
+			 * gone); on workers, just try again. */
 			if (is_leader) {
-				hot_attach_walk(hot_attach_maybe_spawn);
+				reap_exited_tasks();
+				hot_attach_scan();
 			}
 			continue;
 		}
@@ -1812,6 +1995,15 @@ main(void)
 			 * format one line per live slot, send a TAG_DATA
 			 * bytes ref back to the requester. */
 			handle_list_tasks_request();
+		} else if (op == SUP_OP_DIR_NOTIFY) {
+			/* Phase 54: oriscdir tells us /sys/term mutated.
+			 * Re-run the scan so any newly-attached terminal
+			 * gets a login (and any departed terminal's login
+			 * gets killed, once oriscdir grows entry-removal). */
+			if (is_leader) {
+				reap_exited_tasks();
+				hot_attach_scan();
+			}
 		} else {
 			SUP_PRINT(unknown_op);
 		}

@@ -479,6 +479,20 @@ int dir_mount(const char *path, const char *prefix);
  * trailing-NUL-terminator runs`), negative on error. */
 int dir_list(const char *path, char *buf, int cap);
 
+/* dir_subscribe — Phase 54: ask oriscdir to SEND to the notify_cap
+ * currently in O1 whenever the tree mutates at or under `path`. The
+ * notify_op (1..255) lands in R3 of every notification; pick a value
+ * distinct from your other dispatch ops so your poll loop can route.
+ *
+ * Caller MUST OREFLD the notify_cap into O1 immediately before
+ * calling — same convention as dir_register's ref-to-register. The
+ * notify_cap is typically a R+S sub-cap of the same mailbox the
+ * caller's main poll already reads, so notifications interleave
+ * naturally with regular requests.
+ *
+ * Returns 0 on success, negative on error. */
+int dir_subscribe(const char *path, int notify_op);
+
 /* ----- VFS helpers (Phase 45g) ----------------------------------------
  *
  * `vfs.c` is the path-aware front door programs should prefer over

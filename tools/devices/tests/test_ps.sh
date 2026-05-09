@@ -12,14 +12,18 @@
 #                                the shell prompt waiting for input)
 #
 # When term16's shell runs `ps`, both supervisors are live:
-#   - CPU 0 has [sysinit (exited), login (blocked), shell (running)]
+#   - CPU 0 has [login (blocked), shell (running)]
 #   - CPU 1 has [login (blocked), shell (blocked on read_line)]
+#
+# (Phase 54: sysinit on the leader is EXITED by the time ps runs,
+# but the supervisor's slot-table reaper has already reclaimed it,
+# so it doesn't appear in the listing. That's correct semantics —
+# ps shows live + recently-exited tasks; reaped slots are gone.)
 #
 # Asserts:
 #   - ps output contains "CPU 0:" and "CPU 1:"
 #   - ps output contains "shell.orx" (both CPUs have one)
 #   - ps output contains "login.orx"
-#   - ps output contains "sysinit.orx" (leader-only)
 #   - ps output shows at least one "running" or "blocked" state
 #
 # Failure modes worth catching:
@@ -184,14 +188,14 @@ RENDER16=$(sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term16
 echo "$RENDER16" | grep -q "^CPU 0:" \
     || { echo "FAIL: ps didn't print 'CPU 0:' header (op=5 reached supervisor?)" >&2; exit 1; }
 
-# 2) The leader's task list mentions all three programs we know are
-#    live at the moment ps runs: sysinit, login, shell.
+# 2) The leader's task list mentions the still-live programs we
+#    know are running at the moment ps runs: login + shell.
+#    sysinit isn't listed because Phase 54's slot-table reaper
+#    cleared its EXITED slot before ps walked the table.
 echo "$RENDER16" | grep -q "shell.orx" \
     || { echo "FAIL: ps output missing shell.orx (per-task name stash broken?)" >&2; exit 1; }
 echo "$RENDER16" | grep -q "login.orx" \
     || { echo "FAIL: ps output missing login.orx" >&2; exit 1; }
-echo "$RENDER16" | grep -q "sysinit.orx" \
-    || { echo "FAIL: ps output missing sysinit.orx (leader-only)" >&2; exit 1; }
 
 # 3) Cross-CPU: CPU 1 also responded.
 echo "$RENDER16" | grep -q "^CPU 1:" \
