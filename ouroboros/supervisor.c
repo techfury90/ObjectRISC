@@ -879,6 +879,51 @@ hot_attach_walk(visit_fn visit)
 	}
 }
 
+/* --- Phase 54: slot-table reaping ----------------------------------
+ *
+ * Every spawn the supervisor performs allocates a slot in its libc
+ * task table (16 slots total — see TASK_MAX_CONCURRENT in task.c).
+ * task_register_o1 finds the lowest-numbered free slot. Without
+ * reaping, EXITED tasks stay in their slots forever; after enough
+ * sessions / hot-attach cycles / `run` invocations, the table fills
+ * and orx_spawn returns -6 ("task table is full").
+ *
+ * shell.c has its own per-shell reap_exited_tasks (called once per
+ * prompt iteration); the supervisor needs the same hygiene. We call
+ * this from two places:
+ *
+ *   1. The top of handle_spawn_request — natural moment, since
+ *      the next thing we'll do is allocate a slot. Failing alloc
+ *      due to leaked EXITED slots would cascade into a confused
+ *      "spawn failed -6" reply to the shell.
+ *
+ *   2. Right before each hot_attach_walk pass — periodic backstop.
+ *      Even if no spawn requests come in, the leader's hot-attach
+ *      logic itself spawns logins for newly-attached terminals,
+ *      and those logins eventually exit (e.g., on `logout`).
+ *
+ * orx_unload internally task_waits (no-op for already-exited),
+ * ObjFreeDeferreds the manifest entries, and task_frees the slot.
+ * It swallows EFAULT on null-manifest entries (non-orx-spawn'd
+ * children, like our own task_init register) so it's safe to call
+ * on any EXITED slot. We also clear the per-task name stash so a
+ * subsequent `ps` shows the slot as empty rather than carrying a
+ * stale "shell.orx (exit 0)" line forever. */
+static void
+reap_exited_tasks(void)
+{
+	unsigned int mask = task_active_mask();
+	int t;
+	for (t = 0; t < TASK_NAME_SLOTS; t++) {
+		if (!(mask & (1u << t))) continue;
+		struct task_info info;
+		if (task_query((task_t)t, &info) != 0) continue;
+		if (info.state != TASK_STATE_EXITED) continue;
+		(void)orx_unload((task_t)t);
+		task_names[t * TASK_NAME_MAX] = '\0';
+	}
+}
+
 
 /* --- Phase 52: SUP_OP_LIST_TASKS (op=5) ----------------------------
  *
@@ -1215,6 +1260,13 @@ handle_list_tasks_request(void)
 static void
 handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 {
+	/* Phase 54: reap before alloc. Each successful op=1 grabs a
+	 * libc task-table slot; if previous spawns have exited but
+	 * weren't reaped, the table eventually fills and orx_spawn
+	 * returns -6. Sweep EXITED slots first so we hand the next
+	 * spawn a clean table. */
+	reap_exited_tasks();
+
 	asm volatile(
 		"orefst o2, %0(o12)\n"
 		"orefst o3, %1(o12)"
@@ -1728,9 +1780,11 @@ main(void)
 		                              &term_hint);
 		if (status != 0) {
 			/* Either ETIMEOUT (leader's hot-attach pulse fired)
-			 * or some other transient error. On the leader, run
-			 * the hot-attach scan; on workers, just try again. */
+			 * or some other transient error. On the leader, reap
+			 * any exited tasks (Phase 54) and run the hot-attach
+			 * scan; on workers, just try again. */
 			if (is_leader) {
+				reap_exited_tasks();
 				hot_attach_walk(hot_attach_maybe_spawn);
 			}
 			continue;
