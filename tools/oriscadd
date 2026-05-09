@@ -17,17 +17,20 @@ Typical usage (after `oriscrun ...` is already running with sock at
         --socket /tmp/foo.sock \\
         --pid 2 \\
         --supervisor /tmp/build/supervisor.orx \\
-        --hostfsd 17 --directory 18
+        --directory 18
 
-That gives you a HEADLESS worker — useful for compute. To add a CPU
-that owns a fresh terminal instance (rare; usually you'd add a new
-oriscterm and let session_manager spawn the login):
+That gives you a HEADLESS worker — useful for compute. The
+supervisor's boot walks the directory for hostfsd at /sys/hostfsd/0
+and fills in the wire slot itself, so we don't need an explicit
+--hostfsd here. To add a CPU that owns a fresh terminal instance
+(rare; usually you'd add a new oriscterm and let the leader's
+hot-attach scan spawn the login):
 
     tools/oriscadd \\
         --socket /tmp/foo.sock \\
         --pid 2 \\
         --supervisor /tmp/build/supervisor.orx \\
-        --hostfsd 17 --directory 18 \\
+        --directory 18 \\
         --terminal-pid 20
 
 The script execs simorisc directly — once started, killing oriscadd
@@ -52,7 +55,9 @@ def build_services(args) -> list[str]:
         O7 = grid     (terminal idx 3) — null pad if headless
         O8 = oriscdir@1
         O9 = null pad (the supervisor ObjAllocs its own spawn-mailbox)
-        O10 = hostfsd@1
+        O10 = hostfsd@1 — null pad is FINE; the supervisor's boot
+              dir-walk on /sys/hostfsd/0 fills in the slot via the
+              directory if not already wired
 
     See ouroboros/supervisor.c — the boot ABI is comment-block-pinned
     around line 75. If the supervisor's boot ABI changes, this
@@ -67,7 +72,7 @@ def build_services(args) -> list[str]:
         o5 = o6 = o7 = "0=0@0"
     o8  = f"{args.directory}=1@9"
     o9  = "0=0@0"
-    o10 = f"{args.hostfsd}=1@9"
+    o10 = f"{args.hostfsd}=1@9" if args.hostfsd is not None else "0=0@0"
     return [o5, o6, o7, o8, o9, o10]
 
 
@@ -83,9 +88,19 @@ def main(argv) -> int:
                     help="path to supervisor.orx — typically the same "
                          "build the existing CPUs are running")
     ap.add_argument("--directory", type=int, default=18,
-                    help="oriscdir's PID (default: 18, the convention)")
-    ap.add_argument("--hostfsd", type=int, default=17,
-                    help="hostfsd's PID (default: 17, the convention)")
+                    help="oriscdir's PID (default: 18, the convention). "
+                         "REQUIRED in practice — the worker can't reach "
+                         "the rest of the system without it. (oriscdir "
+                         "IS the discovery mechanism, so it can't be "
+                         "discovered through itself.)")
+    ap.add_argument("--hostfsd", type=int, default=None,
+                    help="hostfsd's PID — OPTIONAL. The supervisor's "
+                         "boot path walks /sys/hostfsd/0 in the directory "
+                         "and fills in the wire slot from there, so a "
+                         "null pad here works fine as long as oriscdir is "
+                         "wired. Pass an explicit value only if you want "
+                         "to bypass the directory walk (e.g., a test that "
+                         "deliberately runs without oriscdir).")
     ap.add_argument("--terminal-pid", type=int, default=None,
                     help="oriscterm's PID, IF this CPU should own a "
                          "terminal at boot. Usually omitted — let the "
