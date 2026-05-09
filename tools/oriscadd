@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""oriscadd — add a worker CPU to an already-running Object RISC system.
+
+The companion to oriscrun for hot-add. oriscrun launches the system
+once-and-for-all at boot; this script lets you grow it later by
+spawning a new simorisc process that connects to the same crossbar.
+
+The new CPU's supervisor (Phase 53) registers at
+/sys/cpu/<pid>/supervisor and is then automatically discoverable by
+the leader's pick_next_cpu — no extra plumbing needed; the leader's
+round-robin and `run @N` paths both walk the directory per call.
+
+Typical usage (after `oriscrun ...` is already running with sock at
+/tmp/foo.sock):
+
+    tools/oriscadd \\
+        --socket /tmp/foo.sock \\
+        --pid 2 \\
+        --supervisor /tmp/build/supervisor.orx \\
+        --hostfsd 17 --directory 18
+
+That gives you a HEADLESS worker — useful for compute. To add a CPU
+that owns a fresh terminal instance (rare; usually you'd add a new
+oriscterm and let session_manager spawn the login):
+
+    tools/oriscadd \\
+        --socket /tmp/foo.sock \\
+        --pid 2 \\
+        --supervisor /tmp/build/supervisor.orx \\
+        --hostfsd 17 --directory 18 \\
+        --terminal-pid 20
+
+The script execs simorisc directly — once started, killing oriscadd
+leaves the worker running. To shut down the worker, kill the simorisc
+process; the leader's pick_next_cpu will skip it on the next walk.
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SIMORISC = ROOT / "tools" / "sim" / "simorisc"
+
+
+def build_services(args) -> list[str]:
+    """Construct the --service args for the supervisor's expected boot
+    OPR layout:
+        O5 = console  (terminal idx 1) — null pad if headless
+        O6 = keyboard (terminal idx 2) — null pad if headless
+        O7 = grid     (terminal idx 3) — null pad if headless
+        O8 = oriscdir@1
+        O9 = null pad (the supervisor ObjAllocs its own spawn-mailbox)
+        O10 = hostfsd@1
+
+    See ouroboros/supervisor.c — the boot ABI is comment-block-pinned
+    around line 75. If the supervisor's boot ABI changes, this
+    helper needs to follow.
+    """
+    if args.terminal_pid:
+        term = args.terminal_pid
+        o5 = f"{term}=1@9"
+        o6 = f"{term}=2@9"
+        o7 = f"{term}=3@9"
+    else:
+        o5 = o6 = o7 = "0=0@0"
+    o8  = f"{args.directory}=1@9"
+    o9  = "0=0@0"
+    o10 = f"{args.hostfsd}=1@9"
+    return [o5, o6, o7, o8, o9, o10]
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="oriscadd",
+        description="Add a worker CPU to a running Object RISC system")
+    ap.add_argument("--socket", required=True,
+                    help="UNIX socket path the running crossbar is on")
+    ap.add_argument("--pid", type=int, required=True,
+                    help="PROCID for the new CPU (must not collide "
+                         "with an existing one)")
+    ap.add_argument("--supervisor", required=True,
+                    help="path to supervisor.orx — typically the same "
+                         "build the existing CPUs are running")
+    ap.add_argument("--directory", type=int, default=18,
+                    help="oriscdir's PID (default: 18, the convention)")
+    ap.add_argument("--hostfsd", type=int, default=17,
+                    help="hostfsd's PID (default: 17, the convention)")
+    ap.add_argument("--terminal-pid", type=int, default=None,
+                    help="oriscterm's PID, IF this CPU should own a "
+                         "terminal at boot. Usually omitted — let the "
+                         "leader's session_manager spawn a login on "
+                         "any new /sys/term/<N> entries instead.")
+    args = ap.parse_args(argv)
+
+    if not Path(args.socket).exists():
+        sys.exit(f"oriscadd: socket {args.socket} not found "
+                 "— is oriscrun running?")
+    if not Path(args.supervisor).exists():
+        sys.exit(f"oriscadd: supervisor.orx not found at {args.supervisor}")
+
+    # exec simorisc directly. Once started, oriscadd has no further
+    # work to do — the simorisc process does all the heavy lifting.
+    # Background the invocation if you want to retain shell control:
+    # `tools/oriscadd ... &`.
+    cmd = [sys.executable, str(SIMORISC),
+           "--connect", args.socket,
+           "--pid", str(args.pid)]
+    for svc in build_services(args):
+        cmd.extend(["--service", svc])
+    cmd.append(args.supervisor)
+    os.execv(cmd[0], cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
