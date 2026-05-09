@@ -382,3 +382,180 @@ sup_shutdown(void)
 		: : : "r1", "r4", "r5", "r6", "r7"
 	);
 }
+
+/* --- Phase 52: SUP_OP_LIST_TASKS client side ---------------------- *
+ *
+ * sup_list_tasks(target_recipient, dst, max) → byte length on success,
+ *                                              negative on failure.
+ *
+ * SENDs op=5 to the supervisor at `target_recipient` (a sub-cap of
+ * the desired supervisor's spawn mailbox — caller obtains it via
+ * dir_walk("/sys/cpu/<N>/supervisor")). Awaits a reply on our
+ * lazily-alloc'd reply mailbox; on success the reply carries a
+ * TAG_DATA bytes ref in O2 with a human-readable task listing and
+ * R3 = byte count. We MapObject R-only at LIST_FETCH_VA, copy into
+ * `dst` (capped at `max`), and Unmap.
+ *
+ * This is a free function rather than a wrapper around sup_spawn_at
+ * because the caller wants to address a SPECIFIC peer, not the
+ * "default" local supervisor with relay — for `ps` we walk all the
+ * peers ourselves and SEND directly, no relay. Each peer's reply
+ * comes back to OUR reply mailbox, OBJ_READ_REQ-tunneled if the
+ * peer is on another CPU.
+ *
+ * Returns the actual byte length (0..max) on success, negative on
+ * failure (-1 = recipient null, -2 = mailbox alloc failed, others
+ * = supervisor-reported status).
+ *
+ * The recipient MUST be a non-null R+S sub-cap to a supervisor's
+ * spawn mailbox. Pass it in O14 via the calling convention — see
+ * the asm block below.
+ */
+
+/* Use ObjFetchBytes (#0x108) instead of MapObject for the reply
+ * payload — it handles BOTH local and remote bytes refs through
+ * the same call (firmware issues OBJ_READ_REQ on remote home),
+ * whereas MapObject only works for local-home refs. The shell's
+ * cross-CPU `ps` SENDs op=5 to peer supervisors, and their reply
+ * bytes refs are remote-home → MapObject would return ERR_EREMOTE,
+ * so we must use ObjFetchBytes here.
+ *
+ * Destination is the caller's stack — `dst_va - STACK_BOTTOM` gives
+ * the byte offset into the boot stack object (parked in O11 by
+ * task_init). Limitation: this only works when `dst` is a stack
+ * pointer (caller's local array). Heap or data-segment buffers
+ * would need a different ref. Shell's cmd_ps allocates a local
+ * `char reply_buf[N]` on its stack, so this works. */
+#define STACK_BOTTOM 0x001f0000
+
+static int
+sup_list_fetch_reply(char *dst, int length)
+{
+	int dst_offset = (int)((unsigned int)dst - STACK_BOTTOM);
+	int status;
+	asm volatile(
+		"omov  o1, o14\n"           /* source = reply bytes ref */
+		"omov  o2, o11\n"           /* destination = boot stack */
+		"addiu r4, r0, 0\n"         /* src offset */
+		"addu  r5, %1, r0\n"        /* dst offset */
+		"addu  r6, %2, r0\n"        /* byte count */
+		"call  #0x108\n"            /* ObjFetchBytes */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "r"(dst_offset), "r"(length)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	return status;
+}
+
+/* Block on our reply mailbox for the supervisor's response to op=5.
+ * R3 carries the status, R4 the byte length, O2 the bytes ref. We
+ * stash O2 into O14 for the caller to MapObject. Returns: status in
+ * out_status, byte length in out_length. */
+static int
+sup_list_tasks_recv(int *out_status, int *out_length)
+{
+	int status, length, poll_status;
+	asm volatile(
+		"orefld o1, 552(o12)\n"        /* mailbox */
+		"addiu r4, r0, -1\n"           /* infinite timeout */
+		"call  #0x204\n"               /* ReceiveQueuePoll */
+		"nop\n"
+		"omov  o14, o2\n"              /* stash bytes ref */
+		"addu  %0, r3, r0\n"           /* status */
+		"addu  %1, r4, r0\n"           /* length */
+		"addu  %2, r2, r0"             /* poll status */
+		: "=r"(status), "=r"(length), "=r"(poll_status)
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	if (poll_status != 0) return poll_status;
+	*out_status = status;
+	*out_length = length;
+	return 0;
+}
+
+/* Send op=5 to the supervisor sub-cap held in O14. Reply mailbox
+ * sub-cap (in SUP_REPLY_SCRATCH from caller) goes in O3. */
+static void
+sup_list_tasks_send(void)
+{
+	asm volatile(
+		"omov   o1, o14\n"             /* recipient */
+		"onull  o2\n"
+		"orefld o3, %0(o12)\n"         /* reply sub-cap */
+		"addiu  r4, r0, 5\n"           /* op = LIST_TASKS */
+		"addiu  r5, r0, 0\n"
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		:
+		: "i"(SUP_REPLY_SCRATCH_OFFSET)
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+}
+
+/* Park the supervisor recipient ref into O14 and verify it's
+ * non-null. Returns 0 on success, -1 if null. The shell calls this
+ * AFTER OREFLD'ing the peer sub-cap from its dir_walk result —
+ * that ref is still in O1 at this point. */
+static int
+sup_list_tasks_stash_recipient(void)
+{
+	int isn;
+	asm volatile(
+		"omov o14, o1\n"
+		"oisn %0, o14"
+		: "=r"(isn) : : "r1"
+	);
+	return isn ? -1 : 0;
+}
+
+/* Derive an R+S sub-cap of our reply mailbox (full ref at
+ * REPLY_MB_SLOT) into SUP_REPLY_SCRATCH. Same dance as sup_spawn. */
+static int
+sup_list_tasks_derive_reply_cap(void)
+{
+	int status;
+	asm volatile(
+		"orefld o1, 552(o12)\n"
+		"addiu r4, r0, %1\n"           /* CAP_R | CAP_S = 9 */
+		"call  #0x103\n"               /* ObjDerive */
+		"nop\n"
+		"orefst o1, %2(o12)\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(CAP_R | CAP_S),
+		  "i"(SUP_REPLY_SCRATCH_OFFSET)
+		: "r1", "r2", "r4"
+	);
+	return status;
+}
+
+/* Public API. Caller must have OREFLD'd the target supervisor's
+ * R+S sub-cap into O1 immediately before calling — the entry asm
+ * stashes it to O14. (No clean way to pass an OR ref through a C
+ * arg yet; this is the same pattern dir.c uses for dir_register.) */
+int
+sup_list_tasks(char *dst, int max)
+{
+	if (sup_list_tasks_stash_recipient() != 0) return -1;
+
+	int status = sup_reply_mailbox_init();
+	if (status != 0) return -2;
+
+	status = sup_list_tasks_derive_reply_cap();
+	if (status != 0) return -3;
+
+	sup_list_tasks_send();
+
+	int reply_status, length;
+	if (sup_list_tasks_recv(&reply_status, &length) != 0) return -4;
+	if (reply_status != 0) return reply_status;
+	if (length == 0) return 0;
+
+	int copy_len = (length < max) ? length : max;
+	if (sup_list_fetch_reply(dst, copy_len) != 0) return -5;
+	return copy_len;
+}
