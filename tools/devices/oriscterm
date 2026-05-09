@@ -41,17 +41,33 @@ HELLO_OK     = 0x00000000
 
 PKT_OBJ_READ_REQ   = 0x10
 PKT_OBJ_READ_RESP  = 0x11
+PKT_OBJ_WRITE_REQ  = 0x12
+PKT_OBJ_WRITE_RESP = 0x13
 PKT_SEND_DELIVER   = 0x20
+
+# OBJ-RESP fault codes (Vol IV §4.1, low six bits of the response
+# `flags` byte).  Mirrored from simorisc's RESP_*.
+RESP_OK         = 0x00
+RESP_STALE      = 0x01
+RESP_BOUNDS     = 0x02
+RESP_CAP        = 0x03
 
 # Service objects exposed by oriscterm. Each is a separate capability:
 # CPUs hold an OR per service they want to use, and the dispatch goes
 # by the recipient ref's index field (Vol III §2.1).
-CONSOLE_INDEX  = 1       # text console — append bytes to the text pane
-KEYBOARD_INDEX = 2       # keyboard subscription — receive key events back
-GRID_INDEX     = 3       # grid text — write at (col, row) on the canvas
-VECTOR_INDEX   = 4       # vector graphics — line / rect / oval / clear
-RASTER_INDEX   = 5       # raster blit (protocol pinned, impl deferred)
-POINTER_INDEX  = 6       # pointer / mouse — subscribe to receive events
+CONSOLE_INDEX     = 1    # text console — append bytes to the text pane
+KEYBOARD_INDEX    = 2    # keyboard subscription — receive key events back
+GRID_INDEX        = 3    # grid text — write at (col, row) on the canvas
+VECTOR_INDEX      = 4    # vector graphics — line / rect / oval / clear
+RASTER_INDEX      = 5    # raster blit (protocol pinned, impl deferred)
+POINTER_INDEX     = 6    # pointer / mouse — subscribe to receive events
+FRAMEBUFFER_INDEX = 7    # 8-bit indexed pixel surface — exposed as a
+                         # TAG_DATA-shaped bytes object the canvas
+                         # renders behind everything else.  Clients
+                         # walk /sys/term/<n>/framebuffer to get a
+                         # R|W|V cap and OBJ_READ/WRITE_REQ pixel
+                         # bytes at byte offset (1 byte per pixel,
+                         # row-major; offset = y * fb_w + x).
 
 # Generation is fixed at 1 by simorisc convention (--service spec).
 SERVICE_GENERATION = 1
@@ -63,7 +79,9 @@ SERVICE_MAX_CAPS = 0x5B   # R|W|S|V|C
 # Individual cap bits (Vol III §2.1) — used by the Phase 47
 # self-registration packing.
 CAP_R = 0x01
+CAP_W = 0x02
 CAP_S = 0x08
+CAP_V = 0x10
 
 # Phase 47: oriscdir's pid + service index, plus the inline-register op
 # code. The terminal synthesizes a SEND_DELIVER carrying its own
@@ -201,6 +219,28 @@ def build_obj_read_req(src_pid: int, dst_pid: int, trans_id: int,
     return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_REQ, 0, trans_id, payload)
 
 
+def build_obj_read_resp(src_pid: int, dst_pid: int, trans_id: int,
+                        flags: int, data: bytes) -> bytes:
+    """Pad data to a 4-byte word boundary; pack as response payload.
+    flags carries RESP_OK / RESP_BOUNDS / etc. in low six bits."""
+    if flags == RESP_OK:
+        pad = (-len(data)) % 4
+        padded = data + bytes(pad)
+        words = list(struct.unpack(f">{len(padded)//4}I", padded)) \
+            if padded else []
+    else:
+        words = []
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_RESP, flags,
+                       trans_id, words)
+
+
+def build_obj_write_resp(src_pid: int, dst_pid: int, trans_id: int,
+                         flags: int) -> bytes:
+    """OBJ_WRITE_RESP carries no data — flags is the entire reply."""
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_WRITE_RESP, flags,
+                       trans_id, [])
+
+
 def parse_send_deliver(pkt: Dict):
     p = pkt["payload"]
     if len(p) != 14:
@@ -312,9 +352,9 @@ class Terminal:
         self.text.pack(side="top", fill="both", expand=True)
         self.text.insert("end",
             f"oriscterm online · pid={my_pid}\n"
-            f"  console  idx={CONSOLE_INDEX}    keyboard idx={KEYBOARD_INDEX}\n"
-            f"  grid     idx={GRID_INDEX}    vector   idx={VECTOR_INDEX}\n"
-            f"  pointer  idx={POINTER_INDEX}\n")
+            f"  console  idx={CONSOLE_INDEX}    keyboard    idx={KEYBOARD_INDEX}\n"
+            f"  grid     idx={GRID_INDEX}    vector      idx={VECTOR_INDEX}\n"
+            f"  pointer  idx={POINTER_INDEX}    framebuffer idx={FRAMEBUFFER_INDEX}\n")
         self.text.see("end")
         self.text.configure(state="disabled")
 
@@ -343,6 +383,53 @@ class Terminal:
         # a Canvas item id; on re-paint we delete the old id first.
         # Cleared by VEC_CLEAR and the grid clear sentinel (col=-1).
         self.grid_items: Dict[Tuple[int, int], int] = {}
+
+        # Phase 57 — framebuffer (FRAMEBUFFER_INDEX = 7).  An 8-bit
+        # indexed pixel surface exposed as a TAG_DATA-shaped bytes
+        # object that clients OBJ_READ_REQ / OBJ_WRITE_REQ pixel
+        # bytes against.  Sized to match the existing canvas (so
+        # vector/grid/pointer coordinates and framebuffer pixel
+        # coordinates agree), one byte per pixel, row-major.  Index
+        # space is the same VEC_PALETTE the vector service uses, so
+        # writes pick from the same 9-color "early-1980s graphics
+        # terminal" palette.
+        #
+        # The Tk Canvas hosts the framebuffer as a PhotoImage at
+        # z-bottom; grid / vector / raster items continue to draw on
+        # top.  Repainting is dirty-tracked: the poll loop only
+        # rebuilds the PhotoImage when an OBJ_WRITE_REQ has actually
+        # mutated pixels since the last paint.  No work spent on
+        # static frames.
+        self.fb_w = self.canvas_w
+        self.fb_h = self.canvas_h
+        self.framebuffer = bytearray(self.fb_w * self.fb_h)
+        self.framebuffer_dirty = False
+        # Precompute palette as 768-byte flat RGB lookup; entries
+        # outside VEC_PALETTE fall through to bg color (index 0).
+        self.fb_palette_rgb = bytearray(256 * 3)
+        bg_hex = VEC_PALETTE[0]
+        bg_rgb = (int(bg_hex[1:3], 16),
+                  int(bg_hex[3:5], 16),
+                  int(bg_hex[5:7], 16))
+        for i in range(256):
+            color_hex = VEC_PALETTE.get(i)
+            if color_hex is None:
+                r, g, b = bg_rgb
+            else:
+                r = int(color_hex[1:3], 16)
+                g = int(color_hex[3:5], 16)
+                b = int(color_hex[5:7], 16)
+            self.fb_palette_rgb[i*3]     = r
+            self.fb_palette_rgb[i*3 + 1] = g
+            self.fb_palette_rgb[i*3 + 2] = b
+        # PhotoImage on the canvas at (0, 0), pushed below all other
+        # canvas items so grid / vector / pointer overlays sit on
+        # top.  configure(data=…) with PPM-P6 bytes is the cheapest
+        # full-frame update Tk's stdlib bindings expose.
+        self.fb_image = tk.PhotoImage(width=self.fb_w, height=self.fb_h)
+        self.fb_canvas_item = self.canvas.create_image(
+            0, 0, image=self.fb_image, anchor="nw")
+        self.canvas.tag_lower(self.fb_canvas_item)
 
         # Capture every keystroke at the toplevel so we get them whether
         # focus is on the (disabled) text widget or the root.
@@ -408,12 +495,18 @@ class Terminal:
 
     # ---- Phase 47: directory self-registration ---------------------------
 
-    def _send_inline_register(self, path: str, my_index: int) -> None:
+    def _send_inline_register(self, path: str, my_index: int,
+                               caps: int = CAP_R | CAP_S) -> None:
         """Send a DIR_OP_REG_INLINE packet publishing a sub-cap of one
         of our service objects (CONSOLE_INDEX / KEYBOARD_INDEX /
-        GRID_INDEX) at `path` in oriscdir. Fire-and-forget; failures
-        only surface in oriscdir's log. See tools/devices/oriscdir's
-        wire-protocol docstring for the packing layout."""
+        GRID_INDEX / FRAMEBUFFER_INDEX) at `path` in oriscdir.
+        Fire-and-forget; failures only surface in oriscdir's log.
+        See tools/devices/oriscdir's wire-protocol docstring for the
+        packing layout.
+
+        Service objects (idx 1..6) are SEND targets — published with
+        R|S.  The framebuffer (idx 7) is a bytes object — published
+        with R|W|V so clients can OBJ_READ/WRITE_REQ against it. """
         if self.dir_pid is None:
             return
         path_bytes = path.encode("utf-8")
@@ -422,10 +515,8 @@ class Terminal:
                       f"{len(path_bytes)} not in 1..32")
             return
 
-        # The ref to publish: a R+S sub-cap of the named service.
-        # That's the minimum a peer needs to SEND a wire op at us.
         my_ref = make_ref(generation=SERVICE_GENERATION, home=self.my_pid,
-                          index=my_index, caps=CAP_R | CAP_S)
+                          index=my_index, caps=caps)
         dir_ref = make_ref(generation=SERVICE_GENERATION, home=self.dir_pid,
                            index=DIR_SERVICE_INDEX, caps=CAP_R | CAP_S)
 
@@ -447,16 +538,18 @@ class Terminal:
         self._log(f"register-self: {path!r} → my idx={my_index}")
 
     def _self_register_all(self) -> None:
-        """Publish console / keyboard / grid sub-caps under
-        /sys/term/<instance>/{console,keyboard,grid}. Called once at
-        startup right after the Tk window comes up but before we
-        enter the main loop."""
+        """Publish console / keyboard / grid / framebuffer sub-caps
+        under /sys/term/<instance>/.  Called once at startup right
+        after the Tk window comes up but before we enter the main
+        loop."""
         if self.dir_pid is None:
             return
         base = f"/sys/term/{self.instance}"
-        self._send_inline_register(f"{base}/console",  CONSOLE_INDEX)
-        self._send_inline_register(f"{base}/keyboard", KEYBOARD_INDEX)
-        self._send_inline_register(f"{base}/grid",     GRID_INDEX)
+        self._send_inline_register(f"{base}/console",     CONSOLE_INDEX)
+        self._send_inline_register(f"{base}/keyboard",    KEYBOARD_INDEX)
+        self._send_inline_register(f"{base}/grid",        GRID_INDEX)
+        self._send_inline_register(f"{base}/framebuffer", FRAMEBUFFER_INDEX,
+                                    caps=CAP_R | CAP_W | CAP_V)
 
     def _poll(self) -> None:
         # Drain bytes from socket.
@@ -486,6 +579,12 @@ class Terminal:
             del self.recv_buf[:4 + length]
             self._handle_packet(packet)
 
+        # Phase 57: rebuild the framebuffer image once per poll if any
+        # OBJ_WRITE_REQ has landed since the last paint.  Cheap when
+        # idle (the dirty flag stays False); ~tens-of-ms of pure-Python
+        # palette translation when an actual frame change happens.
+        self._repaint_framebuffer()
+
         if self.connected:
             self.root.after(POLL_INTERVAL_MS, self._poll)
         else:
@@ -500,12 +599,123 @@ class Terminal:
         except ValueError as e:
             self._log(f"malformed packet: {e}")
             return
-        if pkt["type"] == PKT_SEND_DELIVER:
+        t = pkt["type"]
+        if t == PKT_SEND_DELIVER:
             self._handle_send_deliver(pkt)
-        elif pkt["type"] == PKT_OBJ_READ_RESP:
+        elif t == PKT_OBJ_READ_RESP:
             self._handle_read_resp(pkt)
+        elif t == PKT_OBJ_READ_REQ:
+            self._handle_obj_read_req(pkt)
+        elif t == PKT_OBJ_WRITE_REQ:
+            self._handle_obj_write_req(pkt)
         else:
-            self._log(f"unhandled packet type 0x{pkt['type']:02x}")
+            self._log(f"unhandled packet type 0x{t:02x}")
+
+    # ---- framebuffer (idx 7) — OBJ_READ_REQ / OBJ_WRITE_REQ servicing -----
+
+    def _handle_obj_read_req(self, pkt: Dict) -> None:
+        """Service an incoming OBJ_READ_REQ targeting our framebuffer.
+        Payload layout (Vol IV §4.1):
+            words 0..1 = recipient ref (low-half-first 64-bit)
+            word  2    = byte offset
+            word  3    = byte width
+        Reply with OBJ_READ_RESP carrying width bytes from the
+        framebuffer at [offset, offset+width), or RESP_BOUNDS if the
+        range is out of bounds.
+
+        Reads on non-framebuffer indices are dropped with a log —
+        nothing else oriscterm exposes is OBJ_READ-able today."""
+        p = pkt["payload"]
+        if len(p) < 4:
+            self._log("OBJ_READ_REQ payload too short")
+            return
+        ref = p[0] | (p[1] << 32)
+        offset = p[2]
+        width = p[3]
+        idx = ref_index(ref)
+        if idx != FRAMEBUFFER_INDEX:
+            self._log(f"OBJ_READ_REQ for non-framebuffer obj idx={idx} "
+                      f"(only idx={FRAMEBUFFER_INDEX} supports OBJ_READ "
+                      f"on oriscterm)")
+            return
+        fb_size = self.fb_w * self.fb_h
+        if offset > fb_size or width > fb_size or offset + width > fb_size:
+            resp = build_obj_read_resp(self.my_pid, pkt["src_pid"],
+                                        pkt["trans_id"], RESP_BOUNDS, b'')
+            self.send_packet(resp)
+            return
+        data = bytes(self.framebuffer[offset:offset + width])
+        resp = build_obj_read_resp(self.my_pid, pkt["src_pid"],
+                                    pkt["trans_id"], RESP_OK, data)
+        self.send_packet(resp)
+
+    def _handle_obj_write_req(self, pkt: Dict) -> None:
+        """Service an incoming OBJ_WRITE_REQ targeting our framebuffer.
+        Same payload-header layout as OBJ_READ_REQ, with the data
+        bytes appended (padded to a 4-byte word boundary).  Reply
+        with OBJ_WRITE_RESP carrying RESP_OK / RESP_BOUNDS.
+
+        Marks the framebuffer dirty so the Tk poll's next pulse
+        rebuilds the PhotoImage. """
+        p = pkt["payload"]
+        if len(p) < 4:
+            self._log("OBJ_WRITE_REQ payload too short")
+            return
+        ref = p[0] | (p[1] << 32)
+        offset = p[2]
+        width = p[3]
+        idx = ref_index(ref)
+        if idx != FRAMEBUFFER_INDEX:
+            self._log(f"OBJ_WRITE_REQ for non-framebuffer obj idx={idx}")
+            return
+        fb_size = self.fb_w * self.fb_h
+        if offset > fb_size or width > fb_size or offset + width > fb_size:
+            resp = build_obj_write_resp(self.my_pid, pkt["src_pid"],
+                                         pkt["trans_id"], RESP_BOUNDS)
+            self.send_packet(resp)
+            return
+        # Decode the data words (after the 4-word header) into bytes,
+        # truncate to `width` (the trailing padding is harmless).
+        data_words = p[4:]
+        data = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in data_words)
+        data = data[:width]
+        self.framebuffer[offset:offset + width] = data
+        self.framebuffer_dirty = True
+        resp = build_obj_write_resp(self.my_pid, pkt["src_pid"],
+                                     pkt["trans_id"], RESP_OK)
+        self.send_packet(resp)
+
+    def _repaint_framebuffer(self) -> None:
+        """Rebuild the Tk PhotoImage from self.framebuffer if dirty.
+        Cheaper than per-pixel `put` on every poll; we batch into a
+        PPM-P6 byte stream and configure it as the image data.  Only
+        runs when the framebuffer has been mutated since last repaint."""
+        if not self.framebuffer_dirty:
+            return
+        W, H = self.fb_w, self.fb_h
+        # Translate 1-byte indexed pixels to 3-byte RGB via the
+        # palette lookup.  Pure-Python loop; for a 640×384 canvas
+        # that's ~245K iterations on every dirty repaint.  Fine for
+        # the kind of low-frequency updates milestone-3 WM produces
+        # (window decorations, focus flashes, glyph rendering on
+        # keystrokes).  Optimization (dirty-region tracking, PIL,
+        # numpy, etc.) is a follow-up if/when we start animating.
+        pal = self.fb_palette_rgb
+        fb  = self.framebuffer
+        rgb = bytearray(W * H * 3)
+        for i in range(W * H):
+            base = fb[i] * 3
+            j = i * 3
+            rgb[j]     = pal[base]
+            rgb[j + 1] = pal[base + 1]
+            rgb[j + 2] = pal[base + 2]
+        ppm = (b"P6\n" + str(W).encode() + b" "
+               + str(H).encode() + b"\n255\n" + bytes(rgb))
+        try:
+            self.fb_image.configure(data=ppm)
+        except tk.TclError as e:
+            self._log(f"framebuffer repaint failed: {e}")
+        self.framebuffer_dirty = False
 
     def _handle_send_deliver(self, pkt: Dict) -> None:
         try:

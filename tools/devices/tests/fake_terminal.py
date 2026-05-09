@@ -32,14 +32,30 @@ for a pointer subscribe).
 import argparse, errno, selectors, socket, struct, sys, time
 
 HELLO_MAGIC = 0xC0FFEEAA
-PKT_OBJ_READ_REQ  = 0x10
-PKT_OBJ_READ_RESP = 0x11
-PKT_SEND_DELIVER  = 0x20
+PKT_OBJ_READ_REQ   = 0x10
+PKT_OBJ_READ_RESP  = 0x11
+PKT_OBJ_WRITE_REQ  = 0x12
+PKT_OBJ_WRITE_RESP = 0x13
+PKT_SEND_DELIVER   = 0x20
 
-CONSOLE_INDEX  = 1
-KEYBOARD_INDEX = 2
-GRID_INDEX     = 3
-POINTER_INDEX  = 6
+# OBJ-RESP fault codes (Vol IV §4.1).
+RESP_OK     = 0x00
+RESP_BOUNDS = 0x02
+
+CONSOLE_INDEX     = 1
+KEYBOARD_INDEX    = 2
+GRID_INDEX        = 3
+POINTER_INDEX     = 6
+FRAMEBUFFER_INDEX = 7
+
+# Framebuffer dimensions for the test environment.  fake_terminal
+# doesn't render the pixels (no Tk surface) — it just satisfies the
+# wire protocol so a smoke test can OBJ_WRITE_REQ + OBJ_READ_REQ
+# round-trip.  Sized large enough for any test pattern; bytearrays
+# are cheap. */
+FB_TEST_W = 640
+FB_TEST_H = 384
+FB_TEST_SIZE = FB_TEST_W * FB_TEST_H
 
 GRID_COLS = 80
 GRID_ROWS = 24
@@ -84,6 +100,24 @@ def build_obj_read_req(src_pid, dst_pid, trans, ref, offset, width):
     return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_REQ, 0, trans, payload)
 
 
+def build_obj_read_resp(src_pid, dst_pid, trans, flags, data):
+    """Pad data to a 4-byte word boundary; pack as response payload."""
+    if flags == RESP_OK:
+        pad = (-len(data)) % 4
+        padded = data + bytes(pad)
+        words = list(struct.unpack(f">{len(padded)//4}I", padded)) \
+            if padded else []
+    else:
+        words = []
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_READ_RESP, flags,
+                       trans, words)
+
+
+def build_obj_write_resp(src_pid, dst_pid, trans, flags):
+    return pack_packet(src_pid, dst_pid, PKT_OBJ_WRITE_RESP, flags,
+                       trans, [])
+
+
 def ref_home(r): return (r >> 40) & 0xFF
 def ref_index(r): return (r >> 16) & 0xFFFFFF
 
@@ -102,21 +136,24 @@ DIR_SERVICE_INDEX  = 1
 SERVICE_GENERATION = 1
 OP_REG_INLINE      = 5
 CAP_R = 0x01
+CAP_W = 0x02
 CAP_S = 0x08
+CAP_V = 0x10
 
-CONSOLE_INDEX  = 1
-KEYBOARD_INDEX = 2
-GRID_INDEX     = 3
+def send_inline_register(sock, my_pid, dir_pid, my_index, path,
+                          caps=CAP_R | CAP_S):
+    """Send a single DIR_OP_REG_INLINE packet that publishes a sub-cap
+    of (my_pid, my_index) at `path` with the given caps.  Path is
+    packed inline into int_payload[2..3] + or_payload[1..3] (32-byte
+    budget) per oriscdir's docstring.  Fire-and-forget — no reply
+    awaited.
 
-def send_inline_register(sock, my_pid, dir_pid, my_index, path):
-    """Send a single DIR_OP_REG_INLINE packet that publishes a R+S
-    sub-cap of (my_pid, my_index) at `path`. Path is packed inline
-    into int_payload[2..3] + or_payload[1..3] (32-byte budget) per
-    oriscdir's docstring. Fire-and-forget — no reply awaited."""
+    Default caps R|S are right for service objects; the framebuffer
+    publishes with R|W|V so clients can OBJ_READ/WRITE_REQ against it."""
     path_bytes = path.encode("utf-8")
     if not 0 < len(path_bytes) <= 32:
         return
-    my_ref  = make_ref(SERVICE_GENERATION, my_pid,  my_index,        CAP_R | CAP_S)
+    my_ref  = make_ref(SERVICE_GENERATION, my_pid,  my_index,        caps)
     dir_ref = make_ref(SERVICE_GENERATION, dir_pid, DIR_SERVICE_INDEX, CAP_R | CAP_S)
     padded = path_bytes + b'\x00' * (32 - len(path_bytes))
     (b0_3,)   = struct.unpack("<I", padded[0:4])
@@ -145,6 +182,11 @@ class FakeTerminal:
         self.ptr_sub = None
         self.ptr_state = 0
         self.trans = 0
+        # Phase 57: framebuffer storage for the OBJ_READ/WRITE_REQ
+        # round-trip.  fake_terminal doesn't render the pixels, but
+        # it has to satisfy the wire protocol so smoke tests can
+        # write + read back.
+        self.framebuffer = bytearray(FB_TEST_SIZE)
         # Outstanding console-write reads: trans_id → expected length.
         # On OBJ_READ_RESP we decode and append to console_render
         # (kept as a buffer so we can dump it cleanly at exit; per-byte
@@ -183,10 +225,66 @@ class FakeTerminal:
         if pkt["type"] == PKT_OBJ_READ_RESP:
             self._handle_read_resp(pkt)
             return
+        if pkt["type"] == PKT_OBJ_READ_REQ:
+            self._handle_obj_read_req(pkt)
+            return
+        if pkt["type"] == PKT_OBJ_WRITE_REQ:
+            self._handle_obj_write_req(pkt)
+            return
         if pkt["type"] != PKT_SEND_DELIVER:
             print(f"fake_terminal: ignoring pkt type 0x{pkt['type']:02x}",
                   file=sys.stderr, flush=True)
             return
+        self._handle_send_deliver(pkt)
+
+    def _handle_obj_read_req(self, pkt):
+        """OBJ_READ_REQ for the framebuffer.  Same wire shape as
+        oriscterm's handler — see ouroboros/oriscwm.c's milestone-3-α
+        notes for the full protocol."""
+        p = pkt["payload"]
+        if len(p) < 4:
+            return
+        ref = p[0] | (p[1] << 32)
+        offset = p[2]
+        width = p[3]
+        if ref_index(ref) != FRAMEBUFFER_INDEX:
+            return
+        if offset > FB_TEST_SIZE or width > FB_TEST_SIZE \
+                or offset + width > FB_TEST_SIZE:
+            resp = build_obj_read_resp(self.pid, pkt["src"],
+                                        pkt["trans"], RESP_BOUNDS, b'')
+            self.sock.sendall(struct.pack(">I", len(resp)) + resp)
+            return
+        data = bytes(self.framebuffer[offset:offset + width])
+        resp = build_obj_read_resp(self.pid, pkt["src"], pkt["trans"],
+                                    RESP_OK, data)
+        self.sock.sendall(struct.pack(">I", len(resp)) + resp)
+
+    def _handle_obj_write_req(self, pkt):
+        """OBJ_WRITE_REQ for the framebuffer."""
+        p = pkt["payload"]
+        if len(p) < 4:
+            return
+        ref = p[0] | (p[1] << 32)
+        offset = p[2]
+        width = p[3]
+        if ref_index(ref) != FRAMEBUFFER_INDEX:
+            return
+        if offset > FB_TEST_SIZE or width > FB_TEST_SIZE \
+                or offset + width > FB_TEST_SIZE:
+            resp = build_obj_write_resp(self.pid, pkt["src"],
+                                         pkt["trans"], RESP_BOUNDS)
+            self.sock.sendall(struct.pack(">I", len(resp)) + resp)
+            return
+        data_words = p[4:]
+        data = b''.join(struct.pack(">I", w & 0xFFFFFFFF) for w in data_words)
+        data = data[:width]
+        self.framebuffer[offset:offset + width] = data
+        resp = build_obj_write_resp(self.pid, pkt["src"], pkt["trans"],
+                                     RESP_OK)
+        self.sock.sendall(struct.pack(">I", len(resp)) + resp)
+
+    def _handle_send_deliver(self, pkt):
         if len(pkt["payload"]) != 14:
             return
         p = pkt["payload"]
@@ -495,6 +593,9 @@ def main():
                              KEYBOARD_INDEX, f"{base}/keyboard")
         send_inline_register(s, args.pid, args.directory_pid,
                              GRID_INDEX,     f"{base}/grid")
+        send_inline_register(s, args.pid, args.directory_pid,
+                             FRAMEBUFFER_INDEX, f"{base}/framebuffer",
+                             caps=CAP_R | CAP_W | CAP_V)
 
     print(f"fake_terminal READY pid={args.pid}", flush=True)
     s.setblocking(False)
