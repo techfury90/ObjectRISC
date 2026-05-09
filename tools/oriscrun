@@ -98,20 +98,37 @@ def parse_terminal_spec(spec: str) -> dict:
 
 
 def parse_directory_spec(spec: str) -> dict:
-    """Parse 'pid=N[,verbose]' into a dict. Phase 45f."""
-    out = {"pid": None, "verbose": False}
+    """Parse 'pid=N[,config=PATH][,verbose]' into a dict. Phase 45f /
+    Phase 55.
+
+    `config` defaults to tools/devices/oriscdir.default.conf — the
+    canonical mount layout (/programs → /sys/hostfsd/0).  Without it
+    the directory comes up empty, vfs_open("/programs/...") returns
+    -1, and the supervisor's sysinit / login spawns fail with
+    `failed to spawn ... -1`.  Pass `config=none` to launch a
+    configless oriscdir explicitly (test harnesses that prefer to
+    inject mounts at runtime tend to invoke oriscdir directly rather
+    than going through oriscrun, but the field is here for symmetry)."""
+    out = {"pid": None, "config": None, "verbose": False}
     for part in spec.split(","):
         part = part.strip()
         if not part:
             continue
         if part.startswith("pid="):
             out["pid"] = int(part[len("pid="):])
+        elif part.startswith("config="):
+            out["config"] = part[len("config="):]
         elif part == "verbose":
             out["verbose"] = True
         else:
             raise SystemExit(f"oriscrun: unknown --directory field {part!r}")
     if out["pid"] is None:
         raise SystemExit(f"oriscrun: --directory spec missing pid=N: {spec!r}")
+    if out["config"] is None:
+        # Default: the canonical mount file ships in-tree.  Resolve
+        # relative to the repo root so callers don't have to.
+        default_cfg = ROOT / "tools" / "devices" / "oriscdir.default.conf"
+        out["config"] = str(default_cfg) if default_cfg.exists() else "none"
     return out
 
 
@@ -217,11 +234,16 @@ def main(argv) -> int:
                          "in the chunkboot loader pool, respectively). "
                          "image=PATH preloads a single boot image (legacy)")
     ap.add_argument("--directory", action="append", default=[],
-                    metavar="pid=N",
+                    metavar="pid=N[,config=PATH]",
                     help="spawn an oriscdir at the given pid (Phase 45f). "
                          "The directory daemon hosts a hierarchical "
                          "name → ref tree; CPUs find it via boot O8 "
-                         "wired to its primary mailbox at idx=1.")
+                         "wired to its primary mailbox at idx=1.  By "
+                         "default oriscdir loads the canonical mount "
+                         "config from tools/devices/oriscdir.default.conf "
+                         "(/programs → /sys/hostfsd/0); pass "
+                         "config=PATH to use a different file or "
+                         "config=none to launch without one (Phase 55).")
     ap.add_argument("--cpu", action="append", default=[], required=True,
                     metavar="SPEC",
                     help="spawn a simorisc CPU; SPEC is "
@@ -313,6 +335,8 @@ def main(argv) -> int:
     for dspec in dir_specs:
         cmd = [sys.executable, str(ORISCDIR),
                "--socket", sock_path, "--pid", str(dspec["pid"])]
+        if dspec["config"] and dspec["config"] != "none":
+            cmd.extend(["--config", dspec["config"]])
         if dspec["verbose"]:
             cmd.append("-v")
         d = subprocess.Popen(
