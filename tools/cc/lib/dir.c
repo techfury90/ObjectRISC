@@ -39,10 +39,13 @@
 #define CAP_C 0x40
 
 /* Wire ops on oriscdir's mailbox (must match the daemon). */
-#define DIR_OP_REGISTER 1
-#define DIR_OP_MOUNT    2
-#define DIR_OP_WALK     3
-#define DIR_OP_LIST     4
+#define DIR_OP_REGISTER  1
+#define DIR_OP_MOUNT     2
+#define DIR_OP_WALK      3
+#define DIR_OP_LIST      4
+#define DIR_OP_SUBSCRIBE 6   /* Phase 54 — register a notify_cap for
+                              * mutations under a path. See oriscdir
+                              * docstring for the wire details. */
 
 /* Supervisor's get-dir-ref op (handled by supervisor.c — Phase
  * 45f). Shells and other supervisor-spawned programs SEND op=4
@@ -902,4 +905,94 @@ dir_list(const char *path, char *buf, int cap)
 
 	if (status != 0) return status;
 	return count;
+}
+
+/* dir_subscribe — Phase 54: register the notification cap currently
+ * in O1 against `path` so oriscdir SENDs to it whenever the tree
+ * mutates at or under that path. The notify_op (1..255) is what
+ * oriscdir places in R3 of every notification — pick something
+ * distinct from your other dispatch ops so your poll loop can
+ * route. Returns 0 on success, negative on error.
+ *
+ * The caller MUST OREFLD the notify_cap into O1 immediately before
+ * calling — same convention dir_register uses for its
+ * ref-to-register. We stash O1 to DIR_INPUT_REF_SLOT on entry,
+ * before any other code path can clobber it.
+ *
+ * Wire ABI (request, mirror of OP_REGISTER's shape):
+ *   recipient = oriscdir mailbox (DIR_SLOT)
+ *   O2 = path bytes (TAG_DATA)
+ *   O3 = reply_cap (one-shot ack)
+ *   O4 = notify_cap (persistent SEND target)
+ *   R4 = DIR_OP_SUBSCRIBE = 6
+ *   R5 = path length
+ *   R6 = notify_op
+ *
+ * Reply: R3 = 0 OK / negative error. */
+int
+dir_subscribe(const char *path, int notify_op)
+{
+	asm volatile(
+		"orefst o1, %0(o12)"
+		:
+		: "i"(DIR_INPUT_REF_SLOT_OFFSET)
+	);
+
+	int rc = dir_init();
+	if (rc != 0) return rc;
+	rc = dir_reply_mailbox_init();
+	if (rc != 0) return rc;
+
+	int len = dir_strlen(path);
+	if (len <= 0 || len >= DIR_PATH_BUF_SIZE) return -1;
+
+	rc = dir_alloc_bytes_o14(DIR_PATH_BUF_SIZE,
+	                          CAP_R | CAP_W | CAP_V | CAP_C);
+	if (rc != 0) return rc;
+	rc = dir_pack_bytes_o1(path, len, DIR_PATH_BUF_SIZE);
+	if (rc != 0) { dir_free_o14_deferred(); return rc; }
+
+	/* Derive R+S reply sub-cap (one-shot for the subscribe ack). */
+	asm volatile(
+		"orefld o1, 552(o12)\n"
+		"addiu r4, r0, 9\n"
+		"call  #0x103\n"
+		"nop\n"
+		"orefst o1, 608(o12)\n"
+		"addu  %0, r2, r0"
+		: "=r"(rc) : : "r1", "r2", "r4"
+	);
+	if (rc != 0) { dir_free_o14_deferred(); return rc; }
+
+	asm volatile(
+		"orefld o1, 584(o12)\n"        /* DIR_SLOT */
+		"omov   o2, o14\n"
+		"orefld o3, 608(o12)\n"        /* DIR_REPLY_SCRATCH */
+		"orefld o4, %2(o12)\n"         /* DIR_INPUT_REF_SLOT (notify_cap) */
+		"addiu  r4, r0, %0\n"
+		"addu   r5, %1, r0\n"
+		"addu   r6, %3, r0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		: : "i"(DIR_OP_SUBSCRIBE), "r"(len),
+		    "i"(DIR_INPUT_REF_SLOT_OFFSET),
+		    "r"(notify_op)
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+
+	dir_free_o14_deferred();
+
+	int status, reply_status;
+	asm volatile(
+		"orefld o1, 552(o12)\n"
+		"addiu r4, r0, -1\n"
+		"call  #0x204\n"
+		"nop\n"
+		"addu  %0, r3, r0\n"
+		"addu  %1, r2, r0"
+		: "=r"(reply_status), "=r"(status)
+		: : "r1", "r2", "r3", "r4"
+	);
+	if (status != 0) return -6;
+	return reply_status;
 }

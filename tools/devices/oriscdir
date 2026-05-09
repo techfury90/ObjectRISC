@@ -98,6 +98,37 @@ Wire protocol (request: program SENDs to oriscdir at (pid, idx 1)):
                      fails, and asynchronous walks will discover the
                      missing entry quickly).
 
+  OP_SUBSCRIBE = 6   Phase 54: register a notification cap for changes
+                     under a path. After ack, oriscdir SENDs to
+                     notify_cap whenever the tree mutates at or under
+                     the path (currently: register / register-inline /
+                     mount; future ops that mutate fire here too).
+                     The notification's R3 = notify_op (echoed back so
+                     subscribers can multiplex multiple subscriptions
+                     on a single mailbox by varying notify_op). No
+                     payload — receiver re-walks to discover what
+                     changed; oriscdir doesn't try to be diff-aware.
+
+                          O2 = path bytes ref
+                          O3 = reply_cap (one-shot ack mailbox)
+                          O4 = notify_cap (persistent SEND target —
+                               typically a sub-cap of the same mailbox
+                               the subscriber's main poll loop reads,
+                               using a distinct notify_op so the loop
+                               can route)
+                          R5 = path length (bytes)
+                          R6 = notify_op (1..255 — what to put in
+                               R3 of every notification; the
+                               subscriber's dispatch op space)
+                     Reply: R3 = 0 OK, negative on error.
+
+                     Lifetime: subscriptions persist for oriscdir's
+                     lifetime. There's no OP_UNSUBSCRIBE today —
+                     stale subscribers (whose notify_cap goes ESTALE
+                     because the receiver task exited) just have
+                     their notifications silently dropped by the
+                     wire layer.
+
 All responses are SEND_DELIVERs aimed at the caller-supplied
 reply_cap; the result lands in the receiver's R3..R5 / O2 (after
 queue-dispatch overlay shifts caller's R4..R7 → R3..R6 and the
@@ -159,6 +190,14 @@ OP_MOUNT        = 2
 OP_WALK         = 3
 OP_LIST         = 4
 OP_REG_INLINE   = 5     # Phase 47: inline-path register (no ObjAlloc needed)
+OP_SUBSCRIBE    = 6     # Phase 54: subscribe to changes under a path.
+                        # On any register / register-inline / mount that
+                        # touches the subscribed path or one of its
+                        # descendants, oriscdir SENDs a notification to
+                        # the subscriber's notify_cap. Receiver wakes,
+                        # re-walks, reacts. The supervisor uses this to
+                        # eliminate the periodic /sys/term polling that
+                        # Phase 52 introduced.
 
 # ---- Node-kind codes (returned in R4 of OP_WALK responses) ---------------
 
@@ -326,6 +365,12 @@ class OriscDir:
         self.next_trans_id = 0
         self.root = Node(name="")            # the "/" node
         self.pending: Dict[int, PendingRequest] = {}
+        # Phase 54: subscription state. Each entry is (path_components,
+        # notify_cap, notify_op). When the tree mutates at or below
+        # path_components, we SEND a notification to notify_cap with
+        # R4 = notify_op (so the subscriber can multiplex multiple
+        # subscriptions on a single mailbox by varying notify_op).
+        self.subscriptions: list = []
 
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -531,6 +576,8 @@ class OriscDir:
             self._do_walk(pr, path_bytes)
         elif pr.op == OP_LIST:
             self._do_list(pr, path_bytes)
+        elif pr.op == OP_SUBSCRIBE:
+            self._do_subscribe(pr, path_bytes)
         else:
             self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
 
@@ -622,12 +669,14 @@ class OriscDir:
             existing.leaf_ref = ref_to_register
             self._log(f"register-inline {path!r} → 0x{ref_to_register:016x} "
                       f"(promoted from empty dir, src=pid{src_pid})")
+            self._notify_subscribers(comps)
             return
         node.children[last] = Node(
             name=last, parent=node, leaf_ref=ref_to_register
         )
         self._log(f"register-inline {path!r} → 0x{ref_to_register:016x} "
                   f"(src=pid{src_pid})")
+        self._notify_subscribers(comps)
 
     def _do_register(self, pr: PendingRequest, path_bytes: bytes) -> None:
         try:
@@ -662,10 +711,12 @@ class OriscDir:
             existing.leaf_ref = ref_to_register
             self._log(f"register {path!r} → 0x{ref_to_register:016x} "
                       f"(promoted from empty dir)")
+            self._notify_subscribers(comps)
             return self._reply(pr.reply_cap, 0, 0, 0, 0)
         new_node = Node(name=last, parent=node, leaf_ref=ref_to_register)
         node.children[last] = new_node
         self._log(f"register {path!r} → 0x{ref_to_register:016x}")
+        self._notify_subscribers(comps)
         self._reply(pr.reply_cap, 0, 0, 0, 0)
 
     def _do_mount(self, pr: PendingRequest, path_and_prefix: bytes) -> None:
@@ -706,11 +757,13 @@ class OriscDir:
             existing.mount_prefix = prefix
             self._log(f"mount {path!r} → ref=0x{service_ref:016x} "
                       f"prefix={prefix!r} (promoted)")
+            self._notify_subscribers(comps)
             return self._reply(pr.reply_cap, 0, 0, 0, 0)
         new_node = Node(name=last, parent=node,
                         mount_ref=service_ref, mount_prefix=prefix)
         node.children[last] = new_node
         self._log(f"mount {path!r} → ref=0x{service_ref:016x} prefix={prefix!r}")
+        self._notify_subscribers(comps)
         self._reply(pr.reply_cap, 0, 0, 0, 0)
 
     def _do_walk(self, pr: PendingRequest, path_bytes: bytes) -> None:
@@ -850,6 +903,71 @@ class OriscDir:
         self.send_packet(req)
 
     # ---- response back to the caller -------------------------------------
+
+    # ---- Phase 54: subscription notifications --------------------------
+
+    def _do_subscribe(self, pr: PendingRequest, path_bytes: bytes) -> None:
+        """OP_SUBSCRIBE handler. Records (path_components, notify_cap,
+        notify_op) so that any future tree mutation under the path
+        triggers a SEND to notify_cap with R4 = notify_op.
+
+        notify_cap arrives in or_payload[3] (caller's O4 — same slot
+        OP_REGISTER uses for the ref-to-register; we re-purpose the
+        slot meaning per op-code, like the rest of the protocol).
+        notify_op arrives in int_payload[2] (caller's R6).
+
+        Reply: R3 = 0 OK, negative on error. The reply lands on the
+        caller's reply_cap (or_payload[2] = caller's O3) — that's a
+        ONE-shot ack mailbox; ongoing notifications go to notify_cap
+        (a different sub-cap, typically of the same underlying mailbox
+        but reusable across many notification deliveries)."""
+        try:
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        comps = normalize_path(path)
+        if comps is None:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        notify_cap = pr.or_payload[3]
+        notify_op  = pr.int_payload[2] & 0xFF
+        if notify_cap == 0:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        # Tuple of (comps_tuple, notify_cap, notify_op).
+        self.subscriptions.append((tuple(comps), notify_cap, notify_op))
+        self._log(f"subscribe {path!r} → notify_cap=0x{notify_cap:016x} "
+                  f"op={notify_op}")
+        self._reply(pr.reply_cap, 0, 0, 0, 0)
+
+    def _notify_subscribers(self, changed_comps: list) -> None:
+        """Walk the subscription list and SEND a notification for any
+        subscription whose path is a prefix of changed_comps (i.e. the
+        subscriber asked to watch a directory and a child changed).
+
+        We deliberately match prefix-of-changed (subscribed path is
+        ancestor of mutation), not the other direction. So a
+        subscription on '/sys/term' fires for /sys/term/0/console
+        registration, and a subscription on '/' fires for any
+        mutation. A subscription on '/sys/term/0' would NOT fire for
+        '/sys/term/1' — different siblings."""
+        ct = tuple(changed_comps)
+        for (sub_comps, notify_cap, notify_op) in self.subscriptions:
+            if len(sub_comps) > len(ct):
+                continue
+            if ct[:len(sub_comps)] != sub_comps:
+                continue
+            # Match. Fire notification. Receiver's R3 = notify_op,
+            # other args zero. Nothing else to communicate — the
+            # subscriber re-walks the path.
+            trans = self._next_trans()
+            pkt = build_send_deliver(
+                src_pid=self.my_pid,
+                dst_pid=ref_home(notify_cap),
+                trans_id=trans,
+                recipient_ref=notify_cap,
+                int_payload=[notify_op & 0xFF, 0, 0, 0],
+                or_payload=[notify_cap, 0, 0, 0],
+            )
+            self.send_packet(pkt)
 
     def _reply(self, reply_cap: int, status: int, secondary: int,
                tertiary: int, ref_payload: int) -> None:
