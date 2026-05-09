@@ -253,6 +253,21 @@ int lb_spawn(const char *path);
 typedef int task_t;
 
 void   task_init(void);                            /* allocate the task table */
+/* Phase 51: terminal_idx propagation. Each task tracks the index
+ * of the terminal the user is sitting at (independent of which CPU
+ * the task happens to run on). sup_spawn reads this and packs it
+ * into the spawn-request's R7 so the receiving supervisor can dir-
+ * walk /sys/term/<N>/* and inject the right console/keyboard/grid
+ * into the child's OPRs (Phase 49 pass-through machinery).
+ *
+ * task_init computes the initial value from `_orisc_init_r4` (set
+ * by crt0 from R4-at-entry, which was TaskCreate's init_r4). The
+ * encoding is `terminal_idx + 1` with 0 = "no terminal" (-1
+ * internally). Top-level boots (the supervisor) come up with
+ * my_terminal_idx = -1 and need to set it explicitly with
+ * task_set_my_terminal_idx — typically procid at boot. */
+int    task_my_terminal_idx(void);
+void   task_set_my_terminal_idx(int idx);
 task_t task_spawn(void (*entry)(int), int arg);    /* fork; return slot handle */
 int    task_wait(task_t t);                        /* block on t; return exit code */
 int    task_kill(task_t t, int code);              /* mark t EXITED with code */
@@ -314,6 +329,14 @@ int    orx_init(void);                                 /* optional boot-time arg
 int    orx_run  (const char *path, const char *args, const char *cwd);  /* sync */
 task_t orx_spawn(const char *path, const char *args, const char *cwd);  /* async */
 int    orx_unload(task_t t);                           /* wait + deferred-free + reap */
+/* Phase 51: per-spawn override for the child's terminal_idx (the
+ * value that ends up in the child's task_my_terminal_idx() at
+ * boot). Supervisors set this around an orx_spawn for a relayed
+ * pass-through request; everyone else leaves it alone (the default
+ * propagates the parent's own terminal_idx, which is the right
+ * inheritance for a shell running `run cmd` directly). */
+void   orx_set_child_terminal_idx(int idx);
+void   orx_clear_child_terminal_idx(void);
 
 /* ---- sup.c — supervisor RPC client ----------------------------- *
  *
@@ -331,11 +354,25 @@ int    orx_unload(task_t t);                           /* wait + deferred-free +
 
 task_t sup_spawn(const char *path, const char *args, const char *cwd);
 
-/* SUP_TARGET_LOCAL — the sentinel target_pid value passed to
- * sup_spawn_at meaning "spawn on whatever CPU my supervisor is
- * on" (the same behaviour plain sup_spawn gives). Distinct from
- * any literal PROCID (PROCIDs are 0..254). */
+/* SUP_TARGET_LOCAL — sentinel meaning "stay on the local CPU; do
+ * not round-robin." Used when the caller explicitly wants the
+ * spawn to happen on the supervisor's own CPU. Phase 51 also uses
+ * this on the wire as the relay-pinning marker (a relayed packet
+ * arrives at the receiver with target_pid = LOCAL, signalling
+ * "spawn here, no further relay").
+ *
+ * SUP_TARGET_ANY — Phase 51 sentinel meaning "any CPU is fine;
+ * round-robin OK." Plain sup_spawn() uses this so a Phase-51-aware
+ * supervisor can spread load across CPUs. The receiver dir-walks
+ * /sys/term/<requester>/* (carried in R7) and injects the
+ * requester's terminal services into the child's OPRs, so
+ * term_print/term_getkey route to the right oriscterm regardless
+ * of which CPU the spawn lands on.
+ *
+ * Both values are above the 0..254 PROCID range so they never
+ * collide with a literal target. */
 #define SUP_TARGET_LOCAL 0xFF
+#define SUP_TARGET_ANY   0xFE
 
 /* sup_spawn_at — Phase 45e: like sup_spawn, but with explicit
  * target-CPU placement. target_pid is either SUP_TARGET_LOCAL

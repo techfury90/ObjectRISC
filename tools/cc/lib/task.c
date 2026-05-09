@@ -166,6 +166,25 @@
  * in regular int memory; pcc treats it as a normal global. */
 static unsigned int task_slots_in_use;
 
+/* Phase 51: terminal_idx propagation. crt0.s parks the initial R4
+ * (TaskCreate's init_r4 = parent's R5) into _orisc_init_r4 right
+ * before main runs. The encoding is `terminal_idx + 1`, with 0
+ * meaning "no terminal info" — top-level boots (the supervisor
+ * itself) and legacy callers that didn't fill R5 land on 0.
+ *
+ * task_init reads _orisc_init_r4 once and decodes it into
+ * `my_terminal_idx` (-1 for "no terminal," or a non-negative
+ * terminal index). sup.c's sup_spawn re-encodes this into the
+ * spawn-request's R7 so the chain of supervisors can route a
+ * relayed spawn back to the requester's terminal regardless of
+ * which CPU is hosting the running program.
+ *
+ * Programs that need to OVERRIDE this (the supervisor sets it to
+ * its procid at boot, since its R4 from oriscrun is uninitialised)
+ * use task_set_my_terminal_idx. */
+extern int _orisc_init_r4;
+static int my_terminal_idx;
+
 /* --- task_init: park boot ORs + ObjAllocStore the table --------- */
 
 void
@@ -197,6 +216,35 @@ task_init(void)
 		: "r2", "r3", "r4", "r5", "r6"
 	);
 	task_slots_in_use = 0;
+	/* Phase 51: decode terminal_idx from crt0's R4 stash. R4 == 0
+	 * means "no info" (-1 internally); R4 == N+1 maps to terminal
+	 * index N. The supervisor overrides this in main() with its
+	 * own procid, since its R4 came from oriscrun, not a Phase-51-
+	 * aware parent. */
+	if (_orisc_init_r4 > 0) {
+		my_terminal_idx = _orisc_init_r4 - 1;
+	} else {
+		my_terminal_idx = -1;
+	}
+}
+
+/* Phase 51: getter / setter for the libc-managed terminal_idx slot.
+ * sup_spawn reads this to populate R7 (so the supervisor can route
+ * a relayed spawn back to the requester's terminal). The supervisor
+ * sets it explicitly because crt0's R4-stash mechanism doesn't
+ * apply to top-level boots. Other programs leave it alone — the
+ * value task_init computed from the spawn handshake is the right
+ * one for them. */
+int
+task_my_terminal_idx(void)
+{
+	return my_terminal_idx;
+}
+
+void
+task_set_my_terminal_idx(int idx)
+{
+	my_terminal_idx = idx;
 }
 
 /* --- internal: OREFLD slot → O1 / OREFST O1 → slot ---------------

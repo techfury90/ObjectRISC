@@ -532,6 +532,34 @@ orx_init(void)
 #define ORX_SLOT_CHILD_O7_OFFSET 664
 #define ORX_SLOT_O7_SAVE_OFFSET  672
 
+/* Phase 51: per-spawn override of the child's terminal index. The
+ * supervisor sets this before each orx_spawn (to its own procid for
+ * locally-originated spawns, or the requester's terminal_idx for
+ * relayed pass-through spawns). orx_task_create reads it, encodes
+ * as `idx + 1` (with -1 → 0 = "no terminal info"), and stuffs into
+ * R5 just before TaskCreate. The simulator copies caller's R5 →
+ * child's init_r4; crt0.s saves it to _orisc_init_r4; libc's
+ * task_init decodes back to my_terminal_idx.
+ *
+ * The override is consulted only when set (>= 0). When still at the
+ * sentinel default (-1), orx_task_create propagates the parent's
+ * own terminal_idx — i.e., a non-supervisor caller (a shell that
+ * orx_run's a child directly without going through sup_spawn)
+ * inherits its terminal naturally. */
+static int orx_child_term_override = -1;
+
+void
+orx_set_child_terminal_idx(int idx)
+{
+	orx_child_term_override = idx;
+}
+
+void
+orx_clear_child_terminal_idx(void)
+{
+	orx_child_term_override = -1;
+}
+
 /* TaskCreate(O1=code, O2=stack, O3=data, O4=args, R4=entry, R5=0)
  * — leave the resulting task ref in O1 for the caller to register
  * into the libc task table via task_register_o1. Restore O2/O3/O4
@@ -617,20 +645,31 @@ orx_task_create(unsigned int entry, int has_data)
 	 * main asm body stays short — pcc has been observed to lose
 	 * a `\n` inside very long inline asm strings. */
 	asm volatile("orefld o4, 536(o12)");
+	/* Phase 51: pack the child's terminal_idx + 1 into R5 — the
+	 * simulator copies caller's R5 to child's init_r4, crt0 stashes
+	 * to _orisc_init_r4, libc task_init reads back. If the supervisor
+	 * (or a higher caller) didn't set an override via
+	 * orx_set_child_terminal_idx, fall through to the parent's own
+	 * terminal_idx so children of a shell inherit naturally. r5_val
+	 * 0 = "no terminal info." */
+	int term_for_child = (orx_child_term_override >= 0)
+	                        ? orx_child_term_override
+	                        : task_my_terminal_idx();
+	int r5_val = (term_for_child >= 0) ? (term_for_child + 1) : 0;
 	if (has_data) {
 		asm volatile(
 			"orefld o1, 128(o12)\n"
 			"orefld o2, 144(o12)\n"
 			"orefld o3, 136(o12)\n"
 			"addu  r4, %1, r0\n"
-			"addu  r5, r0, r0\n"
+			"addu  r5, %2, r0\n"
 			"call  #0x000\n"
 			"nop\n"
 			"omov  o2, o11\n"
 			"omov  o3, o15\n"
 			"addu  %0, r2, r0"
 			: "=r"(status)
-			: "r"(entry)
+			: "r"(entry), "r"(r5_val)
 			: "r2", "r3", "r4", "r5"
 		);
 	} else {
@@ -639,14 +678,14 @@ orx_task_create(unsigned int entry, int has_data)
 			"orefld o2, 144(o12)\n"
 			"onull  o3\n"
 			"addu  r4, %1, r0\n"
-			"addu  r5, r0, r0\n"
+			"addu  r5, %2, r0\n"
 			"call  #0x000\n"
 			"nop\n"
 			"omov  o2, o11\n"
 			"omov  o3, o15\n"
 			"addu  %0, r2, r0"
 			: "=r"(status)
-			: "r"(entry)
+			: "r"(entry), "r"(r5_val)
 			: "r2", "r3", "r4", "r5"
 		);
 	}
