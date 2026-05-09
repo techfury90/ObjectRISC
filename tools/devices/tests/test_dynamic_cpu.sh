@@ -111,6 +111,7 @@ done
 
 python3 tools/devices/oriscdir \
     --socket "$SOCK" --pid 18 -v \
+    --config tools/devices/oriscdir.default.conf \
     > "$TMP/dir.out" 2>&1 &
 DIR=$!
 for _ in $(seq 50); do
