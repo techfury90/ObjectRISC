@@ -13,14 +13,16 @@
  *     itself at boot via dir_walk, the same path the supervisor uses
  *     for its own boot caps.
  *
- *   - task_query-based auto-destroy is now POSSIBLE (the .orx WM
- *     can use the CPU-side primitive that the Python daemon
- *     couldn't), but the wiring is deferred to a follow-up
- *     milestone.  The owner-task ref is captured at OP_NEW_WINDOW
- *     time (clients pass it in O2) and stashed per-window in O12
- *     scratch slots; scan_owner_exits is a no-op stub that the
- *     follow-up will fill in with the task_query polling loop.
- *     Wire shape is forward-compatible.
+ *   - task_query-based auto-destroy.  The owner-task ref is
+ *     captured at OP_NEW_WINDOW time (clients pass it in O2) and
+ *     stashed per-window in O12 scratch slots; the dispatch loop's
+ *     idle pulse calls scan_owner_exits, which task_queries each
+ *     live window's owner and frees the slot when the owner has
+ *     EXITed.  Graceful degradation: clients that pass non-task
+ *     refs (the smoke test does, since wm_smoke is a single-task
+ *     program with no convenient way to reference itself) get
+ *     task_query failures and are simply skipped — manual
+ *     OP_DESTROY_WINDOW stays the cleanup path for those.
  *
  * The wire protocol is also revised for CPU-friendly dispatch
  * (the milestone-1 per-window-handle services don't fit on a CPU
@@ -75,9 +77,9 @@
  * path find us.
  *
  * Owner-task ref convention: clients pass their owning task ref in
- * O2 of OP_NEW_WINDOW.  The WM stashes the ref per-window for the
- * future task_query auto-destroy.  In milestone 2 the slot is
- * captured but never polled — see scan_owner_exits.
+ * O2 of OP_NEW_WINDOW.  The WM stashes the ref per-window and
+ * task_queries it from scan_owner_exits during each idle pulse;
+ * windows whose owner has EXITed get reclaimed automatically.
  */
 
 #include "liborisc.h"
@@ -604,30 +606,92 @@ handle_subscribe_events(int wid, int notify_op)
 
 /* === Auto-destroy via task_query ====================================== */
 
+/* Helper: load WM_OWNER_BASE+wid*8 into O1 and call task_query
+ * (#0x008).  Returns the firmware status (R2) in `out_status` and
+ * the packed-state word (R3) in `out_state_word`.  R3's low 8 bits
+ * are the TASK_STATE_* enum.
+ *
+ * task_query is remote (the owner ref typically lives on a
+ * different CPU), so this call may block briefly while the
+ * TASK_QUERY_REQ round-trips.  That's fine — the dispatch loop is
+ * idle when scan_owner_exits runs.
+ *
+ * Per-wid switch matches the load_owner_to_o14 pattern: pcc
+ * rejects computed-offset OREFLDs, so each case bakes its
+ * offset in.  Offsets must match WM_OWNER_BASE_OFFSET = 184 +
+ * (wid-1)*8. */
+static int
+task_query_owner(int wid, int *out_state_word)
+{
+	switch (wid) {
+	case  1: asm volatile("orefld o1, 184(o12)"); break;
+	case  2: asm volatile("orefld o1, 192(o12)"); break;
+	case  3: asm volatile("orefld o1, 200(o12)"); break;
+	case  4: asm volatile("orefld o1, 208(o12)"); break;
+	case  5: asm volatile("orefld o1, 216(o12)"); break;
+	case  6: asm volatile("orefld o1, 224(o12)"); break;
+	case  7: asm volatile("orefld o1, 232(o12)"); break;
+	case  8: asm volatile("orefld o1, 240(o12)"); break;
+	case  9: asm volatile("orefld o1, 248(o12)"); break;
+	case 10: asm volatile("orefld o1, 256(o12)"); break;
+	case 11: asm volatile("orefld o1, 264(o12)"); break;
+	case 12: asm volatile("orefld o1, 272(o12)"); break;
+	case 13: asm volatile("orefld o1, 280(o12)"); break;
+	case 14: asm volatile("orefld o1, 288(o12)"); break;
+	case 15: asm volatile("orefld o1, 296(o12)"); break;
+	case 16: asm volatile("orefld o1, 304(o12)"); break;
+	default: asm volatile("onull o1"); break;
+	}
+
+	int status, state_word;
+	asm volatile(
+		"call  #0x008\n"            /* TaskQuery — Vol VI §4.2 */
+		"nop\n"
+		"addu  %0, r2, r0\n"
+		"addu  %1, r3, r0"
+		: "=r"(status), "=r"(state_word)
+		:
+		: "r1", "r2", "r3"
+	);
+	*out_state_word = state_word;
+	return status;
+}
+
 /* Walk the window table; for each live window whose owner task has
  * EXITED, free the slot.  Called periodically from the dispatch
  * loop's idle pulse.  Mirrors the slot-reaper pattern in
- * supervisor.c::reap_exited_tasks. */
+ * supervisor.c::reap_exited_tasks.
+ *
+ * Graceful degradation: clients that pass non-task refs (or null
+ * refs) for the owner cause task_query to return non-zero status;
+ * those windows are simply skipped — the slot stays alive, manual
+ * OP_DESTROY_WINDOW remains the only cleanup path.  This is fine
+ * for clients that don't care about auto-destroy and for tests
+ * where the smoke task itself doesn't exit during the run. */
 static void
 scan_owner_exits(void)
 {
 	int wid;
 	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
 		if (window_type[wid - 1] == 0) continue;
-		/* Need the owner ref in a task_t / ref form.  task_query
-		 * takes a task_t handle, but we have a raw OR ref — the
-		 * libc API expects a task table slot.  Workaround:
-		 * register the owner in an unused task slot, query, free.
-		 *
-		 * Simpler: skip task_query for now and rely on
-		 * OP_DESTROY_WINDOW being called by clients on exit.
-		 * Auto-destroy via owner-task watch is a future-milestone
-		 * deliverable; the wire shape is forward-compatible.
-		 *
-		 * The WM_OWNER_BASE slots still record the owner ref for
-		 * future use — the data is captured, the polling-and-reap
-		 * just isn't wired yet. */
-		(void)wid;
+
+		int state_word;
+		int rc = task_query_owner(wid, &state_word);
+		/* Non-zero status: ref isn't a task or has been freed.
+		 * Skip — clients without auto-destroy semantics use
+		 * OP_DESTROY_WINDOW manually. */
+		if (rc != 0) continue;
+
+		/* low 8 bits = state per Vol VI §4.2's packed return. */
+		int state = state_word & 0xFF;
+		if (state == TASK_STATE_EXITED) {
+			window_type[wid - 1] = 0;
+			window_subscribe_op[wid - 1] = 0;
+			/* The owner-ref and notify-cap slots stay populated;
+			 * they'll get overwritten by the next allocation in
+			 * this slot.  No SEND fires for the close — milestone
+			 * 2's WM doesn't push events to subscribers yet. */
+		}
 	}
 }
 
@@ -749,7 +813,9 @@ main(void)
 		int op, wid_or_zero, arg;
 		int status = poll_one_request(&op, &wid_or_zero, &arg);
 		if (status != 0) {
-			/* Timeout or transient.  Idle work, then re-poll. */
+			/* Timeout or transient.  Run the auto-destroy scan
+			 * (Phase 54-style: task_query each window's owner,
+			 * free EXITed slots), then re-poll. */
 			scan_owner_exits();
 			continue;
 		}

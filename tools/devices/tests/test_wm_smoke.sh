@@ -101,28 +101,17 @@ for _ in $(seq 100); do
 done
 
 # --- launch the smoke-test CPU at pid 1 ----------------------------
-# Boot ABI for the smoke test: O7 = WM main service ref.
+# Boot ABI for the smoke test: O8 = oriscdir mailbox sub-cap.
+# The smoke test uses libc's wm_init() which dir_walks /sys/wm/0
+# to discover the WM — no longer brittle to changes in the WM's
+# startup-time allocation order (milestone 2 wired the WM mailbox
+# idx directly via --service, which broke whenever a new alloc
+# slipped in before allocate_service_mailbox).
 #
-# The WM's service mailbox lands at descriptor idx 6 on its CPU.
-# Boot allocations on each simorisc instance (--connect mode):
-#   idx 1 = boot code object       (init_cpu)
-#   idx 2 = boot stack object      (init_cpu)
-#   idx 3 = boot data object       (init_cpu)
-#   idx 4 = bootstrap task descriptor (make_bootstrap_task — alloc'd
-#                                  inside init_cpu via alloc_task_descriptor)
-#   idx 5 = self-service           (populate_self_service — runs in
-#                                  single-CPU --connect mode, mirroring
-#                                  populate_service_objects in
-#                                  multi-CPU mode)
-#   idx 6 = the WM's allocate_service_mailbox() in main(), which runs
-#           FIRST before task_init() so the idx is stable.
-#
-# A future-milestone test that goes through the directory (dir_walk
-# /sys/wm/0) is more robust to changes in the WM's startup order;
-# the milestone-2 smoke test stays brittle-but-simple and wires the
-# cap directly.
+# --service slot order: O5/O6/O7 unused, O8 = 18=1@9 (oriscdir).
 python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
-    --service "0=0@0" --service "0=0@0" --service "0=6@9" \
+    --service "0=0@0" --service "0=0@0" --service "0=0@0" \
+    --service "18=1@9" \
     "$TMP/wm_smoke.orx" >"$TMP/cpu.out" 2>"$TMP/cpu.err" &
 CPU=$!
 

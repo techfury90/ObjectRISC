@@ -146,8 +146,15 @@
  *     + 8 (ORX_SLOT_CHILD_O6: terminal-pass-through keyboard sub-cap.)
  *     + 8 (ORX_SLOT_O6_SAVE: transient parent-O6 stash.)
  *     + 8 (ORX_SLOT_CHILD_O7: terminal-pass-through grid sub-cap.)
- *     + 8 (ORX_SLOT_O7_SAVE: transient parent-O7 stash.) */
-#define ORX_STATE_BYTES   552
+ *     + 8 (ORX_SLOT_O7_SAVE: transient parent-O7 stash.)
+ *     + 8 (WM_SLOT: window-manager mailbox sub-cap.  Populated lazily
+ *          by wm.c's wm_init via dir_walk("/sys/wm/0").  Null on
+ *          systems without a WM running — wm_init returns -2 and
+ *          callers fall back to direct boot-OPR surfaces.)
+ *     + 8 (WM_INPUT_REF_SLOT: caller's owner-task ref stashed at
+ *          wm_new_window entry, to be passed in O2 of the wire SEND.
+ *          Same role as DIR_INPUT_REF_SLOT for dir.c.) */
+#define ORX_STATE_BYTES   568
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8

@@ -493,6 +493,85 @@ int dir_list(const char *path, char *buf, int cap);
  * Returns 0 on success, negative on error. */
 int dir_subscribe(const char *path, int notify_op);
 
+/* ----- Window-manager client (oriscwm) — milestone 3 -----------------
+ *
+ * libc wrappers for the oriscwm wire protocol.  See
+ * ouroboros/oriscwm.c for the full op writeup; tools/cc/lib/wm.c
+ * implements the SEND-and-poll round-trips against the per-program
+ * reply mailbox (shared with sup.c / dir.c).
+ *
+ * Boot prerequisites: task_init() has run, DIR_SLOT is reachable
+ * (either pre-populated by a parent — supervisors propagate this
+ * through orx_spawn — or BOOT_PARENT_SLOT is wired so dir.c's
+ * lazy bootstrap can populate it).
+ *
+ * Window types (must match ouroboros/oriscwm.c). */
+#define WIN_TYPE_CONSOLE    1
+#define WIN_TYPE_GRAPHICAL  2
+
+/* Surface kinds (mirror oriscterm's service indices). */
+#define WSURF_CONSOLE   1
+#define WSURF_KEYBOARD  2
+#define WSURF_GRID      3
+#define WSURF_VECTOR    4
+#define WSURF_RASTER    5
+#define WSURF_POINTER   6
+
+/* Error codes from wm_*.  Negative-status convention. */
+#define WIN_E_INVAL    (-1)
+#define WIN_E_NOENT    (-2)     /* window not found, or no oriscwm running */
+#define WIN_E_IO       (-6)     /* internal / no oriscdir to bootstrap */
+#define WIN_E_NOSPC    (-7)
+#define WIN_E_NOTIMPL  (-8)
+
+/* wm_init — lazy: ensure WM_SLOT is populated via dir_walk on
+ * "/sys/wm/0".  Returns 0 OK, -6 if no directory available, -2 if
+ * /sys/wm/0 doesn't resolve (no oriscwm in this system).  Idempotent;
+ * subsequent calls fast-return.
+ *
+ * Programs that want the "use-WM-if-present, fall-back-otherwise"
+ * pattern call wm_init and check the status: 0 means proceed with
+ * wm_*, anything else means use direct boot-OPR surfaces. */
+int wm_init(void);
+
+/* wm_new_window — request a window of `type`.
+ *
+ * Caller MUST place the owner-task ref in O1 before calling.  The
+ * WM stashes it for task_query polling: when the owner task
+ * EXITed, the WM auto-destroys the window.  Pass O1 = null to opt
+ * out of auto-destroy.
+ *
+ * On success: *out_wid is set to the window id (1..MAX_WINDOWS),
+ * and *out_w_cells / *out_h_cells are filled with the cell-grid
+ * dimensions (pixel dimensions aren't surfaced in this API yet —
+ * caller can add an API extension if/when graphical clients need
+ * them).  Pass NULL out-pointers to skip. */
+int wm_new_window(int type, int *out_wid,
+                  int *out_w_cells, int *out_h_cells);
+
+/* wm_bind_surface — resolve surface `kind` of window `wid`.
+ *
+ * On success the resolved surface cap is parked in DIR_RESULT_SLOT
+ * (offset 616 in O12 — the same generic last-resolved-ref scratch
+ * dir_walk uses).  Caller follows up with `orefld oN, 616(o12)`
+ * inline asm to land it in the desired OPR. */
+int wm_bind_surface(int wid, int kind);
+
+/* wm_destroy_window — release a window. */
+int wm_destroy_window(int wid);
+
+/* wm_subscribe_events — register a notify cap for window-lifecycle
+ * events (resize, focus, close-request).  Stub on the WM side
+ * today — accepted and stored, no events fire yet — but the wire
+ * shape is committed.
+ *
+ * Caller MUST OREFLD the notify cap into O1 immediately before
+ * calling (same convention as dir_subscribe).  notify_op is the
+ * value (1..255) the WM puts in R3 of every notification SEND so
+ * the subscriber can multiplex multiple subscriptions on a single
+ * mailbox. */
+int wm_subscribe_events(int wid, int notify_op);
+
 /* ----- VFS helpers (Phase 45g) ----------------------------------------
  *
  * `vfs.c` is the path-aware front door programs should prefer over
