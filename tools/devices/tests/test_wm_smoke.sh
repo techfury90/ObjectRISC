@@ -1,28 +1,29 @@
 #!/bin/sh
-# test_wm_smoke.sh — end-to-end test of the oriscwm milestone-1 wire
-# protocol.
+# test_wm_smoke.sh — end-to-end test of the milestone-2 .orx WM.
 #
 # Architecture under test:
 #   - oriscbar (the crossbar)
-#   - fake_terminal at pid 16 (just to provide cap shapes for O5/O6)
-#   - oriscwm at pid 20 (no oriscdir wired — the smoke test bypasses
-#     the directory and gets the WM cap directly via --service)
-#   - simorisc CPU 0 running wm_smoke.orx
+#   - oriscdir at pid 18 (so the WM can dir_walk for surface caps,
+#     and so wm_smoke can bootstrap dir.c if needed)
+#   - oriscterm at pid 16 (publishes /sys/term/0/{console,keyboard,grid})
+#   - simorisc CPU 0 running oriscwm.orx (the WM itself)
+#   - simorisc CPU 1 running wm_smoke.orx (the test client)
 #
-# wm_smoke exercises every milestone-1 wire op (REGISTER_SURFACE,
-# NEW_WINDOW, BIND_SURFACE, DESTROY_WINDOW + the failure cases for
-# E_INVAL / E_NOSPC / E_NOTIMPL).  It prints "PASS" on success.
+# wm_smoke exercises every milestone-2 wire op (NEW_WINDOW,
+# BIND_SURFACE, DESTROY_WINDOW + the failure paths E_INVAL /
+# E_NOSPC / E_NOTIMPL) and prints "wm_smoke: PASS" on success.
 #
-# The fake_terminal is here only to provide live caps for O5/O6.
-# wm_smoke registers them with the WM as opaque "console" and
-# "keyboard" caps; the test never actually exercises the underlying
-# terminal services.  No real keyboard events, no console output to
-# the Tk pane.  Diagnostics go to host stdout via firmware ConsoleWrite.
+# This replaces the milestone-1 Python-daemon test.  The Python
+# daemon at tools/devices/oriscwm has been removed; the wire shape
+# changed too (single service + payload-dispatch — see oriscwm.c
+# for the protocol writeup).
 
 set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
 
+# Build everything once if we don't have liborisc / supervisor — the
+# WM and smoke test share the same build pipeline.
 if [ ! -f build/liborisc.ora ]; then
     make -s lib >/dev/null
 fi
@@ -32,29 +33,49 @@ trap "rm -rf $TMP" EXIT
 
 PCC_BUILD="${PCC_BUILD:-/tmp/pcc-build}"
 
-# --- build wm_smoke.orx ---------------------------------------------
+# --- build the WM (.orx) -------------------------------------------
 "$PCC_BUILD/cc/cpp/orisc-unknown-none-cpp" \
-    -I tools/cc/arch/orisc -I tools/cc/lib examples/cc/wm_smoke.c \
-    > "$TMP/program.i"
-"$PCC_BUILD/cc/ccom/orisc-unknown-none-ccom" \
-    < "$TMP/program.i" > "$TMP/program.s"
+    -I tools/cc/arch/orisc -I tools/cc/lib ouroboros/oriscwm.c \
+    > "$TMP/wm.i"
+"$PCC_BUILD/cc/ccom/orisc-unknown-none-ccom" < "$TMP/wm.i" > "$TMP/wm.s"
 python3 tools/asm/asmorisc -r tools/cc/arch/orisc/crt0.s        -o "$TMP/crt0.oro"
 python3 tools/asm/asmorisc -r tools/cc/arch/orisc/console_io.s  -o "$TMP/console_io.oro"
-python3 tools/asm/asmorisc -r "$TMP/program.s"                  -o "$TMP/program.oro"
-python3 tools/ld/orld -o "$TMP/wm_smoke.orx" \
-    "$TMP/crt0.oro" "$TMP/console_io.oro" "$TMP/program.oro" \
+python3 tools/asm/asmorisc -r "$TMP/wm.s"                       -o "$TMP/wm.oro"
+python3 tools/ld/orld -o "$TMP/oriscwm.orx" \
+    "$TMP/crt0.oro" "$TMP/console_io.oro" "$TMP/wm.oro" \
     build/liborisc.ora
 
-# --- launch oriscbar ------------------------------------------------
+# --- build wm_smoke.orx --------------------------------------------
+"$PCC_BUILD/cc/cpp/orisc-unknown-none-cpp" \
+    -I tools/cc/arch/orisc -I tools/cc/lib examples/cc/wm_smoke.c \
+    > "$TMP/sm.i"
+"$PCC_BUILD/cc/ccom/orisc-unknown-none-ccom" < "$TMP/sm.i" > "$TMP/sm.s"
+python3 tools/asm/asmorisc -r "$TMP/sm.s"                       -o "$TMP/sm.oro"
+python3 tools/ld/orld -o "$TMP/wm_smoke.orx" \
+    "$TMP/crt0.oro" "$TMP/console_io.oro" "$TMP/sm.oro" \
+    build/liborisc.ora
+
+# --- launch oriscbar -----------------------------------------------
 SOCK="$TMP/oriscbar.sock"
 python3 tools/sim/oriscbar --socket "$SOCK" >/dev/null 2>&1 &
 BAR=$!
 for _ in $(seq 50); do [ -S "$SOCK" ] && break; sleep 0.05; done
 
-# --- launch fake_terminal at pid 16 (provides O5/O6 cap shapes) ------
+# --- launch oriscdir at pid 18 -------------------------------------
+python3 tools/devices/oriscdir \
+    --socket "$SOCK" --pid 18 -v \
+    > "$TMP/dir.out" 2>&1 &
+DIR=$!
+for _ in $(seq 50); do
+    grep -q "oriscdir READY" "$TMP/dir.out" 2>/dev/null && break
+    sleep 0.05
+done
+
+# --- launch oriscterm at pid 16 (publishes surfaces) ---------------
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
-    --linger 5.0 \
+    --directory-pid 18 --instance 0 \
+    --linger 8.0 \
     > "$TMP/term.out" 2>&1 &
 TERM_PID=$!
 for _ in $(seq 50); do
@@ -62,23 +83,46 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# --- launch oriscwm at pid 20 (no --directory-pid; bypass oriscdir) --
-python3 tools/devices/oriscwm \
-    --socket "$SOCK" --pid 20 -v \
-    > "$TMP/wm.out" 2>&1 &
-WM=$!
-for _ in $(seq 50); do
-    grep -q "oriscwm READY" "$TMP/wm.out" 2>/dev/null && break
+# --- launch the WM CPU at pid 0 ------------------------------------
+# Boot ABI for the WM: O8 = oriscdir cap (the rest of the boot
+# OPRs aren't used — the WM walks oriscdir for surface caps).
+# --service slot order: O5/O6/O7 unused, O8 = 18=1@9 (oriscdir).
+python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
+    --service "0=0@0" --service "0=0@0" --service "0=0@0" \
+    --service "18=1@9" \
+    "$TMP/oriscwm.orx" >"$TMP/wm.out" 2>"$TMP/wm.err" &
+WM_CPU=$!
+
+# Wait for the WM to register at /sys/wm/0.  We see the "registered"
+# banner in its host stdout.
+for _ in $(seq 100); do
+    grep -q "oriscwm: ready" "$TMP/wm.out" 2>/dev/null && break
     sleep 0.05
 done
 
-# --- launch the smoke-test CPU --------------------------------------
-# Slot layout via --service:
-#   O5 = 16=1@9   (terminal console — used as a generic surface cap)
-#   O6 = 16=2@9   (terminal keyboard — same)
-#   O7 = 20=1@9   (WM main service)
-python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "16=1@9" --service "16=2@9" --service "20=1@9" \
+# --- launch the smoke-test CPU at pid 1 ----------------------------
+# Boot ABI for the smoke test: O7 = WM main service ref.
+#
+# The WM's service mailbox lands at descriptor idx 6 on its CPU.
+# Boot allocations on each simorisc instance (--connect mode):
+#   idx 1 = boot code object       (init_cpu)
+#   idx 2 = boot stack object      (init_cpu)
+#   idx 3 = boot data object       (init_cpu)
+#   idx 4 = bootstrap task descriptor (make_bootstrap_task — alloc'd
+#                                  inside init_cpu via alloc_task_descriptor)
+#   idx 5 = self-service           (populate_self_service — runs in
+#                                  single-CPU --connect mode, mirroring
+#                                  populate_service_objects in
+#                                  multi-CPU mode)
+#   idx 6 = the WM's allocate_service_mailbox() in main(), which runs
+#           FIRST before task_init() so the idx is stable.
+#
+# A future-milestone test that goes through the directory (dir_walk
+# /sys/wm/0) is more robust to changes in the WM's startup order;
+# the milestone-2 smoke test stays brittle-but-simple and wires the
+# cap directly.
+python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
+    --service "0=0@0" --service "0=0@0" --service "0=6@9" \
     "$TMP/wm_smoke.orx" >"$TMP/cpu.out" 2>"$TMP/cpu.err" &
 CPU=$!
 
@@ -86,25 +130,33 @@ wait $CPU 2>/dev/null || true
 CPU_RC=$?
 
 # Cleanup.
-kill -TERM $WM       2>/dev/null || true
+kill -TERM $WM_CPU   2>/dev/null || true
 kill -TERM $TERM_PID 2>/dev/null || true
+kill -TERM $DIR      2>/dev/null || true
 kill -TERM $BAR      2>/dev/null || true
-wait $WM 2>/dev/null || true
+wait $WM_CPU 2>/dev/null || true
 wait $TERM_PID 2>/dev/null || true
+wait $DIR      2>/dev/null || true
 wait $BAR      2>/dev/null || true
 
-echo "--- cpu0 stdout ---"
+echo "--- wm_smoke (cpu1) stdout ---"
 cat "$TMP/cpu.out"
-echo "--- cpu0 stderr ---"
+echo "--- wm_smoke (cpu1) stderr ---"
 cat "$TMP/cpu.err"
-echo "--- oriscwm log ---"
+echo "--- oriscwm (cpu0) stdout ---"
 cat "$TMP/wm.out"
+echo "--- oriscwm (cpu0) stderr ---"
+cat "$TMP/wm.err"
+echo "--- oriscdir log ---"
+cat "$TMP/dir.out"
 
-# Assertions: the smoke test program prints PASS on success and
-# FAIL: <stage> on failure.  We grep stdout and also check that the
-# CPU exited cleanly (return 0 from main → simorisc exit 0).
+# Assertions.
+grep -q "oriscwm: ready" "$TMP/wm.out" \
+    || { echo "FAIL: WM never reached ready" >&2; exit 1; }
+
 grep -q "wm_smoke: PASS" "$TMP/cpu.out" \
-    || { echo "FAIL: smoke-test PASS line missing from cpu0 stdout" >&2; exit 1; }
+    || { echo "FAIL: smoke-test PASS line missing" >&2; exit 1; }
+
 if grep -q "FAIL:" "$TMP/cpu.out"; then
     echo "FAIL: smoke test reported FAIL" >&2
     exit 1
