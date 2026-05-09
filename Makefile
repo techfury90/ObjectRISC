@@ -55,6 +55,7 @@ RUNTIME  := $(CRT0_ORO) $(CIO_ORO)
 SHELL_BUILD_BANNER ?= "Object RISC Shell"
 SHELL_ORX          := $(BUILD)/programs/shell.orx
 SUPERVISOR_ORX     := $(BUILD)/supervisor.orx
+ORISCWM_ORX        := $(BUILD)/oriscwm.orx
 
 # --- ouroboros programs ----------------------------------------------
 
@@ -63,15 +64,17 @@ PROGRAM_ORXS := $(patsubst ouroboros/programs/%.c,$(BUILD)/programs/%.orx,$(PROG
 
 # --- top-level targets ------------------------------------------------
 
-.PHONY: all boot clean lib programs shell supervisor help
+.PHONY: all boot clean lib programs shell supervisor oriscwm help
 
-all: $(LIBORISC) $(SHELL_ORX) $(SUPERVISOR_ORX) $(PROGRAM_ORXS)
+all: $(LIBORISC) $(SHELL_ORX) $(SUPERVISOR_ORX) $(ORISCWM_ORX) $(PROGRAM_ORXS)
 
 lib: $(LIBORISC)
 
 shell: $(SHELL_ORX)
 
 supervisor: $(SUPERVISOR_ORX)
+
+oriscwm: $(ORISCWM_ORX)
 
 programs: $(PROGRAM_ORXS)
 
@@ -83,10 +86,11 @@ clean:
 
 help:
 	@echo "Targets:"
-	@echo "  make           — build liborisc + supervisor + shell + programs"
+	@echo "  make           — build liborisc + supervisor + WM + shell + programs"
 	@echo "  make boot      — build, then start Ouroboros"
 	@echo "  make lib       — build just liborisc.ora"
 	@echo "  make supervisor— build just the supervisor"
+	@echo "  make oriscwm   — build just the window manager"
 	@echo "  make shell     — build just the shell"
 	@echo "  make programs  — build just the programs"
 	@echo "  make clean     — remove build/"
@@ -138,6 +142,19 @@ $(BUILD)/supervisor.oro: ouroboros/supervisor.c | $(BUILD)
 
 $(SUPERVISOR_ORX): $(BUILD)/supervisor.oro $(RUNTIME) $(LIBORISC) | $(BUILD)
 	$(ORLD) -o $@ $(RUNTIME) $(BUILD)/supervisor.oro $(LIBORISC)
+
+# oriscwm — Ouroboros's window manager (.orx, runs on its own CPU).
+# The CPU it runs on dir-walks /sys/term/0/{console,keyboard} for
+# the underlying surface caps and registers itself at /sys/wm/0
+# so client programs (the leader supervisor, etc.) can discover it.
+
+$(BUILD)/oriscwm.oro: ouroboros/oriscwm.c | $(BUILD)
+	$(CPP)  $(CFLAGS) $< > $(@:.oro=.i)
+	$(CCOM) < $(@:.oro=.i) > $(@:.oro=.s)
+	$(ASMORISC) -r $(@:.oro=.s) -o $@
+
+$(ORISCWM_ORX): $(BUILD)/oriscwm.oro $(RUNTIME) $(LIBORISC) | $(BUILD)
+	$(ORLD) -o $@ $(RUNTIME) $(BUILD)/oriscwm.oro $(LIBORISC)
 
 # Programs — uniform c→oro→orx pipeline.
 

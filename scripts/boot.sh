@@ -107,11 +107,25 @@ fi
 # CPU 1 → terminal instance 1 → /sys/term/1/* → oriscterm pid 19
 # (the per-procid path means each CPU's walk lands on its own
 # terminal without any per-CPU configuration on the supervisor.)
+#
+# CPU 2 = oriscwm (Phase 56).  The window manager runs on its own
+# CPU, dir-walks /sys/term/0/{console,keyboard} for the underlying
+# surface caps, and registers itself at /sys/wm/0.  The leader
+# supervisor (CPU 0) discovers it via wm_init and routes its
+# console session through it.  Workers (CPU 1) keep direct
+# /sys/term/<procid>/* terminals — milestone-3 WM only mediates
+# the leader.
+#
+# If the WM crashes / fails to register, supervisor.c's wm_init
+# returns negative and the leader falls back to direct
+# /sys/term/0/* — the shell still works.  So the WM is always-on
+# but never load-bearing.
 exec python3 tools/oriscrun \
     --directory pid=18 \
     --terminal "pid=16,instance=0" \
     --terminal "pid=19,instance=1" \
     --hostfsd "pid=17,instance=0,root=$ROOT" \
+    --cpu "pid=2:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9" \
     --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
     --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
     --leader 0 --leader-timeout 600

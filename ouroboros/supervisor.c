@@ -1669,6 +1669,80 @@ main(void)
 			             :: "i"(DIR_RESULT_SLOT_OFFSET));
 	}
 
+	/* Phase 56: WM-mediated leader session.  The leader CPU
+	 * additionally tries to discover an oriscwm at /sys/wm/0; on
+	 * success, replaces its boot O5/O6 with WM-derived
+	 * console/keyboard caps so spawned children (sysinit, login,
+	 * shell) see WM-mediated surfaces instead of direct terminal
+	 * caps via Phase-49 inheritance.
+	 *
+	 * Workers stay on direct per-CPU /sys/term/<procid>/* — the
+	 * milestone-3 WM only mediates the leader's session.  Multi-
+	 * window tiling (a later milestone) will generalize this.
+	 *
+	 * Graceful degradation: if /sys/wm/0 doesn't resolve (no
+	 * oriscwm running, or it crashed) wm_init returns negative and
+	 * we keep the direct caps walked above.  The shell + login still
+	 * work, just without WM mediation.
+	 *
+	 * We pass O1 = null as the owner-ref to wm_new_window — the
+	 * supervisor never EXITs (it's a long-running daemon), so
+	 * task_query auto-destroy isn't useful here.  The window stays
+	 * alive for the supervisor's lifetime.  */
+	if (is_leader) {
+		/* Boot race: the WM lives on its own CPU and may still be
+		 * mid-init when we get here.  Retry wm_init briefly on
+		 * WIN_E_NOENT (-2 = "/sys/wm/0 didn't resolve yet"); same
+		 * cadence as sup_walk_for_opr's per-CPU /sys/term retry.
+		 * On systems with no WM at all, the directory walk
+		 * returns NOT_FOUND every time and we exit the loop after
+		 * 5 attempts to fall back to direct terminal — adds a few
+		 * task_yields of latency for the no-WM case, which is
+		 * cheap. */
+		int wm_status, attempt;
+		for (attempt = 0; attempt < 5; attempt++) {
+			wm_status = wm_init();
+			if (wm_status == 0)              break;
+			if (wm_status != WIN_E_NOENT)    break;
+			task_yield();
+		}
+		if (wm_status == 0) {
+			int wid, w_cells, h_cells;
+			asm volatile("onull o1");
+			int rc = wm_new_window(WIN_TYPE_CONSOLE, &wid,
+			                       &w_cells, &h_cells);
+			if (rc == 0) {
+				/* Bind console + keyboard.  The resolved cap
+				 * lands in DIR_RESULT_SLOT (offset 616 — wm.c
+				 * shares the slot with dir_walk's result).
+				 * OREFLD into the supervisor's working OPR. */
+				if (wm_bind_surface(wid, WSURF_CONSOLE) == 0) {
+					asm volatile("orefld o5, %0(o12)"
+					             :: "i"(DIR_RESULT_SLOT_OFFSET));
+				}
+				if (wm_bind_surface(wid, WSURF_KEYBOARD) == 0) {
+					asm volatile("orefld o6, %0(o12)"
+					             :: "i"(DIR_RESULT_SLOT_OFFSET));
+				}
+				SUP_PRINT("supervisor: WM-mediated leader "
+				          "session (wid=");
+				SUP_PRINT_INT(wid);
+				SUP_PRINT(")\n");
+			} else {
+				SUP_PRINT("supervisor: wm_new_window failed (");
+				SUP_PRINT_INT(rc);
+				SUP_PRINT(") — using direct terminal\n");
+			}
+		} else if (wm_status != WIN_E_NOENT && wm_status != WIN_E_IO) {
+			/* WIN_E_NOENT (-2) and WIN_E_IO (-6) are the expected
+			 * "no WM available" returns; quiet.  Anything else
+			 * is unexpected. */
+			SUP_PRINT("supervisor: wm_init returned ");
+			SUP_PRINT_INT(wm_status);
+			SUP_PRINT(" — using direct terminal\n");
+		}
+	}
+
 	hf_init();
 	orx_init();
 
