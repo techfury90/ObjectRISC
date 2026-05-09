@@ -138,12 +138,30 @@
  *     176  WM_SCRATCH_SLOT          per-request reply_cap stash
  *     184..312  WM_OWNER_BASE       per-window owner task refs
  *                                   (16 windows × 8 bytes = 128)
- *     312..440  WM_SUBSCRIBE_BASE   per-window event-subscription
- *                                   notify caps (16 × 8)
+ *     312..440  WM_CONSOLE_BASE     per-window CONSOLE service refs.
+ *                                   The WM ObjAllocs a TAG_SERVICE
+ *                                   per CONSOLE window so console
+ *                                   writes from clients land in a
+ *                                   per-window queue we can multiplex
+ *                                   on (see the round-robin polling
+ *                                   in main).  Phase 58 / WM β.
+ *     440  WM_FORWARD_BYTES_SLOT    persistent TAG_DATA scratch the
+ *                                   WM uses when forwarding incoming
+ *                                   CONSOLE bytes to the underlying
+ *                                   terminal (allocated once at boot,
+ *                                   sized for the largest forward we
+ *                                   support).
  *
  * task.c reserves up to offset 672 (ORX_SLOT_O7_SAVE), and the orx-
  * manifest area runs 152..535 — we land safely inside it.  The WM
  * never invokes orx_spawn so the area's nominal use is moot.
+ *
+ * Phase 58 reorg: WM_SUBSCRIBE_BASE was per-window event-subscription
+ * notify caps (the SUBSCRIBE_EVENTS handler stashed them).  No events
+ * fire yet, so the storage was unused; we repurpose the area for
+ * WM_CONSOLE_BASE.  When event-firing is implemented (resize/focus
+ * notifications) we'll need a fresh slot for notify caps — probably
+ * via extending ORX_STATE_BYTES.
  */
 
 #define BOOT_PARENT_SLOT_OFFSET     544
@@ -154,7 +172,8 @@
 #define WM_REPLY_SCRATCH_SLOT_OFFSET   168
 #define WM_SCRATCH_SLOT_OFFSET         176
 #define WM_OWNER_BASE_OFFSET           184
-#define WM_SUBSCRIBE_BASE_OFFSET       312
+#define WM_CONSOLE_BASE_OFFSET         312
+#define WM_FORWARD_BYTES_SLOT_OFFSET   440
 
 #define MAX_WINDOWS 16
 
@@ -421,27 +440,65 @@ load_owner_to_o14(int wid)
 	}
 }
 
+/* === Per-window CONSOLE service slot helpers ==========================
+ *
+ * Phase 58: WM allocates a TAG_SERVICE per CONSOLE window so client
+ * console writes land at a per-window queue we can multiplex via the
+ * round-robin polling in main.  The full cap (R|W|S|V|C, what
+ * ObjAlloc returned) lives in WM_CONSOLE_BASE+wid*8 — used for our
+ * own ReceiveQueueAttach + ReceiveQueuePoll.  Clients receive an
+ * R|S sub-cap (derived on bind_surface).
+ *
+ * Same per-wid switch shape as the WM_OWNER_BASE helpers above. */
+
 static void
-stash_notify_o4(int wid)
+stash_console_o1(int wid)
 {
 	switch (wid) {
-	case  1: asm volatile("orefst o4, 312(o12)"); break;
-	case  2: asm volatile("orefst o4, 320(o12)"); break;
-	case  3: asm volatile("orefst o4, 328(o12)"); break;
-	case  4: asm volatile("orefst o4, 336(o12)"); break;
-	case  5: asm volatile("orefst o4, 344(o12)"); break;
-	case  6: asm volatile("orefst o4, 352(o12)"); break;
-	case  7: asm volatile("orefst o4, 360(o12)"); break;
-	case  8: asm volatile("orefst o4, 368(o12)"); break;
-	case  9: asm volatile("orefst o4, 376(o12)"); break;
-	case 10: asm volatile("orefst o4, 384(o12)"); break;
-	case 11: asm volatile("orefst o4, 392(o12)"); break;
-	case 12: asm volatile("orefst o4, 400(o12)"); break;
-	case 13: asm volatile("orefst o4, 408(o12)"); break;
-	case 14: asm volatile("orefst o4, 416(o12)"); break;
-	case 15: asm volatile("orefst o4, 424(o12)"); break;
-	case 16: asm volatile("orefst o4, 432(o12)"); break;
+	case  1: asm volatile("orefst o1, 312(o12)"); break;
+	case  2: asm volatile("orefst o1, 320(o12)"); break;
+	case  3: asm volatile("orefst o1, 328(o12)"); break;
+	case  4: asm volatile("orefst o1, 336(o12)"); break;
+	case  5: asm volatile("orefst o1, 344(o12)"); break;
+	case  6: asm volatile("orefst o1, 352(o12)"); break;
+	case  7: asm volatile("orefst o1, 360(o12)"); break;
+	case  8: asm volatile("orefst o1, 368(o12)"); break;
+	case  9: asm volatile("orefst o1, 376(o12)"); break;
+	case 10: asm volatile("orefst o1, 384(o12)"); break;
+	case 11: asm volatile("orefst o1, 392(o12)"); break;
+	case 12: asm volatile("orefst o1, 400(o12)"); break;
+	case 13: asm volatile("orefst o1, 408(o12)"); break;
+	case 14: asm volatile("orefst o1, 416(o12)"); break;
+	case 15: asm volatile("orefst o1, 424(o12)"); break;
+	case 16: asm volatile("orefst o1, 432(o12)"); break;
 	default: break;
+	}
+}
+
+/* Load the per-window CONSOLE service ref into O1 (used as the
+ * ReceiveQueuePoll target and as the ObjDerive source when handing
+ * a sub-cap to a client). */
+static void
+load_console_to_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefld o1, 312(o12)"); break;
+	case  2: asm volatile("orefld o1, 320(o12)"); break;
+	case  3: asm volatile("orefld o1, 328(o12)"); break;
+	case  4: asm volatile("orefld o1, 336(o12)"); break;
+	case  5: asm volatile("orefld o1, 344(o12)"); break;
+	case  6: asm volatile("orefld o1, 352(o12)"); break;
+	case  7: asm volatile("orefld o1, 360(o12)"); break;
+	case  8: asm volatile("orefld o1, 368(o12)"); break;
+	case  9: asm volatile("orefld o1, 376(o12)"); break;
+	case 10: asm volatile("orefld o1, 384(o12)"); break;
+	case 11: asm volatile("orefld o1, 392(o12)"); break;
+	case 12: asm volatile("orefld o1, 400(o12)"); break;
+	case 13: asm volatile("orefld o1, 408(o12)"); break;
+	case 14: asm volatile("orefld o1, 416(o12)"); break;
+	case 15: asm volatile("orefld o1, 424(o12)"); break;
+	case 16: asm volatile("orefld o1, 432(o12)"); break;
+	default: asm volatile("onull o1"); break;
 	}
 }
 
@@ -467,13 +524,59 @@ load_surface_to_o14(int kind)
 
 /* === Op handlers ====================================================== */
 
+/* Allocate a TAG_SERVICE per-window console object: ObjAlloc + attach
+ * a queue.  Returns the firmware status; on success the full cap
+ * has been stashed into WM_CONSOLE_BASE+wid*8.
+ *
+ * Phase 58: clients who bind WSURF_CONSOLE on a window get a R|S
+ * sub-cap of this object, so their console writes land on this
+ * object's queue.  The WM round-robin-polls all per-window queues
+ * in the dispatch loop and forwards incoming bytes to the
+ * underlying terminal's CONSOLE service. */
+#define TAG_SERVICE 0x4103
+static int
+alloc_window_console(int wid)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, 16\n"
+		"addiu r5, r0, %1\n"           /* TAG_SERVICE */
+		"addiu r6, r0, %2\n"           /* R|W|S|V|C */
+		"call  #0x100\n"               /* ObjAlloc → O1 */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(TAG_SERVICE),
+		  "i"(CAP_R | CAP_W | CAP_S | CAP_V | CAP_C)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	if (status != 0) return status;
+
+	/* Stash the full cap (now in O1) per-window. */
+	stash_console_o1(wid);
+
+	asm volatile(
+		"addiu r4, r0, 8\n"            /* depth = 8 */
+		"call  #0x203\n"               /* ReceiveQueueAttach */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	return status;
+}
+
 /* WM_OP_NEW_WINDOW — allocate the next free window slot.
  *   R5 = window type
  *   O2 = owner task ref (for task_query auto-destroy)
  * On success, returns wid in R6, geometry packed in R4/R5.
  *
- * Hardcoded N=1 for CONSOLE in milestone 2 — second NEW_WINDOW(CONSOLE)
- * returns E_NOSPC.  GRAPHICAL returns E_NOTIMPL. */
+ * Phase 58: also ObjAllocs a TAG_SERVICE object for the window's
+ * CONSOLE service and attaches a queue.  Hardcoded N=1 for CONSOLE
+ * in this milestone — second NEW_WINDOW(CONSOLE) returns E_NOSPC.
+ * Multi-window tiling lifts this in a follow-up.  GRAPHICAL returns
+ * E_NOTIMPL. */
 static void
 handle_new_window(int wtype)
 {
@@ -505,8 +608,23 @@ handle_new_window(int wtype)
 		return;
 	}
 
-	/* Stash the owner ref (sender's O2 → our O2 from queue dispatch). */
+	/* Stash the owner ref (sender's O2 → our O2 from queue dispatch).
+	 * Do this BEFORE alloc_window_console — alloc_window_console
+	 * issues ObjAlloc which clobbers O1 (and thereby O2 if the asm
+	 * is order-sensitive — being explicit about ordering avoids
+	 * surprises). */
 	stash_owner_o2(wid);
+
+	/* Allocate the per-window CONSOLE service.  On failure roll
+	 * back the slot allocation; client retries with the same op. */
+	int status = alloc_window_console(wid);
+	if (status != 0) {
+		WM_PRINT("oriscwm: alloc_window_console failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT("\n");
+		wm_reply(E_IO, 0, 0, 0);
+		return;
+	}
 
 	window_type[wid - 1] = WIN_TYPE_CONSOLE;
 	window_subscribe_op[wid - 1] = 0;
@@ -516,9 +634,38 @@ handle_new_window(int wtype)
 	wm_reply(0, geom_a, geom_b, wid);
 }
 
-/* WM_OP_BIND_SURFACE — return a registered surface cap for a window.
+/* Free the per-window CONSOLE service: ObjFree the underlying object
+ * + null the slot so polling skips it. */
+static void
+free_window_console(int wid)
+{
+	load_console_to_o1(wid);
+	int isn;
+	asm volatile("oisn %0, o1" : "=r"(isn));
+	if (isn) return;        /* never allocated */
+	asm volatile(
+		"addiu r4, r0, 0\n"
+		"call  #0x101\n"        /* ObjFree */
+		"nop"
+		: : : "r1", "r2", "r4"
+	);
+	/* Null-out the slot. */
+	asm volatile("onull o1");
+	stash_console_o1(wid);
+}
+
+/* WM_OP_BIND_SURFACE — return a surface cap for a window.
  *   R4 = wid  (already-validated by dispatch)
- *   R5 = surface kind */
+ *   R5 = surface kind
+ *
+ * Phase 58:
+ *   - WSURF_CONSOLE returns an R|S sub-cap of the per-window
+ *     CONSOLE service (the WM is in the data path; client SENDs
+ *     land in the per-window queue and the WM forwards them to the
+ *     underlying terminal).
+ *   - WSURF_KEYBOARD still returns the underlying terminal's
+ *     keyboard cap directly (passthrough — keyboard mediation
+ *     comes with multi-window in the next milestone). */
 static void
 handle_bind_surface(int wid, int kind)
 {
@@ -531,28 +678,45 @@ handle_bind_surface(int wid, int kind)
 		wm_reply(E_NOENT, 0, 0, 0);
 		return;
 	}
-	/* Only CONSOLE surfaces (console + keyboard) are bind-able on a
-	 * CONSOLE window.  Graphical kinds are rejected E_INVAL on a
-	 * CONSOLE; on a graphical window they'd be allowed but graphical
-	 * isn't implemented anyway. */
-	if (wtype == WIN_TYPE_CONSOLE) {
-		if (kind != WSURF_CONSOLE && kind != WSURF_KEYBOARD) {
-			wm_reply(E_INVAL, 0, 0, 0);
-			return;
-		}
-	} else {
+	if (wtype != WIN_TYPE_CONSOLE) {
 		/* Shouldn't reach — graphical windows never get created. */
 		wm_reply(E_NOTIMPL, 0, 0, 0);
 		return;
 	}
-	/* Load the registered surface cap into O14, reply with it in O2. */
+	if (kind != WSURF_CONSOLE && kind != WSURF_KEYBOARD) {
+		wm_reply(E_INVAL, 0, 0, 0);
+		return;
+	}
+
+	if (kind == WSURF_CONSOLE) {
+		/* Load full per-window CONSOLE service cap into O1, derive
+		 * an R|S sub-cap for the client, park in O14 for reply. */
+		load_console_to_o1(wid);
+		int derive_status;
+		asm volatile(
+			"addiu r4, r0, %1\n"        /* R | S */
+			"call  #0x103\n"            /* ObjDerive → O1 */
+			"nop\n"
+			"omov  o14, o1\n"
+			"addu  %0, r2, r0"
+			: "=r"(derive_status)
+			: "i"(CAP_R | CAP_S)
+			: "r1", "r2", "r4"
+		);
+		if (derive_status != 0) {
+			wm_reply(E_IO, 0, 0, 0);
+			return;
+		}
+		wm_reply_with_ref_o14(0);
+		return;
+	}
+
+	/* WSURF_KEYBOARD: passthrough to the underlying terminal cap
+	 * walked at WM startup. */
 	load_surface_to_o14(kind);
 	int isn;
 	asm volatile("oisn %0, o14" : "=r"(isn));
 	if (isn) {
-		/* Surface wasn't acquired at boot — typically because the
-		 * directory walk for /sys/term/0/<kind> failed (no oriscterm
-		 * registered).  Translate to E_NOENT. */
 		wm_reply(E_NOENT, 0, 0, 0);
 		return;
 	}
@@ -571,18 +735,24 @@ handle_destroy_window(int wid)
 		wm_reply(E_NOENT, 0, 0, 0);
 		return;
 	}
+	free_window_console(wid);
 	window_type[wid - 1] = 0;
 	window_subscribe_op[wid - 1] = 0;
-	/* Owner-ref stash is left in place for now; future allocations
-	 * will overwrite it.  No SEND fires because milestone 2 doesn't
+	/* Owner-ref stash is left in place; future allocations will
+	 * overwrite it.  No SEND fires for the close — the WM doesn't
 	 * push events to subscribers yet. */
 	wm_reply(0, 0, 0, 0);
 }
 
-/* WM_OP_SUBSCRIBE_EVENTS — record a notify_cap + notify_op for a
- * window.  Stub in milestone 2 (the WM doesn't yet emit any events
- * — resize/focus/close all wait for the layout work in later
- * milestones), but the wire shape is committed now. */
+/* WM_OP_SUBSCRIBE_EVENTS — record a notify_op for a window.
+ * Stub in this milestone (the WM doesn't yet emit any events —
+ * resize/focus/close all wait for the layout work in later
+ * milestones), but the wire shape is committed.
+ *
+ * Phase 58: storage for the notify_cap was repurposed for
+ * WM_CONSOLE_BASE; we accept the cap but discard it.  When events
+ * actually fire we'll re-add storage (probably by extending
+ * ORX_STATE_BYTES). */
 static void
 handle_subscribe_events(int wid, int notify_op)
 {
@@ -598,8 +768,6 @@ handle_subscribe_events(int wid, int notify_op)
 		wm_reply(E_INVAL, 0, 0, 0);
 		return;
 	}
-	/* Stash the notify_cap from O4 (sender's O4, our O4 after dispatch). */
-	stash_notify_o4(wid);
 	window_subscribe_op[wid - 1] = notify_op;
 	wm_reply(0, 0, 0, 0);
 }
@@ -685,20 +853,24 @@ scan_owner_exits(void)
 		/* low 8 bits = state per Vol VI §4.2's packed return. */
 		int state = state_word & 0xFF;
 		if (state == TASK_STATE_EXITED) {
+			free_window_console(wid);
 			window_type[wid - 1] = 0;
 			window_subscribe_op[wid - 1] = 0;
-			/* The owner-ref and notify-cap slots stay populated;
-			 * they'll get overwritten by the next allocation in
-			 * this slot.  No SEND fires for the close — milestone
-			 * 2's WM doesn't push events to subscribers yet. */
+			/* The owner-ref slot stays populated; it'll get
+			 * overwritten by the next allocation in this slot.
+			 * No SEND fires for the close — the WM doesn't push
+			 * events to subscribers yet. */
 		}
 	}
 }
 
 /* === Main loop ======================================================== */
 
-#define WM_POLL_TICKS 5000   /* ~5 s under low load — same as the
-                              * supervisor's hot-attach pulse */
+#define WM_POLL_TICKS 100   /* ~100ms.  Short enough that per-window
+                             * CONSOLE writes (which we round-robin
+                             * after each main-service iteration) get
+                             * drained promptly even when main is
+                             * idle. */
 
 static int
 poll_one_request(int *out_op, int *out_wid, int *out_arg)
@@ -721,6 +893,73 @@ poll_one_request(int *out_op, int *out_wid, int *out_arg)
 	*out_wid = wid;
 	*out_arg = arg;
 	return status;
+}
+
+/* Forward an incoming per-window CONSOLE write to the underlying
+ * terminal's CONSOLE service.  Called from poll_window_consoles
+ * after a successful ReceiveQueuePoll on a per-window queue.
+ *
+ * On dispatch the queue-poll's overlay sets:
+ *   R3 = sender's R4 = byte offset
+ *   R4 = sender's R5 = byte count
+ *   O2 = sender's O2 = source bytes ref
+ *   O3 = sender's O3 = reply_cap (passes through to terminal)
+ *
+ * We re-emit a SEND to the underlying terminal's CONSOLE
+ * (WM_SURF_CONSOLE_SLOT) with the same payload — moving R3/R4 down
+ * to R4/R5 (which is what the terminal expects).  The reply_cap
+ * passes through unchanged so any term-side reply lands at the
+ * original client. */
+static void
+forward_console_write(void)
+{
+	asm volatile(
+		"addu   r5, r4, r0\n"          /* R5 = byte count   (was R4) */
+		"addu   r4, r3, r0\n"          /* R4 = offset       (was R3) */
+		"orefld o1, %0(o12)\n"         /* O1 = underlying CONSOLE cap */
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		:
+		: "i"(WM_SURF_CONSOLE_SLOT_OFFSET)
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+}
+
+/* Round-robin poll all per-window CONSOLE queues with timeout=0.
+ * For each pending SEND, forward to the underlying terminal.
+ *
+ * Empty queues return ETIMEOUT immediately, so this is cheap.  We
+ * call it after every main-service iteration (whether a request
+ * dispatched or the poll timed out) so per-window writes have at
+ * most ~WM_POLL_TICKS of latency on top of the natural turn-around
+ * of the producing program. */
+static void
+poll_window_consoles(void)
+{
+	int wid;
+	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
+		if (window_type[wid - 1] != WIN_TYPE_CONSOLE) continue;
+
+		/* Load full per-window CONSOLE cap into O1 and poll with
+		 * timeout=0.  Status ERR_OK (0) means we got a SEND;
+		 * forward it.  Anything else (typically ETIMEOUT) means
+		 * the queue is empty — move on. */
+		load_console_to_o1(wid);
+		int status;
+		asm volatile(
+			"addiu r4, r0, 0\n"        /* timeout = 0 (non-blocking) */
+			"call  #0x204\n"           /* ReceiveQueuePoll */
+			"nop\n"
+			"addu  %0, r2, r0"
+			: "=r"(status)
+			:
+			: "r1", "r2", "r3", "r4", "r5", "r6"
+		);
+		if (status == 0) {
+			forward_console_write();
+		}
+	}
 }
 
 const char banner_boot[]            = "oriscwm: booting\n";
@@ -806,33 +1045,53 @@ main(void)
 
 	WM_PRINT(banner_ready);
 
-	/* Dispatch loop.  Poll our service queue; on a SEND, dispatch
-	 * by op.  On an idle pulse (timeout), scan for exited owner
-	 * tasks (currently a no-op — see scan_owner_exits comment). */
+	/* Dispatch loop.
+	 *
+	 * Each iteration:
+	 *   1. Poll our main service queue with WM_POLL_TICKS timeout —
+	 *      handles NEW_WINDOW / BIND_SURFACE / DESTROY_WINDOW /
+	 *      SUBSCRIBE_EVENTS.
+	 *   2. After the main poll (whether it dispatched or timed out),
+	 *      drain all per-window CONSOLE queues round-robin and
+	 *      forward writes to the underlying terminal.  Per-window
+	 *      polling is non-blocking (timeout=0) so empty queues
+	 *      cost essentially nothing.
+	 *   3. On main-poll timeout: run the auto-destroy scan
+	 *      (task_query each window's owner; free EXITed slots).
+	 *
+	 * Per-window CONSOLE writes get drained on every iteration, so
+	 * their latency is bounded by the main-poll's turn-around.
+	 * Typical interactive flow (user types → keyboard event wakes
+	 * focused program → program writes to its console → SEND lands
+	 * in per-window queue → next iteration drains it) keeps the
+	 * latency to roughly the wall-clock time of the program's own
+	 * processing.  Pure-idle latency caps at WM_POLL_TICKS. */
 	for (;;) {
 		int op, wid_or_zero, arg;
 		int status = poll_one_request(&op, &wid_or_zero, &arg);
-		if (status != 0) {
-			/* Timeout or transient.  Run the auto-destroy scan
-			 * (Phase 54-style: task_query each window's owner,
-			 * free EXITed slots), then re-poll. */
-			scan_owner_exits();
-			continue;
-		}
-		/* Stash sender's reply_cap (their O3, our O3 post-dispatch)
-		 * into WM_SCRATCH_SLOT before any subsequent asm clobbers O3. */
-		stash_reply_cap_o3();
+		if (status == 0) {
+			/* Stash sender's reply_cap (their O3, our O3 post-
+			 * dispatch) into WM_SCRATCH_SLOT before any subsequent
+			 * asm clobbers O3. */
+			stash_reply_cap_o3();
 
-		if (op == WM_OP_NEW_WINDOW) {
-			handle_new_window(arg);   /* arg = window type (R5) */
-		} else if (op == WM_OP_BIND_SURFACE) {
-			handle_bind_surface(wid_or_zero, arg);  /* wid in R4, kind in R5 */
-		} else if (op == WM_OP_DESTROY_WINDOW) {
-			handle_destroy_window(wid_or_zero);
-		} else if (op == WM_OP_SUBSCRIBE_EVENTS) {
-			handle_subscribe_events(wid_or_zero, arg);  /* wid in R4, notify_op in R5 */
+			if (op == WM_OP_NEW_WINDOW) {
+				handle_new_window(arg);
+			} else if (op == WM_OP_BIND_SURFACE) {
+				handle_bind_surface(wid_or_zero, arg);
+			} else if (op == WM_OP_DESTROY_WINDOW) {
+				handle_destroy_window(wid_or_zero);
+			} else if (op == WM_OP_SUBSCRIBE_EVENTS) {
+				handle_subscribe_events(wid_or_zero, arg);
+			} else {
+				wm_reply(E_INVAL, 0, 0, 0);
+			}
 		} else {
-			wm_reply(E_INVAL, 0, 0, 0);
+			/* Timeout or transient — run the auto-destroy scan. */
+			scan_owner_exits();
 		}
+
+		/* Drain any pending per-window CONSOLE writes. */
+		poll_window_consoles();
 	}
 }
