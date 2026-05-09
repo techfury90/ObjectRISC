@@ -118,11 +118,24 @@
  * the supervisor's own boot O8 IS the directory mailbox. */
 #define DIR_SLOT_OFFSET          584
 
-/* Sentinel target_pid passed in R5 of an op=1 SEND meaning "spawn
- * on whatever CPU this supervisor is on" (the historical 45a/b/c
- * behaviour). Any other value < 0xFF is taken as a literal PROCID
- * and triggers the relay path when it doesn't match self.procid. */
+/* Sentinel target_pid values. PROCIDs occupy 0..0xFD; 0xFE / 0xFF
+ * are reserved as routing markers.
+ *
+ * TARGET_PID_LOCAL (0xFF) — "stay on this supervisor's CPU; do not
+ *   round-robin." Used (a) by callers that want strict local
+ *   placement via sup_spawn_at(SUP_TARGET_LOCAL, ...), and (b) on
+ *   the wire by relay_spawn_request to mark a relayed packet as
+ *   "spawn here, no further relay" — without that pinning the
+ *   receiver could re-relay, ping-ponging the request indefinitely.
+ *
+ * TARGET_PID_ANY (0xFE) — Phase 51 "round-robin OK." Plain
+ *   sup_spawn fills this so the supervisor's pick_next_cpu can
+ *   place the spawn on any live CPU. The receiver dir-walks
+ *   /sys/term/<requester>/* (from R7's term_hint) and injects the
+ *   requester's terminal services into the child's OPRs so output
+ *   routes back regardless of host CPU. */
 #define TARGET_PID_LOCAL         0xFF
+#define TARGET_PID_ANY           0xFE
 
 /* Path-component buffer size for /sys/cpu/<N>/supervisor renders.
  * "/sys/cpu/255/supervisor" is 23 chars + NUL = 24; round up. */
@@ -567,6 +580,50 @@ relay_shutdown_to_leader(void)
 	return 0;
 }
 
+/* Phase 51: round-robin counter, one per supervisor. Initialised in
+ * main() to (procid + 1) so the first relay from this supervisor
+ * lands on the next live CPU (typically a peer, not self), giving
+ * an even initial spread on a multi-CPU boot. The pick_next_cpu
+ * helper iterates through live /sys/cpu/<N>/supervisor entries
+ * starting from this counter and advances. Per-supervisor (no shared
+ * state); under steady load with N supervisors the global
+ * distribution stays roughly fair.
+ *
+ * Round-robin is gated on `term_hint > 0` in handle_spawn_request: a
+ * Phase-51-aware sup_spawn always packs its terminal_idx + 1 into R7,
+ * so we can safely round-robin and rely on the receiver dir-walking
+ * /sys/term/<N>/* to inject the requester's terminal into the
+ * child's OPRs. (R7 == 0 → no info → stay local; preserves the
+ * Phase-49 contract.) */
+#define MAX_PROCID 16
+static int next_cpu_counter;
+
+static int
+pick_next_cpu(int self_procid)
+{
+	int i;
+	/* Walk candidates in round-robin order. Self IS a valid pick:
+	 * with no peers registered yet (single-CPU boot, or boot-time
+	 * races) we land on self every time and stay local — same as
+	 * the no-round-robin path. With peers, the counter spreads
+	 * picks evenly: e.g. with 2 CPUs and counter biased to self+1,
+	 * the sequence is peer, self, peer, self, ... a clean
+	 * alternation. */
+	for (i = 0; i < MAX_PROCID; i++) {
+		int candidate = (next_cpu_counter + i) % MAX_PROCID;
+		char path[PEER_PATH_BUF_SIZE];
+		render_peer_path(candidate, path);
+		if (sup_walk_for_opr(path) == 0) {
+			next_cpu_counter = candidate + 1;
+			return candidate;
+		}
+	}
+	/* No supervisor registered anywhere — shouldn't happen (we
+	 * dir_register'd ourselves at boot) but fall back to self. */
+	next_cpu_counter = self_procid + 1;
+	return self_procid;
+}
+
 /* Phase 49: populate ORX_SLOT_CHILD_O5/O6/O7 from
  * /sys/term/<term_idx>/{console,keyboard,grid}. orx_task_create
  * inside the upcoming orx_spawn swaps these into the child's OPR
@@ -641,64 +698,93 @@ clear_child_term_slots(void)
  *   O2 = bytes ref
  *   O3 = reply cap
  *
- * Phase 49 placement logic:
- *   target_pid != LOCAL && != self  -> existing relay path (peer
- *                                      spawns; we don't track the
- *                                      child).
- *   target_pid == self              -> local spawn.
- *   target_pid == LOCAL && term_hint set
- *                                   -> we received a relayed local-
- *                                      pinned spawn. Spawn locally
- *                                      with terminal-pass-through.
- *   target_pid == LOCAL && no hint  -> shell-originated. Round-robin
- *                                      to spread load. If pick == self,
- *                                      spawn locally. Else relay (with
- *                                      our own terminal index as hint
- *                                      so the child still talks to the
- *                                      shell's terminal).
+ * Placement logic (Phases 45e/49/51):
+ *   target_pid == self || LOCAL     -> local spawn (LOCAL is the
+ *                                      relay-pin marker; see
+ *                                      TARGET_PID_LOCAL doc).
+ *   target_pid == ANY (Phase 51)     -> round-robin: pick the next
+ *                                      live CPU. If picked != self,
+ *                                      relay with term_hint forwarded;
+ *                                      else stay local. Receiver
+ *                                      dir-walks /sys/term/<N>/*
+ *                                      (Phase 49 pass-through) so the
+ *                                      child runs with the requester's
+ *                                      terminal regardless of host
+ *                                      CPU.
+ *   target_pid == literal != self    -> explicit `run @N` to a peer.
+ *                                      Relay; forward term_hint.
  *
  * IMPORTANT: orx_spawn clobbers O1..O3 via its manifest restore
- * path. We stash the reply_cap into SUP_SCRATCH_SLOT immediately
- * so reply_to_requester can recover it; ObjFetchBytes consumes O2
- * before the spawn so the bytes ref doesn't need stashing.
+ * path; pick_next_cpu's dir_walk and relay_spawn_request both
+ * clobber O1..O5 via their inner ReceiveQueuePoll. Stash O2 (bytes
+ * ref) and O3 (reply_cap) IMMEDIATELY so we have one consistent
+ * recovery point regardless of which branch fires.
  */
 static void
 handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 {
-	if (target_pid != TARGET_PID_LOCAL && target_pid != self_procid) {
-		/* Explicit `run @N cmd` to a different CPU. relay_spawn_
-		 * request expects O2 (bytes) and O3 (reply_cap) intact; the
-		 * dequeue left them that way, so just call it. We forward
-		 * `term_hint` if non-zero (a relay arriving here from
-		 * another supervisor that already injected a terminal hint
-		 * — rare, but harmless), or our own terminal index + 1 so
-		 * the peer's spawn lands the requester's terminal services
-		 * into the child's O5/O6/O7. self_procid IS the terminal
-		 * index in the current model (Phase 49 leaves the procid-
-		 * = terminal-index assumption in place; a future phase that
-		 * decouples them will look up the actual terminal-index
-		 * from a dedicated slot.) */
-		int hint = (term_hint > 0) ? term_hint : (self_procid + 1);
-		if (relay_spawn_request(len, target_pid, hint) == 0)
-			return;
-		/* Stash O3 into SUP_SCRATCH so reply_to_requester can
-		 * find the reply_cap. (The local-spawn path below would
-		 * do this for us, but we're skipping past it.) */
+	asm volatile(
+		"orefst o2, %0(o12)\n"
+		"orefst o3, %1(o12)"
+		:
+		: "i"(RELAY_BYTES_SLOT_OFFSET),
+		  "i"(SUP_SCRATCH_SLOT_OFFSET)
+	);
+
+	if (target_pid != TARGET_PID_LOCAL
+	    && target_pid != TARGET_PID_ANY
+	    && target_pid != self_procid) {
+		/* Explicit `run @N` to a different CPU. */
 		asm volatile(
-			"orefst o3, %0(o12)"
+			"orefld o2, %0(o12)\n"
+			"orefld o3, %1(o12)"
 			:
-			: "i"(SUP_SCRATCH_SLOT_OFFSET)
+			: "i"(RELAY_BYTES_SLOT_OFFSET),
+			  "i"(SUP_SCRATCH_SLOT_OFFSET)
+			: "r1"
 		);
+		if (relay_spawn_request(len, target_pid, term_hint) == 0)
+			return;
 		reply_to_requester(-1, -1);
 		return;
 	}
 
-	/* Local spawn path: stash O3 for the reply, fetch bytes,
-	 * spawn. O2 (bytes ref) is still in place from the dequeue. */
+	/* Phase 51: round-robin only fires when the caller asked for it
+	 * (target_pid == TARGET_PID_ANY). TARGET_PID_LOCAL means "stay
+	 * here" (used by relay-pinned packets — without this pin the
+	 * receiver would round-robin again and we'd ping-pong). A
+	 * literal target_pid == self_procid also stays local (handled
+	 * by the explicit-relay branch above missing on equality). */
+	if (target_pid == TARGET_PID_ANY) {
+		int picked = pick_next_cpu(self_procid);
+		if (picked != self_procid) {
+			asm volatile(
+				"orefld o2, %0(o12)\n"
+				"orefld o3, %1(o12)"
+				:
+				: "i"(RELAY_BYTES_SLOT_OFFSET),
+				  "i"(SUP_SCRATCH_SLOT_OFFSET)
+				: "r1"
+			);
+			/* relay_spawn_request always sets target_pid =
+			 * TARGET_PID_LOCAL on the wire, so the receiver
+			 * pins to its own CPU. */
+			if (relay_spawn_request(len, picked, term_hint) == 0)
+				return;
+			reply_to_requester(-1, -1);
+			return;
+		}
+		/* picked == self → fall through to local spawn. */
+	}
+
+	/* Local spawn path. Restore O2 so read_spawn_request can
+	 * ObjFetchBytes from the (still-live) bytes object. O3 stays
+	 * parked in SUP_SCRATCH for reply_to_requester. */
 	asm volatile(
-		"orefst o3, %0(o12)"
+		"orefld o2, %0(o12)"
 		:
-		: "i"(SUP_SCRATCH_SLOT_OFFSET)
+		: "i"(RELAY_BYTES_SLOT_OFFSET)
+		: "r1"
 	);
 
 	if (len <= 0 || len > SPAWN_REQ_MAX) {
@@ -722,30 +808,37 @@ handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 	copy_cstr_from(&p, args, sizeof(args));
 	copy_cstr_from(&p, cwd,  sizeof(cwd));
 
-	/* Phase 49: terminal-pass-through. If the relay arrived with
-	 * `term_hint` set, dir-walk /sys/term/<N>/{console,keyboard,
+	/* Phase 49: terminal-pass-through OPR injection. If the request
+	 * carried a hint, dir-walk /sys/term/<N>/{console,keyboard,
 	 * grid} and stash the resolved refs into ORX_SLOT_CHILD_O5/O6/
 	 * O7. orx_task_create's swap dance picks them up around the
 	 * upcoming TaskCreate and the child wakes up with the
-	 * requester's terminal services in O5/O6/O7 — its term_print/
-	 * term_getkey route to the right oriscterm regardless of
-	 * which CPU is hosting it.
+	 * requester's terminal services in O5/O6/O7.
 	 *
-	 * No hint = locally-originated spawn (a child program called
-	 * sup_spawn on us directly). The child inherits THIS
-	 * supervisor's boot O5/O6/O7, which is also the requester's
-	 * terminal — same effective result, no walk needed. */
+	 * Phase 51: ALSO propagate the terminal_idx itself (as an int)
+	 * via orx_set_child_terminal_idx — orx_task_create stuffs it
+	 * into R5 just before TaskCreate, the simulator copies to the
+	 * child's R4, crt0 stashes to _orisc_init_r4, and the child's
+	 * task_init reads it back into my_terminal_idx. That closes
+	 * the loop: when the round-robin'd shell on a peer CPU later
+	 * calls sup_spawn, ITS libc's R7 packs ITS terminal_idx,
+	 * routing further spawns back to the user's terminal. */
 	if (term_hint > 0) {
-		populate_child_term_slots(term_hint - 1);
+		int term_idx = term_hint - 1;
+		populate_child_term_slots(term_idx);
+		orx_set_child_terminal_idx(term_idx);
 	}
 
 	task_t t = orx_spawn(path, args, cwd);
 	int status = (t < 0) ? (int)t : 0;
 
-	/* Always clear the child slots after orx_spawn so a
-	 * subsequent local spawn (no hint) doesn't pick up a stale
-	 * override. */
-	if (term_hint > 0) clear_child_term_slots();
+	/* Always clear the per-spawn overrides after orx_spawn so a
+	 * subsequent local spawn (no hint) doesn't pick up stale
+	 * state. */
+	if (term_hint > 0) {
+		clear_child_term_slots();
+		orx_clear_child_terminal_idx();
+	}
 
 	reply_to_requester(t, status);
 
@@ -846,6 +939,22 @@ main(void)
 	 * too. */
 	int procid    = read_procid();
 	int is_leader = (procid == 0);
+
+	/* Phase 51: declare our terminal_idx (procid in the current
+	 * model) so children spawned via orx_spawn inherit it through
+	 * the R5 → child.R4 → _orisc_init_r4 chain, and so any future
+	 * sup_spawn from us routes through the right terminal. The
+	 * crt0 stash captured `_orisc_init_r4 = 0` for us (oriscrun
+	 * doesn't fill R5 for top-level boots), so task_init left
+	 * my_terminal_idx = -1 — override here.
+	 *
+	 * Also bias the round-robin counter so this supervisor's first
+	 * relay lands on the next CPU after self. With both leader and
+	 * worker biased this way, the initial spread is symmetric:
+	 * leader picks worker first, worker picks leader first,
+	 * alternating cleanly thereafter. */
+	task_set_my_terminal_idx(procid);
+	next_cpu_counter = procid + 1;
 
 	/* Phase 47: walk the directory for our boot service refs. After
 	 * 45h+47, devices self-register at /sys/term/<N>/* and

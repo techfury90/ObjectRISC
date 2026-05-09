@@ -582,9 +582,11 @@ cmd_run(const char *cwd, const char *arg)
 	/* Phase 45e: parse a leading `@N ` (any single decimal digit
 	 * 0-9) as an explicit target-CPU specifier for the spawn. The
 	 * rest of `arg` proceeds through the existing path/args split
-	 * unchanged. Without `@`, target_pid stays SUP_TARGET_LOCAL
-	 * and sup_spawn_at hands off to the local supervisor as before. */
-	int target_pid = SUP_TARGET_LOCAL;
+	 * unchanged. Without `@`, target_pid stays SUP_TARGET_ANY
+	 * (Phase 51) so the supervisor round-robins the spawn across
+	 * live CPUs; pass-through routes the child's terminal output
+	 * back to OUR terminal regardless of where it lands. */
+	int target_pid = SUP_TARGET_ANY;
 	int p = 0;
 	while (arg[p] == ' ' || arg[p] == '\t') p++;
 	if (arg[p] == '@') {

@@ -100,12 +100,16 @@ main(void)
 		 * subscription for the next welcome cycle. */
 		term_shutdown();
 
-		/* Spawn the shell via the supervisor (sup_spawn → SEND op=1).
-		 * Same path the user-visible `run` command uses — keeps the
-		 * supervisor as the sole spawn-server, so the shell's own
-		 * subsequent `run` requests ride the same path. cwd "/" is
-		 * the conventional starting directory. */
-		task_t shell = sup_spawn(SHELL_PATH, "", "/");
+		/* Spawn the shell via the supervisor. Phase 51: pin the
+		 * shell to the LOCAL CPU (the one our terminal is bound to)
+		 * via sup_spawn_at(SUP_TARGET_LOCAL, ...) instead of plain
+		 * sup_spawn — plain sup_spawn defaults to SUP_TARGET_ANY
+		 * which round-robins. We don't want the user's interactive
+		 * shell to land on a peer CPU; round-robin makes sense for
+		 * SHELL-issued `run cmd` (compute spreading) but the shell
+		 * itself is the user's session and belongs here. */
+		task_t shell = sup_spawn_at(SUP_TARGET_LOCAL,
+		                            SHELL_PATH, "", "/");
 		if (shell < 0) {
 			term_print(spawn_failed);
 			term_print_int((int)shell);
@@ -125,16 +129,35 @@ main(void)
 		 * that), but orx_unload swallows EFAULT on the manifest
 		 * frees, so it's safe — and it gives us the standard
 		 * "release the local handle" path. */
-		(void)orx_unload(shell);
-		/* Trace: shell session ended cleanly (logout / return 0).
-		 * test_shell_logout.sh keys off this to confirm the task_
-		 * wait path actually woke (vs. being task_kill'd by the
-		 * supervisor's op=2 cascade — that path bypasses login's
-		 * loop entirely).
+		int code = orx_unload(shell);
+
+		/* Phase 51: with round-robin enabled, the shell can run on
+		 * a peer CPU. When the user `exit`s, the spawning
+		 * supervisor's op=2 cascade task_kills the shell (code 137)
+		 * — and we (running on a different CPU) wake from our
+		 * remote task_wait BEFORE our own supervisor halts. If we
+		 * looped back here, our term_clear would wipe the rendered
+		 * shell session before fake_terminal/oriscterm could
+		 * capture it.
+		 *
+		 * Distinguish: code == 0 means clean `logout` (shell
+		 * `return 0`d) — redraw the welcome banner for the next
+		 * session. Non-zero means the shell was killed (system is
+		 * shutting down OR the shell crashed); just exit so we
+		 * don't race the cascade. (Without round-robin this branch
+		 * is unreachable — the LOCAL cascade kills login before
+		 * task_wait could ever wake — but it's still defensively
+		 * correct.) */
+		if (code != 0) {
+			return 0;
+		}
+		/* Trace: clean logout. test_shell_logout.sh keys off this
+		 * to confirm task_wait actually returned (vs. login being
+		 * task_kill'd via the supervisor's op=2 cascade).
 		 *
 		 * orx_unload's manifest_load clobbered O3 with manifest[t]
-		 * .data (which is null for sup_spawn'd kids), so restore O3
-		 * = boot data ref before the print. */
+		 * .data (null for sup_spawn'd kids), so restore from O15
+		 * before the print. */
 		asm volatile("omov o3, o15");
 		print_str("login: shell exited cleanly\n");
 

@@ -176,9 +176,14 @@ sup_pack_request(unsigned int va, const char *path,
 task_t
 sup_spawn(const char *path, const char *args, const char *cwd)
 {
-	/* Default placement: spawn on whichever CPU this caller's
-	 * supervisor is on. The shell's `run cmd` path takes this. */
-	return sup_spawn_at(SUP_TARGET_LOCAL, path, args, cwd);
+	/* Phase 51: SUP_TARGET_ANY (= round-robin OK) by default. The
+	 * supervisor spreads load across live CPUs and the receiver's
+	 * pass-through (Phase 49) routes the child's terminal output
+	 * back to the requester's terminal regardless of host CPU.
+	 * Callers wanting strict local placement use sup_spawn_at(
+	 * SUP_TARGET_LOCAL, ...) explicitly; sup_spawn_at(N, ...) with
+	 * a literal procid still pins to that CPU. */
+	return sup_spawn_at(SUP_TARGET_ANY, path, args, cwd);
 }
 
 task_t
@@ -284,16 +289,27 @@ sup_spawn_at(int target_pid, const char *path,
 	 *   R6 = target_pid (Phase 45e — SUP_TARGET_LOCAL or a literal
 	 *        PROCID; the supervisor checks against its own PROCID
 	 *        and relays via op=1 SEND to a peer when they differ) */
+	/* Phase 51: pack our terminal_idx into R7 so the supervisor can
+	 * route a relayed spawn back to the right oriscterm. Encoding:
+	 *   0   = "no terminal info" (top-level boot, legacy callers)
+	 *   N+1 = "this requester is on terminal N"
+	 * The supervisor's handle_spawn_request decodes back to N, sets
+	 * ORX_SLOT_CHILD_O5/O6/O7 from /sys/term/<N>/*, and threads N
+	 * into the child's libc via the orx_task_create R5 → child.R4
+	 * → _orisc_init_r4 chain. */
+	int term_idx = task_my_terminal_idx();
+	int term_hint_plus_one = (term_idx >= 0) ? (term_idx + 1) : 0;
 	asm volatile(
 		"orefld o1, 544(o12)\n"        /* supervisor sub-cap */
 		"omov   o2, o14\n"
-		"orefld o3, %2(o12)\n"         /* SUP_REPLY_SCRATCH */
+		"orefld o3, %3(o12)\n"         /* SUP_REPLY_SCRATCH */
 		"addiu  r4, r0, 1\n"
 		"addu   r5, %0, r0\n"
 		"addu   r6, %1, r0\n"
-		"addiu  r7, r0, 0\n"
+		"addu   r7, %2, r0\n"          /* terminal_idx + 1 */
 		"send   o1\n"
 		: : "r"(payload_len), "r"(target_pid),
+		    "r"(term_hint_plus_one),
 		    "i"(SUP_REPLY_SCRATCH_OFFSET)
 		: "r1", "r4", "r5", "r6", "r7"
 	);
