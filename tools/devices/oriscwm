@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""oriscwm — Object RISC window manager (milestone 1).
+
+A non-CPU participant on the crossbar that arbitrates access to
+terminal surfaces. Programs request a window of a given type; the WM
+hands back a window-handle capability, then resolves
+OP_BIND_SURFACE calls on that handle to the underlying terminal
+service caps that were registered with it at boot.
+
+Architectural notes (see the longer design discussion in the
+`ouroboros-window-manager` PR description):
+
+  - "Console window" = (console, keyboard).  Two surface caps.
+  - "Graphical window" = (keyboard, grid, vector, raster, pointer).
+    Five surface caps.  GRAPHICAL windows are not implemented in
+    this milestone — OP_NEW_WINDOW(WIN_GRAPHICAL) returns
+    E_NOTIMPL.
+
+  - Windows are program-declared.  A program walks /sys/wm/0,
+    SENDs OP_NEW_WINDOW(type), and on success receives a window-
+    handle ref + initial geometry.  The handle is itself a
+    capability whose home is this daemon and whose index is
+    allocated per-window from WINDOW_INDEX_BASE upward.
+
+  - Surface caps come from the underlying terminal.  In milestone 1
+    the WM does NOT walk the directory itself for terminal services.
+    Instead, a trusted client (typically the supervisor, but in the
+    smoke test it's the test program) SENDs OP_REGISTER_SURFACE
+    once per surface kind to populate the WM's surface table.
+    Subsequent OP_BIND_SURFACE calls return whatever was registered.
+    This avoids the bytes-object plumbing the WM would need to
+    issue OP_WALK on its own — Python daemons can't ObjAlloc a
+    TAG_DATA bytes object on a CPU.
+
+  - Hardcoded N=1 for CONSOLE.  Only one console window can exist
+    at a time; a second OP_NEW_WINDOW(WIN_CONSOLE) fails with
+    E_NOSPC.  Multi-window tiling is later milestone work.
+
+  - No auto-destroy on owner exit.  task_query is a CPU-side
+    primitive and Python daemons can't use it; a future milestone
+    will add a supervisor-mediated watch op.  Until then,
+    OP_DESTROY_WINDOW is the only way to free a window handle.
+    The wire shape is forward-compatible.
+
+Wire protocol — request shape: a SEND from a client. The recipient
+ref's index field selects which "service" the client is talking to:
+the main WM service (idx WM_SERVICE_INDEX = 1) for window creation
++ surface registration, or a per-window-handle service (idx >=
+WINDOW_INDEX_BASE) for binding / destroying / subscribing.
+
+Wire ops on the main WM service (SEND to /sys/wm/0):
+
+  WM_OP_REGISTER_SURFACE = 1   Trusted-client registration of an
+                               underlying terminal surface cap that
+                               OP_BIND_SURFACE will subsequently
+                               hand out.
+                               int_payload[0] = op (1)
+                               int_payload[1] = kind (WSURF_CONSOLE
+                                                      .. WSURF_POINTER)
+                               or_payload[1]  = the surface cap
+                               or_payload[2]  = reply cap
+                               Reply: R3 = 0 OK, negative on error.
+
+  WM_OP_NEW_WINDOW       = 2   Allocate a new window of `type`.
+                               int_payload[0] = op (2)
+                               int_payload[1] = type (WIN_CONSOLE,
+                                                      WIN_GRAPHICAL)
+                               or_payload[2]  = reply cap
+                               Reply:
+                                 R3 = status (0 OK)
+                                 R4 = (w_px << 16) | h_px
+                                 R5 = (w_cells << 16) | h_cells
+                                 O2 = window_handle ref
+                                      (R+S, home = our pid,
+                                       index = freshly allocated)
+
+Wire ops on a window-handle service (SEND to a window_handle):
+
+  WM_OP_BIND_SURFACE     = 1   Resolve a surface cap for this window.
+                               int_payload[0] = op (1)
+                               int_payload[1] = kind (WSURF_*)
+                               or_payload[2]  = reply cap
+                               Reply:
+                                 R3 = status (0 OK)
+                                 O2 = surface cap (or null on error)
+
+  WM_OP_DESTROY_WINDOW   = 2   Release this window.  Drops the
+                               handle from our table; future
+                               SENDs to this idx return E_NOENT.
+                               or_payload[2] = reply cap
+                               Reply: R3 = 0 OK.
+
+  WM_OP_SUBSCRIBE_EVENTS = 3   Subscribe a notification cap for
+                               window-lifecycle events (resize,
+                               focus, close-request).  Stub in
+                               milestone 1 — accepts and stores
+                               the subscription, but the WM never
+                               actually fires events yet.
+                               int_payload[0] = op (3)
+                               int_payload[1] = notify_op (1..255)
+                               or_payload[2]  = reply cap
+                               or_payload[3]  = notify_cap
+                               Reply: R3 = 0 OK.
+
+Window types:
+  WIN_CONSOLE   = 1
+  WIN_GRAPHICAL = 2     (returns E_NOTIMPL in milestone 1)
+
+Surface kinds (mirror oriscterm's service indices, plus headroom):
+  WSURF_CONSOLE  = 1
+  WSURF_KEYBOARD = 2
+  WSURF_GRID     = 3
+  WSURF_VECTOR   = 4
+  WSURF_RASTER   = 5
+  WSURF_POINTER  = 6
+
+Errors (negative R3 in responses):
+  -1  E_INVAL    bad arguments / unknown op
+  -2  E_NOENT    no surface of that kind registered, or window not found
+  -6  E_IO       internal / protocol error
+  -7  E_NOSPC    no more windows of that type allocatable
+  -8  E_NOTIMPL  feature not implemented (e.g. GRAPHICAL in milestone 1)
+
+Usage:
+    tools/devices/oriscwm --socket /tmp/oriscbar.sock --pid 20 \\
+        --directory-pid 18
+
+The --directory-pid argument is the oriscdir pid; the WM
+self-registers at /sys/wm/0 via OP_REG_INLINE during startup, the
+same way oriscterm and hostfsd publish their service refs.
+"""
+
+import argparse
+import errno
+import selectors
+import signal
+import socket
+import struct
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+# ---- Wire-format constants — must match simorisc / oriscbar / etc. --------
+
+HELLO_MAGIC      = 0xC0FFEEAA
+HELLO_OK         = 0x00000000
+
+PKT_OBJ_READ_REQ   = 0x10
+PKT_OBJ_READ_RESP  = 0x11
+PKT_OBJ_WRITE_REQ  = 0x12
+PKT_OBJ_WRITE_RESP = 0x13
+PKT_SEND_DELIVER   = 0x20
+
+# ---- Capability bits -----------------------------------------------------
+
+CAP_R = 0x01
+CAP_W = 0x02
+CAP_S = 0x08
+CAP_V = 0x10
+CAP_C = 0x40
+
+# ---- Service constants ---------------------------------------------------
+
+WM_SERVICE_INDEX   = 1
+WINDOW_INDEX_BASE  = 2     # First window-handle index (allocated upward)
+SERVICE_GENERATION = 1
+SERVICE_MAX_CAPS   = 0x5B  # R|W|S|V|C — what oriscrun synthesizes refs with
+
+# ---- Operation codes (main WM service, idx 1) ----------------------------
+
+WM_OP_REGISTER_SURFACE = 1
+WM_OP_NEW_WINDOW       = 2
+
+# ---- Operation codes (window-handle service, idx >= WINDOW_INDEX_BASE) ---
+
+WM_OP_BIND_SURFACE     = 1
+WM_OP_DESTROY_WINDOW   = 2
+WM_OP_SUBSCRIBE_EVENTS = 3
+
+# ---- Window types --------------------------------------------------------
+
+WIN_CONSOLE   = 1
+WIN_GRAPHICAL = 2     # E_NOTIMPL in milestone 1
+
+# ---- Surface kinds (mirror oriscterm's service indices) ------------------
+
+WSURF_CONSOLE  = 1
+WSURF_KEYBOARD = 2
+WSURF_GRID     = 3
+WSURF_VECTOR   = 4
+WSURF_RASTER   = 5
+WSURF_POINTER  = 6
+
+# Per-type surface set: which kinds OP_BIND_SURFACE accepts for this type.
+SURFACE_KINDS_BY_TYPE = {
+    WIN_CONSOLE:   (WSURF_CONSOLE, WSURF_KEYBOARD),
+    WIN_GRAPHICAL: (WSURF_KEYBOARD, WSURF_GRID, WSURF_VECTOR,
+                    WSURF_RASTER,  WSURF_POINTER),
+}
+
+# ---- Error codes (negative R3 in responses) ------------------------------
+
+E_INVAL   = -1
+E_NOENT   = -2
+E_IO      = -6
+E_NOSPC   = -7
+E_NOTIMPL = -8
+
+# ---- Inline-register — oriscdir's OP_REG_INLINE for self-publish ---------
+
+DIR_SERVICE_INDEX  = 1
+DIR_OP_REG_INLINE  = 5
+WM_REGISTER_PATH   = "/sys/wm/0"
+
+# ---- Default window geometry (mirrors oriscterm's canvas defaults) -------
+#
+# oriscterm uses Menlo-14 with an 80-col × 24-row text pane.  In the
+# absence of a query-geometry op (a future milestone), we publish
+# nominal cell counts and a rough pixel size.  Programs use the
+# cell counts; pixel counts are advisory until graphical windows
+# need them in earnest.
+
+DEFAULT_W_PX    = 1200
+DEFAULT_H_PX    = 600
+DEFAULT_W_CELLS = 80
+DEFAULT_H_CELLS = 24
+
+
+# ---- Wire helpers (duplicated from oriscdir/oriscterm; the codebase
+#      has flagged grow-a-shared-library as a follow-up). ----------------
+
+def make_ref(generation: int, home: int, index: int, caps: int) -> int:
+    return (((generation & 0xFFFF) << 48)
+            | ((home       & 0xFF)   << 40)
+            | ((index      & 0xFFFFFF) << 16)
+            | ((caps       & 0xFF)   << 8))
+
+
+def ref_home(r: int)       -> int: return (r >> 40) & 0xFF
+def ref_index(r: int)      -> int: return (r >> 16) & 0xFFFFFF
+def ref_generation(r: int) -> int: return (r >> 48) & 0xFFFF
+def ref_caps(r: int)       -> int: return (r >>  8) & 0xFF
+
+
+def pack_packet(src_pid: int, dst_pid: int, msg_type: int, flags: int,
+                trans_id: int, payload_words) -> bytes:
+    header = struct.pack(">BBBBHH",
+                         src_pid & 0xFF, dst_pid & 0xFF,
+                         msg_type & 0xFF, flags & 0xFF,
+                         trans_id & 0xFFFF, len(payload_words) & 0xFFFF)
+    payload = b''.join(struct.pack(">I", w & 0xFFFFFFFF)
+                       for w in payload_words)
+    h0, h1 = struct.unpack(">II", header)
+    chk = h0 ^ h1
+    for w in payload_words:
+        chk ^= w & 0xFFFFFFFF
+    return header + payload + struct.pack(">I", chk & 0xFFFFFFFF)
+
+
+def unpack_packet(data: bytes) -> Dict:
+    if len(data) < 12:
+        raise ValueError("packet too short")
+    src, dst, mtype, flags, trans_id, length_words = \
+        struct.unpack(">BBBBHH", data[:8])
+    payload_bytes = data[8:8 + length_words * 4]
+    words = list(struct.unpack(f">{length_words}I", payload_bytes)) \
+        if length_words else []
+    h0, h1 = struct.unpack(">II", data[:8])
+    chk = h0 ^ h1
+    for w in words:
+        chk ^= w
+    expected_chk = struct.unpack(">I", data[-4:])[0]
+    if chk != expected_chk:
+        raise ValueError("checksum mismatch")
+    return {"src_pid": src, "dst_pid": dst, "type": mtype,
+            "flags": flags, "trans_id": trans_id, "payload": words}
+
+
+def parse_send_deliver(pkt):
+    p = pkt["payload"]
+    if len(p) != 14:
+        raise ValueError(f"SEND_DELIVER payload must be 14 words, got {len(p)}")
+    recipient_ref = p[0] | (p[1] << 32)
+    int_payload = list(p[2:6])
+    or_payload = []
+    for i in range(4):
+        or_payload.append(p[6 + 2*i] | (p[7 + 2*i] << 32))
+    return recipient_ref, int_payload, or_payload
+
+
+def build_send_deliver(src_pid, dst_pid, trans_id, recipient_ref,
+                       int_payload, or_payload):
+    payload = [recipient_ref & 0xFFFFFFFF,
+               (recipient_ref >> 32) & 0xFFFFFFFF]
+    for i in range(4):
+        payload.append(int_payload[i] & 0xFFFFFFFF if i < len(int_payload) else 0)
+    for i in range(4):
+        ref = or_payload[i] if i < len(or_payload) else 0
+        payload.append(ref & 0xFFFFFFFF)
+        payload.append((ref >> 32) & 0xFFFFFFFF)
+    return pack_packet(src_pid, dst_pid, PKT_SEND_DELIVER, 0, trans_id, payload)
+
+
+# ---- Window state -------------------------------------------------------
+
+@dataclass
+class Window:
+    """One live window.  `handle_idx` is the value clients see in
+    the .index field of the cap they hold; it's also our key into
+    OriscWm.windows."""
+    handle_idx: int
+    type: int
+    # Subscriptions to window events: list of (notify_cap, notify_op).
+    # Stub in milestone 1 — accepted and stored, but no events fire.
+    subscribers: List[Tuple[int, int]] = field(default_factory=list)
+
+
+# ---- The server ---------------------------------------------------------
+
+class OriscWm:
+    def __init__(self, sock_path: str, my_pid: int, dir_pid: Optional[int],
+                 verbose: bool = False):
+        self.my_pid = my_pid
+        self.dir_pid = dir_pid
+        self.verbose = verbose
+        self.next_trans_id = 0
+        # Surface caps registered via OP_REGISTER_SURFACE.
+        # Maps WSURF_* → cap.
+        self.surfaces: Dict[int, int] = {}
+        # Active windows.  Maps handle_idx → Window.
+        self.windows: Dict[int, Window] = {}
+        self.next_window_idx = WINDOW_INDEX_BASE
+
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.connect(sock_path)
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            raise SystemExit(f"oriscwm: connect to {sock_path}: {e}")
+        self.sock.sendall(struct.pack(">II", HELLO_MAGIC, my_pid))
+        reply = self._recv_exact(8)
+        magic, status = struct.unpack(">II", reply)
+        if magic != HELLO_MAGIC or status != HELLO_OK:
+            raise SystemExit(f"oriscwm: handshake failed "
+                             f"(magic={magic:#x}, status={status:#x})")
+        self.sock.setblocking(False)
+        self.recv_buf = bytearray()
+        self.shutdown_requested = False
+
+        self._log(f"online · pid={my_pid} · service idx={WM_SERVICE_INDEX}")
+
+    # ---- network ---------------------------------------------------------
+
+    def _recv_exact(self, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise SystemExit("oriscwm: crossbar closed during handshake")
+            out.extend(chunk)
+        return bytes(out)
+
+    def send_packet(self, packet: bytes) -> None:
+        # Same backpressure dance as oriscdir / hostfsd.
+        import select
+        data = struct.pack(">I", len(packet)) + packet
+        sent = 0
+        while sent < len(data):
+            try:
+                n = self.sock.send(data[sent:])
+                if n == 0:
+                    self.shutdown_requested = True
+                    return
+                sent += n
+            except BlockingIOError:
+                _, w, _ = select.select([], [self.sock], [], 5.0)
+                if not w:
+                    self._log("send blocked >5s; giving up")
+                    self.shutdown_requested = True
+                    return
+            except OSError as e:
+                self._log(f"send failed: {e}")
+                self.shutdown_requested = True
+                return
+
+    def _next_trans(self) -> int:
+        t = self.next_trans_id & 0xFFFF
+        self.next_trans_id = (self.next_trans_id + 1) & 0xFFFF
+        return t
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"oriscwm: {msg}", file=sys.stderr, flush=True)
+
+    # ---- self-registration ----------------------------------------------
+
+    def _self_register(self) -> None:
+        """Publish our main service (WM_SERVICE_INDEX) at /sys/wm/0
+        in oriscdir via OP_REG_INLINE.  Same shape as oriscterm's
+        per-service self-registration; see oriscdir's docstring for
+        the inline-path packing layout."""
+        if self.dir_pid is None:
+            return
+        path_bytes = WM_REGISTER_PATH.encode("utf-8")
+        if not 0 < len(path_bytes) <= 32:
+            self._log(f"register-self: path {WM_REGISTER_PATH!r} length "
+                      f"{len(path_bytes)} not in 1..32")
+            return
+
+        my_ref = make_ref(generation=SERVICE_GENERATION, home=self.my_pid,
+                          index=WM_SERVICE_INDEX, caps=CAP_R | CAP_S)
+        dir_ref = make_ref(generation=SERVICE_GENERATION, home=self.dir_pid,
+                           index=DIR_SERVICE_INDEX, caps=CAP_R | CAP_S)
+
+        padded = path_bytes + b'\x00' * (32 - len(path_bytes))
+        (b0_3,)   = struct.unpack("<I", padded[0:4])
+        (b4_7,)   = struct.unpack("<I", padded[4:8])
+        (b8_15,)  = struct.unpack("<Q", padded[8:16])
+        (b16_23,) = struct.unpack("<Q", padded[16:24])
+        (b24_31,) = struct.unpack("<Q", padded[24:32])
+
+        int_payload = [DIR_OP_REG_INLINE, len(path_bytes), b0_3, b4_7]
+        or_payload  = [my_ref, b8_15, b16_23, b24_31]
+
+        trans = self._next_trans()
+        pkt = build_send_deliver(self.my_pid, self.dir_pid, trans,
+                                 dir_ref, int_payload, or_payload)
+        self.send_packet(pkt)
+        self._log(f"register-self: {WM_REGISTER_PATH!r} → idx={WM_SERVICE_INDEX}")
+
+    # ---- main loop -------------------------------------------------------
+
+    def run(self) -> None:
+        self._self_register()
+        print(f"oriscwm READY pid={self.my_pid}", flush=True)
+        sel = selectors.DefaultSelector()
+        sel.register(self.sock, selectors.EVENT_READ)
+        try:
+            while not self.shutdown_requested:
+                events = sel.select(timeout=0.25)
+                if not events:
+                    continue
+                if not self._drain():
+                    self._log("crossbar closed")
+                    break
+                while True:
+                    pkt = self._take_packet()
+                    if pkt is None:
+                        break
+                    self._handle_packet(pkt)
+        finally:
+            sel.close()
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    def _drain(self) -> bool:
+        try:
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    return False
+                self.recv_buf.extend(chunk)
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError as e:
+            if e.errno in (errno.ECONNRESET, errno.EPIPE):
+                return False
+            raise
+
+    def _take_packet(self) -> Optional[bytes]:
+        if len(self.recv_buf) < 4:
+            return None
+        (length,) = struct.unpack(">I", bytes(self.recv_buf[:4]))
+        if len(self.recv_buf) < 4 + length:
+            return None
+        pkt = bytes(self.recv_buf[4:4 + length])
+        del self.recv_buf[:4 + length]
+        return pkt
+
+    def _handle_packet(self, raw: bytes) -> None:
+        try:
+            pkt = unpack_packet(raw)
+        except ValueError as e:
+            self._log(f"malformed packet: {e}")
+            return
+        t = pkt["type"]
+        if t == PKT_SEND_DELIVER:
+            self._handle_send(pkt)
+        else:
+            self._log(f"unhandled packet type 0x{t:02x} from "
+                      f"pid={pkt['src_pid']}")
+
+    # ---- request dispatch ------------------------------------------------
+
+    def _handle_send(self, pkt) -> None:
+        try:
+            recipient_ref, int_payload, or_payload = parse_send_deliver(pkt)
+        except ValueError as e:
+            self._log(f"bad SEND_DELIVER: {e}")
+            return
+        idx = ref_index(recipient_ref)
+        if idx == WM_SERVICE_INDEX:
+            self._handle_main_send(pkt["src_pid"], int_payload, or_payload)
+        elif idx in self.windows:
+            self._handle_window_send(self.windows[idx], pkt["src_pid"],
+                                     int_payload, or_payload)
+        else:
+            self._log(f"SEND to unknown idx={idx} from pid={pkt['src_pid']}")
+
+    def _handle_main_send(self, src_pid: int,
+                          int_payload: List[int], or_payload: List[int]) -> None:
+        op = int_payload[0]
+        reply_cap = or_payload[2]
+        if reply_cap == 0:
+            self._log(f"main op={op} from pid={src_pid} with null reply_cap; "
+                      f"dropping")
+            return
+        if op == WM_OP_REGISTER_SURFACE:
+            kind = int_payload[1]
+            cap  = or_payload[1]
+            if kind not in (WSURF_CONSOLE, WSURF_KEYBOARD, WSURF_GRID,
+                            WSURF_VECTOR,  WSURF_RASTER,   WSURF_POINTER):
+                self._log(f"register-surface: bad kind {kind}")
+                return self._reply(reply_cap, E_INVAL, 0, 0, 0)
+            if cap == 0:
+                self._log(f"register-surface: null cap for kind {kind}")
+                return self._reply(reply_cap, E_INVAL, 0, 0, 0)
+            self.surfaces[kind] = cap
+            self._log(f"register-surface: kind={kind} cap=0x{cap:016x}")
+            return self._reply(reply_cap, 0, 0, 0, 0)
+
+        if op == WM_OP_NEW_WINDOW:
+            wtype = int_payload[1]
+            if wtype == WIN_CONSOLE:
+                # Hardcoded N=1 for milestone 1: only one CONSOLE window
+                # may be alive at a time.  Multi-window tiling is later
+                # milestone work.
+                if any(w.type == WIN_CONSOLE for w in self.windows.values()):
+                    self._log(f"new-window: CONSOLE refused (already one alive)")
+                    return self._reply(reply_cap, E_NOSPC, 0, 0, 0)
+            elif wtype == WIN_GRAPHICAL:
+                self._log(f"new-window: GRAPHICAL not implemented in milestone 1")
+                return self._reply(reply_cap, E_NOTIMPL, 0, 0, 0)
+            else:
+                self._log(f"new-window: bad type {wtype}")
+                return self._reply(reply_cap, E_INVAL, 0, 0, 0)
+
+            hidx = self.next_window_idx
+            self.next_window_idx += 1
+            win = Window(handle_idx=hidx, type=wtype)
+            self.windows[hidx] = win
+            handle_ref = make_ref(generation=SERVICE_GENERATION,
+                                  home=self.my_pid,
+                                  index=hidx,
+                                  caps=CAP_R | CAP_S)
+            geom_a = ((DEFAULT_W_PX & 0xFFFF) << 16) | (DEFAULT_H_PX & 0xFFFF)
+            geom_b = ((DEFAULT_W_CELLS & 0xFFFF) << 16) | (DEFAULT_H_CELLS & 0xFFFF)
+            self._log(f"new-window: type={wtype} idx={hidx} "
+                      f"handle=0x{handle_ref:016x}")
+            return self._reply(reply_cap, 0, geom_a, geom_b, handle_ref)
+
+        self._log(f"main: unknown op {op}")
+        return self._reply(reply_cap, E_INVAL, 0, 0, 0)
+
+    def _handle_window_send(self, win: Window, src_pid: int,
+                            int_payload: List[int],
+                            or_payload: List[int]) -> None:
+        op = int_payload[0]
+        reply_cap = or_payload[2]
+        if reply_cap == 0:
+            self._log(f"window {win.handle_idx} op={op} from pid={src_pid} "
+                      f"with null reply_cap; dropping")
+            return
+        if op == WM_OP_BIND_SURFACE:
+            kind = int_payload[1]
+            allowed = SURFACE_KINDS_BY_TYPE.get(win.type, ())
+            if kind not in allowed:
+                self._log(f"bind-surface: kind={kind} not allowed for "
+                          f"type={win.type}")
+                return self._reply(reply_cap, E_INVAL, 0, 0, 0)
+            cap = self.surfaces.get(kind)
+            if not cap:
+                self._log(f"bind-surface: no surface registered for kind={kind}")
+                return self._reply(reply_cap, E_NOENT, 0, 0, 0)
+            self._log(f"bind-surface: window={win.handle_idx} kind={kind} "
+                      f"→ 0x{cap:016x}")
+            return self._reply(reply_cap, 0, 0, 0, cap)
+
+        if op == WM_OP_DESTROY_WINDOW:
+            self._log(f"destroy-window: idx={win.handle_idx}")
+            del self.windows[win.handle_idx]
+            return self._reply(reply_cap, 0, 0, 0, 0)
+
+        if op == WM_OP_SUBSCRIBE_EVENTS:
+            notify_cap = or_payload[3]
+            notify_op  = int_payload[1] & 0xFF
+            if notify_cap == 0 or not (1 <= notify_op <= 255):
+                return self._reply(reply_cap, E_INVAL, 0, 0, 0)
+            win.subscribers.append((notify_cap, notify_op))
+            self._log(f"subscribe-events: window={win.handle_idx} "
+                      f"notify_cap=0x{notify_cap:016x} op={notify_op} "
+                      f"(stub — events not yet fired in milestone 1)")
+            return self._reply(reply_cap, 0, 0, 0, 0)
+
+        self._log(f"window {win.handle_idx}: unknown op {op}")
+        return self._reply(reply_cap, E_INVAL, 0, 0, 0)
+
+    # ---- reply ----------------------------------------------------------
+
+    def _reply(self, reply_cap: int, status: int, secondary: int,
+               tertiary: int, ref_payload: int) -> None:
+        """SEND a reply back to the caller's reply_cap.
+
+        Same convention as oriscdir._reply:
+            R4 = status      → receiver's R3
+            R5 = secondary   → receiver's R4
+            R6 = tertiary    → receiver's R5
+            O2 = ref_payload → receiver's O2
+        """
+        trans = self._next_trans()
+        pkt = build_send_deliver(
+            src_pid=self.my_pid,
+            dst_pid=ref_home(reply_cap),
+            trans_id=trans,
+            recipient_ref=reply_cap,
+            int_payload=[status & 0xFFFFFFFF,
+                         secondary & 0xFFFFFFFF,
+                         tertiary & 0xFFFFFFFF,
+                         0],
+            or_payload=[reply_cap, ref_payload, 0, 0],
+        )
+        self.send_packet(pkt)
+
+
+# ---- CLI ----------------------------------------------------------------
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="oriscwm",
+        description="Object RISC window manager (milestone 1)")
+    ap.add_argument("--socket", required=True,
+                    help="path to oriscbar's UNIX domain socket")
+    ap.add_argument("--pid", type=int, required=True,
+                    help="processor identifier this server presents to "
+                         "the crossbar")
+    ap.add_argument("--directory-pid", type=int, default=None,
+                    help="oriscdir's pid (for self-registration at "
+                         "/sys/wm/0).  If omitted, the WM stays "
+                         "anonymous — useful for harness tests that "
+                         "wire its cap to clients via --service.")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    server = OriscWm(args.socket, args.pid,
+                     dir_pid=args.directory_pid,
+                     verbose=args.verbose)
+
+    def _signal(_signo, _frame):
+        server.shutdown_requested = True
+    signal.signal(signal.SIGINT,  _signal)
+    signal.signal(signal.SIGTERM, _signal)
+
+    server.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
