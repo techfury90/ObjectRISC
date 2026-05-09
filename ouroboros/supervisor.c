@@ -845,6 +845,20 @@ handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 	/* Resume the new task — orx_spawn registers but doesn't
 	 * resume; we want the task to actually run. */
 	if (t >= 0) (void)task_resume(t);
+
+	/* Yield to give the just-resumed child at least one quantum
+	 * before we loop back to poll. Without this, any SEND already
+	 * queued in our mailbox at this point (most commonly a
+	 * worker's relayed op=2 shutdown — Phase 48
+	 * relay_shutdown_to_leader) is picked up by the very next
+	 * poll and triggers the cascade-kill before the spawned task
+	 * ever ran. The user-visible symptom: the requester's shell
+	 * session never starts because TaskCreate-then-TaskKill lands
+	 * first. Yielding here lets the child run through crt0,
+	 * task_init, term_init's keyboard subscribe, and the welcome
+	 * banner SEND, until it blocks on term_getkey's
+	 * RecvQueuePoll. See test_supervisor_session_manager.sh. */
+	if (t >= 0) task_yield();
 }
 
 /* Dequeue one message from O9. Infinite timeout: the loop is
