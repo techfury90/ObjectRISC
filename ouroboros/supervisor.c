@@ -1748,38 +1748,25 @@ main(void)
 		}
 	}
 
-	/* Phase 48 leader-only setup. The /programs MOUNT has to happen
-	 * inline here BEFORE we spawn sysinit — sysinit lives at
-	 * /programs/sysinit.orx, so we need that path resolvable to
-	 * load it. (We tried hosting the mount inside sysinit; the
-	 * resulting chicken-and-egg made the supervisor unable to
-	 * orx_spawn any /programs/* file.)
+	/* Phase 55: the /programs MOUNT is no longer the supervisor's
+	 * problem. oriscdir reads its --config file at startup and
+	 * stages the mount as a deferred intent; when hostfsd's
+	 * self-register lands at /sys/hostfsd/0, oriscdir applies the
+	 * mount automatically. By the time the leader gets here, walks
+	 * for /programs/* resolve through the directory without any
+	 * supervisor-side dir_mount call. (See
+	 * tools/devices/oriscdir.default.conf for the canonical config.)
 	 *
-	 * After the mount is installed, we spawn sysinit as a one-shot
-	 * "system setup" task that the user wanted in front of the
-	 * shell. It currently has nothing required to do — we may
-	 * add late-boot setup work to it in future phases. Fire-and-
-	 * forget: blocking on task_wait would deadlock against
-	 * sysinit's own dir_init lazy-bootstrap (op=4 SEND to us).
+	 * In degraded test configs without a directory daemon, the
+	 * mount obviously isn't present — orx_spawn's vfs_open falls
+	 * back to direct hf_open, same as the pre-Phase-55 dir_mount-
+	 * failed path did.
 	 *
-	 * The mount publishes O10 (boot hostfsd) directly. Boot ref
-	 * has caps R|S — no C — so ObjDerive would EPERM; storing O10
-	 * verbatim is fine, peers walking the mount get a ref
-	 * equivalent to their own boot O10. */
+	 * Sysinit still spawns here as a one-shot "system setup" hook;
+	 * it currently doesn't do much, but the slot is available for
+	 * late-boot setup work that's CPU-local (i.e., something a
+	 * directory mutation can't express). */
 	if (is_leader) {
-		asm volatile("omov o1, o10");
-		int mount_status = dir_mount("/programs", "/programs");
-		if (mount_status != 0) {
-			/* Non-fatal: in test harnesses without a directory the
-			 * mount returns -6. orx_spawn's vfs_open will fall
-			 * back to direct hf_open in that case; the system
-			 * keeps coming up as long as the relevant .orx files
-			 * exist at literal hostfsd paths. */
-			SUP_PRINT("supervisor: dir_mount /programs failed (");
-			SUP_PRINT_INT(mount_status);
-			SUP_PRINT(") — continuing\n");
-		}
-
 		task_t sysinit = sup_spawn_named(SYSINIT_PATH, "", "/");
 		if (sysinit < 0) {
 			SUP_PRINT("supervisor: failed to spawn sysinit: ");

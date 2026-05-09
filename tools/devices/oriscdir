@@ -20,6 +20,37 @@ does. Three node types:
 
 Usage:
     tools/devices/oriscdir --socket /tmp/oriscbar.sock --pid 18
+    tools/devices/oriscdir --socket /tmp/oriscbar.sock --pid 18 \\
+        --config tools/devices/oriscdir.default.conf
+
+Configuration file format (Phase 55) — a small declarative grammar
+for tree-shape that the daemon installs at startup, so client
+programs (the supervisor, mostly) don't have to do it themselves.
+Lines are blank, comments (#), or directives. The only directive
+today is `mount`:
+
+    mount  <target_path>  <source_leaf_path>  <prefix>
+
+Installs a MOUNT at <target_path> whose service ref is whatever is
+registered at <source_leaf_path>. Resolution is DEFERRED: the source
+leaf doesn't have to exist when config is parsed (it usually
+doesn't — hostfsd's self-register is a wire packet that arrives
+after we've processed config). When the source eventually
+registers, the mount is applied automatically and any subscribers
+get a tree-changed notification.
+
+Example (canonical default — see oriscdir.default.conf):
+
+    # /programs lives in the hostfsd at /sys/hostfsd/0, served from
+    # the host-side directory the hostfsd was launched against.
+    mount /programs /sys/hostfsd/0 /programs
+
+The mount directive replaces the leader supervisor's pre-Phase-55
+inline `dir_mount("/programs", "/programs")` call — the supervisor
+no longer participates in setting up /programs at all. (Bringing
+mount management in here also means a brand-new worker CPU added
+via oriscadd never has to think about /programs setup; the mount
+is already in place by the time it boots.)
 
 Wire protocol (request: program SENDs to oriscdir at (pid, idx 1)):
 
@@ -371,6 +402,11 @@ class OriscDir:
         # R4 = notify_op (so the subscriber can multiplex multiple
         # subscriptions on a single mailbox by varying notify_op).
         self.subscriptions: list = []
+        # Phase 55: deferred mount intents from --config. Each entry is
+        # (target_components, source_components, prefix). On every
+        # tree mutation we re-try pending mounts; once the source leaf
+        # exists we apply the mount and drop it from the list.
+        self.pending_mounts: list = []
 
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -669,14 +705,14 @@ class OriscDir:
             existing.leaf_ref = ref_to_register
             self._log(f"register-inline {path!r} → 0x{ref_to_register:016x} "
                       f"(promoted from empty dir, src=pid{src_pid})")
-            self._notify_subscribers(comps)
+            self._after_tree_mutation(comps)
             return
         node.children[last] = Node(
             name=last, parent=node, leaf_ref=ref_to_register
         )
         self._log(f"register-inline {path!r} → 0x{ref_to_register:016x} "
                   f"(src=pid{src_pid})")
-        self._notify_subscribers(comps)
+        self._after_tree_mutation(comps)
 
     def _do_register(self, pr: PendingRequest, path_bytes: bytes) -> None:
         try:
@@ -711,12 +747,12 @@ class OriscDir:
             existing.leaf_ref = ref_to_register
             self._log(f"register {path!r} → 0x{ref_to_register:016x} "
                       f"(promoted from empty dir)")
-            self._notify_subscribers(comps)
+            self._after_tree_mutation(comps)
             return self._reply(pr.reply_cap, 0, 0, 0, 0)
         new_node = Node(name=last, parent=node, leaf_ref=ref_to_register)
         node.children[last] = new_node
         self._log(f"register {path!r} → 0x{ref_to_register:016x}")
-        self._notify_subscribers(comps)
+        self._after_tree_mutation(comps)
         self._reply(pr.reply_cap, 0, 0, 0, 0)
 
     def _do_mount(self, pr: PendingRequest, path_and_prefix: bytes) -> None:
@@ -757,13 +793,13 @@ class OriscDir:
             existing.mount_prefix = prefix
             self._log(f"mount {path!r} → ref=0x{service_ref:016x} "
                       f"prefix={prefix!r} (promoted)")
-            self._notify_subscribers(comps)
+            self._after_tree_mutation(comps)
             return self._reply(pr.reply_cap, 0, 0, 0, 0)
         new_node = Node(name=last, parent=node,
                         mount_ref=service_ref, mount_prefix=prefix)
         node.children[last] = new_node
         self._log(f"mount {path!r} → ref=0x{service_ref:016x} prefix={prefix!r}")
-        self._notify_subscribers(comps)
+        self._after_tree_mutation(comps)
         self._reply(pr.reply_cap, 0, 0, 0, 0)
 
     def _do_walk(self, pr: PendingRequest, path_bytes: bytes) -> None:
@@ -938,6 +974,155 @@ class OriscDir:
                   f"op={notify_op}")
         self._reply(pr.reply_cap, 0, 0, 0, 0)
 
+    # ---- Phase 55: config-driven deferred mounts -----------------------
+
+    def load_config(self, path: str) -> None:
+        """Parse a config file and stage any `mount` directives into
+        pending_mounts. Each line is either blank, a comment (starting
+        with `#`), or a directive:
+
+          mount  <target_path>  <source_leaf_path>  <prefix>
+
+        target_path: where the MOUNT node lives in our tree (e.g.
+                     /programs).
+        source_leaf_path: the leaf in our OWN tree whose registered
+                     ref will be used as the mount's service ref
+                     (e.g. /sys/hostfsd/0). Resolution is deferred —
+                     the source leaf doesn't have to exist yet, and
+                     usually doesn't (hostfsd's self-register comes
+                     in over the wire after we've parsed config).
+        prefix:      passed back to MOUNT walk callers as the
+                     remainder; the convention is to use the same
+                     name as the target_path (e.g. /programs) so a
+                     walk for /programs/foo.orx returns
+                     prefix='/programs', leftover='foo.orx', and the
+                     caller forwards '/programs/foo.orx' to the
+                     mounted service.
+
+        Any other directive triggers a SystemExit — silent typos in
+        config files are a worse failure mode than refusing to
+        start. Comments + blank lines are tolerated freely."""
+        try:
+            with open(path) as f:
+                content = f.read()
+        except FileNotFoundError:
+            sys.exit(f"oriscdir: config file not found: {path}")
+        for lineno, raw_line in enumerate(content.splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            directive = parts[0]
+            if directive == "mount":
+                if len(parts) != 4:
+                    sys.exit(f"oriscdir: {path}:{lineno}: mount needs "
+                             f"3 args (target source prefix), got "
+                             f"{len(parts) - 1}: {raw_line!r}")
+                target, source, prefix = parts[1], parts[2], parts[3]
+                tcomps = normalize_path(target)
+                scomps = normalize_path(source)
+                if tcomps is None or not tcomps:
+                    sys.exit(f"oriscdir: {path}:{lineno}: bad target "
+                             f"path {target!r}")
+                if scomps is None or not scomps:
+                    sys.exit(f"oriscdir: {path}:{lineno}: bad source "
+                             f"path {source!r}")
+                self.pending_mounts.append(
+                    (tuple(tcomps), tuple(scomps), prefix))
+                self._log(f"config: mount {target} ← {source} "
+                          f"prefix={prefix!r} (deferred)")
+            else:
+                sys.exit(f"oriscdir: {path}:{lineno}: unknown "
+                         f"directive {directive!r}")
+        self._retry_pending_mounts()
+
+    def _walk_internal(self, comps):
+        """Walk our own tree along `comps`. Returns the terminal Node
+        if the walk lands on an existing node, or None if any step
+        misses. Used by _retry_pending_mounts to look up the source
+        leaf's ref. Doesn't follow MOUNTs (we only care about LEAFs
+        here) and doesn't auto-create."""
+        node = self.root
+        for c in comps:
+            if node.kind() != KIND_DIR:
+                return None
+            if c not in node.children:
+                return None
+            node = node.children[c]
+        return node
+
+    def _retry_pending_mounts(self) -> None:
+        """Walk pending_mounts; for each entry whose source leaf is
+        now resolvable, install the MOUNT and drop the entry. Called
+        after every tree mutation that adds a leaf. Idempotent."""
+        if not self.pending_mounts:
+            return
+        still_pending = []
+        for (tcomps, scomps, prefix) in self.pending_mounts:
+            source_node = self._walk_internal(list(scomps))
+            if source_node is None or source_node.kind() != KIND_LEAF:
+                still_pending.append((tcomps, scomps, prefix))
+                continue
+            # Source resolved. Install the mount in our own tree.
+            service_ref = source_node.leaf_ref
+            ok = self._install_mount(list(tcomps), service_ref, prefix)
+            if not ok:
+                # Mount install failed (target conflict). Don't keep
+                # retrying — drop with a log.
+                continue
+            self._log(f"config: applied mount /{'/'.join(tcomps)} "
+                      f"← /{'/'.join(scomps)} "
+                      f"(ref=0x{service_ref:016x}, prefix={prefix!r})")
+            self._notify_subscribers(list(tcomps))
+        self.pending_mounts = still_pending
+
+    def _install_mount(self, tcomps: list, service_ref: int,
+                       prefix: str) -> bool:
+        """Internal mount installer used by config-driven applies.
+        Same shape as _do_mount's tree mutation, but no wire reply
+        and no error-out — we either succeed or log+drop."""
+        if not tcomps:
+            self._log("config-mount: refusing to mount at root")
+            return False
+        node = self.root
+        for c in tcomps[:-1]:
+            if node.kind() != KIND_DIR:
+                self._log(f"config-mount: traverses through non-dir "
+                          f"at {c!r}")
+                return False
+            if c not in node.children:
+                node.children[c] = Node(name=c, parent=node)
+            node = node.children[c]
+        last = tcomps[-1]
+        if node.kind() != KIND_DIR:
+            return False
+        if last in node.children:
+            existing = node.children[last]
+            if existing.kind() != KIND_DIR or existing.children:
+                self._log(f"config-mount: target /{'/'.join(tcomps)} "
+                          f"already populated (kind={existing.kind()})")
+                return False
+            existing.mount_ref = service_ref
+            existing.mount_prefix = prefix
+            return True
+        node.children[last] = Node(name=last, parent=node,
+                                    mount_ref=service_ref,
+                                    mount_prefix=prefix)
+        return True
+
+    def _after_tree_mutation(self, changed_comps: list) -> None:
+        """Common post-mutation hook: notify subscribers, then retry
+        any pending config-driven mounts. Order matters — we notify
+        first so subscribers see the original mutation, then retry
+        mounts (which may install a MOUNT and trigger another
+        mutation, recursing here for that). The recursion terminates
+        because pending_mounts shrinks monotonically across each
+        successful apply."""
+        self._notify_subscribers(changed_comps)
+        self._retry_pending_mounts()
+
     def _notify_subscribers(self, changed_comps: list) -> None:
         """Walk the subscription list and SEND a notification for any
         subscription whose path is a prefix of changed_comps (i.e. the
@@ -1005,9 +1190,18 @@ def main(argv) -> int:
                     help="processor identifier this server presents to "
                          "the crossbar")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--config",
+                    help="path to a configuration file. Currently the "
+                         "only directive is `mount <target> <source> "
+                         "<prefix>` — see the docstring at the top of "
+                         "this file. Mounts whose source leaf isn't "
+                         "registered yet are deferred and applied "
+                         "automatically once the source self-registers.")
     args = ap.parse_args(argv)
 
     server = OriscDir(args.socket, args.pid, verbose=args.verbose)
+    if args.config:
+        server.load_config(args.config)
 
     def _signal(_signo, _frame):
         server.shutdown_requested = True
