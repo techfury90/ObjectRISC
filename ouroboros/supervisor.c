@@ -744,6 +744,142 @@ clear_child_term_slots(void)
 	);
 }
 
+/* --- Phase 52: hot-attach for terminals ----------------------------
+ *
+ * The leader supervisor's dispatch loop wakes periodically (finite-
+ * timeout poll, see poll_one_request_timed) and scans /sys/term for
+ * any newly-registered terminal directories. For each one not yet
+ * seen, it spawns a fresh login.orx with the appropriate Phase 49
+ * terminal-pass-through so the spawned login binds to /sys/term/
+ * <new-idx>/{console,keyboard,grid} regardless of which CPU it
+ * lands on (round-robin via SUP_TARGET_ANY in plain orx_spawn —
+ * actually we use orx_spawn local since hot-attach happens on the
+ * leader's CPU; the child still gets the right terminal services
+ * via populate_child_term_slots).
+ *
+ * Why baked into the supervisor instead of a separate session_
+ * manager.orx program: an earlier prototype put session_manager in
+ * its own .orx, but loading that ~30 KiB file via hf_read on cpu0's
+ * boot path widens the leader's startup window enough that a fast
+ * peer worker shell can finish its session and relay op=2 BEFORE
+ * cpu0's own login has even rendered the welcome banner — and the
+ * cascade-kill curtails the leader's shell before it really starts.
+ * test_multiterminal demonstrated the regression conclusively.
+ * Embedding the hot-attach logic here avoids the .orx load
+ * entirely; the supervisor is already loaded.
+ *
+ * Boot seeding: we mark all terminals registered AT BOOT TIME as
+ * already-seen, so the per-supervisor has_terminal block (which
+ * spawns a boot login for each CPU's own terminal) doesn't get
+ * doubled up by the first hot-attach scan. From then on, only
+ * NEWLY-appearing terminals trigger spawns. */
+
+#define HOT_ATTACH_MAX_TERMS 16
+#define HOT_ATTACH_LIST_BUF  256
+static unsigned int hot_attach_seen;
+
+typedef void (*visit_fn)(int idx);
+
+/* Parse a leading run of decimal digits in `s` into `*out`. Returns
+ * the number of digits consumed; 0 = no digits. Stops at any non-
+ * digit (oriscdir suffixes directory names with '/', so "0/" parses
+ * as 0 and we stop at the slash). */
+static int
+hot_attach_parse_decimal(const char *s, int *out)
+{
+	int v = 0, n = 0;
+	while (s[n] >= '0' && s[n] <= '9') {
+		v = v * 10 + (s[n] - '0');
+		n++;
+	}
+	if (n == 0) return 0;
+	*out = v;
+	return n;
+}
+
+/* dir_list returns the entry count; the byte length of the NUL-
+ * separated names buffer needs to be derived. We trust the count
+ * and walk forward, stopping after `count` NUL terminators. */
+static int
+hot_attach_listing_byte_len(const char *buf, int cap, int count)
+{
+	int i = 0, found = 0;
+	while (i < cap && found < count) {
+		while (i < cap && buf[i] != '\0') i++;
+		if (i < cap) {
+			i++;
+			found++;
+		}
+	}
+	return i;
+}
+
+/* Mark `idx` as seen without spawning. Used at boot to seed
+ * hot_attach_seen with the terminals the per-supervisor has_terminal
+ * block already handled. */
+static void
+hot_attach_mark(int idx)
+{
+	if (idx >= 0 && idx < HOT_ATTACH_MAX_TERMS)
+		hot_attach_seen |= (1u << idx);
+}
+
+/* Spawn login for `idx` if not already seen, then mark it seen. */
+static void
+hot_attach_maybe_spawn(int idx)
+{
+	if (idx < 0 || idx >= HOT_ATTACH_MAX_TERMS) return;
+	if (hot_attach_seen & (1u << idx)) return;
+	hot_attach_seen |= (1u << idx);
+
+	/* Phase 49 pass-through dance: fill ORX_SLOT_CHILD_O5/O6/O7
+	 * from /sys/term/<idx>/* so the spawned login wakes up bound
+	 * to the right terminal services. orx_set_child_terminal_idx
+	 * also stuffs idx+1 into R5 → child's R4 → _orisc_init_r4 so
+	 * its libc task_init reads back my_terminal_idx = idx (for
+	 * any future sup_spawn from that login carrying the right R7
+	 * routing hint). */
+	populate_child_term_slots(idx);
+	orx_set_child_terminal_idx(idx);
+	task_t t = sup_spawn_named(LOGIN_PATH, "", "/");
+	clear_child_term_slots();
+	orx_clear_child_terminal_idx();
+
+	if (t < 0) {
+		SUP_PRINT("supervisor: hot-attach spawn failed for term=");
+		SUP_PRINT_INT(idx);
+		SUP_PRINT(" rc=");
+		SUP_PRINT_INT((int)t);
+		SUP_PRINT("\n");
+		return;
+	}
+	(void)task_resume(t);
+	task_yield();    /* same race-fix discipline as handle_spawn_request */
+	SUP_PRINT("supervisor: hot-attached login for term=");
+	SUP_PRINT_INT(idx);
+	SUP_PRINT("\n");
+}
+
+/* dir_list /sys/term, walk the names, invoke `visit(idx)` for each
+ * integer-named entry. Used by both seed and scan. */
+static void
+hot_attach_walk(visit_fn visit)
+{
+	char buf[HOT_ATTACH_LIST_BUF];
+	int count = dir_list("/sys/term", buf, sizeof(buf));
+	if (count <= 0) return;
+	int total = hot_attach_listing_byte_len(buf, sizeof(buf), count);
+	int i = 0;
+	while (i < total) {
+		int idx;
+		int n = hot_attach_parse_decimal(buf + i, &idx);
+		if (n > 0) visit(idx);
+		while (i < total && buf[i] != '\0') i++;
+		if (i < total) i++;
+	}
+}
+
+
 /* --- Phase 52: SUP_OP_LIST_TASKS (op=5) ----------------------------
  *
  * Cross-CPU `ps`. The shell SENDs op=5 to each peer supervisor's
@@ -1235,14 +1371,39 @@ handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
  * console/keyboard/grid (we dir_walk /sys/term/<N>/* before spawn)."
  * Set when a peer relays a spawn from a foreign-terminal'd shell,
  * unset when a child program calls sup_spawn directly. */
+/* Phase 52: the leader's dispatch loop uses a finite timeout so it
+ * wakes periodically to scan /sys/term for hot-attached terminals.
+ * Workers stay on infinite-timeout polling — they don't run the
+ * hot-attach scan, and a timeout wakeup would just cost a wire
+ * round-trip with nothing to do.
+ *
+ * The timeout is in scheduler ticks. simorisc decrements it only
+ * when the supervisor is the current task on its CPU, so the
+ * effective wall-clock interval is "this many ticks of supervisor
+ * being current" — i.e., mostly idle ticks. With idle ticks pacing
+ * at ~1ms, HOT_ATTACH_POLL_TICKS = 5000 gives roughly 5-second
+ * hot-attach latency under low load, while a busy shell session
+ * (where the supervisor is frequently blocked) extends that
+ * naturally — exactly the throttling we want.
+ *
+ * The timeout is delivered to poll_one_request via a static
+ * because pcc-orisc trips on a 5th C arg ("adrput: illegal op 57"
+ * — same constraint that bit Phase 51's sup_spawn_for_terminal and
+ * Phase 52's ps handler). Caller sets poll_timeout_ticks before
+ * calling poll_one_request; the default -1 (infinite) is
+ * preserved for workers and the legacy contract. */
+#define HOT_ATTACH_POLL_TICKS 5000
+static int poll_timeout_ticks = -1;
+
 static int
 poll_one_request(int *out_op, int *out_len, int *out_target_pid,
                  int *out_term_hint)
 {
 	int status, op, len, target_pid, term_hint;
+	int t = poll_timeout_ticks;
 	asm volatile(
 		"omov  o1, o9\n"               /* mailbox */
-		"addiu r4, r0, -1\n"           /* infinite */
+		"addu  r4, %5, r0\n"           /* timeout */
 		"call  #0x204\n"               /* ReceiveQueuePoll */
 		"nop\n"
 		"addu  %0, r2, r0\n"
@@ -1252,7 +1413,7 @@ poll_one_request(int *out_op, int *out_len, int *out_target_pid,
 		"addu  %4, r6, r0"
 		: "=r"(status), "=r"(op), "=r"(len),
 		  "=r"(target_pid), "=r"(term_hint)
-		:
+		: "r"(t)
 		: "r1", "r2", "r3", "r4", "r5", "r6"
 	);
 	*out_op = op;
@@ -1532,6 +1693,17 @@ main(void)
 		                * sup_shutdown) actually halts us. */
 	}
 
+	/* Phase 52: seed hot_attach_seen with the terminals already
+	 * registered at boot time. Per-supervisor has_terminal blocks
+	 * (above) handled them; the dispatch-loop hot-attach scan
+	 * should only act on terminals that appear AFTER this point.
+	 * Leader-only — workers don't run the scan, so they don't need
+	 * the seed either. */
+	if (is_leader) {
+		hot_attach_walk(hot_attach_mark);
+		SUP_PRINT("supervisor: hot-attach seeded\n");
+	}
+
 	/* Dispatch loop. Wake-up is event-driven: each `run`/`edit`
 	 * from a shell SENDs op=1 (spawn), and the leader's shell
 	 * SENDs op=2 (sup_shutdown) right before its TaskExit on
@@ -1544,11 +1716,25 @@ main(void)
 	 * tools/oriscrun.) Without that external teardown a worker
 	 * would block in poll_one_request forever waiting for a SEND
 	 * that never comes. */
+	/* Leader: enable hot-attach polling. Workers leave the timeout
+	 * at -1 (infinite) — they don't run the scan. */
+	if (is_leader) {
+		poll_timeout_ticks = HOT_ATTACH_POLL_TICKS;
+	}
+
 	for (;;) {
 		int op, len, target_pid, term_hint;
 		int status = poll_one_request(&op, &len, &target_pid,
 		                              &term_hint);
-		if (status != 0) continue;
+		if (status != 0) {
+			/* Either ETIMEOUT (leader's hot-attach pulse fired)
+			 * or some other transient error. On the leader, run
+			 * the hot-attach scan; on workers, just try again. */
+			if (is_leader) {
+				hot_attach_walk(hot_attach_maybe_spawn);
+			}
+			continue;
+		}
 
 		if (op == 1) {
 			handle_spawn_request(len, target_pid, term_hint, procid);
