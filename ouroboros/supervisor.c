@@ -598,6 +598,62 @@ relay_shutdown_to_leader(void)
 #define MAX_PROCID 16
 static int next_cpu_counter;
 
+/* Phase 52: per-task name stash for `ps`. Indexed by libc task_t,
+ * stores the basename of the .orx path each spawn loaded (e.g.
+ * "shell.orx" out of "/programs/shell.orx"). Used by the op=5
+ * SUP_OP_LIST_TASKS handler to render human-readable task lists.
+ *
+ * 24 bytes per slot is enough for typical names ("shell.orx",
+ * "session_manager.orx") with NUL room. Truncation is silent. */
+#define TASK_NAME_MAX 24
+#define TASK_NAME_SLOTS 16
+static char task_names[TASK_NAME_SLOTS * TASK_NAME_MAX];
+
+/* Find the last '/' in `path` and return the byte after it (i.e.,
+ * basename). For "/programs/shell.orx" returns "shell.orx"; for
+ * "shell.orx" or "" returns the input unchanged. Pure pointer math —
+ * no copy. */
+static const char *
+basename_of(const char *path)
+{
+	const char *p = path;
+	const char *last = path;
+	while (*p) {
+		if (*p == '/') last = p + 1;
+		p++;
+	}
+	return last;
+}
+
+/* Stash the basename of `path` into task_names[t]. Caller passes the
+ * libc task_t handle returned by orx_spawn. Overwrites any previous
+ * entry — fine because supervisor task slots aren't reused while the
+ * task is live, and a slot reused after task_free naturally needs a
+ * fresh name. */
+static void
+stash_task_name(int t, const char *path)
+{
+	if (t < 0 || t >= TASK_NAME_SLOTS) return;
+	const char *base = basename_of(path);
+	char *dst = &task_names[t * TASK_NAME_MAX];
+	int i = 0;
+	while (i + 1 < TASK_NAME_MAX && base[i]) {
+		dst[i] = base[i];
+		i++;
+	}
+	dst[i] = '\0';
+}
+
+/* Wrapper: orx_spawn + name stash. Use this everywhere the supervisor
+ * loads a child .orx so `ps` can label them. */
+static task_t
+sup_spawn_named(const char *path, const char *args, const char *cwd)
+{
+	task_t t = orx_spawn(path, args, cwd);
+	if (t >= 0) stash_task_name(t, path);
+	return t;
+}
+
 static int
 pick_next_cpu(int self_procid)
 {
@@ -686,6 +742,306 @@ clear_child_term_slots(void)
 		  "i"(ORX_SLOT_CHILD_O6_OFFSET),
 		  "i"(ORX_SLOT_CHILD_O7_OFFSET)
 	);
+}
+
+/* --- Phase 52: SUP_OP_LIST_TASKS (op=5) ----------------------------
+ *
+ * Cross-CPU `ps`. The shell SENDs op=5 to each peer supervisor's
+ * mailbox (discovered via dir_walk("/sys/cpu/<N>/supervisor")) and
+ * each replies with a TAG_DATA bytes object holding its task list,
+ * one task per line. The shell MapObject's R-only, prints, and
+ * Unmaps.
+ *
+ * Wire reply format (this supervisor → shell):
+ *     R4 = status   (0 OK; negative on alloc/map failure)
+ *     R5 = length   (byte count of valid data in the bytes object)
+ *     O2 = bytes ref (TAG_DATA, R+V — null on error)
+ *
+ * Per-line text format (one task per line, NUL not included; the
+ * total length is sent in R5 since clients can't strlen across an
+ * MapObject boundary safely):
+ *     "[N] STATE NAME\n"          for live tasks
+ *     "[N] exited NAME (exit C)\n" for EXITED tasks
+ * Slot N is the supervisor's libc task_t handle. NAME comes from
+ * task_names[t] (basename stashed at spawn time). Empty list (no
+ * live tasks) replies length=0.
+ *
+ * The shell adds a "CPU N:" header when printing. */
+
+#define SUP_OP_LIST_TASKS  5
+#define LIST_REPLY_VA      0x00600000   /* matches sup_pack_request's
+                                         * scratch VA — only one
+                                         * MapObject lives there at a
+                                         * time and we Unmap before
+                                         * returning. */
+#define LIST_BUF_MAX       1024         /* 16 tasks × ~50 chars + slack */
+
+/* Map TASK_STATE_* to a short word printable into our reply buffer.
+ * Mirror of shell.c's task_state_label, but inlined here so the
+ * supervisor doesn't need to pull in shell internals. */
+static const char *
+state_word(int state)
+{
+	switch (state) {
+	case TASK_STATE_NEW:       return "new";
+	case TASK_STATE_RUNNABLE:  return "runnable";
+	case TASK_STATE_RUNNING:   return "running";
+	case TASK_STATE_SUSPENDED: return "suspended";
+	case TASK_STATE_BLOCKED:   return "blocked";
+	case TASK_STATE_EXITED:    return "exited";
+	}
+	return "?";
+}
+
+/* The reply text is written into the static `list_buf`. `list_pos`
+ * tracks the write cursor. Using globals (instead of passing the
+ * buffer pointer through args) keeps each render helper to ≤2
+ * arguments — pcc-orisc's calling-convention lowering chokes on
+ * 5-arg static helpers (`adrput: illegal op 57`), seen first in
+ * Phase 51 and again here. The trade-off is that the renderers
+ * are not re-entrant, but the supervisor's dispatch loop is
+ * single-threaded so that's fine.
+ *
+ * Forward-declare list_buf here; the actual `static char[]`
+ * definition lives just before handle_list_tasks_request along
+ * with build_task_listing (its primary consumer). */
+#define LIST_BUF_MAX       1024
+static char list_buf[LIST_BUF_MAX];
+static int  list_pos;
+
+/* Append `s` to list_buf, capped at LIST_BUF_MAX-1. */
+static void
+list_emit_str(const char *s)
+{
+	while (*s && list_pos + 1 < LIST_BUF_MAX) {
+		list_buf[list_pos++] = *s++;
+	}
+}
+
+static void
+list_emit_char(char c)
+{
+	if (list_pos + 1 < LIST_BUF_MAX) {
+		list_buf[list_pos++] = c;
+	}
+}
+
+/* Append decimal `n` (0..255). Reuses the existing append_decimal
+ * helper from supervisor.c (used by render_peer_path / render_term_
+ * path). */
+static void
+list_emit_int(int n)
+{
+	if (list_pos + 4 > LIST_BUF_MAX) return;
+	list_pos = append_decimal(n, list_buf, list_pos);
+}
+
+/* Render one task line at list_buf[list_pos]. Format:
+ *     "[N] STATE NAME\n"          for live tasks
+ *     "[N] exited NAME (exit C)\n" for EXITED tasks */
+static void
+render_task_line(int slot, const struct task_info *info)
+{
+	list_emit_char('[');
+	list_emit_int(slot);
+	list_emit_str("] ");
+	list_emit_str(state_word(info->state));
+	list_emit_char(' ');
+	const char *name = &task_names[slot * TASK_NAME_MAX];
+	if (*name) {
+		list_emit_str(name);
+	} else {
+		list_emit_str("(unnamed)");
+	}
+	if (info->state == TASK_STATE_EXITED) {
+		list_emit_str(" (exit ");
+		list_emit_int(info->exit_code);
+		list_emit_char(')');
+	}
+	list_emit_char('\n');
+}
+
+/* --- handle_list_tasks_request helpers --------------------------- *
+ *
+ * Split into small functions because pcc-orisc chokes on a single
+ * function with multiple asm blocks, register-input asm operands,
+ * and several local vars (`adrput: illegal op 57`). Each helper
+ * uses at most one asm block + one or two locals. */
+
+/* ObjAlloc(size, TAG_DATA, R+W+V+C) → O1; copy O1 to O14 so it
+ * survives subsequent OPR clobbers. Returns firmware status. */
+static int
+list_alloc_reply(int size)
+{
+	int status;
+	asm volatile(
+		"addu  r4, %1, r0\n"
+		"addiu r5, r0, %2\n"
+		"addiu r6, r0, %3\n"
+		"call  #0x100\n"
+		"nop\n"
+		"omov  o14, o1\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "r"(size), "i"(0x4102),
+		  "i"(CAP_R | CAP_W | CAP_V | CAP_C)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	return status;
+}
+
+/* MapObject(O14, LIST_REPLY_VA, 0, R+W, size). */
+static int
+list_map_reply(int size)
+{
+	int status;
+	asm volatile(
+		"omov  o1, o14\n"
+		"lui   r4, %1\n"
+		"addu  r5, r0, r0\n"
+		"addiu r6, r0, %2\n"
+		"addu  r7, %3, r0\n"
+		"call  #0x110\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(LIST_REPLY_VA >> 16),
+		  "i"(CAP_R | CAP_W),
+		  "r"(size)
+		: "r1", "r2", "r4", "r5", "r6", "r7"
+	);
+	return status;
+}
+
+/* Unmap(LIST_REPLY_VA, size). */
+static int
+list_unmap_reply(int size)
+{
+	int status;
+	asm volatile(
+		"lui   r4, %1\n"
+		"addu  r5, %2, r0\n"
+		"call  #0x111\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(LIST_REPLY_VA >> 16), "r"(size)
+		: "r2", "r3", "r4", "r5"
+	);
+	return status;
+}
+
+/* SEND the reply: O1 = stashed reply_cap, O2 = O14 (bytes ref or
+ * null on failure), R4 = status, R5 = length. */
+static void
+list_send_reply(int reply_status, int length)
+{
+	asm volatile(
+		"orefld o1, %0(o12)\n"
+		"omov   o2, o14\n"
+		"onull  o3\n"
+		"addu   r4, %1, r0\n"
+		"addu   r5, %2, r0\n"
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		:
+		: "i"(SUP_SCRATCH_SLOT_OFFSET),
+		  "r"(reply_status), "r"(length)
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+}
+
+/* ObjFreeDeferred(O14, 1500ms). */
+static void
+list_free_reply(void)
+{
+	asm volatile(
+		"omov  o1, o14\n"
+		"addiu r4, r0, 1500\n"
+		"call  #0x107\n"
+		"nop"
+		: : : "r2", "r3", "r4"
+	);
+}
+
+/* Stash the dequeued reply_cap (O3) into SUP_SCRATCH_SLOT so it
+ * survives ObjAlloc/MapObject's OPR clobbers. */
+static void
+list_stash_reply_cap(void)
+{
+	asm volatile(
+		"orefst o3, %0(o12)"
+		: : "i"(SUP_SCRATCH_SLOT_OFFSET)
+	);
+}
+
+/* Walk the libc task table, format one line per live slot into the
+ * static reply buffer. Resets list_pos at entry. Returns the byte
+ * length of the formatted text. */
+static int
+build_task_listing(void)
+{
+	list_pos = 0;
+	unsigned int mask = task_active_mask();
+	int t;
+	for (t = 0; t < TASK_NAME_SLOTS; t++) {
+		if (!(mask & (1u << t))) continue;
+		struct task_info info;
+		if (task_query((task_t)t, &info) != 0) continue;
+		render_task_line(t, &info);
+	}
+	return list_pos;
+}
+
+/* Copy `n` bytes from list_buf into the destination at `va`. We pass
+ * `va` as an argument rather than referencing LIST_REPLY_VA directly
+ * inside the body — pcc-orisc lowers `(char *)CONSTANT_LITERAL` as
+ * `la r, CONSTANT` and asmorisc's `la` only accepts labels, not
+ * numeric immediates. Routing the constant through a function arg
+ * forces pcc to use `li` (which lowers to lui+ori at the asm level)
+ * instead. */
+static void
+copy_listing_to_va(unsigned int va, int n)
+{
+	char *dst = (char *)va;
+	int i;
+	for (i = 0; i < n; i++) dst[i] = list_buf[i];
+}
+
+/* Service an op=5 SUP_OP_LIST_TASKS. Walks the libc task table,
+ * formats one line per live slot into a temp buffer, ObjAllocs a
+ * matching-size TAG_DATA bytes object, copies the text in via a
+ * temporary R+W mapping, Unmaps, SENDs the ref to the requester,
+ * then ObjFreeDeferred's the bytes (drain window so the shell can
+ * still OBJ_READ_REQ from it).
+ *
+ * The dequeue has already filled O3 with the requester's reply_cap
+ * (mirror of handle_spawn_request's contract). */
+static void
+handle_list_tasks_request(void)
+{
+	list_stash_reply_cap();
+	int n = build_task_listing();
+
+	/* Allocate a TAG_DATA bytes object sized to the actual text.
+	 * ObjAlloc rejects size 0, so use 1 in the empty-list case
+	 * (we reply length=0 regardless and the byte goes unread). */
+	int alloc_size = (n > 0) ? n : 1;
+	int reply_status = list_alloc_reply(alloc_size);
+	if (reply_status != 0) {
+		asm volatile("onull o14");
+	} else if (n > 0) {
+		int s = list_map_reply(alloc_size);
+		if (s == 0) {
+			copy_listing_to_va(LIST_REPLY_VA, n);
+			s = list_unmap_reply(alloc_size);
+		}
+		if (s != 0) reply_status = s;
+	}
+
+	list_send_reply(reply_status, n);
+	if (reply_status == 0) list_free_reply();
 }
 
 /* Service one spawn request that just landed on our queue. The
@@ -829,7 +1185,7 @@ handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 		orx_set_child_terminal_idx(term_idx);
 	}
 
-	task_t t = orx_spawn(path, args, cwd);
+	task_t t = sup_spawn_named(path, args, cwd);
 	int status = (t < 0) ? (int)t : 0;
 
 	/* Always clear the per-spawn overrides after orx_spawn so a
@@ -1093,7 +1449,7 @@ main(void)
 			SUP_PRINT(") — continuing\n");
 		}
 
-		task_t sysinit = orx_spawn(SYSINIT_PATH, "", "/");
+		task_t sysinit = sup_spawn_named(SYSINIT_PATH, "", "/");
 		if (sysinit < 0) {
 			SUP_PRINT("supervisor: failed to spawn sysinit: ");
 			SUP_PRINT_INT((int)sysinit);
@@ -1158,7 +1514,7 @@ main(void)
 				task_yield();
 			}
 		}
-		task_t login = orx_spawn(LOGIN_PATH, "", "/");
+		task_t login = sup_spawn_named(LOGIN_PATH, "", "/");
 		if (login < 0) {
 			SUP_PRINT("supervisor: failed to spawn login: ");
 			SUP_PRINT_INT((int)login);
@@ -1265,6 +1621,11 @@ main(void)
 				: "r"(reply_status), "i"(DIR_SLOT_OFFSET)
 				: "r1", "r4", "r5", "r6", "r7"
 			);
+		} else if (op == SUP_OP_LIST_TASKS) {
+			/* Phase 52: cross-CPU `ps`. Walk our task table,
+			 * format one line per live slot, send a TAG_DATA
+			 * bytes ref back to the requester. */
+			handle_list_tasks_request();
 		} else {
 			SUP_PRINT(unknown_op);
 		}

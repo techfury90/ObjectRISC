@@ -19,6 +19,7 @@
  *     wait <task>   — block until backgrounded task exits, print code
  *     kill <task>   — externally terminate a backgrounded task (exit 137)
  *     jobs          — list backgrounded tasks + state
+ *     ps            — list tasks across all live CPUs (Phase 52)
  *     cycles      — print the CPU's cycle counter
  *     time        — print microseconds since boot (wall clock, 32-bit)
  *     exit / quit — end the session
@@ -89,6 +90,7 @@ const char help_msg[] =
     "  wait <task>     — block until backgrounded task exits; print its exit code\n"
     "  kill <task>     — externally terminate a backgrounded task (exit 137)\n"
     "  jobs            — list backgrounded tasks and their state\n"
+    "  ps              — list tasks across all live CPUs (cross-supervisor)\n"
     "  cycles          — print the CPU's cycle counter\n"
     "  time            — print microseconds since boot (wall clock)\n"
     "  logout          — end this session; login.orx welcomes the next user\n"
@@ -976,6 +978,97 @@ cmd_jobs(void)
 		term_print("(no live tasks)\n");
 }
 
+/* Phase 52: cross-CPU `ps`. Asks each peer supervisor to list its
+ * task table and prints the result with a "CPU N:" prefix.
+ *
+ * Discovery: walk /sys/cpu/<N>/supervisor for procids 0..MAX_PS_CPU.
+ * Each registered supervisor publishes a R+S sub-cap to its spawn
+ * mailbox at that path; we OREFLD the resolved ref into O1 and call
+ * sup_list_tasks(), which SENDs op=5 and blocks on our reply mailbox
+ * for the supervisor's text response.
+ *
+ * Skips procids that don't have a registered supervisor (e.g.,
+ * single-CPU configs where only /sys/cpu/0 exists). Prints
+ * "(no supervisors found)" if NONE respond — usually means the
+ * shell wasn't launched under a supervisor at all (oriscrun
+ * --service degenerate test config). */
+#define PS_PATH_BUF 32
+#define PS_LIST_BUF 1024
+#define MAX_PS_CPU 8
+
+/* Render "/sys/cpu/<n>/supervisor" into buf. */
+static void
+ps_render_path(int n, char *buf)
+{
+	const char prefix[] = "/sys/cpu/";
+	const char suffix[] = "/supervisor";
+	int i, p = 0;
+	for (i = 0; prefix[i]; i++) buf[p++] = prefix[i];
+	if (n >= 10) {
+		buf[p++] = '0' + (n / 10);
+		buf[p++] = '0' + (n % 10);
+	} else {
+		buf[p++] = '0' + n;
+	}
+	for (i = 0; suffix[i]; i++) buf[p++] = suffix[i];
+	buf[p] = '\0';
+}
+
+/* Print `n` bytes of the supervisor's reply to the terminal. The
+ * data is in `buf` already, just term_print one line at a time so
+ * the print machinery doesn't need a NUL. */
+static void
+ps_print_reply(const char *buf, int n)
+{
+	int i;
+	for (i = 0; i < n; i++) term_print_char(buf[i]);
+}
+
+static void
+cmd_ps(void)
+{
+	char path[PS_PATH_BUF];
+	char reply_buf[PS_LIST_BUF];
+	int kind;
+	char remainder[16];
+	int found_any = 0;
+	int n;
+	int procid;
+
+	for (procid = 0; procid < MAX_PS_CPU; procid++) {
+		ps_render_path(procid, path);
+		int rc = dir_walk(path, &kind, remainder, sizeof(remainder));
+		if (rc < 0 || kind != DIR_KIND_LEAF) continue;
+		/* dir_walk leaves the resolved ref in DIR_RESULT_SLOT
+		 * (offset 616). Pull it into O1 so sup_list_tasks's
+		 * entry asm can stash it to O14 as the recipient. */
+		asm volatile(
+			"orefld o1, 616(o12)"
+			: : : "r1"
+		);
+		n = sup_list_tasks(reply_buf, sizeof(reply_buf));
+		if (n < 0) {
+			term_print("CPU ");
+			term_print_int(procid);
+			term_print(": (error ");
+			term_print_int(n);
+			term_print(")\n");
+			continue;
+		}
+		term_print("CPU ");
+		term_print_int(procid);
+		term_print(":\n");
+		if (n == 0) {
+			term_print("  (no live tasks)\n");
+		} else {
+			ps_print_reply(reply_buf, n);
+		}
+		found_any = 1;
+	}
+	if (!found_any)
+		term_print("(no supervisors found)\n");
+}
+
 /* Auto-reaper. Called each prompt iteration: scans the libc task
  * table, prints "[task N done CODE]" for any EXITED entries, and
  * orx_unloads them so the slot frees up for the next spawn. */
@@ -1117,6 +1210,8 @@ main(void)
 			cmd_kill(arg);
 		} else if (strcmp(line, "jobs") == 0) {
 			cmd_jobs();
+		} else if (strcmp(line, "ps") == 0) {
+			cmd_ps();
 		} else if (strcmp(line, "cycles") == 0) {
 			cmd_cycles();
 		} else if (strcmp(line, "time") == 0) {

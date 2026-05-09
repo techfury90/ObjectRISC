@@ -400,6 +400,25 @@ void sup_shutdown(void);
  * mitigation) and a clean return (no-supervisor test path). */
 int  sup_have_supervisor(void);
 
+/* sup_list_tasks — Phase 52: cross-CPU `ps`. Sends an op=5
+ * SUP_OP_LIST_TASKS to the supervisor whose R+S sub-cap is in O1 at
+ * call time (caller OREFLDs from a dir_walk result; see
+ * shell.c::cmd_ps for the pattern). The supervisor replies with a
+ * human-readable text listing of its libc task table, one task per
+ * line ("[N] STATE NAME [ (exit C)]\n"). We MapObject the bytes
+ * R-only, copy up to `max` bytes into `dst`, and Unmap.
+ *
+ * Returns:
+ *     >= 0  byte length copied into dst (0 if the supervisor's task
+ *           table is empty)
+ *     < 0   error: -1 = recipient ref in O1 was null, other negative
+ *                  values mirror firmware status codes
+ *
+ * The caller addresses a SPECIFIC supervisor (no relay) — for `ps`
+ * we walk /sys/cpu/<N>/supervisor for each candidate procid and
+ * SEND directly to each one's mailbox. */
+int  sup_list_tasks(char *dst, int max);
+
 /* ----- Directory service (Phase 45f) ----------------------------------
  *
  * `oriscdir` is a small daemon that holds a hierarchical name → ref
