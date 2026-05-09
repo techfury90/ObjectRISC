@@ -179,16 +179,17 @@ done
 # process joining an already-running system. The oriscadd helper
 # (Phase 53) wraps the simorisc invocation with sensible defaults
 # for the supervisor's expected boot OPR layout (null pads at
-# O5/O6/O7 since this is a headless worker, oriscdir at O8,
-# hostfsd at O10). No `--terminal-pid` because we don't want this
-# CPU to OWN a terminal — we just want it as compute.
+# O5/O6/O7 since this is a headless worker, oriscdir at O8).
+# Notice we don't pass --hostfsd: the supervisor's boot walks
+# /sys/hostfsd/0 in the directory and fills in O10 from there.
+# No `--terminal-pid` either — we just want this CPU as compute.
 #
 # The supervisor on cpu1 registers at /sys/cpu/1/supervisor on
 # boot; cpu0's pick_next_cpu / relay_spawn_request find it via
 # dir_walk on the next round-robin pick. No extra plumbing needed.
 python3 tools/oriscadd --socket "$SOCK" --pid 1 \
     --supervisor "$TMP/supervisor.orx" \
-    --directory 18 --hostfsd 17 \
+    --directory 18 \
     >"$TMP/cpu1.out" 2>"$TMP/cpu1.err" &
 CPU1=$!
 
