@@ -426,10 +426,49 @@ class Terminal:
         # canvas items so grid / vector / pointer overlays sit on
         # top.  configure(data=…) with PPM-P6 bytes is the cheapest
         # full-frame update Tk's stdlib bindings expose.
-        self.fb_image = tk.PhotoImage(width=self.fb_w, height=self.fb_h)
-        self.fb_canvas_item = self.canvas.create_image(
-            0, 0, image=self.fb_image, anchor="nw")
-        self.canvas.tag_lower(self.fb_canvas_item)
+        # Phase 59 / WM γ.5 — framebuffer lives in its own Toplevel.
+        # Originally we drew the framebuffer at z-bottom of the main
+        # canvas under the grid/vector/pointer overlays, but that put
+        # it directly underneath the Tk text widget that's *also*
+        # showing the same console output via the wire-forward path.
+        # Pixel-perfect alignment + a same-size cell grid made the
+        # two indistinguishable at a glance, so the framebuffer
+        # rendering was invisible despite being correct.
+        #
+        # Now: dedicated Toplevel ("Window 2"), framebuffer-only,
+        # zoomed 2× from the native 640×384 to 1280×768 so it's
+        # visibly the dominant display.  The native resolution
+        # stays at FB_W × FB_H on the wire so the WM and any
+        # framebuffer-byte clients (fb_smoke) keep their existing
+        # offsets; oriscterm does the upscaling to PPM in
+        # _repaint_framebuffer (each native pixel becomes a 2×2
+        # block in the displayed PPM).
+        #
+        # The main canvas in window 1 keeps its grid / vector /
+        # pointer overlays for compat, but no longer carries the
+        # framebuffer underlay.  Future migration moves those
+        # overlays here too.
+        self.fb_zoom         = 2
+        self.fb_display_w    = self.fb_w * self.fb_zoom
+        self.fb_display_h    = self.fb_h * self.fb_zoom
+        self.fb_window       = tk.Toplevel(self.root)
+        self.fb_window.title(f"Object RISC Framebuffer · pid={my_pid}")
+        self.fb_window_image = tk.PhotoImage(width=self.fb_display_w,
+                                             height=self.fb_display_h)
+        self.fb_window_canvas = tk.Canvas(self.fb_window,
+                                          width=self.fb_display_w,
+                                          height=self.fb_display_h,
+                                          bg=VEC_PALETTE[0],
+                                          borderwidth=0,
+                                          highlightthickness=0)
+        self.fb_window_canvas.pack(fill="both", expand=True)
+        self.fb_window_canvas.create_image(
+            0, 0, image=self.fb_window_image, anchor="nw")
+        # Closing the FB window just hides it — keeps the main
+        # oriscterm window alive (which is what controls the process
+        # lifetime).
+        self.fb_window.protocol(
+            "WM_DELETE_WINDOW", self.fb_window.withdraw)
 
         # Capture every keystroke at the toplevel so we get them whether
         # focus is on the (disabled) text widget or the root.
@@ -686,33 +725,51 @@ class Terminal:
         self.send_packet(resp)
 
     def _repaint_framebuffer(self) -> None:
-        """Rebuild the Tk PhotoImage from self.framebuffer if dirty.
-        Cheaper than per-pixel `put` on every poll; we batch into a
-        PPM-P6 byte stream and configure it as the image data.  Only
-        runs when the framebuffer has been mutated since last repaint."""
+        """Rebuild the FB-window PhotoImage from self.framebuffer if
+        dirty.  We translate 1-byte indexed pixels through the
+        palette to RGB, then upscale fb_zoom× (each source pixel
+        becomes a Z×Z block) directly into the PPM byte stream.
+        One configure(data=…) on the window-2 PhotoImage updates the
+        display.
+
+        Pure-Python loop; for a 640×384 source at 2× zoom that's
+        245K source pixels → 980K output pixels on every dirty
+        repaint.  Fine for the kind of low-frequency updates the
+        WM's glyph renderer produces (one strip per console line,
+        16 wire RTTs each).  PIL/numpy is the follow-up if anyone
+        animates against the framebuffer."""
         if not self.framebuffer_dirty:
             return
-        W, H = self.fb_w, self.fb_h
-        # Translate 1-byte indexed pixels to 3-byte RGB via the
-        # palette lookup.  Pure-Python loop; for a 640×384 canvas
-        # that's ~245K iterations on every dirty repaint.  Fine for
-        # the kind of low-frequency updates milestone-3 WM produces
-        # (window decorations, focus flashes, glyph rendering on
-        # keystrokes).  Optimization (dirty-region tracking, PIL,
-        # numpy, etc.) is a follow-up if/when we start animating.
+        W, H, Z = self.fb_w, self.fb_h, self.fb_zoom
+        DW = W * Z
+        DH = H * Z
         pal = self.fb_palette_rgb
         fb  = self.framebuffer
-        rgb = bytearray(W * H * 3)
-        for i in range(W * H):
-            base = fb[i] * 3
-            j = i * 3
-            rgb[j]     = pal[base]
-            rgb[j + 1] = pal[base + 1]
-            rgb[j + 2] = pal[base + 2]
-        ppm = (b"P6\n" + str(W).encode() + b" "
-               + str(H).encode() + b"\n255\n" + bytes(rgb))
+        # Build one source row, expanded horizontally to DW pixels,
+        # then write it Z times to cover the vertical zoom.  Using
+        # a row-at-a-time buffer avoids a 980K * 3-byte allocation
+        # if Z grows.
+        rgb = bytearray(DW * DH * 3)
+        for y in range(H):
+            row = bytearray(DW * 3)
+            src_off = y * W
+            for x in range(W):
+                base = fb[src_off + x] * 3
+                # Each source pixel becomes Z output pixels
+                # horizontally.
+                for k in range(Z):
+                    out = (x * Z + k) * 3
+                    row[out]     = pal[base]
+                    row[out + 1] = pal[base + 1]
+                    row[out + 2] = pal[base + 2]
+            # Write the row Z times for vertical zoom.
+            for k in range(Z):
+                dy = y * Z + k
+                rgb[dy * DW * 3 : (dy + 1) * DW * 3] = row
+        ppm = (b"P6\n" + str(DW).encode() + b" "
+               + str(DH).encode() + b"\n255\n" + bytes(rgb))
         try:
-            self.fb_image.configure(data=ppm)
+            self.fb_window_image.configure(data=ppm)
         except tk.TclError as e:
             self._log(f"framebuffer repaint failed: {e}")
         self.framebuffer_dirty = False
