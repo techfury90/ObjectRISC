@@ -5873,6 +5873,76 @@ framebuffer pixels through the same 8×16 font path the WM glyph
 renderer already uses, and oriscterm's grid service becomes
 vestigial. Same shape for vector, raster, pointer afterward.
 
+### γ.9 — WM-mediated GRID
+
+First architectural step in the overlay-retirement migration.  The
+WM gains a per-window GRID service mirroring Phase 58's per-window
+CONSOLE: clients that `wm_bind_surface(WSURF_GRID)` get an R|S
+sub-cap of a `TAG_SERVICE` object the WM allocates at
+`NEW_WINDOW` time; positioned-text SENDs land in the per-window
+queue, the WM polls and rasterises them into the framebuffer at
+the (col, row) the SEND specifies via the same `flush_strip` path
+console rendering already uses.
+
+Wiring:
+
+- `task.c`: `ORX_STATE_BYTES` 584 → 712.  New `WM_LEADER_GRID_SLOT`
+  at offset 704 (mirror of `WM_LEADER_CONSOLE_SLOT`); the WM-side
+  `WM_GRID_BASE` per-window slot region lives at offset 712..840.
+- `supervisor.c`: at boot, after `wm_bind_surface(WSURF_GRID)` lands
+  the resolved cap in `DIR_RESULT_SLOT`, copy it into
+  `WM_LEADER_GRID_SLOT`.  `populate_child_term_slots` reads it back
+  and wires `ORX_SLOT_CHILD_O7` so login / sysinit / shell / etc.
+  inherit the WM-mediated GRID cap when their terminal idx matches
+  the leader's own — same shape as the CONSOLE wiring from γ.3.
+- `oriscwm.c`: `alloc_window_grid` / `free_window_grid` mirror their
+  CONSOLE peers (ObjAlloc TAG_SERVICE + ReceiveQueueAttach depth
+  256, ObjFree on destroy).  `WSURF_GRID` joins `WSURF_CONSOLE` in
+  `handle_bind_surface` returning a derived R|S sub-cap.
+  `forward_grid_write` ObjFetchBytes the SEND's source bytes,
+  filters non-printable bytes to space, and dispatches one
+  `flush_strip` call at the requested (col, row) — no cursor
+  advance, since grid is explicit positioning.  The legacy
+  `col == row == 0xFFFFFFFF` clear sentinel is currently a no-op
+  (full-framebuffer clear would also wipe the WM's console
+  rendering; per-overlay backing store is a follow-up).
+
+The receive-queue dispatch unpacks five wire payload values
+(status + offset + count + col + row) but pcc-orisc's codegen
+limit (`adrput: illegal op 57`) caps single-asm output operands at
+4.  First-attempt workaround — splitting into one 1-output asm
+followed by four single-output asms — produced silently corrupt
+captures: pcc places intermediate compiler-managed values in
+R3/R5/R6 between the asms even with `asm volatile`, so the col/row
+the WM saw weren't the values the SEND actually carried.  Final
+workaround: combine all five captures into one asm by sending R2
+(status) to a file-scope `_wm_grid_poll_status` global via
+`la` + `sw` from inside the asm body, while R3..R6 use the regular
+4-output reg constraints.  Both the asm body's `memory` clobber
+and the global-vs-stack choice keep pcc from spilling around the
+call.
+
+`wm_smoke` updates step 6: `bind GRID` now expects success rather
+than `WIN_E_INVAL`, and verifies the resolved cap is non-null.
+
+`cmd_edit` (shell builtin) pins the spawn to `SUP_TARGET_LOCAL`
+instead of round-robin (`sup_spawn` default).  Only the leader has
+WM mediation wired; a relayed spawn that landed on a worker would
+populate `ORX_SLOT_CHILD_O7` from the direct `/sys/term/0/grid`
+walk, sending edit's output through oriscterm's Tk-overlay
+grid handler instead of the WM's framebuffer rasteriser.  This is
+the same `LOCAL` pin login already uses for the shell.  Architectural
+follow-up: spawn-relay should propagate the leader's WM caps so a
+worker can serve a grid-using child without losing WM mediation,
+or each worker binds its own WM surfaces.
+
+This is step 1 of 4 in the bitmapped-overlays migration.  Vector
+needs actual line / rect / oval rasterisers in the WM (Bresenham
+etc.); raster + pointer have their own shapes, with pointer
+needing focus-aware coordinate translation.  Validating the
+per-window-service pattern on GRID first means the others reuse
+identical plumbing.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

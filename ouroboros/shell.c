@@ -685,11 +685,21 @@ cmd_run(const char *cwd, const char *arg)
  * cmd_run's & path: sup_spawn fills both fields of the shared
  * argv buffer, edit reads them via program_args() / program_cwd()
  * and resolves relative paths against cwd just like the cmd_run
- * path does. */
+ * path does.
+ *
+ * Phase 59 / WM γ.9: pin to the local CPU instead of round-robin
+ * (default sup_spawn behaviour).  Edit renders into the grid
+ * surface, and only the LEADER's supervisor has WM mediation
+ * wired — a worker that received a relayed spawn would
+ * populate_child_term_slots from the direct /sys/term/0/grid
+ * walk, sending edit's output through oriscterm's Tk-overlay
+ * grid handler instead of the WM's framebuffer rasteriser.
+ * Same logic login uses to pin the shell. */
 static void
 cmd_edit(const char *cwd, const char *arg)
 {
-	task_t t = sup_spawn("/programs/edit.orx", arg, cwd);
+	task_t t = sup_spawn_at(SUP_TARGET_LOCAL,
+	                        "/programs/edit.orx", arg, cwd);
 	if (t < 0) {
 		term_print("spawn failed: ");
 		term_print_int(t);

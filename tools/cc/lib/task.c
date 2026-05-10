@@ -162,8 +162,20 @@
  *          so children inherit the WM-mediated console (output gets
  *          glyph-rendered) instead of bypassing the WM via the
  *          direct /sys/term/<idx>/console walk.  Null on workers
- *          and on leaders without WM mediation.  Phase 59 / WM γ.3.) */
-#define ORX_STATE_BYTES   576
+ *          and on leaders without WM mediation.  Phase 59 / WM γ.3.)
+ *     + 8 (WM_LEADER_GRID_SLOT: same shape as WM_LEADER_CONSOLE_SLOT
+ *          but for the GRID surface.  Filled when the leader runs
+ *          wm_bind_surface(WSURF_GRID) successfully; read back by
+ *          populate_child_term_slots to wire ORX_SLOT_CHILD_O7 so
+ *          spawned children write positioned text through the WM's
+ *          GRID rasteriser instead of /sys/term/<idx>/grid.
+ *          Phase 59 / WM γ.9.)
+ *     + 128 (WM_GRID_BASE: WM-only — per-window GRID service refs
+ *          (16 windows × 8 bytes).  Mirrors WM_CONSOLE_BASE but for
+ *          positioned-text SENDs.  Other programs leave this dead;
+ *          the libc allocates the space so the WM doesn't have to
+ *          claim its own OPR slot for a separate objstore.) */
+#define ORX_STATE_BYTES   712
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8

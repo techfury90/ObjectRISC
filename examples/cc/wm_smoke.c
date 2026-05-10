@@ -142,12 +142,18 @@ main(void)
 	}
 	WP("wm_smoke: bind CONSOLE + KEYBOARD OK\n");
 
-	/* Step 6: bind GRID on a CONSOLE window — must fail WIN_E_INVAL. */
+	/* Step 6: bind GRID on a CONSOLE window — Phase 59 / WM γ.9 made
+	 * this succeed, returning an R|S sub-cap of the per-window GRID
+	 * service.  Verify the resolved cap is non-null. */
 	rc = wm_bind_surface(wid, WSURF_GRID);
-	if (rc != WIN_E_INVAL) {
-		fail("bind GRID expected WIN_E_INVAL", rc); return 6;
+	if (rc != 0) { fail("bind GRID", rc); return 6; }
+	{
+		int isn;
+		asm volatile("orefld o1, 616(o12)\noisn %0, o1"
+		             : "=r"(isn) : : "r1");
+		if (isn) { fail("bind GRID cap null", 0); return 6; }
 	}
-	WP("wm_smoke: bind GRID rejected (expected)\n");
+	WP("wm_smoke: bind GRID OK\n");
 
 	/* Step 7: second CONSOLE allocation — must fail WIN_E_NOSPC. */
 	int dummy_wid = 0, dummy_w = 0, dummy_h = 0;
