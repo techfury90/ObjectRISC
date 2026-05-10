@@ -3416,6 +3416,68 @@ def primitive_ObjBlitGlyphs(cpu: CPU) -> None:
     cpu.set_gpr(3, rendered)
 
 
+def primitive_ObjFillRect(cpu: CPU) -> None:
+    """Phase 60 step 5 — fill a rectangle in a TAG_FRAMEBUFFER with a
+    single palette index.  Companion to ObjBlitGlyphs; lets oriscwm
+    paint window chrome (background, border lines) in one firmware
+    call instead of N per-row ObjStoreBytes.
+
+    Inputs:
+      O1 = framebuffer ref      (TAG_FRAMEBUFFER, must be local)
+      R4 = packed (x << 16) | y      — top-left pixel
+      R5 = packed (w << 16) | h      — rectangle size in pixels
+      R6 = color                     — low byte = palette index
+
+    Outputs:
+      R2 = status (ERR_OK / ERR_EFAULT / ERR_EPERM / ERR_EREMOTE /
+                   ERR_ESTALE / ERR_EINVAL)
+
+    Off-screen pixels clip silently; (w, h) of 0 is a no-op. """
+    fb_ref = cpu.get_opr(1)
+    if fb_ref == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if (ref_caps(fb_ref) & CAP_W) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return
+    if ref_home(fb_ref) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+    fb_idx = ref_index(fb_ref)
+    if fb_idx <= 0 or fb_idx >= len(cpu.descriptors) \
+            or cpu.descriptors[fb_idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); return
+    fb_desc = cpu.descriptors[fb_idx]
+    if not fb_desc.live or fb_desc.generation != ref_generation(fb_ref):
+        cpu.set_gpr(2, ERR_ESTALE); return
+    if fb_desc.type_tag != TAG_FRAMEBUFFER:
+        cpu.set_gpr(2, ERR_EINVAL); return
+
+    r4 = cpu.get_gpr(4)
+    x = sext32((r4 >> 16) & 0xFFFF)
+    y = sext32(r4 & 0xFFFF)
+    r5 = cpu.get_gpr(5)
+    w = (r5 >> 16) & 0xFFFF
+    h = r5 & 0xFFFF
+    color = cpu.get_gpr(6) & 0xFF
+
+    fb_w = fb_desc.fb_width
+    fb_h = fb_desc.fb_height
+    # Clip to FB bounds.
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(fb_w, x + w)
+    y1 = min(fb_h, y + h)
+    if x1 <= x0 or y1 <= y0:
+        cpu.set_gpr(2, ERR_OK); return
+
+    fb_storage = fb_desc.storage
+    span = x1 - x0
+    fill = bytes((color,)) * span
+    for row_y in range(y0, y1):
+        row_base = row_y * fb_w + x0
+        fb_storage[row_base:row_base + span] = fill
+    fb_desc.fb_dirty = True
+    cpu.set_gpr(2, ERR_OK)
+
+
 def primitive_ObjAllocInputSink(cpu: CPU) -> None:
     """Phase 60 step 3 — allocate a TAG_INPUT_SINK object that
     receives synthetic SEND_DELIVER events from simorisc's host
@@ -4101,6 +4163,7 @@ PRIMITIVE_MIN_MODE = {
     0x102: MODE_USER,        # ObjAllocFramebuffer (Phase 60)
     0x10B: MODE_USER,        # ObjAllocInputSink (Phase 60 step 3)
     0x10C: MODE_USER,        # ObjBlitGlyphs (Phase 60 step 4)
+    0x10D: MODE_USER,        # ObjFillRect (Phase 60 step 5)
     0x107: MODE_USER,        # ObjFreeDeferred — drain-window wrapper
     0x103: MODE_USER,        # ObjDerive
     0x106: MODE_USER,        # ObjAllocStore
@@ -4159,6 +4222,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjAllocInputSink(cpu)
     elif prim == 0x10C:
         primitive_ObjBlitGlyphs(cpu)
+    elif prim == 0x10D:
+        primitive_ObjFillRect(cpu)
     elif prim == 0x107:
         primitive_ObjFreeDeferred(cpu)
     elif prim == 0x103:

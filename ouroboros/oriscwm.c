@@ -44,6 +44,10 @@
  *                          O4 = notify_cap
  *                          Reply: R3=status
  *
+ *   WM_OP_QUERY_GEOMETRY   R4 = wid (or 0 = first live window)
+ *                          Reply: R3=status, R4=geom_a, R5=geom_b,
+ *                                 R6=resolved wid
+ *
  * Window types:
  *   WIN_CONSOLE   = 1   (console + keyboard)
  *   WIN_GRAPHICAL = 2   (E_NOTIMPL — same as milestone 1; surfaces
@@ -90,6 +94,7 @@
 #define WM_OP_BIND_SURFACE       2
 #define WM_OP_DESTROY_WINDOW     3
 #define WM_OP_SUBSCRIBE_EVENTS   4
+#define WM_OP_QUERY_GEOMETRY     5
 
 #define WIN_TYPE_CONSOLE   1
 #define WIN_TYPE_GRAPHICAL 2
@@ -107,12 +112,16 @@
 #define E_NOSPC    (-7)
 #define E_NOTIMPL  (-8)
 
-/* Default window geometry — mirrors the milestone-1 Python prototype.
- * Future milestones will query oriscterm for actual dimensions. */
-#define DEFAULT_W_PX     1200
-#define DEFAULT_H_PX     600
-#define DEFAULT_W_CELLS  80
-#define DEFAULT_H_CELLS  24
+/* Default window geometry — reported back to wm_new_window callers
+ * as the *usable* (inside-the-border) cell area in geom_b, and the
+ * usable pixel area in geom_a.  The full FB is FB_W × FB_H but the
+ * outer ring of cells is reserved for the window border / padding,
+ * so programs see a slightly smaller cell grid (see N_COLS / N_ROWS
+ * below). */
+#define DEFAULT_W_CELLS  158
+#define DEFAULT_H_CELLS  46
+#define DEFAULT_W_PX     (DEFAULT_W_CELLS * 8)   /* 1264 */
+#define DEFAULT_H_PX     (DEFAULT_H_CELLS * 16)  /* 736  */
 
 /* ObjAlloc tags / cap bits. */
 #define TAG_SERVICE 0x4103
@@ -258,19 +267,44 @@
 #define CELL_W   8
 #define CELL_H   16
 
-/* 160 cols × 48 rows × 8×16 cells = 1280 × 768 framebuffer.  Text
- * stays at native font size; the larger grid gives the leader's
- * 80-col session room to breathe and leaves space on the right /
- * bottom for future multi-window tiling.  oriscterm displays the
- * framebuffer 1:1 — no scaling anywhere. */
-#define N_COLS   160
-#define N_ROWS   48
-#define FB_W    (CELL_W * N_COLS)   /* 1280 */
-#define FB_H    (CELL_H * N_ROWS)   /* 768  */
+/* The framebuffer is 160 × 48 cells (1280 × 768 px), but the outer
+ * ring of cells is reserved for the window border / padding.  We
+ * report the *usable* inner grid to clients and offset all cell
+ * rendering by BORDER_CELLS in each direction so (col=0, row=0) in
+ * client coordinates lands at FB cell (BORDER_CELLS, BORDER_CELLS).
+ *
+ * Layout (with BORDER_CELLS=1):
+ *   y px       what
+ *   0..15      top margin (cell row 0); border line at y=14..15
+ *   16..751    usable cell rows 0..45 (46 rows × 16 px = 736)
+ *   752..767   bottom margin (cell row 47); border line at y=752..753
+ *   x px       what
+ *   0..7       left margin (cell col 0); border line at x=6..7
+ *   8..1271    usable cell cols 0..157 (158 cols × 8 px = 1264)
+ *   1272..1279 right margin (cell col 159); border line at x=1272..1273
+ *
+ * Border thickness BORDER_LINE_PX is 2 — readable on a 1280×768 CRT
+ * without dominating the visual; matches the chunky one-pixel-line
+ * look of mid-80s desktops without going full skeuomorphic.  Border
+ * sits one pixel inside the cell-row/col boundary so it touches the
+ * usable cell area's outer edge cleanly. */
+#define BORDER_CELLS    1
+#define BORDER_LINE_PX  2
+#define N_COLS          158
+#define N_ROWS          46
+#define FB_CELLS_W      (N_COLS + 2 * BORDER_CELLS)
+#define FB_CELLS_H      (N_ROWS + 2 * BORDER_CELLS)
+#define FB_W            (CELL_W * FB_CELLS_W)   /* 1280 */
+#define FB_H            (CELL_H * FB_CELLS_H)   /* 768  */
+#define CELL_ORIGIN_X   (CELL_W * BORDER_CELLS)  /* 8  */
+#define CELL_ORIGIN_Y   (CELL_H * BORDER_CELLS)  /* 16 */
+#define USABLE_W_PX     (CELL_W * N_COLS)        /* 1264 */
+#define USABLE_H_PX     (CELL_H * N_ROWS)        /* 736 */
 
 /* Palette indices (matching VEC_PALETTE in tools/devices/oriscterm). */
 #define WM_BG_COLOR  0    /* dark navy background */
 #define WM_FG_COLOR  1    /* light gray foreground */
+#define WM_BORDER_COLOR 1 /* same fg gray for the chrome line */
 
 /* Stack VA layout (CONTRACT.md §2).  Used for stack-relative offsets
  * passed to ObjFetchBytes / ObjStoreBytes — the boot stack ref lives
@@ -645,6 +679,81 @@ alloc_local_framebuffer(void)
 		: "r1", "r2", "r4", "r5", "r6"
 	);
 	return status;
+}
+
+/* Phase 60 step 5 — fill a rectangle in the framebuffer with a single
+ * palette index via the #0x10D ObjFillRect firmware op.  Used to paint
+ * the bg backdrop and the four border lines at FB-init time.
+ *
+ * 3-arg signature (packed_xy, packed_wh, color) sidesteps pcc-orisc's
+ * 5-arg call-codegen bug — the WM works around it elsewhere by
+ * packing arg pairs into single ints (see flush_strip's packed_xy /
+ * packed_shape).  Caller packs (x:high16, y:low16) and (w:high16,
+ * h:low16).
+ *
+ * pcc-orisc input-clobber dance: copy the three "r" inputs to safe
+ * temps before the body's first store of r4..r6 (same hygiene
+ * flush_strip uses for ObjBlitGlyphs). */
+static void
+fill_rect_packed(int packed_xy, int packed_wh, int color)
+{
+	if (((packed_wh >> 16) & 0xFFFF) == 0) return;
+	if ((packed_wh & 0xFFFF) == 0)         return;
+	asm volatile(
+		"addu   r8,  %0, r0\n"      /* save packed_xy */
+		"addu   r9,  %1, r0\n"      /* save packed_wh */
+		"addu   r10, %2, r0\n"      /* save color */
+		"orefld o1, %3(o12)\n"      /* O1 = framebuffer */
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r10, r0\n"
+		"call   #0x10D\n"           /* ObjFillRect */
+		"nop"
+		:
+		: "r"(packed_xy), "r"(packed_wh), "r"(color),
+		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6",
+		  "r8", "r9", "r10"
+	);
+}
+
+/* Paint the window chrome: solid bg fill + a 2-pixel border line just
+ * inside the outer cell ring.  Called once after alloc_local_framebuffer
+ * so the FB never appears as a black void to the user — they see the
+ * border before the first glyph lands.
+ *
+ * Border layout (BORDER_LINE_PX=2, BORDER_CELLS=1):
+ *   top:    y ∈ [CELL_ORIGIN_Y - BORDER_LINE_PX, CELL_ORIGIN_Y)
+ *   bottom: y ∈ [CELL_ORIGIN_Y + USABLE_H_PX, +BORDER_LINE_PX)
+ *   left:   x ∈ [CELL_ORIGIN_X - BORDER_LINE_PX, CELL_ORIGIN_X)
+ *   right:  x ∈ [CELL_ORIGIN_X + USABLE_W_PX, +BORDER_LINE_PX)
+ * Lines extend across the full inner-cell-area width/height so the
+ * four corners overlap and form a clean rectangle. */
+static void
+paint_window_chrome(void)
+{
+	/* Background. */
+	fill_rect_packed(((0 & 0xFFFF) << 16) | (0 & 0xFFFF),
+	                 ((FB_W & 0xFFFF) << 16) | (FB_H & 0xFFFF),
+	                 WM_BG_COLOR);
+
+	int top_y    = CELL_ORIGIN_Y - BORDER_LINE_PX;
+	int bottom_y = CELL_ORIGIN_Y + USABLE_H_PX;
+	int left_x   = CELL_ORIGIN_X - BORDER_LINE_PX;
+	int right_x  = CELL_ORIGIN_X + USABLE_W_PX;
+	int frame_w  = (right_x + BORDER_LINE_PX) - left_x;
+	int frame_h  = (bottom_y + BORDER_LINE_PX) - top_y;
+	int hline_wh = ((frame_w & 0xFFFF) << 16) | (BORDER_LINE_PX & 0xFFFF);
+	int vline_wh = ((BORDER_LINE_PX & 0xFFFF) << 16) | (frame_h & 0xFFFF);
+
+	fill_rect_packed(((left_x & 0xFFFF) << 16) | (top_y & 0xFFFF),
+	                 hline_wh, WM_BORDER_COLOR);
+	fill_rect_packed(((left_x & 0xFFFF) << 16) | (bottom_y & 0xFFFF),
+	                 hline_wh, WM_BORDER_COLOR);
+	fill_rect_packed(((left_x & 0xFFFF) << 16) | (top_y & 0xFFFF),
+	                 vline_wh, WM_BORDER_COLOR);
+	fill_rect_packed(((right_x & 0xFFFF) << 16) | (top_y & 0xFFFF),
+	                 vline_wh, WM_BORDER_COLOR);
 }
 
 /* Phase 60 step 3 superseded subscribe_term_pointer (the
@@ -1749,6 +1858,42 @@ handle_destroy_window(int wid)
 	wm_reply(0, 0, 0, 0);
 }
 
+/* WM_OP_QUERY_GEOMETRY — read back a window's pixel + cell extents.
+ *   R5 = wid (or 0 to use the first live window — the typical
+ *           leader-spawn shell that didn't open its own window
+ *           inherits the supervisor's CONSOLE/GRID caps; passing
+ *           wid=0 lets such a child query "the window I'm rendering
+ *           into" without having to know its id).
+ * Reply:
+ *   R3 = status,
+ *   R4 = geom_a = (w_px << 16) | h_px         (usable pixel area)
+ *   R5 = geom_b = (w_cells << 16) | h_cells   (usable cell grid)
+ *
+ * No auth: window dimensions are public — every cap holder already
+ * sees the rendered output and can guess the size from observation.
+ * Phase 60 step 5. */
+static void
+handle_query_geometry(int wid)
+{
+	if (wid == 0) {
+		int i;
+		for (i = 1; i <= MAX_WINDOWS; i++) {
+			if (window_type[i - 1] != 0) { wid = i; break; }
+		}
+	}
+	if (wid < 1 || wid > MAX_WINDOWS) {
+		wm_reply(E_INVAL, 0, 0, 0);
+		return;
+	}
+	if (window_type[wid - 1] == 0) {
+		wm_reply(E_NOENT, 0, 0, 0);
+		return;
+	}
+	int geom_a = ((DEFAULT_W_PX & 0xFFFF) << 16) | (DEFAULT_H_PX & 0xFFFF);
+	int geom_b = ((DEFAULT_W_CELLS & 0xFFFF) << 16) | (DEFAULT_H_CELLS & 0xFFFF);
+	wm_reply(0, geom_a, geom_b, wid);
+}
+
 /* WM_OP_SUBSCRIBE_EVENTS — record a notify_op for a window.
  * Stub in this milestone (the WM doesn't yet emit any events —
  * resize/focus/close all wait for the layout work in later
@@ -2184,7 +2329,12 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 
 	int text_off = (int)((unsigned int)glyphs - STACK_BOTTOM);
 	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
-	int packed_xy = ((col_start & 0xFFFF) << 16) | (cell_row & 0xFFFF);
+	/* Translate client cell coords (0..N_COLS-1, 0..N_ROWS-1) to FB
+	 * cell coords by adding BORDER_CELLS — keeps the outer ring
+	 * reserved for the chrome painted by paint_window_chrome. */
+	int fb_col = col_start + BORDER_CELLS;
+	int fb_row = cell_row  + BORDER_CELLS;
+	int packed_xy = ((fb_col & 0xFFFF) << 16) | (fb_row & 0xFFFF);
 	int packed_shape = ((n_glyphs & 0xFFFF) << 16)
 	                 | ((WM_FG_COLOR & 0xFF) << 8)
 	                 | (WM_BG_COLOR & 0xFF);
@@ -3112,6 +3262,7 @@ main(void)
 		WM_PRINT("x");
 		WM_PRINT_INT(FB_H);
 		WM_PRINT(")\n");
+		paint_window_chrome();
 	} else {
 		WM_PRINT("oriscwm: ObjAllocFramebuffer failed: ");
 		WM_PRINT_INT(status);
@@ -3207,6 +3358,8 @@ main(void)
 				handle_destroy_window(wid_or_zero);
 			} else if (op == WM_OP_SUBSCRIBE_EVENTS) {
 				handle_subscribe_events(wid_or_zero, arg);
+			} else if (op == WM_OP_QUERY_GEOMETRY) {
+				handle_query_geometry(wid_or_zero);
 			} else {
 				wm_reply(E_INVAL, 0, 0, 0);
 			}

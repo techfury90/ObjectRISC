@@ -155,6 +155,26 @@ main(void)
 	}
 	WP("wm_smoke: bind GRID OK\n");
 
+	/* Step 6b (Phase 60 step 5): wm_get_geometry on this window
+	 * should return the same dimensions as wm_new_window did, plus
+	 * non-zero pixel extents.  Probe with wid=0 to also verify the
+	 * "first live window" default. */
+	{
+		int geom[4];
+		geom[0] = 0; geom[1] = 0; geom[2] = 0; geom[3] = 0;
+		rc = wm_get_geometry(0, geom);
+		if (rc != 0)                          { fail("get_geometry rc", rc); return 6; }
+		if (geom[WM_GEOM_W_CELLS] != w_cells) { fail("get_geometry w_cells", geom[WM_GEOM_W_CELLS]); return 6; }
+		if (geom[WM_GEOM_H_CELLS] != h_cells) { fail("get_geometry h_cells", geom[WM_GEOM_H_CELLS]); return 6; }
+		if (geom[WM_GEOM_W_PX] == 0)          { fail("get_geometry w_px zero", geom[WM_GEOM_W_PX]); return 6; }
+		if (geom[WM_GEOM_H_PX] == 0)          { fail("get_geometry h_px zero", geom[WM_GEOM_H_PX]); return 6; }
+		WP("wm_smoke: get_geometry OK (");
+		WP_INT(geom[WM_GEOM_W_CELLS]); WP("x"); WP_INT(geom[WM_GEOM_H_CELLS]);
+		WP(" cells / ");
+		WP_INT(geom[WM_GEOM_W_PX]);    WP("x"); WP_INT(geom[WM_GEOM_H_PX]);
+		WP(" px)\n");
+	}
+
 	/* Step 7: second CONSOLE allocation — must fail WIN_E_NOSPC. */
 	int dummy_wid = 0, dummy_w = 0, dummy_h = 0;
 	asm volatile("onull o1");
