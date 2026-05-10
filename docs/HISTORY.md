@@ -5822,6 +5822,57 @@ garbled or entirely missing.
 Both are real pcc-orisc issues — filed mentally for a future
 toolchain pass.
 
+### γ.7 — Native 1280×768 framebuffer, text-only window 1
+
+The 2× display upscale in γ.6 made glyphs visually big but pixelated.
+Trade it for a literal 1280×768 framebuffer with no scaling anywhere
+— the WM fills it at the original 8×16 cell size by widening the
+cell grid from 80×24 to 160×48 cells. Result: small, sharp Lucida
+glyphs filling exactly the upper-left quadrant for the leader's
+80-col session, with room on the right and bottom for future
+multi-window tiling.
+
+oriscterm's `fb_w` / `fb_h` decouple from the canvas-font metrics
+(hardcoded `1280` / `768` regardless of Menlo measurements);
+`fb_zoom` and the manual PPM upscaling logic in
+`_repaint_framebuffer` go away. Window 1 turns text-only — the
+graphics canvas (still used for grid / vector / raster / pointer
+item state) is intentionally not packed, an unmapped widget that
+holds item state without taking screen real estate.
+
+WM-side: `N_COLS` 80 → 160, `N_ROWS` 24 → 48; `CELL_W` / `CELL_H`
+stay at 8 / 16; `flush_strip`'s `pixel_row` scratch grows from 640
+to 1280 bytes (still ~1.3KB stack frame, well within the 64KB
+stack).
+
+### γ.8 — Grid / vector / raster / pointer overlays move to window 2
+
+Intermediate step toward bitmapped grid/vector under the WM. Window
+1 retires its standalone graphics canvas; the FB Toplevel canvas in
+window 2 hosts both the framebuffer image (at z-bottom via
+`tag_lower`) and the existing Tk-rendered grid / vector / raster /
+pointer overlays on top. No functional regression — tests that
+drive those services (`test_view`, `test_mouse_paint`) keep working
+through the same oriscterm-side service code, just rendering on a
+different canvas.
+
+`self.canvas` is aliased to `self.fb_window_canvas` so every
+existing `self.canvas.create_…` / `.bind` / `.delete` site (grid
+glyphs, vector primitives, pointer event binds) targets the FB
+Toplevel canvas without further edits. A new `_clear_overlays()`
+helper replaces `canvas.delete("all")` at the two grid-clear /
+`VEC_CLEAR` sites — `"all"` would also nuke the framebuffer image
+now that it shares the canvas.
+
+This isn't the architectural endpoint. Grid / vector / raster items
+are still drawn by Tk Canvas primitives, not rasterised into the
+framebuffer through the WM. The migration retires each overlay type
+in turn — the WM gains a per-window GRID service (mirroring Phase
+58's per-window CONSOLE), rasterises `(col, row, ch)` into
+framebuffer pixels through the same 8×16 font path the WM glyph
+renderer already uses, and oriscterm's grid service becomes
+vestigial. Same shape for vector, raster, pointer afterward.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

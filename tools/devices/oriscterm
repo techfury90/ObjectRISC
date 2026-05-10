@@ -358,30 +358,19 @@ class Terminal:
         self.text.see("end")
         self.text.configure(state="disabled")
 
-        # The graphics Canvas. Character-cell metrics come from the
-        # same monospace font as the text pane, so the grid service can
-        # land bytes at integer (col, row) positions that visually
-        # match what the text pane shows.
+        # Cell metrics for the grid service: integer (col, row)
+        # positions translate to (col*cell_w, row*cell_h) pixel
+        # coordinates on the graphics canvas.  Same Menlo-14 font
+        # as the text pane; cell dims are 8 × 16 on macOS.  The
+        # 80×24 cell budget the grid expects fits in a 640×384
+        # corner of the now-1280×768 framebuffer Toplevel canvas
+        # — there's room for higher-density grid clients later.
         self.cell_w = font.measure("M")
         self.cell_h = font.metrics("linespace")
         self.canvas_cols = 80
         self.canvas_rows = 24
         self.canvas_w = self.cell_w * self.canvas_cols
         self.canvas_h = self.cell_h * self.canvas_rows
-        # Phase 59 / WM γ.6 — window 1 is text-pane only.  The
-        # graphics canvas still exists (grid / vector / raster /
-        # pointer items are created on it) but isn't packed — it's
-        # an unmapped widget that holds item state without taking
-        # screen real estate.  The next migration step routes these
-        # items to a canvas in window 2 alongside the framebuffer.
-        # Until then, grid/vector demos won't be visually
-        # observable in `make boot` (only test paths, which use
-        # fake_terminal's separate grid storage).
-        self.canvas = tk.Canvas(self.root,
-                                width=self.canvas_w, height=self.canvas_h,
-                                bg=VEC_PALETTE[0],
-                                borderwidth=0, highlightthickness=0)
-        # NOTE: canvas intentionally not packed.
         self.canvas_font = font
         self.vec_color = VEC_PALETTE[1]   # current stroke / fill color
 
@@ -438,25 +427,15 @@ class Terminal:
             self.fb_palette_rgb[i*3]     = r
             self.fb_palette_rgb[i*3 + 1] = g
             self.fb_palette_rgb[i*3 + 2] = b
-        # PhotoImage on the canvas at (0, 0), pushed below all other
-        # canvas items so grid / vector / pointer overlays sit on
-        # top.  configure(data=…) with PPM-P6 bytes is the cheapest
-        # full-frame update Tk's stdlib bindings expose.
-        # Phase 59 / WM γ.5 — framebuffer lives in its own Toplevel
-        # ("Window 2") at native 1280×768.  The WM renders glyphs at
-        # this resolution directly (16×32 cells = 80 cols × 24 rows,
-        # 2× upscale of the embedded 8×16 font).  No display-side
-        # zoom: oriscterm renders the framebuffer 1:1 to a PhotoImage
-        # of the same size.
-        #
-        # Originally the FB rode at z-bottom of the main canvas under
-        # the grid/vector/pointer overlays — but that put it
-        # underneath the Tk text widget showing the same console
-        # output via the wire-forward path, and the two were
-        # pixel-identical.  The dedicated Toplevel lifts the FB out
-        # so the WM's bitmap rendering is visibly distinct from the
-        # console pane in the main window.  Grid / vector / pointer
-        # overlays will migrate to window 2 in a follow-up.
+        # Phase 59 / WM γ.7 — framebuffer + grid/vector/raster/pointer
+        # overlays all live on the FB Toplevel canvas now ("Window 2").
+        # The framebuffer image sits at z-bottom (tag_lower below); any
+        # grid / vector / raster / pointer item created via
+        # self.canvas.create_… renders above the bitmap-rendered text.
+        # Window 1 keeps only the Tk text widget (the legacy console
+        # pane), and the standalone window-1 graphics canvas retires.
+        # Grid coordinates are still 8×16 cells; an 80×24 grid fills
+        # a 640×384 corner of the 1280×768 canvas.
         self.fb_window       = tk.Toplevel(self.root)
         self.fb_window.title(f"Object RISC Framebuffer · pid={my_pid}")
         self.fb_window_image = tk.PhotoImage(width=self.fb_w,
@@ -468,8 +447,12 @@ class Terminal:
                                           borderwidth=0,
                                           highlightthickness=0)
         self.fb_window_canvas.pack(fill="both", expand=True)
-        self.fb_window_canvas.create_image(
+        self.fb_image_item = self.fb_window_canvas.create_image(
             0, 0, image=self.fb_window_image, anchor="nw")
+        self.fb_window_canvas.tag_lower(self.fb_image_item)
+        # Alias: every existing self.canvas.create_xxx / .bind /
+        # .delete in this file targets the FB Toplevel canvas now.
+        self.canvas = self.fb_window_canvas
         # Closing the FB window just hides it — keeps the main
         # oriscterm window alive (which is what controls the process
         # lifetime).
@@ -730,6 +713,18 @@ class Terminal:
                                      pkt["trans_id"], RESP_OK)
         self.send_packet(resp)
 
+    def _clear_overlays(self) -> None:
+        """Delete every grid / vector / raster / pointer item from the
+        canvas while preserving the framebuffer image at z-bottom.
+        Replaces the older `canvas.delete('all')` pattern that was
+        safe when the canvas was overlay-only; with the FB image
+        sharing the canvas (Phase 59 / WM γ.7), 'all' would also
+        nuke the bitmap rendering."""
+        for item in self.canvas.find_all():
+            if item != self.fb_image_item:
+                self.canvas.delete(item)
+        self.grid_items.clear()
+
     def _repaint_framebuffer(self) -> None:
         """Rebuild the FB-window PhotoImage from self.framebuffer if
         dirty.  Translate 1-byte indexed pixels through the palette
@@ -831,8 +826,7 @@ class Terminal:
         col    = int_payload[2]
         row    = int_payload[3]
         if col == 0xFFFFFFFF and row == 0xFFFFFFFF:
-            self.canvas.delete("all")
-            self.grid_items.clear()
+            self._clear_overlays()
             return
         if source_ref == 0 or length == 0:
             return
@@ -879,8 +873,7 @@ class Terminal:
             return hi, lo
 
         if cmd == VEC_CLEAR:
-            self.canvas.delete("all")
-            self.grid_items.clear()
+            self._clear_overlays()
             return
 
         if cmd == VEC_SET_COLOR:
