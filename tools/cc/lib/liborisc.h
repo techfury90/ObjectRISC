@@ -313,6 +313,11 @@ int  term_getkey(int *out_mods);
 #define TK_DOWN      0x181
 #define TK_LEFT      0x182
 #define TK_RIGHT     0x183
+#define TK_HOME      0x184
+#define TK_END       0x185
+#define TK_PAGE_UP   0x186
+#define TK_PAGE_DOWN 0x187
+#define TK_F1        0x190    /* F1..F12 = 0x190..0x19B */
 
 /* Modifier mask bits (mirrored from oriscterm). */
 #define TK_MOD_SHIFT 0x01
