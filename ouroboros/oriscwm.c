@@ -242,6 +242,15 @@
 #define WM_KBD_SUB_SLOT_OFFSET          1160  /* current subscriber's reply ref */
 #define WM_KBD_EVENTS_SLOT_OFFSET       1168  /* TAG_INPUT_SINK kind=0 */
 
+/* Phase 60 step 7 — per-window backing store.  Currently a single
+ * slot since handle_new_window still enforces N=1 CONSOLE windows;
+ * a per-wid array (WM_WINDOW_FB_BASE = 1184..1312) will land when
+ * multi-window comes online.  The screen FB at
+ * WM_SURF_FRAMEBUFFER_SLOT_OFFSET stays the host-mirrored surface;
+ * this slot holds the offscreen FB (FB_FLAG_OFFSCREEN) the WM
+ * renders into and then ObjBlitCopy-composites onto the screen. */
+#define WM_WINDOW_FB_SLOT_OFFSET        1176
+
 /* === Glyph rendering ==================================================
  *
  * The framebuffer is row-major, one byte per pixel (palette index;
@@ -669,6 +678,7 @@ alloc_local_framebuffer(void)
 		"addiu r4, r0, %1\n"           /* width = FB_W */
 		"addiu r5, r0, %2\n"           /* height = FB_H */
 		"addiu r6, r0, 3\n"            /* CAP_R | CAP_W */
+		"addiu r7, r0, 0\n"            /* flags = 0 (mirror to display) */
 		"call  #0x102\n"               /* ObjAllocFramebuffer */
 		"nop\n"
 		"orefst o1, %3(o12)\n"
@@ -676,9 +686,111 @@ alloc_local_framebuffer(void)
 		: "=r"(status)
 		: "i"(FB_W), "i"(FB_H),
 		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET)
-		: "r1", "r2", "r4", "r5", "r6"
+		: "r1", "r2", "r4", "r5", "r6", "r7"
 	);
 	return status;
+}
+
+/* Phase 60 step 7 — allocate the offscreen backing store the WM
+ * renders this window's content into.  Sized to the usable cell area
+ * (USABLE_W_PX × USABLE_H_PX) so render coords land at (col*8,
+ * row*16) inside the buffer with no border offset.  The
+ * FB_FLAG_OFFSCREEN flag tells simorisc to skip Tk display
+ * registration — we composite onto the screen FB rather than
+ * mirroring directly.
+ *
+ * Post-alloc the storage is zeroed (palette index 0 = bg) which is
+ * what we want for the cleared inner area — no explicit fill needed.
+ *
+ * Single global slot for v1 (handle_new_window still enforces N=1
+ * CONSOLE windows); will become a per-wid array when multi-window
+ * lands. */
+static int
+alloc_window_fb(void)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, %1\n"           /* width = USABLE_W_PX */
+		"addiu r5, r0, %2\n"           /* height = USABLE_H_PX */
+		"addiu r6, r0, 3\n"            /* CAP_R | CAP_W */
+		"addiu r7, r0, 1\n"            /* FB_FLAG_OFFSCREEN */
+		"call  #0x102\n"               /* ObjAllocFramebuffer */
+		"nop\n"
+		"orefst o1, %3(o12)\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(USABLE_W_PX), "i"(USABLE_H_PX),
+		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6", "r7"
+	);
+	return status;
+}
+
+static void
+free_window_fb(void)
+{
+	int isn;
+	asm volatile(
+		"orefld o1, %1(o12)\n"
+		"oisn   %0, o1"
+		: "=r"(isn)
+		: "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		: "r1"
+	);
+	if (isn) return;
+	asm volatile(
+		"addiu r4, r0, 0\n"
+		"call  #0x101\n"               /* ObjFree */
+		"nop\n"
+		"onull o1\n"
+		"orefst o1, %0(o12)"
+		:
+		: "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		: "r1", "r2", "r4"
+	);
+}
+
+/* Composite a sub-rectangle of the window backing store onto the
+ * screen FB.  Coords (wx, wy) and (w, h) are in window-local pixel
+ * space; the destination on the screen FB is (wx + CELL_ORIGIN_X,
+ * wy + CELL_ORIGIN_Y) — i.e. the chrome's inner edge is the window's
+ * (0, 0).  One #0x10F ObjBlitCopy call. */
+static void
+composite_window_region(int wx, int wy, int w, int h)
+{
+	int packed_src_xy = ((wx & 0xFFFF) << 16) | (wy & 0xFFFF);
+	int packed_dst_xy = (((wx + CELL_ORIGIN_X) & 0xFFFF) << 16)
+	                  | (((wy + CELL_ORIGIN_Y) & 0xFFFF));
+	int packed_wh     = ((w & 0xFFFF) << 16) | (h & 0xFFFF);
+	asm volatile(
+		"addu   r8,  %0, r0\n"
+		"addu   r9,  %1, r0\n"
+		"addu   r10, %2, r0\n"
+		"orefld o1, %3(o12)\n"          /* O1 = screen FB (dst) */
+		"orefld o2, %4(o12)\n"          /* O2 = window FB (src) */
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r10, r0\n"
+		"call   #0x10F\n"               /* ObjBlitCopy */
+		"nop"
+		:
+		: "r"(packed_src_xy), "r"(packed_dst_xy), "r"(packed_wh),
+		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET),
+		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6",
+		  "r8", "r9", "r10"
+	);
+}
+
+/* Composite the entire window backing store onto the screen FB.
+ * Used after operations whose dirty rect is awkward to track (full-
+ * window scroll, future vector / raster ops once they migrate to
+ * the window FB).  Costs one bytearray copy of USABLE_W_PX ×
+ * USABLE_H_PX = ~930KB ≈ 5ms — bearable at human typing rates. */
+static void
+composite_whole_window(void)
+{
+	composite_window_region(0, 0, USABLE_W_PX, USABLE_H_PX);
 }
 
 /* Phase 60 step 5 — fill a rectangle in the framebuffer with a single
@@ -1487,6 +1599,23 @@ handle_new_window(int wtype)
 		return;
 	}
 
+	/* Phase 60 step 7 — per-window backing store.  CONSOLE / GRID
+	 * writes land here; the WM composites the touched region onto
+	 * the screen FB after each paint.  Single global slot in this
+	 * milestone (N=1 CONSOLE windows enforced above). */
+	status = alloc_window_fb();
+	if (status != 0) {
+		WM_PRINT("oriscwm: alloc_window_fb failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT("\n");
+		free_window_raster(wid);
+		free_window_vector(wid);
+		free_window_grid(wid);
+		free_window_console(wid);
+		wm_reply(E_IO, 0, 0, 0);
+		return;
+	}
+
 	window_type[wid - 1] = WIN_TYPE_CONSOLE;
 	window_subscribe_op[wid - 1] = 0;
 	window_cur_col[wid - 1] = 0;
@@ -1850,6 +1979,7 @@ handle_destroy_window(int wid)
 	free_window_grid(wid);
 	free_window_vector(wid);
 	free_window_raster(wid);
+	free_window_fb();
 	window_type[wid - 1] = 0;
 	window_subscribe_op[wid - 1] = 0;
 	/* Owner-ref stash is left in place; future allocations will
@@ -2007,6 +2137,7 @@ scan_owner_exits(void)
 			free_window_grid(wid);
 			free_window_vector(wid);
 			free_window_raster(wid);
+			free_window_fb();
 			window_type[wid - 1] = 0;
 			window_subscribe_op[wid - 1] = 0;
 			/* The owner-ref slot stays populated; it'll get
@@ -2329,12 +2460,11 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 
 	int text_off = (int)((unsigned int)glyphs - STACK_BOTTOM);
 	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
-	/* Translate client cell coords (0..N_COLS-1, 0..N_ROWS-1) to FB
-	 * cell coords by adding BORDER_CELLS — keeps the outer ring
-	 * reserved for the chrome painted by paint_window_chrome. */
-	int fb_col = col_start + BORDER_CELLS;
-	int fb_row = cell_row  + BORDER_CELLS;
-	int packed_xy = ((fb_col & 0xFFFF) << 16) | (fb_row & 0xFFFF);
+	/* Phase 60 step 7: render coords are now WINDOW-local — the window
+	 * backing store is sized to the usable cell area exactly, so
+	 * (col*CELL_W, row*CELL_H) lands in-bounds without the
+	 * BORDER_CELLS offset previous steps required. */
+	int packed_xy = ((col_start & 0xFFFF) << 16) | (cell_row & 0xFFFF);
 	int packed_shape = ((n_glyphs & 0xFFFF) << 16)
 	                 | ((WM_FG_COLOR & 0xFF) << 8)
 	                 | (WM_BG_COLOR & 0xFF);
@@ -2347,7 +2477,7 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 		"addu   r9,  %1, r0\n"      /* save packed_shape */
 		"addu   r10, %2, r0\n"      /* save font_off */
 		"addu   r11, %3, r0\n"      /* save text_off */
-		"orefld o1, %4(o12)\n"      /* O1 = framebuffer */
+		"orefld o1, %4(o12)\n"      /* O1 = window FB (offscreen) */
 		"omov   o2, o15\n"          /* O2 = boot data (font) */
 		"omov   o3, o11\n"          /* O3 = boot stack (text) */
 		"addu   r4, r8,  r0\n"
@@ -2359,10 +2489,16 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 		:
 		: "r"(packed_xy), "r"(packed_shape),
 		  "r"(font_off),  "r"(text_off),
-		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET)
+		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
 		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
 		  "r8", "r9", "r10", "r11"
 	);
+
+	/* Composite the just-painted strip onto the screen FB so the
+	 * change is visible.  Strip pixel rect in window-local coords:
+	 * (col_start*CELL_W, cell_row*CELL_H) → (n_glyphs*CELL_W, CELL_H). */
+	composite_window_region(col_start * CELL_W, cell_row * CELL_H,
+	                        n_glyphs   * CELL_W, CELL_H);
 }
 
 /* Phase 60 step 6 — shift the inner cell area up by one cell row
@@ -2379,12 +2515,16 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 static void
 fb_scroll_up_one_cell(void)
 {
-	int packed_xy = ((CELL_ORIGIN_X & 0xFFFF) << 16)
-	              | (CELL_ORIGIN_Y & 0xFFFF);
+	/* Phase 60 step 7: scroll happens in WINDOW-local coords inside
+	 * the window backing store — the full backing-store region
+	 * (0..USABLE_W_PX × 0..USABLE_H_PX).  After the in-FB shift we
+	 * composite the whole window onto the screen so the user sees
+	 * the new state.  Two firmware calls total per scroll
+	 * (ObjFbScroll + ObjBlitCopy) — still cheap compared to
+	 * per-row blits. */
+	int packed_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
 	int packed_wh = ((USABLE_W_PX & 0xFFFF) << 16)
 	              | (USABLE_H_PX & 0xFFFF);
-	/* dy:fill — dy occupies the upper 24 bits (signed); positive
-	 * shifts content toward y=0.  fill is the bottom 8 bits. */
 	int packed_dy_fill = ((CELL_H & 0xFFFFFF) << 8)
 	                   | (WM_BG_COLOR & 0xFF);
 	asm volatile(
@@ -2399,10 +2539,11 @@ fb_scroll_up_one_cell(void)
 		"nop"
 		:
 		: "r"(packed_xy), "r"(packed_wh), "r"(packed_dy_fill),
-		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET)
+		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
 		: "r1", "r2", "r4", "r5", "r6",
 		  "r8", "r9", "r10"
 	);
+	composite_whole_window();
 }
 
 /* Hoist `*row` back into [0, N_ROWS) by scrolling the inner cell

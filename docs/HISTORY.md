@@ -6644,6 +6644,71 @@ silently truncating.  Scroll-back history is still not stored —
 content shifted off the top of the inner area is lost (no
 per-window backing store yet).  That's the next milestone.
 
+## Phase 60 step 7 — per-window backing store
+
+The user-visible gaps from step 4 are closed; the next layer is the
+load-bearing one: windows still composite *transparently* onto a
+single shared framebuffer.  Without a per-window backing store
+there's no way to have overlapping opaque windows, title bars
+that paint on top of underlying content, scrollback, or any of
+the other usual window-manager features.  This step lays the
+foundation by giving each window its own offscreen FB the WM
+renders into, then composites onto the on-screen FB after every
+paint.
+
+simorisc:
+- `primitive_ObjAllocFramebuffer` gains an R7 flags word.  Bit 0
+  (FB_FLAG_OFFSCREEN) skips host-display-worker registration so
+  the FB is a pure offscreen bytearray — what we want for
+  per-window backing stores (otherwise we'd open one Tk window
+  per backing store).  Backward-compat: existing callers leave
+  R7 zero and get the prior "mirror to display" behaviour; the
+  WM's screen FB now sets R7=0 explicitly.
+- New firmware op #0x10F ObjBlitCopy(O1=dst, O2=src, R4=src_xy,
+  R5=dst_xy, R6=wh).  Cross-FB or in-FB rectangular copy with
+  independent clipping at both ends.  Same-FB overlapping
+  src/dst with dst_y > src_y iterates bottom-up so reads don't
+  trample writes.
+
+oriscwm:
+- New `alloc_window_fb()` / `free_window_fb()` — single global
+  slot `WM_WINDOW_FB_SLOT_OFFSET` (since N=1 CONSOLE remains
+  enforced).  When multi-window lands this becomes a 16-entry
+  per-wid array.
+- handle_new_window allocs the window FB after the CONSOLE /
+  GRID / VECTOR / RASTER service objects; rolls them all back
+  on failure.  handle_destroy_window + scan_owner_exits free
+  it alongside the service objects.
+- `flush_strip` now targets the window FB at window-local cell
+  coords (no BORDER_CELLS offset — the backing store is sized
+  exactly to the usable area).  After painting it composites
+  the strip's pixel rect onto the screen FB at
+  `(CELL_ORIGIN + col*CELL_W, CELL_ORIGIN + row*CELL_H)`.
+- `fb_scroll_up_one_cell` scrolls the window FB (full backing-
+  store region in window-local coords), then composites the
+  whole window onto the screen.  Two firmware calls per scroll
+  (ObjFbScroll + ObjBlitCopy) — bytearray copy of ~930KB per
+  composite, ~10ms.
+- Chrome (border + bg) keeps painting on the screen FB at boot.
+  The window's first composite over the inner area is a no-op
+  visually (zero-init window FB = bg palette index 0).
+
+VECTOR / RASTER ops still target the screen FB directly in this
+step; migrating them to the window FB (so they're stackable
+along with the text) is the next milestone — the wire shape
+stays the same, only the WM's draw helpers get retargeted.
+
+Tests:
+- fb_local_smoke gains step 7: ObjBlitCopy a 4-row strip in-place
+  onto a non-overlapping band, fetch back, byte-compare.  Catches
+  both the firmware op's correctness and overlapping semantics.
+- wm_smoke + supervisor_session_manager + directory + fb_local
+  all green.
+
+The user-visible result is still "looks the same as before" —
+this is foundation.  Title bars, opaque overlap, scrollback all
+build on top.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

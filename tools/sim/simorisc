@@ -3242,6 +3242,13 @@ def primitive_ObjAllocFramebuffer(cpu: CPU) -> None:
       R4 = width  (pixels, 1..4096)
       R5 = height (pixels, 1..4096)
       R6 = caps mask (typically R|W|C for the WM's own use)
+      R7 = flags
+            bit 0: FB_FLAG_OFFSCREEN — skip host display worker
+                   registration.  Used for per-window backing stores
+                   that the WM composites onto a separate "screen"
+                   framebuffer; we don't want a Tk window per window.
+                   Default 0 = mirror to display (Phase-60-step-1
+                   behaviour).
 
     Outputs:
       R2 = status (ERR_OK / ERR_EINVAL / ERR_ENOMEM)
@@ -3254,6 +3261,8 @@ def primitive_ObjAllocFramebuffer(cpu: CPU) -> None:
     width  = cpu.get_gpr(4) & 0xFFFF
     height = cpu.get_gpr(5) & 0xFFFF
     init_caps = cpu.get_gpr(6) & 0xFF
+    flags = cpu.get_gpr(7)
+    offscreen = bool(flags & 0x1)
     if width == 0 or height == 0 or width > 4096 or height > 4096:
         cpu.set_gpr(2, ERR_EINVAL); cpu.set_opr(1, 0); return
     size = width * height
@@ -3270,9 +3279,12 @@ def primitive_ObjAllocFramebuffer(cpu: CPU) -> None:
     # Notify the host display worker (if any) so it can create a Tk
     # window for this framebuffer.  Headless / no-display runs leave
     # the object as a plain bytearray; ObjStoreBytes still works.
-    worker = getattr(cpu, "display_worker", None)
-    if worker is not None:
-        worker.register_framebuffer(cpu, idx, desc)
+    # OFFSCREEN flag skips this — per-window backing stores composite
+    # onto a separate screen FB and shouldn't own their own Tk window.
+    if not offscreen:
+        worker = getattr(cpu, "display_worker", None)
+        if worker is not None:
+            worker.register_framebuffer(cpu, idx, desc)
     cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
 
 
@@ -3580,6 +3592,102 @@ def primitive_ObjFbScroll(cpu: CPU) -> None:
             fb_storage[base:base + cw] = fill_row
 
     fb_desc.fb_dirty = True
+    cpu.set_gpr(2, ERR_OK)
+
+
+def primitive_ObjBlitCopy(cpu: CPU) -> None:
+    """Phase 60 step 7 — copy a rectangular region from one
+    TAG_FRAMEBUFFER to another (or in-place within one) as a single
+    firmware call.  The compositor for per-window backing stores:
+    the WM keeps each window's pixels in an offscreen FB and blits
+    its visible region onto the on-screen FB after each paint.
+
+    Inputs:
+      O1 = destination framebuffer ref (TAG_FRAMEBUFFER, local).
+      O2 = source framebuffer ref      (TAG_FRAMEBUFFER, local).
+            May be the same ref as O1 for in-FB copy (e.g. scroll-via-
+            blit if ObjFbScroll didn't fit); pre-handled by the caller.
+      R4 = packed (src_x << 16) | src_y — top-left in source.
+      R5 = packed (dst_x << 16) | dst_y — top-left in destination.
+      R6 = packed (w << 16) | h         — region size in pixels.
+
+    Outputs:
+      R2 = status (ERR_OK / ERR_EFAULT / ERR_EPERM / ERR_EREMOTE /
+                   ERR_ESTALE / ERR_EINVAL)
+
+    Both rects clip to their respective FB bounds independently; the
+    actual transfer takes the intersection so the visible result is
+    well-defined even when one side overflows.  Same-FB overlapping
+    src/dst with src_y < dst_y iterates bottom-up so we don't trample
+    reads (the in-FB scroll-down case). """
+    dst_ref = cpu.get_opr(1)
+    src_ref = cpu.get_opr(2)
+    if dst_ref == 0 or src_ref == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if (ref_caps(dst_ref) & CAP_W) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return
+    if (ref_caps(src_ref) & CAP_R) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return
+    if ref_home(dst_ref) != cpu.pid or ref_home(src_ref) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+    dst_idx = ref_index(dst_ref)
+    src_idx = ref_index(src_ref)
+    for idx, ref in ((dst_idx, dst_ref), (src_idx, src_ref)):
+        if idx <= 0 or idx >= len(cpu.descriptors) \
+                or cpu.descriptors[idx] is None:
+            cpu.set_gpr(2, ERR_ESTALE); return
+        d = cpu.descriptors[idx]
+        if not d.live or d.generation != ref_generation(ref):
+            cpu.set_gpr(2, ERR_ESTALE); return
+    dst_desc = cpu.descriptors[dst_idx]
+    src_desc = cpu.descriptors[src_idx]
+    if dst_desc.type_tag != TAG_FRAMEBUFFER \
+       or src_desc.type_tag != TAG_FRAMEBUFFER:
+        cpu.set_gpr(2, ERR_EINVAL); return
+
+    r4 = cpu.get_gpr(4)
+    sx = sext32((r4 >> 16) & 0xFFFF)
+    sy = sext32(r4 & 0xFFFF)
+    r5 = cpu.get_gpr(5)
+    dx = sext32((r5 >> 16) & 0xFFFF)
+    dy = sext32(r5 & 0xFFFF)
+    r6 = cpu.get_gpr(6)
+    rw = (r6 >> 16) & 0xFFFF
+    rh = r6 & 0xFFFF
+    if rw == 0 or rh == 0:
+        cpu.set_gpr(2, ERR_OK); return
+
+    sw, sh = src_desc.fb_width, src_desc.fb_height
+    dw, dh = dst_desc.fb_width, dst_desc.fb_height
+    # Clip rw/rh so neither the source nor destination overflows.
+    if sx < 0:
+        rw += sx; dx -= sx; sx = 0
+    if sy < 0:
+        rh += sy; dy -= sy; sy = 0
+    if dx < 0:
+        rw += dx; sx -= dx; dx = 0
+    if dy < 0:
+        rh += dy; sy -= dy; dy = 0
+    rw = min(rw, sw - sx, dw - dx)
+    rh = min(rh, sh - sy, dh - dy)
+    if rw <= 0 or rh <= 0:
+        cpu.set_gpr(2, ERR_OK); return
+
+    src_storage = src_desc.storage
+    dst_storage = dst_desc.storage
+    same = (dst_idx == src_idx)
+    # In-place overlapping case: copy bottom-up if dst_y > src_y so
+    # we read each row before it's overwritten.  Distinct FBs: always
+    # safe to iterate top-down.
+    if same and dy > sy:
+        rows = range(rh - 1, -1, -1)
+    else:
+        rows = range(rh)
+    for ry in rows:
+        s = (sy + ry) * sw + sx
+        d = (dy + ry) * dw + dx
+        dst_storage[d:d + rw] = src_storage[s:s + rw]
+    dst_desc.fb_dirty = True
     cpu.set_gpr(2, ERR_OK)
 
 
@@ -4270,6 +4378,7 @@ PRIMITIVE_MIN_MODE = {
     0x10C: MODE_USER,        # ObjBlitGlyphs (Phase 60 step 4)
     0x10D: MODE_USER,        # ObjFillRect (Phase 60 step 5)
     0x10E: MODE_USER,        # ObjFbScroll (Phase 60 step 6)
+    0x10F: MODE_USER,        # ObjBlitCopy (Phase 60 step 7)
     0x107: MODE_USER,        # ObjFreeDeferred — drain-window wrapper
     0x103: MODE_USER,        # ObjDerive
     0x106: MODE_USER,        # ObjAllocStore
@@ -4332,6 +4441,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjFillRect(cpu)
     elif prim == 0x10E:
         primitive_ObjFbScroll(cpu)
+    elif prim == 0x10F:
+        primitive_ObjBlitCopy(cpu)
     elif prim == 0x107:
         primitive_ObjFreeDeferred(cpu)
     elif prim == 0x103:

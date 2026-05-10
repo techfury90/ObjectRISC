@@ -246,6 +246,90 @@ main(void)
 	}
 	WP("fb_local_smoke: scroll verify OK\n");
 
+	/* Step 7 (Phase 60 step 7): ObjBlitCopy a sub-rect from the same
+	 * FB to itself, in-place — verifies the same-FB / overlapping
+	 * path.  Copy rows 0..3 (post-scroll: src[4..7] pattern + first
+	 * row of the fill band gone since dst overlaps src at +4) onto
+	 * rows 8..11.  Then byte-check rows 8..11 match what rows 0..3
+	 * had just before the copy.
+	 *
+	 * Save rows 0..3 first so we have a ground-truth for the check
+	 * (the copy mutates the source if dst overlaps src... it doesn't
+	 * here since dst_y=8 > src_y=0 with non-overlapping 4-row band). */
+	unsigned char saved[4 * FB_W];
+	{
+		int y2;
+		for (y2 = 0; y2 < 4; y2++)
+			for (x = 0; x < FB_W; x++)
+				saved[y2 * FB_W + x] = post[y2 * FB_W + x];
+	}
+	int blit_status;
+	{
+		register int sxy  asm("r12") = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
+		register int dxy  asm("r13") = ((0 & 0xFFFF) << 16) | (8 & 0xFFFF);
+		register int whp  asm("r14") = ((FB_W & 0xFFFF) << 16) | (4 & 0xFFFF);
+		asm volatile(
+			"omov o1, o5\n"             /* dst = framebuffer */
+			"omov o2, o5\n"             /* src = same framebuffer */
+			"addu r4, r12, r0\n"
+			"addu r5, r13, r0\n"
+			"addu r6, r14, r0\n"
+			"call #0x10F\n"             /* ObjBlitCopy */
+			"nop\n"
+			"addu %0, r2, r0"
+			: "=r"(blit_status)
+			: "r"(sxy), "r"(dxy), "r"(whp)
+			: "r1", "r2", "r4", "r5", "r6"
+		);
+	}
+	if (blit_status != 0) {
+		fail("ObjBlitCopy", blit_status); return 9;
+	}
+	WP("fb_local_smoke: blit-copy OK\n");
+
+	/* Re-fetch + verify rows 8..11 now match what rows 0..3 held. */
+	unsigned char post2[FB_BYTES];
+	int post2_off = (int)((unsigned int)post2 - 0x001f0000U);
+	int post2_status;
+	asm volatile(
+		"addu  r8, %1, r0\n"
+		"omov  o1, o5\n"
+		"omov  o2, o11\n"
+		"addiu r4, r0, 0\n"
+		"addu  r5, r8, r0\n"
+		"addiu r6, r0, %2\n"
+		"call  #0x108\n"                /* ObjFetchBytes */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(post2_status)
+		: "r"(post2_off), "i"(FB_BYTES)
+		: "r1", "r2", "r3", "r4", "r5", "r6", "r8"
+	);
+	if (post2_status != 0) {
+		fail("ObjFetchBytes post-blit", post2_status); return 10;
+	}
+	int y3;
+	for (y3 = 0; y3 < 4; y3++) {
+		for (x = 0; x < FB_W; x++) {
+			int got  = post2[(y3 + 8) * FB_W + x];
+			int want = saved[y3 * FB_W + x];
+			if (got != want) {
+				restore_or_state();
+				print_str("FAIL: blit-copy mismatch y=");
+				print_int(y3 + 8);
+				print_str(" x=");
+				print_int(x);
+				print_str(" got=");
+				print_int(got);
+				print_str(" want=");
+				print_int(want);
+				print_str("\n");
+				return 11;
+			}
+		}
+	}
+	WP("fb_local_smoke: blit-copy verify OK\n");
+
 	WP("fb_local_smoke: PASS\n");
 	return 0;
 }
