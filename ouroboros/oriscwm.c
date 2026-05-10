@@ -220,8 +220,18 @@
 #define WM_POINTER_CAP_SLOT_OFFSET      1112  /* libc-visible bound cap */
 #define WM_POINTER_SVC_SLOT_OFFSET      1120  /* TAG_SERVICE clients SEND to */
 #define WM_PTR_SUB_SLOT_OFFSET          1128  /* current subscriber's reply ref */
-#define WM_PTR_EVENTS_SLOT_OFFSET       1136  /* mailbox: WM polls term events */
-#define WM_SURF_POINTER_SLOT_OFFSET     1144  /* /sys/term/0/pointer cap */
+#define WM_PTR_EVENTS_SLOT_OFFSET       1136  /* TAG_INPUT_SINK kind=1 */
+#define WM_SURF_POINTER_SLOT_OFFSET     1144  /* unused post step 3 */
+
+/* Phase 60 step 3 — terminal-firmware unification.  The WM allocates
+ * its keyboard / pointer event sinks LOCALLY via the simorisc
+ * #0x10B ObjAllocInputSink primitive; the host display worker
+ * (--display tk) translates Tk events into SEND_DELIVER packets and
+ * appends them to the sink queue.  oriscterm no longer mediates
+ * input — the WM CPU IS the terminal. */
+#define WM_KEYBOARD_SVC_SLOT_OFFSET     1152  /* TAG_SERVICE clients SEND to */
+#define WM_KBD_SUB_SLOT_OFFSET          1160  /* current subscriber's reply ref */
+#define WM_KBD_EVENTS_SLOT_OFFSET       1168  /* TAG_INPUT_SINK kind=0 */
 
 /* === Glyph rendering ==================================================
  *
@@ -561,22 +571,51 @@ walk_console_to_slot(void)
 	return 0;
 }
 
+/* Phase 60 step 3 — local input sinks.  Each of these allocates a
+ * TAG_INPUT_SINK object via the simorisc #0x10B primitive; the host
+ * display worker (--display tk) translates Tk events into
+ * SEND_DELIVER packets and appends them to the sink's queue.  The
+ * WM polls the queue from its main loop and forwards events on to
+ * subscribers — replaces the prior walk + subscribe-to-/sys/term/-
+ * <N>/pointer dance for pointer, and the prior walk + WSURF_KEYBOARD
+ * passthrough for keyboard.  Two wrappers (instead of one
+ * parameterised helper) because pcc-orisc rejects computed-offset
+ * OREFST and each caller bakes its destination slot in via the "i"
+ * asm constraint. */
 static int
-walk_keyboard_to_slot(void)
+alloc_local_keyboard_sink(void)
 {
-	int kind;
-	char rem[16];
-	int rc = dir_walk(path_keyboard, &kind, rem, sizeof(rem));
-	if (rc != 0) return rc;
-	if (kind != DIR_KIND_LEAF) return -1;
+	int status;
 	asm volatile(
-		"orefld o1, 616(o12)\n"
-		"orefst o1, %0(o12)"
-		:
-		: "i"(WM_SURF_KEYBOARD_SLOT_OFFSET)
-		: "r1"
+		"addiu r4, r0, 0\n"            /* kind = 0 (keyboard) */
+		"addiu r5, r0, 31\n"           /* caps R|W|S|V|C — CAP_V needed for RQP */
+		"call  #0x10B\n"
+		"nop\n"
+		"orefst o1, %1(o12)\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(WM_KBD_EVENTS_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6"
 	);
-	return 0;
+	return status;
+}
+
+static int
+alloc_local_pointer_sink(void)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, 1\n"            /* kind = 1 (pointer) */
+		"addiu r5, r0, 31\n"           /* caps R|W|S|V|C — CAP_V needed for RQP */
+		"call  #0x10B\n"
+		"nop\n"
+		"orefst o1, %1(o12)\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(WM_PTR_EVENTS_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	return status;
 }
 
 /* Phase 60 step 2 — allocate the framebuffer LOCALLY via the new
@@ -608,42 +647,17 @@ alloc_local_framebuffer(void)
 	return status;
 }
 
-/* Same shape as walk_framebuffer_to_slot but for /sys/term/0/pointer
- * (Phase 59 / WM γ.13).  The WM subscribes a private mailbox to it
- * at boot via subscribe_term_pointer below. */
+/* Phase 60 step 3 superseded subscribe_term_pointer (the
+ * /sys/term/<N>/pointer subscribe) and walk_pointer_to_slot.  The
+ * pointer events mailbox is now a TAG_INPUT_SINK allocated by
+ * alloc_local_pointer_sink above; simorisc's display worker
+ * enqueues Tk pointer events into it directly.  Kept the old
+ * helper below dead-stripped via #if 0 to make the migration
+ * easy to retrace later. */
+#if 0
 static int
-walk_pointer_to_slot(void)
-{
-	int kind;
-	char rem[16];
-	int rc = dir_walk(path_pointer, &kind, rem, sizeof(rem));
-	if (rc != 0) return rc;
-	if (kind != DIR_KIND_LEAF) return -1;
-	asm volatile(
-		"orefld o1, 616(o12)\n"
-		"orefst o1, %0(o12)"
-		:
-		: "i"(WM_SURF_POINTER_SLOT_OFFSET)
-		: "r1"
-	);
-	return 0;
-}
+walk_pointer_to_slot(void) { /* removed in Phase 60 step 3 */ }
 
-/* Phase 59 / WM γ.13 — boot helper that:
- *   1. ObjAllocs a TAG_SERVICE event mailbox + ReceiveQueueAttach
- *      (depth 64 — larger than the ~8-event-per-Tk-tick burst the
- *      pointer can produce during fast drags).
- *   2. Stashes the mailbox into WM_PTR_EVENTS_SLOT.
- *   3. Derives an R|S sub-cap and SENDs it to /sys/term/0/pointer
- *      with the standard "non-null O2 = subscribe" wire shape.
- *
- * After this returns 0, the underlying terminal will SEND every
- * pointer event it observes to our event mailbox.  poll_pointer_events
- * picks them up and forwards them on to the WM-mediated subscriber.
- *
- * The pointer service object the WM allocates separately
- * (alloc_pointer_service) is the one CLIENTS SEND to in order to
- * subscribe — distinct from this event mailbox. */
 static int
 subscribe_term_pointer(void)
 {
@@ -699,6 +713,7 @@ subscribe_term_pointer(void)
 	);
 	return 0;
 }
+#endif  /* end pre-step-3 helpers */
 
 /* Allocate the WM-side pointer SERVICE object — clients SEND to a
  * derived R|S sub-cap of this when they subscribe via
@@ -724,6 +739,43 @@ alloc_pointer_service(void)
 
 	asm volatile("orefst o1, %0(o12)"
 	             :: "i"(WM_POINTER_SVC_SLOT_OFFSET));
+
+	asm volatile(
+		"addiu r4, r0, 16\n"
+		"call  #0x203\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	return status;
+}
+
+/* Phase 60 step 3 — same shape as alloc_pointer_service for the
+ * keyboard subscribe service.  Clients SEND subscribe to a derived
+ * R|S sub-cap of WM_KEYBOARD_SVC_SLOT (returned by
+ * wm_bind_surface(WSURF_KEYBOARD)). */
+static int
+alloc_keyboard_service(void)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, 16\n"
+		"addiu r5, r0, %1\n"
+		"addiu r6, r0, %2\n"
+		"call  #0x100\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(TAG_SERVICE),
+		  "i"(CAP_R | CAP_W | CAP_S | CAP_V | CAP_C)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	if (status != 0) return status;
+
+	asm volatile("orefst o1, %0(o12)"
+	             :: "i"(WM_KEYBOARD_SVC_SLOT_OFFSET));
 
 	asm volatile(
 		"addiu r4, r0, 16\n"
@@ -1639,16 +1691,38 @@ handle_bind_surface(int wid, int kind)
 		return;
 	}
 
-	/* WSURF_KEYBOARD: passthrough to the underlying terminal cap
-	 * walked at WM startup. */
-	load_surface_to_o14(kind);
-	int isn;
-	asm volatile("oisn %0, o14" : "=r"(isn));
-	if (isn) {
-		wm_reply(E_NOENT, 0, 0, 0);
+	/* WSURF_KEYBOARD: broker (Phase 60 step 3 — was passthrough to
+	 * /sys/term/<N>/keyboard, but oriscterm is gone now).  Mirror
+	 * of WSURF_POINTER above: derive R|S sub-cap of
+	 * WM_KEYBOARD_SVC_SLOT, return it.  Clients SEND subscribe
+	 * requests to the sub-cap; poll_keyboard_subscribes captures
+	 * them; poll_keyboard_events forwards key events from the
+	 * local TAG_INPUT_SINK queue. */
+	if (kind == WSURF_KEYBOARD) {
+		int derive_status;
+		asm volatile(
+			"orefld o1, %1(o12)\n"
+			"addiu  r4, r0, %2\n"
+			"call   #0x103\n"
+			"nop\n"
+			"omov   o14, o1\n"
+			"addu   %0, r2, r0"
+			: "=r"(derive_status)
+			: "i"(WM_KEYBOARD_SVC_SLOT_OFFSET),
+			  "i"(CAP_R | CAP_S)
+			: "r1", "r2", "r4"
+		);
+		if (derive_status != 0) {
+			wm_reply(E_IO, 0, 0, 0);
+			return;
+		}
+		wm_reply_with_ref_o14(0);
 		return;
 	}
-	wm_reply_with_ref_o14(0);
+
+	/* No other surface kinds left (CONSOLE / GRID / VECTOR / RASTER /
+	 * POINTER / KEYBOARD all handled above).  Should be unreachable. */
+	wm_reply(E_INVAL, 0, 0, 0);
 }
 
 /* WM_OP_DESTROY_WINDOW — release a window. */
@@ -2322,32 +2396,40 @@ forward_console_write(int wid, int offset, int count)
 		);
 	}
 
-	/* Now forward the SEND.  The terminal does its own OBJ_READ_REQ
-	 * to the leader's source — the leader's still blocked, so the
-	 * source is valid.  After we forward, oriscterm will process the
-	 * SEND_DELIVER, then process the OBJ_WRITE_REQs from
-	 * render_buffer below — console pane updates before the
-	 * framebuffer pane fills in. */
+	/* Phase 60 step 3 — was a forward to oriscterm's underlying
+	 * CONSOLE here; with oriscterm gone, the WM IS the CONSOLE
+	 * receiver.  If the client's SEND carried a non-null reply_cap
+	 * (term_print_n_sync wants an ack so it can unblock), send a
+	 * header-only SEND_DELIVER ack.  Otherwise nothing more to do
+	 * on the wire — the client's SEND already returned (R2 = OK)
+	 * the moment we delivered the packet to the per-window queue. */
+	int reply_isn;
 	asm volatile(
-		"orefld o1, %0(o12)\n"          /* O1 = underlying CONSOLE cap */
-		"orefld o2, %1(o12)\n"          /* O2 = original source ref */
-		"orefld o3, %2(o12)\n"          /* O3 = client's reply_cap */
-		"addu   r4, %3, r0\n"           /* R4 = offset */
-		"addu   r5, %4, r0\n"           /* R5 = count */
-		"addiu  r6, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(WM_SURF_CONSOLE_SLOT_OFFSET),
-		  "i"(WM_FORWARD_SRC_SLOT_OFFSET),
-		  "i"(WM_FORWARD_REPLY_SLOT_OFFSET),
-		  "r"(offset), "r"(count)
-		: "r1", "r4", "r5", "r6", "r7"
+		"orefld o1, %1(o12)\n"
+		"oisn   %0, o1"
+		: "=r"(reply_isn)
+		: "i"(WM_FORWARD_REPLY_SLOT_OFFSET)
+		: "r1"
 	);
+	if (!reply_isn) {
+		asm volatile(
+			"orefld o1, %0(o12)\n"   /* O1 = client's reply_cap */
+			"onull  o2\n"
+			"onull  o3\n"
+			"addiu  r4, r0, 0\n"
+			"addiu  r5, r0, 0\n"
+			"addiu  r6, r0, 0\n"
+			"addiu  r7, r0, 0\n"
+			"send   o1"
+			:
+			: "i"(WM_FORWARD_REPLY_SLOT_OFFSET)
+			: "r1", "r4", "r5", "r6", "r7"
+		);
+	}
 
-	/* Render against our private buf copy.  The source ref may
-	 * already be racing the leader's stack reuse here, but we
-	 * don't care — we're working from buf, which is on our stack. */
+	/* Render against our private buf copy.  We've already replied
+	 * (if needed); the leader's stack is fair game to reuse from
+	 * here on out, which is fine since buf is on OUR stack. */
 	if (fetch_count > 0) {
 		render_buffer(wid, buf, fetch_count);
 	}
@@ -2859,6 +2941,94 @@ poll_pointer_events(void)
 	);
 }
 
+/* Phase 60 step 3 — keyboard subscribe/event polls.  Direct mirror
+ * of the pointer pair above: subscribers register reply refs at
+ * WM_KEYBOARD_SVC_SLOT (single subscriber for v1, stashed in
+ * WM_KBD_SUB_SLOT); Tk events arrive in WM_KBD_EVENTS_SLOT (a
+ * TAG_INPUT_SINK fed by simorisc's display worker); each event gets
+ * forwarded to the current subscriber via SEND. */
+static int _wm_kbd_sub_poll_status;
+
+static void
+poll_keyboard_subscribes(void)
+{
+	asm volatile("orefld o1, %0(o12)"
+	             :: "i"(WM_KEYBOARD_SVC_SLOT_OFFSET));
+	asm volatile(
+		"addiu r4, r0, 0\n"
+		"call  #0x204\n"
+		"nop\n"
+		"la    r1, _wm_kbd_sub_poll_status\n"
+		"sw    r2, 0(r1)"
+		:
+		:
+		: "r1", "r2", "memory"
+	);
+	if (_wm_kbd_sub_poll_status != 0) return;
+	asm volatile(
+		"orefst o2, %0(o12)"
+		:
+		: "i"(WM_KBD_SUB_SLOT_OFFSET)
+		: "memory"
+	);
+}
+
+static int _wm_kbd_evt_poll_status;
+
+static void
+poll_keyboard_events(void)
+{
+	int sub_isn;
+	asm volatile(
+		"orefld o1, %1(o12)\n"
+		"oisn   %0, o1"
+		: "=r"(sub_isn)
+		: "i"(WM_KBD_SUB_SLOT_OFFSET)
+		: "r1"
+	);
+	if (sub_isn) return;
+
+	asm volatile("orefld o1, %0(o12)"
+	             :: "i"(WM_KBD_EVENTS_SLOT_OFFSET));
+	int code, mods, r5_zero, r6_zero;
+	asm volatile(
+		"addiu r4, r0, 0\n"
+		"call  #0x204\n"
+		"nop\n"
+		"la    r1, _wm_kbd_evt_poll_status\n"
+		"sw    r2, 0(r1)\n"
+		"addu  %0, r3, r0\n"
+		"addu  %1, r4, r0\n"
+		"addu  %2, r5, r0\n"
+		"addu  %3, r6, r0"
+		: "=r"(code), "=r"(mods),
+		  "=r"(r5_zero), "=r"(r6_zero)
+		:
+		: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+	);
+	if (_wm_kbd_evt_poll_status != 0) return;
+
+	/* Forward: SEND to subscriber's ref with int_payload[0..3] =
+	 * (code, mods, 0, 0).  Same safe-temps dance as the pointer
+	 * forwarder. */
+	asm volatile(
+		"addu   r8,  %1, r0\n"
+		"addu   r9,  %2, r0\n"
+		"orefld o1, %0(o12)\n"
+		"onull  o2\n"
+		"onull  o3\n"
+		"addu   r4, r8, r0\n"
+		"addu   r5, r9, r0\n"
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1"
+		:
+		: "i"(WM_KBD_SUB_SLOT_OFFSET),
+		  "r"(code), "r"(mods)
+		: "r1", "r4", "r5", "r6", "r7", "r8", "r9"
+	);
+}
+
 const char banner_boot[]            = "oriscwm: booting\n";
 const char banner_alloc_fail[]      = "oriscwm: failed to allocate service mailbox: ";
 const char banner_ready[]           = "oriscwm: ready\n";
@@ -2942,16 +3112,13 @@ main(void)
 		return 1;
 	}
 
-	/* Walk the directory for our underlying surface caps. */
-	status = walk_console_to_slot();
-	if (status == 0) wm_print_walk_ok(path_console);
-	else             wm_print_walk_fail(path_console, status);
-	/* Continue on failure — OP_BIND_SURFACE returns E_NOENT for the
-	 * missing kind. */
-	status = walk_keyboard_to_slot();
-	if (status == 0) wm_print_walk_ok(path_keyboard);
-	else             wm_print_walk_fail(path_keyboard, status);
-	/* Phase 60 step 2 — framebuffer is local now (no /sys/term walk). */
+	/* Phase 60 step 3 — nothing under /sys/term/<N>/* anymore.
+	 * Keyboard, pointer, framebuffer are all local: keyboard +
+	 * pointer via the #0x10B ObjAllocInputSink primitive
+	 * (simorisc's display worker enqueues Tk events into the sink
+	 * queues), framebuffer via #0x102 ObjAllocFramebuffer.
+	 * forward_console_write replies to the client's reply_cap
+	 * directly — no underlying CONSOLE service to forward to. */
 	status = alloc_local_framebuffer();
 	if (status == 0) {
 		WM_PRINT("oriscwm: framebuffer allocated locally (");
@@ -2965,27 +3132,38 @@ main(void)
 		WM_PRINT(" — glyph rendering disabled\n");
 	}
 
-	/* Phase 59 / WM γ.13 — pointer mediation. */
-	status = walk_pointer_to_slot();
-	if (status == 0) {
-		wm_print_walk_ok(path_pointer);
+	/* Pointer: local sink + WM-side subscribe service. */
+	status = alloc_local_pointer_sink();
+	if (status != 0) {
+		WM_PRINT("oriscwm: alloc_local_pointer_sink failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT("\n");
+	} else {
 		status = alloc_pointer_service();
 		if (status != 0) {
 			WM_PRINT("oriscwm: alloc_pointer_service failed: ");
 			WM_PRINT_INT(status);
 			WM_PRINT("\n");
 		} else {
-			status = subscribe_term_pointer();
-			if (status != 0) {
-				WM_PRINT("oriscwm: subscribe_term_pointer failed: ");
-				WM_PRINT_INT(status);
-				WM_PRINT("\n");
-			} else {
-				WM_PRINT("oriscwm: pointer mediation ready\n");
-			}
+			WM_PRINT("oriscwm: pointer mediation ready\n");
 		}
+	}
+
+	/* Keyboard: local sink + WM-side subscribe service. */
+	status = alloc_local_keyboard_sink();
+	if (status != 0) {
+		WM_PRINT("oriscwm: alloc_local_keyboard_sink failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT("\n");
 	} else {
-		wm_print_walk_fail(path_pointer, status);
+		status = alloc_keyboard_service();
+		if (status != 0) {
+			WM_PRINT("oriscwm: alloc_keyboard_service failed: ");
+			WM_PRINT_INT(status);
+			WM_PRINT("\n");
+		} else {
+			WM_PRINT("oriscwm: keyboard mediation ready\n");
+		}
 	}
 
 	WM_PRINT("oriscwm: registered at ");
@@ -3058,5 +3236,7 @@ main(void)
 		poll_window_rasters();
 		poll_pointer_subscribes();
 		poll_pointer_events();
+		poll_keyboard_subscribes();
+		poll_keyboard_events();
 	}
 }

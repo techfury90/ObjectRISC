@@ -109,20 +109,21 @@ fi
 # terminal without any per-CPU configuration on the supervisor.)
 #
 # CPUs 2 + 3 = oriscwm instances (Phase 59 / WM γ.15: one per
-# terminal).  Each WM dir-walks /sys/term/<N>/{console,keyboard,
-# framebuffer,pointer} for the surfaces of its terminal and
-# registers at /sys/wm/<N>/0; supervisors discover their own
+# terminal; Phase 60 step 3 promoted them into "terminal firmware").
+# Each WM owns its terminal's display + keyboard + pointer locally
+# via simorisc's --display tk + ObjAllocFramebuffer / ObjAllocInputSink
+# primitives — no oriscterm process in the loop anymore.  WMs
+# register at /sys/wm/<N>/0; supervisors discover their own
 # terminal's WM via wm_init (walks /sys/wm/<my_term>/0).  init-r4=N+1
-# tells the WM its terminal index — task_init decodes init_r4 into
-# task_my_terminal_idx (Phase 51 convention).
+# tells the WM its terminal index.
 #
 # If a WM crashes / fails to register, the matching supervisor's
-# wm_init returns negative and falls back to direct /sys/term/<N>/*
-# — the shell still works.  WMs are always-on but never load-bearing.
+# wm_init returns negative — there's no fallback display anymore,
+# so the system effectively halts on that terminal.  Acceptable: the
+# WM is now load-bearing rather than the always-on-but-optional
+# luxury it was pre-Phase-60.
 exec python3 tools/oriscrun \
     --directory pid=18 \
-    --terminal "pid=16,instance=0" \
-    --terminal "pid=19,instance=1" \
     --hostfsd "pid=17,instance=0,root=$ROOT" \
     --cpu "pid=2:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=1,display=tk" \
     --cpu "pid=3:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=2,display=tk" \

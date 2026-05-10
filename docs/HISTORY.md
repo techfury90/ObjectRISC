@@ -6423,6 +6423,61 @@ through the WM so the terminal-firmware CPU owns both display and
 input.  Workaround for now: focus oriscterm's legacy text-widget
 window (still visible alongside the FB) to type.
 
+## Phase 60 step 3 — terminal-firmware unification
+
+Drops oriscterm from the runtime entirely.  The simorisc instance
+hosting each WM CPU also owns its terminal's display, keyboard and
+pointer in-process — there's no separate oriscterm process to
+mediate input or render the legacy text widget.
+
+**Mechanism:**
+
+- New firmware op `ObjAllocInputSink` (#0x10B): allocates a
+  `TAG_INPUT_SINK` (0x4105) object with an auto-attached queue
+  (depth 64).  R4 = kind (0=keyboard, 1=pointer); R5 = caps mask.
+  simorisc records `cpu.input_sinks[kind] = idx`.
+- `TkDisplayWorker` binds `<Key>` / `<Motion>` / `<ButtonPress>` /
+  `<ButtonRelease>` on the framebuffer Canvas (Toplevel doesn't
+  take focus directly — Canvas with `takefocus=1` does).  Each
+  event is translated and enqueued as a synthetic SEND_DELIVER
+  packet directly into the registered sink's queue.  Click-to-focus
+  via `<ButtonPress>` so users get input by clicking the FB window.
+- WM allocates two sinks at boot: keyboard at
+  `WM_KBD_EVENTS_SLOT_OFFSET` and pointer at
+  `WM_PTR_EVENTS_SLOT_OFFSET` (replacing the prior subscribe-to-
+  /sys/term/<N>/pointer dance — the slot offset is reused
+  unchanged).  Caps must include `CAP_V` for `ReceiveQueuePoll` to
+  accept the ref (got that wrong on the first try and the WM saw
+  every poll return `ERR_EPERM`).
+- WSURF_KEYBOARD changes from passthrough to broker, mirroring
+  WSURF_POINTER γ.13: the WM allocates a per-WM keyboard subscribe
+  service (`WM_KEYBOARD_SVC_SLOT`); clients SEND subscribe through
+  a derived R|S sub-cap; the WM polls the subscribe queue, captures
+  the subscriber's reply ref, and forwards key events from the
+  local sink.  Single-subscriber v1; multi-window focus routing is
+  follow-up.
+- `forward_console_write` no longer forwards to a `/sys/term/<N>/
+  console` underlying terminal (there isn't one).  It just renders
+  bytes into the local framebuffer and, if the client SEND carried
+  a non-null `reply_cap` (`term_print_n_sync`), sends a
+  header-only ack so the client unblocks.
+- `scripts/boot.sh` drops both `--terminal pid=16,instance=0` and
+  `--terminal pid=19,instance=1`.  The system now boots with
+  4 CPUs (2 supervisors + 2 WMs) plus the directory daemon and
+  hostfsd — no oriscterm processes at all.
+
+**Result:** end-to-end input working — click an FB window, type,
+shell sees keystrokes.  This is the "terminal-firmware" model in
+practice: each terminal is one simorisc process owning display +
+input + the WM, with the supervisor on a separate fabric CPU
+relaying spawns.
+
+**Vestigial code kept around:** oriscterm.py is still in the tree
+(used by `fb_smoke.c` / `test_framebuffer.sh` and the headless
+`fake_terminal.py` that several smoke tests depend on).  The WM's
+`walk_console_to_slot` / `WM_SURF_*` slots are dead but defined
+(future cleanup).
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
