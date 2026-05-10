@@ -7023,6 +7023,58 @@ Caveats — still deferred:
   reclaim it on child exit.  Click-to-raise would make this
   WM-managed properly.
 
+## Phase 60 step 14 — cascade visible + clean window destroy
+
+Two small fixes that together make multi-window feel like
+multi-window.
+
+Step 11's cascade math reserved horizontal/vertical slack for
+window offsets, but with the prior 158×45 windows occupying nearly
+the full 160×48 screen, the slack was 0 — every cascaded window
+stacked at the same screen position and only z-order distinguished
+them.  Now windows are 80×24 (the classic mid-80s terminal size),
+leaving 624 px horizontal and 336 px vertical of slack.  The
+existing cascade-by-32-px math kicks in naturally: window 1 at
+(8, 16), window 2 at (40, 48), window 3 at (72, 80), etc.
+Multiple windows visibly stagger across the screen.
+
+oriscwm:
+- N_COLS dropped 158 → 80, N_ROWS dropped 45 → 24.  USABLE_W_PX
+  becomes 640 px, USABLE_H_PX (incl. title bar) 400 px.
+- FB_W / FB_H are now hard-coded (1280 × 768) rather than derived
+  from N_COLS / N_ROWS — the SCREEN size is fixed, only the
+  per-window size shrunk.
+- DEFAULT_W_CELLS / DEFAULT_H_CELLS updated to match — clients
+  calling wm_new_window / wm_get_geometry now see 80×24.
+- New `composite_screen_rect(sx, sy, w, h)` — extracted from
+  `composite_window_region` so the destroy path can reuse the
+  z-walk logic.
+- New `recompose_after_destroy(sx, sy, w, h)`: fills the
+  destroyed window's screen rect with bg, then composites the
+  rect from remaining z-stack windows.  Hooked into
+  handle_destroy_window AND scan_owner_exits (auto-destroy on
+  owner exit).  Vacated pixels no longer linger.
+
+libc:
+- `WM_MAX_TITLE_LEN` drops 158 → 80 to track the WM's
+  `MAX_TITLE_LEN` (= N_COLS).
+
+Tests:
+- wm_smoke now reports `(wid=1, w_cells=80, h_cells=24)` /
+  `(80x24 cells / 640x384 px)`.
+- fb_local + vec + raster + supervisor_session_manager all green.
+
+Programs:
+- edit (already 80×24-compatible): runs unchanged in the new
+  smaller windows.
+- shell + winhello: same.
+
+Visible result on boot.sh: each WM-mediated window (supervisor's
+leader, winhello, edit) appears as a smaller 80×24 cell box;
+launching multiple windows stacks them with a 32-px cascade
+offset rather than perfectly overlapping; closing a window leaves
+the screen pixels beneath cleanly redrawn.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
