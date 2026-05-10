@@ -411,6 +411,67 @@ calling task or returns `ENOSYS` per its policy.
 > reading from it when the deadline elapses; this is a hint for
 > receivers to drain, not a hard reference count.
 
+#### 5.1.3 `0x108  ObjFetchBytes` — *Non-restartable.*
+
+> Copy `R6` bytes from `O1`+`R4` to `O2`+`R5`. The source object may
+> be local or remote; the destination must be local and must not
+> carry `OBJSTORE` (the OR-typed-storage flag — Volume III Section
+> 3.3). When the source is remote, firmware issues a single
+> `OBJ_READ_REQ` for the full range over the crossbar and blocks the
+> caller until the matching `OBJ_READ_RESP` arrives, at which point
+> the payload is written into the local destination. The integer
+> `OL{B,H,W}` instructions can perform the same effect for narrow
+> widths but require a static immediate offset and one wire
+> round-trip per access; `ObjFetchBytes` accepts a register-supplied
+> offset and length and collapses an arbitrary range into a single
+> round-trip. The bulk-transfer counterpart of `ObjStoreBytes`.
+>
+> Args:
+> - `O1`: source object reference (must carry `R`).
+> - `O2`: destination object reference (must carry `W`, must be
+>   local, must not carry `OBJSTORE`).
+> - `R4`: byte offset within `O1` at which to begin reading.
+> - `R5`: byte offset within `O2` at which to begin writing.
+> - `R6`: byte count.
+>
+> Returns:
+> - `R2`: status.
+> - `R3`: bytes copied (`R6` on success, zero on error).
+>
+> Errors: `EFAULT` (null reference), `EPERM` (capability mismatch),
+> `EREMOTE` (destination not local), `ESTALE`, `EINVAL` (destination
+> is OR-typed, or either offset+count exceeds the underlying
+> object's length). Wire-side faults map from the response flags to
+> `ESTALE` / `EINVAL` / `EPERM` / `EFAULT` per the same convention
+> the integer `OL`/`OS` paths use.
+
+#### 5.1.4 `0x109  ObjStoreBytes` — *Non-restartable.*
+
+> Copy `R6` bytes from `O1`+`R4` to `O2`+`R5`. The source must be
+> local and must not carry `OBJSTORE`; the destination may be local
+> or remote. When the destination is remote, firmware issues a
+> single `OBJ_WRITE_REQ` carrying all `R6` bytes and blocks until
+> the matching `OBJ_WRITE_RESP` returns. The bulk-transfer
+> counterpart of `ObjFetchBytes`: between them they cover bulk
+> transfers in either direction provided one side is local.
+>
+> Args:
+> - `O1`: source object reference (must carry `R`, must be local,
+>   must not carry `OBJSTORE`).
+> - `O2`: destination object reference (must carry `W`).
+> - `R4`: byte offset within `O1` at which to begin reading.
+> - `R5`: byte offset within `O2` at which to begin writing.
+> - `R6`: byte count.
+>
+> Returns:
+> - `R2`: status.
+> - `R3`: bytes written (`R6` on success, zero on error).
+>
+> Errors: `EFAULT`, `EPERM`, `EREMOTE` (source not local), `ESTALE`,
+> `EINVAL` (source is OR-typed, or either offset+count exceeds the
+> underlying object's length). Wire-side faults on the destination
+> map from `OBJ_WRITE_RESP` flags exactly as for `ObjFetchBytes`.
+
 **`0x101  ObjFree`** — *Non-restartable.*
 
 > Increment the descriptor's generation counter and return its storage

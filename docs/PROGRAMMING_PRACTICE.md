@@ -371,6 +371,54 @@ drivers, for language runtimes that emit code at runtime, and for any
 operating-system facility that benefits from extending its dispatch
 surface without rebuilding its boot image.
 
+### 3.5 Bulk-Byte Transfer Between Objects
+
+The integer load and store instructions through an object register
+(`OL{B,H,W}` / `OS{B,H,W}`) take an immediate offset and transfer one
+to four bytes per instruction. When both objects are local, a copy
+loop is the right shape. When one side is remote, the cost changes:
+each dereference becomes an `OBJ_READ_REQ` / `OBJ_WRITE_REQ` round-trip
+across the crossbar, and a 128-byte copy expressed as `OSB` in a loop
+incurs 128 round-trips.
+
+The firmware therefore exposes two primitives that collapse a
+contiguous range to one wire round-trip when one side is remote:
+
+- `ObjFetchBytes` (Volume VI, primitive `0x108`) — copy `R6` bytes
+  from `O1+R4` to `O2+R5`. The source may be remote; the destination
+  must be local.
+- `ObjStoreBytes` (Volume VI, primitive `0x109`) — copy `R6` bytes
+  from `O1+R4` to `O2+R5`. The source must be local; the destination
+  may be remote.
+
+The pair covers transfers in either direction between two objects
+when at most one is remote. Neither addresses remote-to-remote
+transfers; the calling task arranges a local staging object if it
+needs to bridge two remote sides.
+
+```
+    ; Pull an 80-byte record from a remote service object (held in
+    ; O5 with R) into a local stack-resident scratch buffer (held in
+    ; O6 with R|W).
+    omov  o1, o5               ; source (remote)
+    omov  o2, o6               ; destination (local)
+    addiu r4, r0, 0            ; source offset
+    addiu r5, r0, 0            ; destination offset
+    addiu r6, r0, 80           ; byte count
+    call  #0x108               ; ObjFetchBytes
+    bne   r2, r0, fetch_fail
+    nop                        ; r3 = bytes copied (= 80 on success)
+```
+
+The two primitives are non-restartable: the calling task blocks
+until the matching `OBJ_READ_RESP` / `OBJ_WRITE_RESP` returns. The
+descriptor and capability checks are identical to those imposed by
+the per-instruction dereference paths; the only architectural
+relaxation is on the destination of `ObjFetchBytes`, which must not
+carry the `OBJSTORE` flag (Volume III Section 5.4) — the bulk path
+copies bytes-as-bytes and would breach the OR-typed-storage
+invariant if applied to a slot intended for object references.
+
 ## 4. Inter-Processor Communication Idioms
 
 ### 4.1 The Self Convention for Handlers
