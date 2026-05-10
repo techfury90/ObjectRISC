@@ -85,6 +85,7 @@ const char help_msg[] =
     "  rm <path>       — remove a file (refuses on directories)\n"
     "  touch <path>    — create an empty file or no-op if it exists\n"
     "  echo <text>     — print the rest of the line\n"
+    "  title <text>    — set this window's title bar text\n"
     "  run <path>[&]   — load + run another .orx as a child task ('&' = background)\n"
     "  edit [<path>]   — shorthand for `run /programs/edit.orx <path> &`\n"
     "  wait <task>     — block until backgrounded task exits; print its exit code\n"
@@ -566,6 +567,21 @@ cmd_echo(const char *arg)
 {
 	term_print(arg);
 	term_print("\n");
+}
+
+/* Phase 60 step 9 — set the WM-mediated window's title bar text.
+ * `title foo bar baz` passes the rest-of-line literally (no quoting,
+ * trailing whitespace preserved as-is — same shape as `echo`).  The
+ * libc helper truncates to WM_MAX_TITLE_LEN characters; longer titles
+ * silently lose the tail.  No-op (with a soft note) when the WM isn't
+ * mediating the session. */
+static void
+cmd_title(const char *arg)
+{
+	int rc = wm_set_title(0, arg);
+	if (rc != 0) {
+		term_print("title: WM unavailable\n");
+	}
 }
 
 static void
@@ -1205,6 +1221,8 @@ main(void)
 			cmd_touch(cwd, arg);
 		} else if (strcmp(line, "echo") == 0) {
 			cmd_echo(arg);
+		} else if (strcmp(line, "title") == 0) {
+			cmd_title(arg);
 		} else if (strcmp(line, "run") == 0) {
 			if (*arg == 0) term_print("usage: run <path> [&]\n");
 			else cmd_run(cwd, arg);
