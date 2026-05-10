@@ -294,57 +294,81 @@
 #define CELL_W   8
 #define CELL_H   16
 
-/* The framebuffer is 160 × 48 cells (1280 × 768 px), but the outer
- * ring of cells is reserved for the window border / padding.  We
- * report the *usable* inner grid to clients and offset all cell
- * rendering by BORDER_CELLS in each direction so (col=0, row=0) in
- * client coordinates lands at FB cell (BORDER_CELLS, BORDER_CELLS).
- *
- * Layout (with BORDER_CELLS=1):
- *   y px       what
- *   0..15      top margin (cell row 0); border line at y=14..15
- *   16..751    usable cell rows 0..45 (46 rows × 16 px = 736)
- *   752..767   bottom margin (cell row 47); border line at y=752..753
- *   x px       what
- *   0..7       left margin (cell col 0); border line at x=6..7
- *   8..1271    usable cell cols 0..157 (158 cols × 8 px = 1264)
- *   1272..1279 right margin (cell col 159); border line at x=1272..1273
- *
- * Border thickness BORDER_LINE_PX is 2 — readable on a 1280×768 CRT
- * without dominating the visual; matches the chunky one-pixel-line
- * look of mid-80s desktops without going full skeuomorphic.  Border
- * sits one pixel inside the cell-row/col boundary so it touches the
- * usable cell area's outer edge cleanly. */
-#define BORDER_CELLS    1
-#define BORDER_LINE_PX  2
+/* SCREEN dimensions — the host display surface. */
+#define FB_W            1280
+#define FB_H            768
 
-/* Phase 60 step 8 — per-window title bar.  Lives at the top of each
- * window's backing store (pixel rows [0..TITLE_BAR_PX)); the cell
- * content area follows at [TITLE_BAR_PX..USABLE_H_PX).  Eats one
- * cell-row's worth of vertical space, so the cell grid client
- * programs see drops from 46 to 45 rows.  16-px tall fits the
- * 16-px glyph with zero vertical padding — tight but unambiguous;
- * a future polish pass can widen it. */
+/* Per-window title bar (Phase 60 step 8).  Lives just inside the
+ * top border of each window's backing store; the cell content area
+ * follows it.  16 px = one cell row, fits a 16-px glyph with zero
+ * vertical padding. */
 #define TITLE_BAR_CELLS 1
 #define TITLE_BAR_PX    (CELL_H * TITLE_BAR_CELLS)   /* 16 */
 
-/* Phase 60 step 14 — windows are no longer fullscreen.  The SCREEN
- * stays 1280 × 768 (host display surface); each window is a smaller
- * 80 × 24 cell grid plus title bar — the classic mid-80s terminal
- * size, with room for cascade.  Slack = (FB - window - 2*chrome)
- * = (1280 - 640 - 16) = 624 px horizontal, (768 - 400 - 32) = 336
- * px vertical, plenty of room to spread multiple windows. */
-#define FB_W            1280
-#define FB_H            768
-#define CELL_ORIGIN_X   (CELL_W * BORDER_CELLS)  /* 8  */
-#define CELL_ORIGIN_Y   (CELL_H * BORDER_CELLS)  /* 16 */
+/* Per-window border (Phase 60 step 15).  Each window FB has a
+ * cell-aligned outer ring (1 cell wide on every side); inside that
+ * ring sits a crisp BORDER_LINE_PX-thick gray line at the outermost
+ * pixels.  Cell alignment lets ObjBlitGlyphs's cell-coord math
+ * keep working — title bar text and content cells render with a
+ * BORDER_CELLS_* offset that's a clean cell count, not a pixel
+ * fraction.
+ *
+ * Layout inside each window FB (with BORDER_CELLS_X=BORDER_CELLS_Y=1,
+ * BORDER_LINE_PX=2, TITLE_BAR_CELLS=1):
+ *   y px       what
+ *   0..1       top border line                              (2 px)
+ *   2..15      top border ring padding                      (14 px bg)
+ *   16..31     title bar                                    (16 px)
+ *   32..415    cell content area (24 rows × 16 px)          (384 px)
+ *   416..429   bottom border ring padding                   (14 px bg)
+ *   430..431   bottom border line                           (2 px)
+ *   x px
+ *   0..1       left border line                             (2 px)
+ *   2..7       left border ring padding                     (6 px bg)
+ *   8..647     cell columns (80 × 8 px)                     (640 px)
+ *   648..653   right border ring padding                    (6 px bg)
+ *   654..655   right border line                            (2 px)
+ *
+ * Window FB total: 656 × 432. */
+#define BORDER_CELLS_X  1
+#define BORDER_CELLS_Y  1
+#define BORDER_LINE_PX  2
 
-#define N_COLS          80     /* per-window cell columns */
+#define N_COLS          80     /* per-window cell columns (content area) */
 #define N_ROWS          24     /* per-window cell rows (content area) */
-#define USABLE_W_PX     (CELL_W * N_COLS)                 /* 640 */
-/* Window FB height covers title bar + cell content. */
-#define USABLE_H_PX     (TITLE_BAR_PX + CELL_H * N_ROWS)  /* 400 */
-#define CELL_CONTENT_PX (CELL_H * N_ROWS)                 /* 384 */
+#define CELL_AREA_W_PX  (CELL_W * N_COLS)                 /* 640 */
+#define CELL_AREA_H_PX  (CELL_H * N_ROWS)                 /* 384 */
+#define CELL_CONTENT_PX CELL_AREA_H_PX                    /* alias for fb_scroll */
+
+/* USABLE_W_PX / USABLE_H_PX now refer to the full WINDOW FB size
+ * (including border ring + title bar + content area).  Used by
+ * alloc_window_fb, the compositor, and recompose_after_destroy
+ * for "the window's full screen footprint." */
+#define USABLE_W_PX  ((N_COLS + 2 * BORDER_CELLS_X) * CELL_W)
+                                                          /* 656 */
+#define USABLE_H_PX  ((BORDER_CELLS_Y + TITLE_BAR_CELLS + N_ROWS \
+                       + BORDER_CELLS_Y) * CELL_H)        /* 432 */
+
+/* Cell offsets in cell coords — passed to ObjBlitGlyphs's
+ * (cell_x, cell_y) packed arg so glyphs land inside the border
+ * ring + below the title bar. */
+#define CONTENT_CELL_X_OFF  BORDER_CELLS_X
+#define CONTENT_CELL_Y_OFF  (BORDER_CELLS_Y + TITLE_BAR_CELLS)
+#define TITLE_CELL_X_OFF    BORDER_CELLS_X
+#define TITLE_CELL_Y_OFF    BORDER_CELLS_Y
+
+/* Pixel offsets — derived. */
+#define CONTENT_X_OFF_PX    (CONTENT_CELL_X_OFF * CELL_W)
+#define CONTENT_Y_OFF_PX    (CONTENT_CELL_Y_OFF * CELL_H)
+#define TITLE_X_OFF_PX      (TITLE_CELL_X_OFF * CELL_W)
+#define TITLE_Y_OFF_PX      (TITLE_CELL_Y_OFF * CELL_H)
+
+/* Per-window border occupies the entire visible chrome now — there
+ * is no screen-wide chrome any more.  CELL_ORIGIN_* survives only
+ * as the minimum cascade position (small aesthetic margin so the
+ * first window doesn't slam into the absolute (0, 0) corner). */
+#define CELL_ORIGIN_X   (CELL_W)         /* 8  — one cell column */
+#define CELL_ORIGIN_Y   (CELL_H)         /* 16 — one cell row */
 
 /* Palette indices (matching VEC_PALETTE in tools/devices/oriscterm). */
 #define WM_BG_COLOR  0    /* dark navy background */
@@ -997,6 +1021,9 @@ recompose_after_destroy(int sx, int sy, int w, int h)
 	int packed_wh = ((w  & 0xFFFF) << 16) | (h  & 0xFFFF);
 	fill_rect_packed(packed_xy, packed_wh, WM_BG_COLOR);
 	composite_screen_rect(sx, sy, w, h);
+	/* No screen chrome border to repaint — per-window borders are
+	 * inside each remaining window's FB and re-blitted as part of
+	 * composite_screen_rect above. */
 }
 
 /* Composite the entire window backing store onto the screen FB.
@@ -1011,15 +1038,15 @@ composite_whole_window(void)
 }
 
 /* Phase 60 step 10 — composite the cell-content area only, leaving
- * the title bar pixels on the screen FB untouched.  Used by the
- * vector / raster forwarders, which paint into the window FB at
- * client-visible (0..USABLE_W_PX × 0..CELL_CONTENT_PX) coords; they
- * call this once per request rather than once per inner blit. */
+ * the title bar + border pixels untouched.  Used by the vector /
+ * raster forwarders, which paint into the window FB at
+ * client-visible (0..CELL_AREA_W_PX × 0..CELL_AREA_H_PX) coords;
+ * they call this once per request rather than once per inner blit. */
 static void
 composite_content_area(void)
 {
-	composite_window_region(0, TITLE_BAR_PX,
-	                        USABLE_W_PX, CELL_CONTENT_PX);
+	composite_window_region(CONTENT_X_OFF_PX, CONTENT_Y_OFF_PX,
+	                        CELL_AREA_W_PX, CELL_AREA_H_PX);
 }
 
 /* fill_rect_packed targets the screen FB (paint_window_chrome's
@@ -1062,7 +1089,11 @@ blit_title_text(int start_col, int n_chars)
 	if (n_chars <= 0) return;
 	int text_off = (int)((unsigned int)window_title - DATA_VA);
 	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
-	int packed_xy = ((start_col & 0xFFFF) << 16) | (0 & 0xFFFF);
+	/* Title text sits inside the border ring at cell-row
+	 * TITLE_CELL_Y_OFF; centre start_col offset by
+	 * TITLE_CELL_X_OFF for the left border. */
+	int fb_col = start_col + TITLE_CELL_X_OFF;
+	int packed_xy = ((fb_col & 0xFFFF) << 16) | (TITLE_CELL_Y_OFF & 0xFFFF);
 	int packed_shape = ((n_chars & 0xFFFF) << 16)
 	                 | ((WM_TITLE_BAR_FG & 0xFF) << 8)
 	                 | (WM_TITLE_BAR_BG & 0xFF);
@@ -1100,8 +1131,13 @@ blit_title_text(int start_col, int n_chars)
 static void
 paint_title_bar(void)
 {
-	int bar_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
-	int bar_wh = ((USABLE_W_PX & 0xFFFF) << 16) | (TITLE_BAR_PX & 0xFFFF);
+	/* Title bar lives inside the border ring at
+	 * (TITLE_X_OFF_PX, TITLE_Y_OFF_PX), extent
+	 * (CELL_AREA_W_PX, TITLE_BAR_PX). */
+	int bar_xy = ((TITLE_X_OFF_PX & 0xFFFF) << 16)
+	           | (TITLE_Y_OFF_PX & 0xFFFF);
+	int bar_wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
+	           | (TITLE_BAR_PX & 0xFFFF);
 	fill_rect_window(bar_xy, bar_wh, WM_TITLE_BAR_BG);
 
 	int n = window_title_len;
@@ -1111,7 +1147,8 @@ paint_title_bar(void)
 		blit_title_text(start_col, n);
 	}
 
-	composite_window_region(0, 0, USABLE_W_PX, TITLE_BAR_PX);
+	composite_window_region(TITLE_X_OFF_PX, TITLE_Y_OFF_PX,
+	                        CELL_AREA_W_PX, TITLE_BAR_PX);
 }
 
 /* Phase 60 step 5 — fill a rectangle in the framebuffer with a single
@@ -1150,43 +1187,54 @@ fill_rect_packed(int packed_xy, int packed_wh, int color)
 	);
 }
 
-/* Paint the window chrome: solid bg fill + a 2-pixel border line just
- * inside the outer cell ring.  Called once after alloc_local_framebuffer
- * so the FB never appears as a black void to the user — they see the
- * border before the first glyph lands.
+/* Paint the screen chrome: a 2-pixel border line just inside the
+ * outer pixel edges of the screen FB.  Frames the whole desktop —
+ * windows live inside the chrome's inner area.
  *
- * Border layout (BORDER_LINE_PX=2, BORDER_CELLS=1):
- *   top:    y ∈ [CELL_ORIGIN_Y - BORDER_LINE_PX, CELL_ORIGIN_Y)
- *   bottom: y ∈ [CELL_ORIGIN_Y + USABLE_H_PX, +BORDER_LINE_PX)
- *   left:   x ∈ [CELL_ORIGIN_X - BORDER_LINE_PX, CELL_ORIGIN_X)
- *   right:  x ∈ [CELL_ORIGIN_X + USABLE_W_PX, +BORDER_LINE_PX)
- * Lines extend across the full inner-cell-area width/height so the
- * four corners overlap and form a clean rectangle. */
+ * Phase 60 step 14: was using USABLE_W_PX / USABLE_H_PX (the
+ * per-window size) which post-step-14 are 640/400 rather than the
+ * screen-sized 1280/768.  Result: chrome was a small 644×404 frame
+ * stuck in the top-left, and any window whose cascade offset
+ * crossed its right/bottom edges would erase part of it on destroy.
+ * Now uses FB_W/FB_H so the frame surrounds the whole screen.
+ *
+ * Border layout (BORDER_LINE_PX=2, CELL_ORIGIN=8/16):
+ *   top:    y ∈ [14, 16)         left:  x ∈ [6, 8)
+ *   bottom: y ∈ [752, 754)       right: x ∈ [1272, 1274)
+ * Lines extend across the full screen so the four corners overlap
+ * and form a clean rectangle. */
+/* Phase 60 step 15 — boot-time desktop paint.  Just bg fill;
+ * decoration is per-window now, not screen-wide. */
 static void
 paint_window_chrome(void)
 {
-	/* Background. */
 	fill_rect_packed(((0 & 0xFFFF) << 16) | (0 & 0xFFFF),
 	                 ((FB_W & 0xFFFF) << 16) | (FB_H & 0xFFFF),
 	                 WM_BG_COLOR);
+}
 
-	int top_y    = CELL_ORIGIN_Y - BORDER_LINE_PX;
-	int bottom_y = CELL_ORIGIN_Y + USABLE_H_PX;
-	int left_x   = CELL_ORIGIN_X - BORDER_LINE_PX;
-	int right_x  = CELL_ORIGIN_X + USABLE_W_PX;
-	int frame_w  = (right_x + BORDER_LINE_PX) - left_x;
-	int frame_h  = (bottom_y + BORDER_LINE_PX) - top_y;
-	int hline_wh = ((frame_w & 0xFFFF) << 16) | (BORDER_LINE_PX & 0xFFFF);
-	int vline_wh = ((BORDER_LINE_PX & 0xFFFF) << 16) | (frame_h & 0xFFFF);
-
-	fill_rect_packed(((left_x & 0xFFFF) << 16) | (top_y & 0xFFFF),
-	                 hline_wh, WM_BORDER_COLOR);
-	fill_rect_packed(((left_x & 0xFFFF) << 16) | (bottom_y & 0xFFFF),
-	                 hline_wh, WM_BORDER_COLOR);
-	fill_rect_packed(((left_x & 0xFFFF) << 16) | (top_y & 0xFFFF),
-	                 vline_wh, WM_BORDER_COLOR);
-	fill_rect_packed(((right_x & 0xFFFF) << 16) | (top_y & 0xFFFF),
-	                 vline_wh, WM_BORDER_COLOR);
+/* Paint the four border lines INSIDE the active window's FB at the
+ * outermost pixels of the cell-aligned outer ring.  Called from
+ * handle_new_window after the title bar; cheap (four fill_rects).
+ * Borders are in window-local coords and target WM_ACTIVE_FB_SLOT
+ * (same as paint_title_bar's fills). */
+static void
+paint_window_border(void)
+{
+	int wfb_w = USABLE_W_PX;
+	int wfb_h = USABLE_H_PX;
+	int top_xy  = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
+	int top_wh  = ((wfb_w & 0xFFFF) << 16) | (BORDER_LINE_PX & 0xFFFF);
+	int bot_xy  = ((0 & 0xFFFF) << 16)
+	            | ((wfb_h - BORDER_LINE_PX) & 0xFFFF);
+	int left_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
+	int left_wh = ((BORDER_LINE_PX & 0xFFFF) << 16) | (wfb_h & 0xFFFF);
+	int right_xy = (((wfb_w - BORDER_LINE_PX) & 0xFFFF) << 16)
+	             | (0 & 0xFFFF);
+	fill_rect_window(top_xy,   top_wh,  WM_BORDER_COLOR);
+	fill_rect_window(bot_xy,   top_wh,  WM_BORDER_COLOR);
+	fill_rect_window(left_xy,  left_wh, WM_BORDER_COLOR);
+	fill_rect_window(right_xy, left_wh, WM_BORDER_COLOR);
 }
 
 /* Phase 60 step 3 superseded subscribe_term_pointer (the
@@ -1974,8 +2022,13 @@ handle_new_window(int wtype)
 	 * un-painted parts of the new content area until something
 	 * actually renders there.  The composite walks z-order so
 	 * higher-z windows still correctly overpaint. */
-	composite_window_region(0, TITLE_BAR_PX,
-	                        USABLE_W_PX, CELL_CONTENT_PX);
+	composite_window_region(CONTENT_X_OFF_PX, CONTENT_Y_OFF_PX,
+	                        CELL_AREA_W_PX, CELL_AREA_H_PX);
+	/* Paint the per-window border ring inside the FB + composite
+	 * the whole window so the border + bg padding around it land
+	 * on screen too. */
+	paint_window_border();
+	composite_window_region(0, 0, USABLE_W_PX, USABLE_H_PX);
 
 	window_type[wid - 1] = WIN_TYPE_CONSOLE;
 	window_subscribe_op[wid - 1] = 0;
@@ -2680,19 +2733,23 @@ poll_one_request(int *out_op, int *out_wid, int *out_arg)
 static void
 fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 {
-	if (y < 0 || y >= CELL_CONTENT_PX) return;
-	if (n_pixels <= 0)                 return;
+	if (y < 0 || y >= CELL_AREA_H_PX) return;
+	if (n_pixels <= 0)                return;
 	if (x < 0) {
 		if (n_pixels + x <= 0) return;
 		pixels   -= x;        /* skip leading off-screen */
 		n_pixels += x;
 		x         = 0;
 	}
-	if (x >= USABLE_W_PX)            return;
-	if (x + n_pixels > USABLE_W_PX)  n_pixels = USABLE_W_PX - x;
+	if (x >= CELL_AREA_W_PX)           return;
+	if (x + n_pixels > CELL_AREA_W_PX) n_pixels = CELL_AREA_W_PX - x;
 
 	int src_off = (int)((unsigned int)pixels - STACK_BOTTOM);
-	int dst_off = (y + TITLE_BAR_PX) * USABLE_W_PX + x;
+	/* Window FB stride is USABLE_W_PX (the full FB width, including
+	 * border ring); cell-area pixel (x, y) lives at window-FB pixel
+	 * (CONTENT_X_OFF_PX + x, CONTENT_Y_OFF_PX + y). */
+	int dst_off = (y + CONTENT_Y_OFF_PX) * USABLE_W_PX
+	            + (x + CONTENT_X_OFF_PX);
 	asm volatile(
 		"addu  r7, %1, r0\n"
 		"addu  r8, %2, r0\n"
@@ -2936,12 +2993,16 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 
 	int text_off = (int)((unsigned int)glyphs - STACK_BOTTOM);
 	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
-	/* Phase 60 step 8: cell content sits below the title bar in the
-	 * window FB, so we add TITLE_BAR_CELLS to the cell-row coord.
-	 * `col_start` stays as-is (no horizontal padding); `cell_row` is
-	 * the client's logical row within the N_ROWS-tall content area. */
-	int fb_row = cell_row + TITLE_BAR_CELLS;
-	int packed_xy = ((col_start & 0xFFFF) << 16) | (fb_row & 0xFFFF);
+	/* Phase 60 step 15: cell content sits below the title bar AND
+	 * inside the per-window border ring, so we add
+	 * CONTENT_CELL_Y_OFF (= BORDER_CELLS_Y + TITLE_BAR_CELLS) to
+	 * the row coord and CONTENT_CELL_X_OFF (= BORDER_CELLS_X) to
+	 * the column.  Both are cell counts, so ObjBlitGlyphs's
+	 * pixel-coord math (cell_x * 8, cell_y * 16) lands at the
+	 * right place automatically. */
+	int fb_col = col_start + CONTENT_CELL_X_OFF;
+	int fb_row = cell_row  + CONTENT_CELL_Y_OFF;
+	int packed_xy = ((fb_col & 0xFFFF) << 16) | (fb_row & 0xFFFF);
 	int packed_shape = ((n_glyphs & 0xFFFF) << 16)
 	                 | ((WM_FG_COLOR & 0xFF) << 8)
 	                 | (WM_BG_COLOR & 0xFF);
@@ -2973,10 +3034,10 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 
 	/* Composite the just-painted strip onto the screen FB so the
 	 * change is visible.  Strip pixel rect in window-local coords:
-	 * (col_start*CELL_W, fb_row*CELL_H) → (n_glyphs*CELL_W, CELL_H).
-	 * fb_row already includes the TITLE_BAR_CELLS offset. */
-	composite_window_region(col_start * CELL_W, fb_row * CELL_H,
-	                        n_glyphs   * CELL_W, CELL_H);
+	 * (fb_col*CELL_W, fb_row*CELL_H) → (n_glyphs*CELL_W, CELL_H).
+	 * fb_col / fb_row already include the border + title offsets. */
+	composite_window_region(fb_col * CELL_W, fb_row * CELL_H,
+	                        n_glyphs * CELL_W, CELL_H);
 }
 
 /* Phase 60 step 6 — shift the inner cell area up by one cell row
@@ -2993,13 +3054,14 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 static void
 fb_scroll_up_one_cell(void)
 {
-	/* Phase 60 step 8: scroll the cell-content region only.  The
-	 * title bar at y ∈ [0..TITLE_BAR_PX) stays put so the window
-	 * identity doesn't smear during fast output.  Region covers
-	 * y ∈ [TITLE_BAR_PX..USABLE_H_PX) — i.e. CELL_CONTENT_PX rows. */
-	int packed_xy = ((0 & 0xFFFF) << 16) | (TITLE_BAR_PX & 0xFFFF);
-	int packed_wh = ((USABLE_W_PX & 0xFFFF) << 16)
-	              | (CELL_CONTENT_PX & 0xFFFF);
+	/* Phase 60 step 15: scroll the cell-content region only.  The
+	 * border + title bar stay put.  Region covers x ∈
+	 * [CONTENT_X_OFF_PX..CONTENT_X_OFF_PX+CELL_AREA_W_PX), y ∈
+	 * [CONTENT_Y_OFF_PX..CONTENT_Y_OFF_PX+CELL_AREA_H_PX). */
+	int packed_xy = ((CONTENT_X_OFF_PX & 0xFFFF) << 16)
+	              | (CONTENT_Y_OFF_PX & 0xFFFF);
+	int packed_wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
+	              | (CELL_AREA_H_PX & 0xFFFF);
 	int packed_dy_fill = ((CELL_H & 0xFFFFFF) << 8)
 	                   | (WM_BG_COLOR & 0xFF);
 	asm volatile(
@@ -3018,9 +3080,9 @@ fb_scroll_up_one_cell(void)
 		: "r1", "r2", "r4", "r5", "r6",
 		  "r8", "r9", "r10"
 	);
-	/* Only the cell-content area changed; title bar is untouched. */
-	composite_window_region(0, TITLE_BAR_PX,
-	                        USABLE_W_PX, CELL_CONTENT_PX);
+	/* Only the cell-content area changed; border + title stay put. */
+	composite_window_region(CONTENT_X_OFF_PX, CONTENT_Y_OFF_PX,
+	                        CELL_AREA_W_PX, CELL_AREA_H_PX);
 }
 
 /* Hoist `*row` back into [0, N_ROWS) by scrolling the inner cell
@@ -3470,13 +3532,12 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 	}
 	if (op == VEC_OP_CLEAR) {
 		/* Repaint the cell-content area to bg via ObjFillRect on
-		 * the window FB, then composite once.  Phase 60 step 10:
-		 * with per-window backing stores this no longer wipes
-		 * console + grid output — the content area is the
-		 * vector/raster space, distinct from chrome and title. */
-		int xy = ((0 & 0xFFFF) << 16) | (TITLE_BAR_PX & 0xFFFF);
-		int wh = ((USABLE_W_PX & 0xFFFF) << 16)
-		       | (CELL_CONTENT_PX & 0xFFFF);
+		 * the window FB, then composite once.  Border + title bar
+		 * stay put. */
+		int xy = ((CONTENT_X_OFF_PX & 0xFFFF) << 16)
+		       | (CONTENT_Y_OFF_PX & 0xFFFF);
+		int wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
+		       | (CELL_AREA_H_PX & 0xFFFF);
 		fill_rect_window(xy, wh, WM_BG_COLOR);
 		composite_content_area();
 		return;
@@ -3564,12 +3625,12 @@ static void
 forward_raster_write(int op, int packed1, int packed2, int byte_offset)
 {
 	if (op == RST_OP_CLEAR) {
-		/* Phase 60 step 10: same per-window backing-store treatment
-		 * as VEC_OP_CLEAR — fill the cell-content area with bg and
-		 * composite once. */
-		int xy = ((0 & 0xFFFF) << 16) | (TITLE_BAR_PX & 0xFFFF);
-		int wh = ((USABLE_W_PX & 0xFFFF) << 16)
-		       | (CELL_CONTENT_PX & 0xFFFF);
+		/* Same per-window backing-store treatment as VEC_OP_CLEAR
+		 * — fill the cell-content area with bg and composite. */
+		int xy = ((CONTENT_X_OFF_PX & 0xFFFF) << 16)
+		       | (CONTENT_Y_OFF_PX & 0xFFFF);
+		int wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
+		       | (CELL_AREA_H_PX & 0xFFFF);
 		fill_rect_window(xy, wh, WM_BG_COLOR);
 		composite_content_area();
 		return;
@@ -3581,7 +3642,7 @@ forward_raster_write(int op, int packed1, int packed2, int byte_offset)
 	int w = vec_unpack_hi(packed2);
 	int h = vec_unpack_lo(packed2);
 	if (w <= 0 || h <= 0)        return;
-	if (w > USABLE_W_PX) w = USABLE_W_PX;
+	if (w > CELL_AREA_W_PX) w = CELL_AREA_W_PX;
 
 	/* Stash sender's source ref so we can OREFLD it again on each
 	 * per-row ObjFetchBytes. */
@@ -3594,12 +3655,15 @@ forward_raster_write(int op, int packed1, int packed2, int byte_offset)
 	int row;
 	for (row = 0; row < h; row++) {
 		int dst_y = y + row;
-		if (dst_y < 0 || dst_y >= CELL_CONTENT_PX) continue;
+		if (dst_y < 0 || dst_y >= CELL_AREA_H_PX) continue;
 
 		int src_off = byte_offset + row * w;
-		/* dst_off lands in the WINDOW FB, with TITLE_BAR_PX added to
-		 * the y coord and USABLE_W_PX as the row stride. */
-		int dst_off = (dst_y + TITLE_BAR_PX) * USABLE_W_PX + x;
+		/* Window FB stride is USABLE_W_PX (full FB width including
+		 * border ring); cell-area pixel (x, dst_y) lives at
+		 * window-FB pixel (CONTENT_X_OFF_PX + x, CONTENT_Y_OFF_PX
+		 * + dst_y). */
+		int dst_off = (dst_y + CONTENT_Y_OFF_PX) * USABLE_W_PX
+		            + (x + CONTENT_X_OFF_PX);
 
 		/* ObjFetchBytes from sender's source (O2 ← slot) into
 		 * our vec_scratch_row via boot data ref (O15). */
