@@ -174,13 +174,29 @@
  *                                   WM_GRID_BASE for line / rect /
  *                                   oval rasterisation through the
  *                                   WM.  Phase 59 / WM γ.11.
+ *     984..1112 WM_RASTER_BASE       per-window RASTER service refs
+ *                                   (16 windows × 8 bytes).  Same
+ *                                   shape — clients that
+ *                                   wm_bind_surface(WSURF_RASTER)
+ *                                   get an R|S sub-cap; the WM polls
+ *                                   the queues from the dispatch loop
+ *                                   and forward_raster_write blits
+ *                                   their pixel buffers into the
+ *                                   framebuffer.  Phase 59 / WM γ.12.
+ *                                   (Skips offset 976 — that's
+ *                                   WM_RASTER_CAP_SLOT in the libc
+ *                                   layout, lives between
+ *                                   WM_VECTOR_BASE and WM_RASTER_BASE
+ *                                   to avoid renumbering 32 hardcoded
+ *                                   per-wid offsets in stash/load
+ *                                   switches above.)
  *
  * task.c reserves up to offset 720 (post-γ.11: WM_LEADER_CONSOLE_SLOT
  * 696, WM_LEADER_GRID_SLOT 704, WM_VECTOR_CAP_SLOT 712), and the
  * orx-manifest area runs 152..535 — we land safely inside it for the
- * slots up to 464.  WM_GRID_BASE / WM_VECTOR_BASE sit past the
- * supervisor's scratch slots.  The WM never invokes orx_spawn so the
- * orx-manifest area's nominal use is moot.
+ * slots up to 464.  WM_GRID_BASE / WM_VECTOR_BASE / WM_RASTER_BASE
+ * sit past the supervisor's scratch slots.  The WM never invokes
+ * orx_spawn so the orx-manifest area's nominal use is moot.
  */
 
 #define BOOT_PARENT_SLOT_OFFSET     544
@@ -197,6 +213,7 @@
 #define WM_FORWARD_REPLY_SLOT_OFFSET    456
 #define WM_GRID_BASE_OFFSET             720
 #define WM_VECTOR_BASE_OFFSET           848
+#define WM_RASTER_BASE_OFFSET           984
 
 /* === Glyph rendering ==================================================
  *
@@ -242,6 +259,11 @@
  * in O11 after task_init, and we compute byte offsets by subtracting
  * STACK_BOTTOM from a stack-local buffer's VA. */
 #define STACK_BOTTOM 0x001f0000
+/* Boot data segment VA — used by forward_raster_write to address its
+ * static scratch buffer (vec_scratch_row) through O15 (boot data ref)
+ * for ObjFetchBytes / ObjStoreBytes.  Same constant grid.c / raster.c
+ * use on the libc side. */
+#define DATA_VA      0x00040000
 
 /* 8×16 bitmap font, 95 printable ASCII chars (codepoints 32..126),
  * 16 pixel rows per char packed into 4 big-endian 32-bit words
@@ -816,6 +838,60 @@ load_vector_to_o1(int wid)
 	}
 }
 
+/* === Per-window RASTER service slot helpers ===========================
+ *
+ * Same shape as the GRID / VECTOR helpers above, just at
+ * WM_RASTER_BASE (984..1104, in 8-byte stride per wid).  Phase 59 /
+ * WM γ.12. */
+
+static void
+stash_raster_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefst o1, 984(o12)"); break;
+	case  2: asm volatile("orefst o1, 992(o12)"); break;
+	case  3: asm volatile("orefst o1, 1000(o12)"); break;
+	case  4: asm volatile("orefst o1, 1008(o12)"); break;
+	case  5: asm volatile("orefst o1, 1016(o12)"); break;
+	case  6: asm volatile("orefst o1, 1024(o12)"); break;
+	case  7: asm volatile("orefst o1, 1032(o12)"); break;
+	case  8: asm volatile("orefst o1, 1040(o12)"); break;
+	case  9: asm volatile("orefst o1, 1048(o12)"); break;
+	case 10: asm volatile("orefst o1, 1056(o12)"); break;
+	case 11: asm volatile("orefst o1, 1064(o12)"); break;
+	case 12: asm volatile("orefst o1, 1072(o12)"); break;
+	case 13: asm volatile("orefst o1, 1080(o12)"); break;
+	case 14: asm volatile("orefst o1, 1088(o12)"); break;
+	case 15: asm volatile("orefst o1, 1096(o12)"); break;
+	case 16: asm volatile("orefst o1, 1104(o12)"); break;
+	default: break;
+	}
+}
+
+static void
+load_raster_to_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefld o1, 984(o12)"); break;
+	case  2: asm volatile("orefld o1, 992(o12)"); break;
+	case  3: asm volatile("orefld o1, 1000(o12)"); break;
+	case  4: asm volatile("orefld o1, 1008(o12)"); break;
+	case  5: asm volatile("orefld o1, 1016(o12)"); break;
+	case  6: asm volatile("orefld o1, 1024(o12)"); break;
+	case  7: asm volatile("orefld o1, 1032(o12)"); break;
+	case  8: asm volatile("orefld o1, 1040(o12)"); break;
+	case  9: asm volatile("orefld o1, 1048(o12)"); break;
+	case 10: asm volatile("orefld o1, 1056(o12)"); break;
+	case 11: asm volatile("orefld o1, 1064(o12)"); break;
+	case 12: asm volatile("orefld o1, 1072(o12)"); break;
+	case 13: asm volatile("orefld o1, 1080(o12)"); break;
+	case 14: asm volatile("orefld o1, 1088(o12)"); break;
+	case 15: asm volatile("orefld o1, 1096(o12)"); break;
+	case 16: asm volatile("orefld o1, 1104(o12)"); break;
+	default: asm volatile("onull o1"); break;
+	}
+}
+
 /* === Surface-cap loader (for wm_reply_with_ref_o14) =================== */
 
 static void
@@ -1010,6 +1086,19 @@ handle_new_window(int wtype)
 		return;
 	}
 
+	/* And RASTER (Phase 59 / WM γ.12). */
+	status = alloc_window_raster(wid);
+	if (status != 0) {
+		WM_PRINT("oriscwm: alloc_window_raster failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT("\n");
+		free_window_vector(wid);
+		free_window_grid(wid);
+		free_window_console(wid);
+		wm_reply(E_IO, 0, 0, 0);
+		return;
+	}
+
 	window_type[wid - 1] = WIN_TYPE_CONSOLE;
 	window_subscribe_op[wid - 1] = 0;
 	window_cur_col[wid - 1] = 0;
@@ -1119,6 +1208,58 @@ free_window_vector(int wid)
 	stash_vector_o1(wid);
 }
 
+/* Mirror of alloc_window_grid for the RASTER surface (Phase 59 / WM
+ * γ.12).  Same lifetime as the CONSOLE / GRID / VECTOR peers. */
+static int
+alloc_window_raster(int wid)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, 16\n"
+		"addiu r5, r0, %1\n"
+		"addiu r6, r0, %2\n"
+		"call  #0x100\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(TAG_SERVICE),
+		  "i"(CAP_R | CAP_W | CAP_S | CAP_V | CAP_C)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	if (status != 0) return status;
+
+	stash_raster_o1(wid);
+
+	asm volatile(
+		"addiu r4, r0, 256\n"
+		"call  #0x203\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	return status;
+}
+
+/* Mirror for the RASTER service. */
+static void
+free_window_raster(int wid)
+{
+	load_raster_to_o1(wid);
+	int isn;
+	asm volatile("oisn %0, o1" : "=r"(isn));
+	if (isn) return;
+	asm volatile(
+		"addiu r4, r0, 0\n"
+		"call  #0x101\n"
+		"nop"
+		: : : "r1", "r2", "r4"
+	);
+	asm volatile("onull o1");
+	stash_raster_o1(wid);
+}
+
 /* WM_OP_BIND_SURFACE — return a surface cap for a window.
  *   R4 = wid  (already-validated by dispatch)
  *   R5 = surface kind
@@ -1154,7 +1295,8 @@ handle_bind_surface(int wid, int kind)
 	}
 	if (kind != WSURF_CONSOLE && kind != WSURF_KEYBOARD
 	                          && kind != WSURF_GRID
-	                          && kind != WSURF_VECTOR) {
+	                          && kind != WSURF_VECTOR
+	                          && kind != WSURF_RASTER) {
 		wm_reply(E_INVAL, 0, 0, 0);
 		return;
 	}
@@ -1224,6 +1366,27 @@ handle_bind_surface(int wid, int kind)
 		return;
 	}
 
+	if (kind == WSURF_RASTER) {
+		load_raster_to_o1(wid);
+		int derive_status;
+		asm volatile(
+			"addiu r4, r0, %1\n"
+			"call  #0x103\n"
+			"nop\n"
+			"omov  o14, o1\n"
+			"addu  %0, r2, r0"
+			: "=r"(derive_status)
+			: "i"(CAP_R | CAP_S)
+			: "r1", "r2", "r4"
+		);
+		if (derive_status != 0) {
+			wm_reply(E_IO, 0, 0, 0);
+			return;
+		}
+		wm_reply_with_ref_o14(0);
+		return;
+	}
+
 	/* WSURF_KEYBOARD: passthrough to the underlying terminal cap
 	 * walked at WM startup. */
 	load_surface_to_o14(kind);
@@ -1251,6 +1414,7 @@ handle_destroy_window(int wid)
 	free_window_console(wid);
 	free_window_grid(wid);
 	free_window_vector(wid);
+	free_window_raster(wid);
 	window_type[wid - 1] = 0;
 	window_subscribe_op[wid - 1] = 0;
 	/* Owner-ref stash is left in place; future allocations will
@@ -1371,6 +1535,7 @@ scan_owner_exits(void)
 			free_window_console(wid);
 			free_window_grid(wid);
 			free_window_vector(wid);
+			free_window_raster(wid);
 			window_type[wid - 1] = 0;
 			window_subscribe_op[wid - 1] = 0;
 			/* The owner-ref slot stays populated; it'll get
@@ -2204,6 +2369,126 @@ poll_window_vectors(void)
 	}
 }
 
+/* WSURF_RASTER forward.  Wire payload:
+ *   O2 = source pixel buffer ref     (saved into WM_FORWARD_SRC_SLOT
+ *                                     during dispatch)
+ *   R3 = op (RST_OP_*)
+ *   R4 = packed1: (x << 16) | y    (destination in framebuffer)
+ *   R5 = packed2: (w << 16) | h    (dimensions of pixel buffer)
+ *   R6 = byte offset within source where pixel data starts
+ *
+ * BLIT path: per-row ObjFetchBytes the source pixels into
+ * vec_scratch_row (reused from γ.11; both fill primitives and raster
+ * blits go through this one buffer), then ObjStoreBytes the row into
+ * the framebuffer.  2 wire RTTs per row, h rows total = 2h RTTs.
+ *
+ * vec_scratch_row lives in the data segment (oriscwm's own boot data
+ * ref O15), so ObjFetchBytes uses O15 as destination and ObjStoreBytes
+ * uses O15 as source — different from flush_strip which addresses
+ * the stack-resident pixel_row via O11.  Caller's source ref came in
+ * O2 and is stashed via WM_FORWARD_SRC_SLOT same as forward_grid_write
+ * does. */
+static void
+forward_raster_write(int op, int packed1, int packed2, int byte_offset)
+{
+	if (op == RST_OP_CLEAR) {
+		/* TODO: per-window backing store — same blocker as
+		 * VEC_OP_CLEAR / GRID's clear sentinel. */
+		return;
+	}
+	if (op != RST_OP_BLIT) return;
+
+	int x = vec_unpack_hi(packed1);
+	int y = vec_unpack_lo(packed1);
+	int w = vec_unpack_hi(packed2);
+	int h = vec_unpack_lo(packed2);
+	if (w <= 0 || h <= 0)        return;
+	if (w > FB_W) w = FB_W;
+
+	/* Stash sender's source ref so we can OREFLD it again on each
+	 * per-row ObjFetchBytes. */
+	asm volatile("orefst o2, %0(o12)"
+	             :: "i"(WM_FORWARD_SRC_SLOT_OFFSET));
+
+	int scratch_data_off = (int)((unsigned int)vec_scratch_row - DATA_VA);
+
+	int row;
+	for (row = 0; row < h; row++) {
+		int dst_y = y + row;
+		if (dst_y < 0 || dst_y >= FB_H) continue;
+
+		int src_off = byte_offset + row * w;
+		int dst_off = dst_y * FB_W + x;
+
+		/* ObjFetchBytes from sender's source (O2 ← slot) into
+		 * our vec_scratch_row via boot data ref (O15). */
+		asm volatile(
+			"orefld o1, %0(o12)\n"
+			"omov   o2, o15\n"
+			"addu   r4, %1, r0\n"
+			"addu   r5, %2, r0\n"
+			"addu   r6, %3, r0\n"
+			"call   #0x108\n"
+			"nop"
+			:
+			: "i"(WM_FORWARD_SRC_SLOT_OFFSET),
+			  "r"(src_off), "r"(scratch_data_off), "r"(w)
+			: "r1", "r2", "r3", "r4", "r5", "r6"
+		);
+
+		/* ObjStoreBytes from O15 (boot data, holds vec_scratch_row)
+		 * into the framebuffer slot. */
+		asm volatile(
+			"omov  o1, o15\n"
+			"orefld o2, %0(o12)\n"
+			"addu  r4, %1, r0\n"
+			"addu  r5, %2, r0\n"
+			"addu  r6, %3, r0\n"
+			"call  #0x109\n"
+			"nop"
+			:
+			: "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET),
+			  "r"(scratch_data_off), "r"(dst_off), "r"(w)
+			: "r1", "r2", "r3", "r4", "r5", "r6"
+		);
+	}
+}
+
+/* See poll_window_grids — same status-via-global trick.  Wire here
+ * carries 4 int payload values (op + 2 packed words + byte offset),
+ * which exactly fills the 4-output regular operand limit. */
+static int _wm_raster_poll_status;
+
+static void
+poll_window_rasters(void)
+{
+	int wid;
+	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
+		if (window_type[wid - 1] != WIN_TYPE_CONSOLE) continue;
+
+		load_raster_to_o1(wid);
+		int op, packed1, packed2, byte_off;
+		asm volatile(
+			"addiu r4, r0, 0\n"
+			"call  #0x204\n"
+			"nop\n"
+			"la    r1, _wm_raster_poll_status\n"
+			"sw    r2, 0(r1)\n"
+			"addu  %0, r3, r0\n"
+			"addu  %1, r4, r0\n"
+			"addu  %2, r5, r0\n"
+			"addu  %3, r6, r0"
+			: "=r"(op), "=r"(packed1),
+			  "=r"(packed2), "=r"(byte_off)
+			:
+			: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+		);
+		if (_wm_raster_poll_status == 0) {
+			forward_raster_write(op, packed1, packed2, byte_off);
+		}
+	}
+}
+
 const char banner_boot[]            = "oriscwm: booting\n";
 const char banner_console_walk_ok[] = "oriscwm: /sys/term/0/console acquired\n";
 const char banner_keyboard_walk_ok[]= "oriscwm: /sys/term/0/keyboard acquired\n";
@@ -2347,5 +2632,6 @@ main(void)
 		poll_window_consoles();
 		poll_window_grids();
 		poll_window_vectors();
+		poll_window_rasters();
 	}
 }

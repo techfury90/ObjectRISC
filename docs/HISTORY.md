@@ -6039,6 +6039,76 @@ recording because they'll bite again:
    subtraction into a separate `int slot = wid - 1;` so pcc emits
    a runtime `sub` instead of a compile-time fold.
 
+### γ.12 — WM-mediated raster blit
+
+Step 3 of 4 in the bitmapped-overlays migration.  Same shape as γ.9
+GRID and γ.11 vector: per-window TAG_SERVICE + ReceiveQueue,
+WSURF_RASTER bind returns an R|S sub-cap, dispatch loop polls and
+the WM forwards each SEND into the framebuffer.
+
+This phase replaces a "protocol pinned but implementation deferred"
+stub in oriscterm — raster never had a host-side rasteriser, so
+γ.12 is the first end-to-end raster path Ouroboros has had.
+
+Wire payload differs from grid / vector in carrying a sender-supplied
+source ref:
+
+  O1 = raster cap        (WM_RASTER_CAP_SLOT on the libc side)
+  O2 = source pixel ref  (boot-stack vs boot-data picked by the libc
+                          based on buffer VA, same trick grid_print_n
+                          uses)
+  R3 = op (RST_OP_BLIT / RST_OP_CLEAR)
+  R4 = packed (x << 16) | y       — destination top-left
+  R5 = packed (w << 16) | h       — pixel buffer dimensions
+  R6 = byte offset within source where pixel data starts
+
+The blit is per-row: ObjFetchBytes(w bytes) into the WM's
+`vec_scratch_row` (reused from γ.11 — fill primitives and raster
+blits share one buffer), then ObjStoreBytes the row into the
+framebuffer.  2 wire RTTs per row, h rows total = 2h RTTs.  No
+per-pixel work on the WM CPU — pure byte copies.
+
+`vec_scratch_row` is a static buffer in the WM's data segment, so
+both ObjFetchBytes (destination = O15 boot data) and ObjStoreBytes
+(source = O15) address it through the same boot OPR rather than
+through O11 (boot stack) like flush_strip does.  The rest of the
+γ.4-onward hot loop conventions (one-call-per-row,
+WM_FORWARD_SRC_SLOT for source-ref stash) carry over unchanged.
+
+Slot-map deltas:
+
+- `task.c`: `ORX_STATE_BYTES` 848 → 984.  New `WM_RASTER_CAP_SLOT`
+  at offset 976 (between WM_VECTOR_BASE and WM_RASTER_BASE in the
+  layout, deliberately past the existing WM_*_BASE arrays to avoid
+  renumbering 32 hardcoded per-wid offsets in oriscwm's
+  stash/load switches).  Slot is libc-visible because
+  `ORX_STATE_BYTES` covers it.
+- `oriscwm.c`: new `WM_RASTER_BASE_OFFSET` = 984.  Per-wid
+  `stash_raster_o1` / `load_raster_to_o1` mirror the GRID / VECTOR
+  switches; allocation / free / bind / destroy paths get a fourth
+  surface.
+
+`RST_OP_CLEAR` is a no-op for the same per-window-backing-store
+reason VEC_OP_CLEAR and GRID's clear sentinel are.  Library still
+emits the SEND.
+
+### pcc-orisc gotcha (recurring)
+
+Hit the 5-arg-call limit again on the *libc client* this time —
+`raster_blit(int x, int y, int w, int h, const unsigned char *p)`
+fails to compile at the call site.  Picked the same workaround
+γ.11 used internally: change the API to accept packed words.  New
+`WM_PACK_XY(x, y)` / `WM_PACK_WH(w, h)` macros in liborisc.h roll
+the 16-bit halves; the public signature is now
+`raster_blit(packed_xy, packed_wh, pixels)` (3 args, fits in pcc's
+register-passing budget).  Same trick will apply to any future
+4-coordinate-plus-payload API.
+
+Smoke test (`raster_smoke.c` + `test_raster_smoke.sh`) blits a
+16×16 static checkerboard via the boot-data path and an 8×8
+stack-local pattern via the boot-stack path, verifies both
+return 0, then exercises CLEAR + DESTROY.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
