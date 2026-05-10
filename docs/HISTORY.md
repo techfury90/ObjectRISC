@@ -6930,6 +6930,50 @@ Known caveats:
   fullscreen-ish windows), so two cascaded windows mostly
   overlap.  That changes naturally once window resize is in.
 
+## Phase 60 step 12 — multi-window demo + open-session helper
+
+Step 11 wired the multi-window infrastructure but left it
+unobservable from production: every spawned task inherited the
+parent window's CONSOLE / KEYBOARD / GRID caps, so nothing actually
+opened a second window outside of wm_smoke's test path.  This step
+makes the unlock real-world visible.
+
+libc:
+- `wm_open_session(title, &wid)` — one-call wrapper that
+  wm_new_window's a fresh CONSOLE window, wm_bind_surface's
+  CONSOLE / KEYBOARD / GRID, installs each resolved cap into the
+  caller's O5 / O6 / O7 (overriding the parent-window caps
+  TaskCreate copied in), and (optionally) sets a title.  After it
+  returns, term_print / term_read / grid_write target the
+  newly-created window instead of the parent's.  Owner ref is
+  null — no auto-destroy via task_query; callers wm_destroy_window
+  before returning from main().
+
+demo:
+- `/programs/winhello.orx` — minimal multi-window proof.  Calls
+  wm_open_session("winhello"), term_print's a greeting, yields
+  briefly so the WM finishes compositing, then wm_destroy_window's
+  on exit.
+
+User experience: from the shell, `run /programs/winhello.orx` now
+pops up a second window stacked at the same screen position as
+the leader's, with "winhello" in its title bar.  After the brief
+yield loop it tears down cleanly and the shell window remains the
+only one alive.
+
+Caveats:
+- No keyboard focus handoff yet — winhello doesn't subscribe to
+  KEYBOARD, so the shell keeps receiving keystrokes throughout.
+  When a windowed app does need input (edit.orx is the
+  motivating case), we'll need a focus-switch protocol so the
+  parent shell re-subscribes on child exit.  That's the next
+  step.
+- Z-order is still "newest on top"; we don't yet raise on click
+  or drag windows around.  With current near-fullscreen sizes
+  cascade is invisible — every cascaded window stacks at
+  (CELL_ORIGIN_X, CELL_ORIGIN_Y) — but the second window's title
+  bar still composes correctly above the first.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

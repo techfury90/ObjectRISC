@@ -388,6 +388,51 @@ wm_bind_surface(int wid, int kind)
 	return status;
 }
 
+/* Phase 60 step 12 — open a brand-new WM-mediated session for the
+ * caller, replacing the inherited parent-window CONSOLE / KEYBOARD /
+ * GRID caps (in O5 / O6 / O7) with caps for a freshly-allocated
+ * window.  After this returns, term_print / term_read / grid_write
+ * land in the new window rather than the parent's.
+ *
+ * Owner-task ref is passed as null (no auto-destroy via task_query);
+ * callers should wm_destroy_window before exit.  When orx_spawn
+ * carries the calling task's own ref in some future revision, this
+ * helper can be extended to opt into auto-destroy.
+ *
+ * `title` may be NULL to skip the wm_set_title round-trip; passing
+ * "" sets an empty (visible blank) bar. */
+int
+wm_open_session(const char *title, int *out_wid)
+{
+	int wid = 0, w_cells = 0, h_cells = 0;
+	asm volatile("onull o1");
+	int rc = wm_new_window(WIN_TYPE_CONSOLE, &wid, &w_cells, &h_cells);
+	if (rc != 0) return rc;
+
+	rc = wm_bind_surface(wid, 1 /*WSURF_CONSOLE*/);
+	if (rc != 0) { wm_destroy_window(wid); return rc; }
+	asm volatile("orefld o5, %0(o12)"
+	             :: "i"(DIR_RESULT_SLOT_OFFSET) : "r1");
+
+	rc = wm_bind_surface(wid, 2 /*WSURF_KEYBOARD*/);
+	if (rc != 0) { wm_destroy_window(wid); return rc; }
+	asm volatile("orefld o6, %0(o12)"
+	             :: "i"(DIR_RESULT_SLOT_OFFSET) : "r1");
+
+	rc = wm_bind_surface(wid, 3 /*WSURF_GRID*/);
+	if (rc != 0) { wm_destroy_window(wid); return rc; }
+	asm volatile("orefld o7, %0(o12)"
+	             :: "i"(DIR_RESULT_SLOT_OFFSET) : "r1");
+
+	if (title) {
+		/* Best-effort: failure here doesn't undo the bind+install. */
+		wm_set_title(wid, title);
+	}
+
+	if (out_wid) *out_wid = wid;
+	return 0;
+}
+
 /* OP_DESTROY_WINDOW: SEND with R4=op, R5=wid. */
 int
 wm_destroy_window(int wid)
