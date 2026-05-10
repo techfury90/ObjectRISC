@@ -811,10 +811,13 @@ stash_window_fb_o1(int wid)
 }
 
 /* Install wid's window FB ref into WM_ACTIVE_FB_SLOT so the painting
- * helpers (which target that slot) operate on the right window. */
+ * helpers (which target that slot) operate on the right window.
+ * Also updates the active_wid global so composite_window_region can
+ * compute the correct screen position. */
 static void
 set_active_window(int wid)
 {
+	active_wid = wid;
 	load_window_fb_to_o1(wid);
 	asm volatile("orefst o1, %0(o12)"
 	             :: "i"(WM_ACTIVE_FB_SLOT_OFFSET));
@@ -1888,20 +1891,28 @@ handle_new_window(int wtype)
 		return;
 	}
 
-	/* Phase 60 step 11 — assign cascade position.  Each new window
-	 * lands CASCADE_OFFSET_PX further right and down than its
-	 * predecessor, modulo the screen so we don't fall off-screen.
-	 * Window 1 starts top-left at (0, 0).  No active windows means
-	 * we're back to position 0 even if previous windows lived
-	 * elsewhere. */
+	/* Phase 60 step 11 — assign default position.  The first window
+	 * lands at the chrome-inset origin (CELL_ORIGIN_X, CELL_ORIGIN_Y)
+	 * so the screen-FB chrome (border + bg margins) stays visible
+	 * around it — matches the pre-multi-window single-window appearance.
+	 * Subsequent windows cascade by CASCADE_OFFSET_PX wherever there's
+	 * slack between FB size and window size; with today's nearly-
+	 * fullscreen windows that slack is zero, so all cascaded windows
+	 * stack at the same origin and z-order alone distinguishes them.
+	 * When window resize lands the slack opens up and cascade
+	 * activates naturally. */
 #define CASCADE_OFFSET_PX 32
 	{
 		int idx = wid - 1;
 		int n   = window_z_count;
-		int px  = (n * CASCADE_OFFSET_PX) % (FB_W - USABLE_W_PX + 1);
-		int py  = (n * CASCADE_OFFSET_PX) % (FB_H - USABLE_H_PX + 1);
-		if (px < 0) px = 0;
-		if (py < 0) py = 0;
+		int slack_x = FB_W - USABLE_W_PX - 2 * CELL_ORIGIN_X;
+		int slack_y = FB_H - USABLE_H_PX - 2 * CELL_ORIGIN_Y;
+		if (slack_x < 0) slack_x = 0;
+		if (slack_y < 0) slack_y = 0;
+		int px = CELL_ORIGIN_X;
+		int py = CELL_ORIGIN_Y;
+		if (slack_x > 0) px += (n * CASCADE_OFFSET_PX) % (slack_x + 1);
+		if (slack_y > 0) py += (n * CASCADE_OFFSET_PX) % (slack_y + 1);
 		window_pos_x[idx] = px;
 		window_pos_y[idx] = py;
 	}
