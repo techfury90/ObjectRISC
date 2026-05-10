@@ -6974,6 +6974,55 @@ Caveats:
   (CELL_ORIGIN_X, CELL_ORIGIN_Y) — but the second window's title
   bar still composes correctly above the first.
 
+## Phase 60 step 13 — keyboard focus handoff
+
+Step 12 made multi-window observable but left one critical gap:
+the WM's keyboard broker is a single-subscriber model.  When a
+windowed child (winhello, eventually edit) calls term_init through
+its newly-installed O6, its subscribe SEND replaces the shell's
+— the shell stops receiving keystrokes for the rest of its life.
+That's a no-go for the "edit.orx in its own window" experience.
+
+The fix here is small because the libc already has the right
+primitive — Phase 48's `term_resubscribe()` was built for
+login.orx reclaiming focus after a shell session.  We just need to
+wire it into the shell's foreground spawn path.
+
+shell.c:
+- `cmd_run`'s foreground branch (non-`&` spawn) calls
+  `term_resubscribe()` immediately after `orx_unload()` returns.
+  Re-emits the shell-side subscribe via the existing O6 + O9, no
+  fresh allocations.  No-op when the child never touched the
+  keyboard.
+- `cmd_wait` does the same after harvesting a backgrounded task
+  — covers the `winhello &; wait N` workflow.
+
+winhello.c — extended to actually exercise input handoff:
+- After wm_open_session, calls `term_init()` (full setup, not
+  just term_print_only_init) — allocates the mailbox + SUBSCRIBES
+  to the keyboard via the freshly-installed O6, so keystrokes
+  flow to us instead of the shell.
+- Reads a line via `term_getkey` + echoes each character into the
+  new window via O5.
+- Prints "You typed: <line>" back, yields briefly so the user can
+  read it, then `term_shutdown()` + `wm_destroy_window` on exit.
+
+User experience: `run /programs/winhello.orx` from the shell pops
+a new window, prints a prompt, accepts a line of input (echoed
+into the new window, not the shell), then closes.  The shell
+reclaims keystrokes on the next prompt.
+
+Caveats — still deferred:
+- Backgrounded windowed apps (`winhello &`) hold focus until the
+  user `wait`s on them.  Subsequent shell input until then goes
+  to the background task.  Acceptable for v1 — focus management
+  during concurrent windowed apps is a WM-level problem
+  (raise-on-click, etc.).
+- WM-level focus tracking is still not really a thing; "focus" =
+  "most-recent keyboard subscriber" and only the parent knows to
+  reclaim it on child exit.  Click-to-raise would make this
+  WM-managed properly.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

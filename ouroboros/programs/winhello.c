@@ -1,18 +1,56 @@
 /*
- * winhello.c — multi-window demo.  Opens its own WM-mediated window
- * (separate from the spawning shell's), prints a greeting into it,
- * waits a short while so the user can see the new window appear,
- * and tears it down on exit.
+ * winhello.c — multi-window demo with input focus.
  *
- * Demonstrates Phase 60 step 12's `wm_open_session` helper:
- * everything term_print / grid_write does between the helper
- * returning and wm_destroy_window lands in the new window.
- * print_str (firmware ConsoleWrite) still goes to the simorisc
- * stdout regardless — useful for diagnostics that survive even
- * when the window itself doesn't render correctly.
+ * Opens its own WM-mediated window (separate from the spawning
+ * shell's), subscribes to keyboard so keystrokes flow to *us*
+ * instead of the shell, reads a line of text, echoes it back, then
+ * tears the window down on exit.  The shell reclaims keyboard focus
+ * via term_resubscribe() in its cmd_run foreground path.
+ *
+ * Demonstrates Phase 60 step 13's focus-handoff dance:
+ *   1. wm_open_session installs the new window's CONSOLE / KEYBOARD
+ *      / GRID caps into O5 / O6 / O7.
+ *   2. term_init allocates our private mailbox + SENDs subscribe to
+ *      O6 (= the WM keyboard service), making us the WM's single
+ *      keyboard subscriber — keystrokes now arrive at *our* queue.
+ *   3. read_line echoes characters back into our window via O5.
+ *   4. term_shutdown unsubscribes; wm_destroy_window tears down the
+ *      window.  Parent shell's task_wait returns, then its own
+ *      term_resubscribe re-emits the shell-side subscribe so the
+ *      next prompt sees keystrokes again.
  */
 
 #include "liborisc.h"
+
+#define WINHELLO_INPUT_MAX 80
+
+static int
+winhello_read_line(char *buf, int max)
+{
+	int n = 0;
+	for (;;) {
+		int mods = 0;
+		int c = term_getkey(&mods);
+		if (c < 0) continue;
+		if (c == '\r' || c == '\n') {
+			term_print_char('\n');
+			break;
+		}
+		if (c == 0x08) {       /* backspace */
+			if (n > 0) {
+				n--;
+				term_print_char('\b');
+			}
+			continue;
+		}
+		if (n < max - 1 && c >= 32 && c < 127) {
+			buf[n++] = (char)c;
+			term_print_char((char)c);
+		}
+	}
+	buf[n] = '\0';
+	return n;
+}
 
 int
 main(void)
@@ -28,24 +66,29 @@ main(void)
 		return rc;
 	}
 
-	/* term_print_only_init parks the boot O2/O3/O4 into the slots
-	 * term.c's _term_console_write expects.  Skips the keyboard
-	 * subscribe that term_init would do — we don't want to steal
-	 * focus from the parent shell's keyboard subscription. */
-	term_print_only_init();
+	/* Full term_init (not just term_print_only_init): allocates the
+	 * private mailbox + queue and SUBSCRIBES to the keyboard via our
+	 * freshly-installed O6.  After this, keystrokes route to us
+	 * instead of the shell. */
+	term_init();
+
 	term_print("Hello from winhello!\n");
-	term_print("This window will close in a moment.\n");
+	term_print("Type a line and press Enter: ");
 
-	/* Yield a few times so the WM finishes compositing the title
-	 * bar + greeting before we tear the window down.  No proper
-	 * sleep primitive yet — a tight task_yield loop is the lightest
-	 * "give other tasks a slice" mechanism we have.  Count is
-	 * tuned for a roughly half-second wait at simorisc's
-	 * interpreted rate; bump if the new window flickers in and out
-	 * before the user can see it. */
+	char line[WINHELLO_INPUT_MAX];
+	winhello_read_line(line, WINHELLO_INPUT_MAX);
+
+	term_print("You typed: ");
+	term_print(line);
+	term_print("\n");
+
+	/* Give the user a beat to read the echo. */
 	int i;
-	for (i = 0; i < 10000; i++) task_yield();
+	for (i = 0; i < 4000; i++) task_yield();
 
+	/* Release our subscription before destroying the window so the
+	 * WM doesn't keep routing events to a dead mailbox. */
+	term_shutdown();
 	wm_destroy_window(wid);
 
 	print_str("winhello: done\n");
