@@ -834,6 +834,29 @@ maybe_lazy_wm_bind(void)
 		render_wm_leader_path(my_term, "grid", wm_path);
 		dir_register(wm_path);
 	}
+
+	/* Phase 60 step 9 — populate the title bar with something
+	 * informative right after binding.  "Terminal N" works for the
+	 * bring-up phase; users can override via the shell `title`
+	 * builtin.  Only single-digit terminal indices are formatted
+	 * here — we cap at 4 supervisors today, more would just need
+	 * extra digit handling. */
+	{
+		char default_title[16];
+		default_title[0]  = 'T';
+		default_title[1]  = 'e';
+		default_title[2]  = 'r';
+		default_title[3]  = 'm';
+		default_title[4]  = 'i';
+		default_title[5]  = 'n';
+		default_title[6]  = 'a';
+		default_title[7]  = 'l';
+		default_title[8]  = ' ';
+		default_title[9]  = (char)('0' + (my_term & 0x0F));
+		default_title[10] = '\0';
+		wm_set_title(wid, default_title);
+	}
+
 	SUP_PRINT("supervisor: WM-mediated session (term=");
 	SUP_PRINT_INT(my_term);
 	SUP_PRINT(", wid=");

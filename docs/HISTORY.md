@@ -6764,6 +6764,36 @@ Deferred to follow-ups:
   too would make the per-window backing store fully owned by
   the window.  That's the next milestone.
 
+## Phase 60 step 9 — title-bar caller integration
+
+Step 8 wired the title-bar API but left no caller actually using
+it; production windows showed empty (gray) bars at boot.  This
+step plugs the API into the two natural callers: the supervisor
+sets a default "Terminal N" title when it binds the leader's
+window, and the shell gains a `title <text>` builtin so users
+can override it.
+
+supervisor.c:
+- After `wm_bind_surface(wid, WSURF_GRID)` succeeds in
+  `maybe_lazy_wm_bind`, format "Terminal N" (where N is
+  `task_my_terminal_idx()`, single-digit) and `wm_set_title()`.
+  Each terminal's window now identifies itself in its title bar
+  as soon as the supervisor finishes wiring.
+
+shell.c:
+- New `title <text>` builtin.  Forwards the rest-of-line
+  literally to `wm_set_title(0, …)` (wid=0 = first live window —
+  matches the inherited-CONSOLE case).  On WM-unavailable systems
+  it prints a soft note rather than failing silently.
+- help text gains the new builtin.
+
+Tests:
+- wm_smoke + supervisor_session_manager + test_shell green.
+
+Visible result: at boot, both terminal windows show their default
+"Terminal 0" / "Terminal 1" titles centered in the gray bar.
+`title hello` from inside the shell rewrites the bar live.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
