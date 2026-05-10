@@ -118,6 +118,17 @@
  * the supervisor's own boot O8 IS the directory mailbox. */
 #define DIR_SLOT_OFFSET          584
 
+/* Phase 59 / WM γ.3: when a leader successfully wm_init's,
+ * wm_new_window's, and wm_bind_surface(CONSOLE)'s, it parks the
+ * resulting WM-mediated CONSOLE sub-cap here.  populate_child_term_-
+ * slots reads it back for spawns whose terminal index matches the
+ * supervisor's own, so children inherit the WM-mediated console
+ * (their output gets glyph-rendered into the framebuffer) instead
+ * of the direct /sys/term/<idx>/console path.  Null on workers, on
+ * leaders without WM mediation, and for spawns targeting a different
+ * terminal than the supervisor's own (cross-terminal hot-attach). */
+#define WM_LEADER_CONSOLE_SLOT_OFFSET  696
+
 /* Sentinel target_pid values. PROCIDs occupy 0..0xFD; 0xFE / 0xFF
  * are reserved as routing markers.
  *
@@ -680,12 +691,35 @@ pick_next_cpu(int self_procid)
 	return self_procid;
 }
 
+/* OISN-style probe of WM_LEADER_CONSOLE_SLOT.  Returns 1 if null. */
+static int
+wm_leader_console_isn(void)
+{
+	int isn;
+	asm volatile(
+		"orefld o14, %1(o12)\n"
+		"oisn   %0, o14"
+		: "=r"(isn)
+		: "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
+		: "r14"
+	);
+	return isn;
+}
+
 /* Phase 49: populate ORX_SLOT_CHILD_O5/O6/O7 from
  * /sys/term/<term_idx>/{console,keyboard,grid}. orx_task_create
  * inside the upcoming orx_spawn swaps these into the child's OPR
  * file just before TaskCreate. After the spawn returns, the caller
  * MUST clear these slots (clear_child_term_slots) so a subsequent
  * local spawn doesn't accidentally inherit a stale terminal.
+ *
+ * Phase 59 / WM γ.3: for the CONSOLE slot specifically, prefer the
+ * leader's WM-mediated CONSOLE sub-cap (parked at WM_LEADER_CONSOLE_-
+ * SLOT during boot) when `term_idx` matches the supervisor's own
+ * terminal.  That routes children through the WM so their output
+ * gets glyph-rendered into the framebuffer.  Cross-terminal
+ * hot-attach (term_idx != my_terminal_idx) and non-WM workers fall
+ * through to the direct /sys/term/<N>/console walk.
  *
  * Best-effort: missing services (a partial /sys/term/<N> subtree)
  * leave the corresponding slot null and the child inherits this
@@ -698,15 +732,31 @@ populate_child_term_slots(int term_idx)
 {
 	char path[PEER_PATH_BUF_SIZE];
 
-	render_term_path(term_idx, "console", path);
-	if (sup_walk_for_opr(path) == 0) {
+	int wired_console = 0;
+	if (term_idx == task_my_terminal_idx()
+	    && wm_leader_console_isn() == 0) {
+		/* WM-mediated CONSOLE for the leader's own terminal. */
 		asm volatile(
 			"orefld o14, %0(o12)\n"
 			"orefst o14, %1(o12)"
 			:
-			: "i"(DIR_RESULT_SLOT_OFFSET),
+			: "i"(WM_LEADER_CONSOLE_SLOT_OFFSET),
 			  "i"(ORX_SLOT_CHILD_O5_OFFSET)
+			: "r14"
 		);
+		wired_console = 1;
+	}
+	if (!wired_console) {
+		render_term_path(term_idx, "console", path);
+		if (sup_walk_for_opr(path) == 0) {
+			asm volatile(
+				"orefld o14, %0(o12)\n"
+				"orefst o14, %1(o12)"
+				:
+				: "i"(DIR_RESULT_SLOT_OFFSET),
+				  "i"(ORX_SLOT_CHILD_O5_OFFSET)
+			);
+		}
 	}
 	render_term_path(term_idx, "keyboard", path);
 	if (sup_walk_for_opr(path) == 0) {
@@ -1715,10 +1765,23 @@ main(void)
 				/* Bind console + keyboard.  The resolved cap
 				 * lands in DIR_RESULT_SLOT (offset 616 — wm.c
 				 * shares the slot with dir_walk's result).
-				 * OREFLD into the supervisor's working OPR. */
+				 * OREFLD into the supervisor's working OPR.
+				 *
+				 * For CONSOLE we ALSO stash the resolved cap
+				 * into WM_LEADER_CONSOLE_SLOT so populate_child_-
+				 * term_slots can hand it down to spawned children
+				 * (login, shell) targeting the leader's own
+				 * terminal.  Without that, children walk
+				 * /sys/term/0/console directly and their output
+				 * bypasses the WM. */
 				if (wm_bind_surface(wid, WSURF_CONSOLE) == 0) {
-					asm volatile("orefld o5, %0(o12)"
-					             :: "i"(DIR_RESULT_SLOT_OFFSET));
+					asm volatile(
+						"orefld o5, %0(o12)\n"
+						"orefst o5, %1(o12)"
+						:
+						: "i"(DIR_RESULT_SLOT_OFFSET),
+						  "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
+					);
 				}
 				if (wm_bind_surface(wid, WSURF_KEYBOARD) == 0) {
 					asm volatile("orefld o6, %0(o12)"

@@ -153,8 +153,17 @@
  *          callers fall back to direct boot-OPR surfaces.)
  *     + 8 (WM_INPUT_REF_SLOT: caller's owner-task ref stashed at
  *          wm_new_window entry, to be passed in O2 of the wire SEND.
- *          Same role as DIR_INPUT_REF_SLOT for dir.c.) */
-#define ORX_STATE_BYTES   568
+ *          Same role as DIR_INPUT_REF_SLOT for dir.c.)
+ *     + 8 (WM_LEADER_CONSOLE_SLOT: supervisor-only — when a leader
+ *          succeeds at wm_init + wm_new_window + wm_bind_surface
+ *          (CONSOLE), it stashes the WM-mediated CONSOLE sub-cap
+ *          here.  populate_child_term_slots reads it back for
+ *          spawns whose terminal idx matches the supervisor's own,
+ *          so children inherit the WM-mediated console (output gets
+ *          glyph-rendered) instead of bypassing the WM via the
+ *          direct /sys/term/<idx>/console walk.  Null on workers
+ *          and on leaders without WM mediation.  Phase 59 / WM γ.3.) */
+#define ORX_STATE_BYTES   576
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8
