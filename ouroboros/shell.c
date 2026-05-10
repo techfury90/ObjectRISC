@@ -687,13 +687,6 @@ cmd_run(const char *cwd, const char *arg)
 			return;
 		}
 		int code = orx_unload(t);
-		/* Phase 60 step 13 — reclaim keyboard focus.  If the child
-		 * called wm_open_session + term_init (e.g. winhello) it
-		 * replaced us as the WM's single keyboard subscriber.  Re-
-		 * emit our own subscribe SEND so the next read_line sees
-		 * keystrokes.  Cheap (one SEND, no allocation); no-op when
-		 * the child never touched the keyboard. */
-		term_resubscribe();
 		term_print(run_done_pre);
 		term_print_int(code);
 		term_print(run_done_post);
@@ -726,10 +719,18 @@ cmd_edit(const char *cwd, const char *arg)
 		term_print("\n");
 		return;
 	}
-	term_print(run_bg_pre);
-	term_print_int(t);
-	term_print(run_bg_post);
-	task_yield();
+	/* Phase 60 step 13 — edit now opens its own window and takes
+	 * keyboard focus.  Wait for it to exit, then re-subscribe to
+	 * reclaim the keyboard for the next shell prompt.  Pre-multi-
+	 * window this was a fire-and-forget bg spawn; that no longer
+	 * works because edit's subscription would supersede ours and
+	 * never get cleaned up, so we'd block on the next read_line
+	 * forever. */
+	int code = orx_unload(t);
+	term_resubscribe();
+	term_print(run_done_pre);
+	term_print_int(code);
+	term_print(run_done_post);
 }
 
 static void
@@ -744,8 +745,6 @@ cmd_wait(const char *arg)
 		term_print("wait: bad task or task_wait error\n");
 		return;
 	}
-	/* Same focus-reclaim as cmd_run's foreground path. */
-	term_resubscribe();
 	term_print("[task ");
 	term_print_int(t);
 	term_print(" exited ");

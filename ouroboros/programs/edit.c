@@ -299,10 +299,23 @@ main(void)
 	int key;
 	int mods;
 
-	/* Full term_init — subscribes to the keyboard. The shell's
-	 * subscribe already happened; ours lands as subscriber #2,
-	 * and oriscterm flips its title bar to advertise the F1
-	 * focus-cycle hotkey. */
+	/* Phase 60 step 13 — try to grab our own WM-mediated window so
+	 * we render in a dedicated frame rather than overprinting the
+	 * spawning shell's.  Graceful fallback to the inherited shell
+	 * caps when there's no WM (e.g. legacy oriscterm-only tests):
+	 * wm_open_session returns negative, we just keep O5 / O6 / O7
+	 * as the shell handed them to us.
+	 *
+	 * task_init parks boot O2/O3 into O11/O15, which wm_open_session
+	 * restores after its internal SEND churn so the term_init that
+	 * follows can save them again cleanly. */
+	task_init();
+	int wid = 0;
+	int has_window = (wm_open_session("edit", &wid) == 0);
+
+	/* Full term_init — subscribes to the keyboard via O6.  When
+	 * has_window is set, O6 is our new window's KEYBOARD service;
+	 * otherwise it's the parent's. */
 	term_init();
 	hf_init();
 
@@ -355,6 +368,23 @@ main(void)
 
 	edit_load(&es);
 
+	/* Title bar shows the file being edited.  Skipped in the no-WM
+	 * fallback (wid is 0 and no chrome to paint anyway). */
+	if (has_window) {
+		char title[EDIT_PATH_MAX + 8];
+		const char *prefix = "edit ";
+		int ti = 0;
+		while (prefix[ti] && ti < (int)sizeof(title) - 1) {
+			title[ti] = prefix[ti]; ti++;
+		}
+		int pi = 0;
+		while (es.path[pi] && ti < (int)sizeof(title) - 1) {
+			title[ti++] = es.path[pi++];
+		}
+		title[ti] = '\0';
+		wm_set_title(wid, title);
+	}
+
 	for (;;) {
 		edit_scroll_into_view(&es);
 		edit_render(&es);
@@ -400,5 +430,6 @@ main(void)
 	 * back to just the shell. Without this, oriscterm would keep the
 	 * dead subscriber and F1 cycles could land on a stale queue. */
 	term_shutdown();
+	if (has_window) wm_destroy_window(wid);
 	return 0;
 }
