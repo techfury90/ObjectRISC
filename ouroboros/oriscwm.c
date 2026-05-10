@@ -1171,15 +1171,21 @@ render_glyph(int wid, int ch)
  * Step-by-step:
  *   1. Stash O2 (source ref) and O3 (reply_cap) into per-request
  *      slots so subsequent asm can stomp on them.
- *   2. ObjFetchBytes the bytes from the client into a stack-local
- *      buffer (one wire RTT, arbitrary count up to 256).
- *   3. Iterate the buffer, render_glyph each byte.
- *   4. Re-emit the SEND to underlying terminal CONSOLE with the
- *      original (source, offset, count, reply_cap) — so the existing
- *      oriscterm console pane keeps showing text and tests that
- *      grep it keep passing.  When the γ-stage migration retires
- *      that pane, this forward step goes away (the render step
- *      stays — text becomes pixels only). */
+ *   2. Re-emit the SEND to the underlying terminal CONSOLE with the
+ *      original (source, offset, count, reply_cap) — fires the
+ *      console-pane update first, in parallel with our render.  The
+ *      terminal's OBJ_READ_REQ goes back to the leader's source ref
+ *      directly (the leader's still blocked waiting for the
+ *      terminal's reply, so the source stays alive).
+ *   3. ObjFetchBytes the bytes from the same source into a stack-
+ *      local buffer (one wire RTT).
+ *   4. Iterate the buffer, render_glyph each byte → 16N OBJ_WRITE_REQs
+ *      to the framebuffer.  These arrive at oriscterm after the
+ *      SEND_DELIVER, so the console pane is current before the
+ *      framebuffer pane catches up.
+ * When the γ-stage migration retires the underlying console pane,
+ * step 2 goes away (the render becomes the only output path — text
+ * becomes pixels only). */
 static void
 forward_console_write(int wid, int offset, int count)
 {
@@ -1193,12 +1199,45 @@ forward_console_write(int wid, int offset, int count)
 	asm volatile("orefst o3, %0(o12)"
 	             :: "i"(WM_FORWARD_REPLY_SLOT_OFFSET));
 
+	/* Forward FIRST.  Re-emit the SEND with the original source /
+	 * offset / count / reply_cap so the underlying terminal can
+	 * start processing — OBJ_READ_REQ to the source, console-pane
+	 * update, reply to the original reply_cap — all in parallel
+	 * with our render below.
+	 *
+	 * Doing the forward first puts the SEND_DELIVER on the wire
+	 * before the 16N OBJ_WRITE_REQs that render_glyph emits.
+	 * Oriscterm processes inbound packets in arrival order, so the
+	 * console pane updates first and the framebuffer pane fills in
+	 * pixel-row by pixel-row afterwards.  The leader's source ref
+	 * stays alive because it's blocked waiting for the terminal's
+	 * reply (which goes direct, not back through the WM), so we can
+	 * still ObjFetchBytes from it below.  When the γ-stage migration
+	 * retires the underlying console pane this forward step goes
+	 * away. */
+	asm volatile(
+		"orefld o1, %0(o12)\n"          /* O1 = underlying CONSOLE cap */
+		"orefld o2, %1(o12)\n"          /* O2 = original source ref */
+		"orefld o3, %2(o12)\n"          /* O3 = client's reply_cap */
+		"addu   r4, %3, r0\n"           /* R4 = offset */
+		"addu   r5, %4, r0\n"           /* R5 = count */
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		:
+		: "i"(WM_SURF_CONSOLE_SLOT_OFFSET),
+		  "i"(WM_FORWARD_SRC_SLOT_OFFSET),
+		  "i"(WM_FORWARD_REPLY_SLOT_OFFSET),
+		  "r"(offset), "r"(count)
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+
 	/* ObjFetchBytes from the client's source into a stack-local
-	 * buffer.  Clamp to 256 bytes — the standard term_print path
-	 * batches per-string, so a typical write is short.  Anything
-	 * larger gets the leading 256 rendered + the full count
-	 * forwarded (so the underlying terminal still gets all the
-	 * bytes). */
+	 * buffer, then render each byte to the framebuffer.  Clamp to
+	 * 256 bytes — the standard term_print path batches per-string,
+	 * so a typical write is short.  Anything larger gets the leading
+	 * 256 rendered (the full count was already forwarded above so
+	 * the underlying terminal still got all the bytes). */
 	unsigned char buf[256];
 	int fetch_count = (count > 256) ? 256 : count;
 	if (fetch_count > 0) {
@@ -1217,37 +1256,11 @@ forward_console_write(int wid, int offset, int count)
 			: "r1", "r2", "r3", "r4", "r5", "r6"
 		);
 
-		/* Render each fetched byte to the framebuffer.  This is the
-		 * Phase 59 / WM γ.2 milestone: bytes that go to oriscterm's
-		 * console pane also become pixels in the framebuffer pane.
-		 * When the γ-stage migration retires the console pane this
-		 * forward_console_write loses its forward step but keeps
-		 * this render step — text goes only to pixels. */
 		int i;
 		for (i = 0; i < fetch_count; i++) {
 			render_glyph(wid, (int)buf[i]);
 		}
 	}
-
-	/* Forward: re-emit the SEND with the original source/offset/
-	 * count/reply_cap.  Underlying terminal does its own
-	 * OBJ_READ_REQ from the source, same as before. */
-	asm volatile(
-		"orefld o1, %0(o12)\n"          /* O1 = underlying CONSOLE cap */
-		"orefld o2, %1(o12)\n"          /* O2 = original source ref */
-		"orefld o3, %2(o12)\n"          /* O3 = client's reply_cap */
-		"addu   r4, %3, r0\n"           /* R4 = offset */
-		"addu   r5, %4, r0\n"           /* R5 = count */
-		"addiu  r6, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(WM_SURF_CONSOLE_SLOT_OFFSET),
-		  "i"(WM_FORWARD_SRC_SLOT_OFFSET),
-		  "i"(WM_FORWARD_REPLY_SLOT_OFFSET),
-		  "r"(offset), "r"(count)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
 }
 
 /* Round-robin poll all per-window CONSOLE queues with timeout=0.
