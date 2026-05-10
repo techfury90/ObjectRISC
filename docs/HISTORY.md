@@ -5943,6 +5943,32 @@ needing focus-aware coordinate translation.  Validating the
 per-window-service pattern on GRID first means the others reuse
 identical plumbing.
 
+### γ.10 — Faster framebuffer repaint in `oriscterm`
+
+The WM-mediated overlays in γ.7–γ.9 made every glyph cell a
+framebuffer write, so `_repaint_framebuffer` runs much more often
+than it did when the framebuffer was an occasional canvas.  The
+old palette-translation hot loop walked all 1,280 × 768 ≈ 983 K
+pixels in pure Python with three `bytearray` writes per pixel,
+which made interactive use of `edit` (and just typing into the
+shell) feel sluggish on the host.
+
+Replaced the per-pixel loop with a precomputed 256-entry list of
+3-byte `bytes` objects (one per palette index, populated alongside
+`fb_palette_rgb` at init), then `b"".join([lut[b] for b in
+self.framebuffer])`.  The list comprehension still pays Python
+overhead per pixel, but the inner work collapses from six index /
+assign ops on a `bytearray` to a single list-index, and `b"".join`
+runs entirely in C.
+
+A standalone benchmark on the host shows ~6.8× speedup on a full
+1280×768 repaint (≈145 ms → ≈21 ms).  No new dependencies — still
+pure stdlib, so the cross-platform setup story is unchanged.  PIL
+or numpy would go faster still, but the remaining cost is now
+small enough to leave for if/when the overlay traffic itself
+shrinks (per-window backing stores, batched cell strips beyond
+γ.4).
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

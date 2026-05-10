@@ -427,6 +427,13 @@ class Terminal:
             self.fb_palette_rgb[i*3]     = r
             self.fb_palette_rgb[i*3 + 1] = g
             self.fb_palette_rgb[i*3 + 2] = b
+        # Per-index 3-byte RGB lookup, used by _repaint_framebuffer's
+        # b"".join hot loop.  The join runs at C speed; only the index
+        # lookup is Python-level, which keeps a 1280×768 repaint inside
+        # an animation budget instead of taking seconds.
+        self.fb_palette_lut = [
+            bytes(self.fb_palette_rgb[i*3:i*3 + 3]) for i in range(256)
+        ]
         # Phase 59 / WM γ.7 — framebuffer + grid/vector/raster/pointer
         # overlays all live on the FB Toplevel canvas now ("Window 2").
         # The framebuffer image sits at z-bottom (tag_lower below); any
@@ -732,24 +739,20 @@ class Terminal:
         is the on-the-wire resolution and the FB Toplevel canvas is
         the same size, so no scaling is needed here.
 
-        Pure-Python loop; at 1280×768 that's ~983K iterations on
-        every dirty repaint.  Fine for the kind of low-frequency
-        updates the WM's glyph renderer produces.  PIL/numpy is the
-        follow-up if anyone animates against the framebuffer."""
+        Hot path: a list comprehension feeding b"".join.  Each pixel
+        is a single Python list-index into fb_palette_lut (a 256-entry
+        list of 3-byte bytes objects); the join itself runs in C.  At
+        1280×768 that's ~983K LUT lookups per dirty repaint instead of
+        ~6M bytearray index/assign operations the per-byte loop did,
+        which keeps repaints in the tens of ms range without pulling
+        in PIL/numpy."""
         if not self.framebuffer_dirty:
             return
         W, H = self.fb_w, self.fb_h
-        pal = self.fb_palette_rgb
-        fb  = self.framebuffer
-        rgb = bytearray(W * H * 3)
-        for i in range(W * H):
-            base = fb[i] * 3
-            j = i * 3
-            rgb[j]     = pal[base]
-            rgb[j + 1] = pal[base + 1]
-            rgb[j + 2] = pal[base + 2]
+        lut = self.fb_palette_lut
+        rgb = b"".join([lut[b] for b in self.framebuffer])
         ppm = (b"P6\n" + str(W).encode() + b" "
-               + str(H).encode() + b"\n255\n" + bytes(rgb))
+               + str(H).encode() + b"\n255\n" + rgb)
         try:
             self.fb_window_image.configure(data=ppm)
         except tk.TclError as e:
