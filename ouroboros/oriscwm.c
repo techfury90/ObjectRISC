@@ -252,14 +252,22 @@
 #define WM_KBD_SUB_SLOT_OFFSET          1160  /* current subscriber's reply ref */
 #define WM_KBD_EVENTS_SLOT_OFFSET       1168  /* TAG_INPUT_SINK kind=0 */
 
-/* Phase 60 step 7 — per-window backing store.  Currently a single
- * slot since handle_new_window still enforces N=1 CONSOLE windows;
- * a per-wid array (WM_WINDOW_FB_BASE = 1184..1312) will land when
- * multi-window comes online.  The screen FB at
- * WM_SURF_FRAMEBUFFER_SLOT_OFFSET stays the host-mirrored surface;
- * this slot holds the offscreen FB (FB_FLAG_OFFSCREEN) the WM
- * renders into and then ObjBlitCopy-composites onto the screen. */
-#define WM_WINDOW_FB_SLOT_OFFSET        1176
+/* Phase 60 step 11 — per-wid window backing stores.  Each CONSOLE
+ * window owns an offscreen TAG_FRAMEBUFFER at WM_WINDOW_FB_BASE +
+ * (wid - 1) * 8.  load_window_fb_to_o1(wid) does the per-wid
+ * dispatch (pcc-orisc rejects computed-offset OREFLD).  The screen
+ * FB at WM_SURF_FRAMEBUFFER_SLOT_OFFSET stays the host-mirrored
+ * surface; the WM ObjBlitCopy-composites window FBs onto it in
+ * z-order. */
+#define WM_WINDOW_FB_BASE_OFFSET        1176
+
+/* The painting helpers (flush_strip, fb_blit_row, fill_rect_window,
+ * blit_title_text, fb_scroll_up_one_cell, alloc/free_window_fb)
+ * target this slot rather than reading from the per-wid array
+ * directly — saves us from threading wid through every asm block.
+ * Caller invokes set_active_window(wid) before any paint to copy
+ * the right per-wid FB ref into here. */
+#define WM_ACTIVE_FB_SLOT_OFFSET        1304
 
 /* === Glyph rendering ==================================================
  *
@@ -489,11 +497,30 @@ static int    window_cur_col[MAX_WINDOWS];      /* cursor col within cell grid *
 static int    window_cur_row[MAX_WINDOWS];      /* cursor row within cell grid */
 static unsigned char window_vec_color[MAX_WINDOWS]; /* current pen palette idx */
 
+/* Phase 60 step 11 — per-wid screen position + z-order.  The window
+ * FB at WM_WINDOW_FB_BASE+(wid-1)*8 composites onto the screen FB
+ * starting at (window_pos_x[wid-1], window_pos_y[wid-1]).  Z-order
+ * is a simple ordered list: window_z[0] = bottommost, [count-1] =
+ * topmost.  New windows go on top; destroy compacts in place. */
+static int           window_pos_x[MAX_WINDOWS];
+static int           window_pos_y[MAX_WINDOWS];
+static int           window_z[MAX_WINDOWS];
+static int           window_z_count;
+
+/* The wid most recently passed to set_active_window.  composite_-
+ * window_region reads this to compute the affected screen rect — see
+ * the trick described above WM_ACTIVE_FB_SLOT_OFFSET.  Painting
+ * helpers that don't take a wid arg (flush_strip, fill_rect_window,
+ * fb_scroll_up_one_cell, blit_title_text) inherit it transparently. */
+static int           active_wid;
+
 /* Phase 60 step 8 — title bar text storage.  Single buffer for v1
- * (N=1 CONSOLE window); becomes per-wid when multi-window lands.
- * Lives in the data segment so the WM can pass O3 = boot data (O15)
- * to ObjBlitGlyphs without copying to the stack.  Initialised empty;
- * wm_set_title overwrites + repaints. */
+ * (one title overwrites another at wm_set_title time, regardless of
+ * which window receives it); per-wid title strings would need a
+ * (16 × MAX_TITLE_LEN) array — punt until programs actually want
+ * distinct titles per window.  Lives in the data segment so the WM
+ * can pass O3 = boot data (O15) to ObjBlitGlyphs without copying to
+ * the stack.  Initialised empty; wm_set_title overwrites + repaints. */
 static unsigned char window_title[MAX_TITLE_LEN];
 static int           window_title_len;
 
@@ -731,6 +758,68 @@ alloc_local_framebuffer(void)
 	return status;
 }
 
+/* Phase 60 step 11 — per-wid window FB slot dispatch.  Mirrors the
+ * load_console_to_o1 / stash_console_o1 pattern: pcc-orisc rejects
+ * computed-offset OREFLD/OREFST so each wid has its own case with a
+ * baked-in offset (WM_WINDOW_FB_BASE_OFFSET + (wid-1)*8). */
+static void
+load_window_fb_to_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefld o1, 1176(o12)"); break;
+	case  2: asm volatile("orefld o1, 1184(o12)"); break;
+	case  3: asm volatile("orefld o1, 1192(o12)"); break;
+	case  4: asm volatile("orefld o1, 1200(o12)"); break;
+	case  5: asm volatile("orefld o1, 1208(o12)"); break;
+	case  6: asm volatile("orefld o1, 1216(o12)"); break;
+	case  7: asm volatile("orefld o1, 1224(o12)"); break;
+	case  8: asm volatile("orefld o1, 1232(o12)"); break;
+	case  9: asm volatile("orefld o1, 1240(o12)"); break;
+	case 10: asm volatile("orefld o1, 1248(o12)"); break;
+	case 11: asm volatile("orefld o1, 1256(o12)"); break;
+	case 12: asm volatile("orefld o1, 1264(o12)"); break;
+	case 13: asm volatile("orefld o1, 1272(o12)"); break;
+	case 14: asm volatile("orefld o1, 1280(o12)"); break;
+	case 15: asm volatile("orefld o1, 1288(o12)"); break;
+	case 16: asm volatile("orefld o1, 1296(o12)"); break;
+	default: asm volatile("onull o1"); break;
+	}
+}
+
+static void
+stash_window_fb_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefst o1, 1176(o12)"); break;
+	case  2: asm volatile("orefst o1, 1184(o12)"); break;
+	case  3: asm volatile("orefst o1, 1192(o12)"); break;
+	case  4: asm volatile("orefst o1, 1200(o12)"); break;
+	case  5: asm volatile("orefst o1, 1208(o12)"); break;
+	case  6: asm volatile("orefst o1, 1216(o12)"); break;
+	case  7: asm volatile("orefst o1, 1224(o12)"); break;
+	case  8: asm volatile("orefst o1, 1232(o12)"); break;
+	case  9: asm volatile("orefst o1, 1240(o12)"); break;
+	case 10: asm volatile("orefst o1, 1248(o12)"); break;
+	case 11: asm volatile("orefst o1, 1256(o12)"); break;
+	case 12: asm volatile("orefst o1, 1264(o12)"); break;
+	case 13: asm volatile("orefst o1, 1272(o12)"); break;
+	case 14: asm volatile("orefst o1, 1280(o12)"); break;
+	case 15: asm volatile("orefst o1, 1288(o12)"); break;
+	case 16: asm volatile("orefst o1, 1296(o12)"); break;
+	default: break;
+	}
+}
+
+/* Install wid's window FB ref into WM_ACTIVE_FB_SLOT so the painting
+ * helpers (which target that slot) operate on the right window. */
+static void
+set_active_window(int wid)
+{
+	load_window_fb_to_o1(wid);
+	asm volatile("orefst o1, %0(o12)"
+	             :: "i"(WM_ACTIVE_FB_SLOT_OFFSET));
+}
+
 /* Phase 60 step 7 — allocate the offscreen backing store the WM
  * renders this window's content into.  Sized to the usable cell area
  * (USABLE_W_PX × USABLE_H_PX) so render coords land at (col*8,
@@ -742,11 +831,11 @@ alloc_local_framebuffer(void)
  * Post-alloc the storage is zeroed (palette index 0 = bg) which is
  * what we want for the cleared inner area — no explicit fill needed.
  *
- * Single global slot for v1 (handle_new_window still enforces N=1
- * CONSOLE windows); will become a per-wid array when multi-window
- * lands. */
+ * Phase 60 step 11 — stashes into the per-wid slot AND the
+ * WM_ACTIVE_FB_SLOT (so paint_title_bar / chrome paint right after
+ * alloc target the freshly-created FB). */
 static int
-alloc_window_fb(void)
+alloc_window_fb(int wid)
 {
 	int status;
 	asm volatile(
@@ -756,58 +845,71 @@ alloc_window_fb(void)
 		"addiu r7, r0, 1\n"            /* FB_FLAG_OFFSCREEN */
 		"call  #0x102\n"               /* ObjAllocFramebuffer */
 		"nop\n"
-		"orefst o1, %3(o12)\n"
+		"orefst o1, %3(o12)\n"         /* stash into ACTIVE */
 		"addu  %0, r2, r0"
 		: "=r"(status)
 		: "i"(USABLE_W_PX), "i"(USABLE_H_PX),
-		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
 		: "r1", "r2", "r4", "r5", "r6", "r7"
 	);
-	return status;
+	if (status != 0) return status;
+	/* Mirror into the per-wid slot.  ACTIVE still points at it; both
+	 * slots hold the same ref. */
+	asm volatile("orefld o1, %0(o12)"
+	             :: "i"(WM_ACTIVE_FB_SLOT_OFFSET) : "r1");
+	stash_window_fb_o1(wid);
+	return 0;
 }
 
 static void
-free_window_fb(void)
+free_window_fb(int wid)
 {
+	load_window_fb_to_o1(wid);
 	int isn;
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"oisn   %0, o1"
-		: "=r"(isn)
-		: "i"(WM_WINDOW_FB_SLOT_OFFSET)
-		: "r1"
-	);
+	asm volatile("oisn %0, o1" : "=r"(isn));
 	if (isn) return;
 	asm volatile(
 		"addiu r4, r0, 0\n"
 		"call  #0x101\n"               /* ObjFree */
-		"nop\n"
-		"onull o1\n"
-		"orefst o1, %0(o12)"
+		"nop"
 		:
-		: "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		:
 		: "r1", "r2", "r4"
 	);
+	asm volatile("onull o1");
+	stash_window_fb_o1(wid);
 }
 
-/* Composite a sub-rectangle of the window backing store onto the
- * screen FB.  Coords (wx, wy) and (w, h) are in window-local pixel
- * space; the destination on the screen FB is (wx + CELL_ORIGIN_X,
- * wy + CELL_ORIGIN_Y) — i.e. the chrome's inner edge is the window's
- * (0, 0).  One #0x10F ObjBlitCopy call. */
+/* Phase 60 step 11 — composite a sub-rectangle of the active
+ * window's backing store onto the screen FB, respecting z-order.
+ * Coords (wx, wy) + (w, h) are in window-local pixel space relative
+ * to the active window (set via set_active_window).  The dirty
+ * region on the screen is computed as
+ *   (active.pos_x + wx, active.pos_y + wy, w, h)
+ * and then redrawn by walking the z-stack from bottom to top: each
+ * window's intersection with the dirty rect is blitted from that
+ * window's FB.  Higher-z windows therefore correctly overpaint
+ * lower-z ones, which is what overlapping opaque windows need.
+ *
+ * Side effect: WM_ACTIVE_FB_SLOT is clobbered during the walk
+ * (each iteration loads a different window's FB into it).  All paint
+ * helpers call set_active_window before painting anyway, so this
+ * only matters in code that paints AFTER calling
+ * composite_window_region — and there isn't any: composite is always
+ * the last step of a forward_* / paint_* / flush_strip request. */
+/* 3-arg packed signature dodges pcc-orisc's 4-arg call ceiling.
+ * Caller packs (x:high16, y:low16) for src/dst and (w:high16,
+ * h:low16) for size. */
 static void
-composite_window_region(int wx, int wy, int w, int h)
+do_blit_copy_active_to_screen(int packed_src_xy, int packed_dst_xy,
+                              int packed_wh)
 {
-	int packed_src_xy = ((wx & 0xFFFF) << 16) | (wy & 0xFFFF);
-	int packed_dst_xy = (((wx + CELL_ORIGIN_X) & 0xFFFF) << 16)
-	                  | (((wy + CELL_ORIGIN_Y) & 0xFFFF));
-	int packed_wh     = ((w & 0xFFFF) << 16) | (h & 0xFFFF);
 	asm volatile(
 		"addu   r8,  %0, r0\n"
 		"addu   r9,  %1, r0\n"
 		"addu   r10, %2, r0\n"
 		"orefld o1, %3(o12)\n"          /* O1 = screen FB (dst) */
-		"orefld o2, %4(o12)\n"          /* O2 = window FB (src) */
+		"orefld o2, %4(o12)\n"          /* O2 = ACTIVE = source */
 		"addu   r4, r8,  r0\n"
 		"addu   r5, r9,  r0\n"
 		"addu   r6, r10, r0\n"
@@ -816,10 +918,45 @@ composite_window_region(int wx, int wy, int w, int h)
 		:
 		: "r"(packed_src_xy), "r"(packed_dst_xy), "r"(packed_wh),
 		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET),
-		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
 		: "r1", "r2", "r4", "r5", "r6",
 		  "r8", "r9", "r10"
 	);
+}
+
+static void
+composite_window_region(int wx, int wy, int w, int h)
+{
+	int wid = active_wid;
+	if (wid < 1 || wid > MAX_WINDOWS) return;
+	int sx  = window_pos_x[wid - 1] + wx;
+	int sy  = window_pos_y[wid - 1] + wy;
+	int sxe = sx + w;
+	int sye = sy + h;
+	int z;
+	for (z = 0; z < window_z_count; z++) {
+		int t = window_z[z];
+		if (t < 1 || t > MAX_WINDOWS) continue;
+		int tx  = window_pos_x[t - 1];
+		int ty  = window_pos_y[t - 1];
+		int txe = tx + USABLE_W_PX;
+		int tye = ty + USABLE_H_PX;
+		int ix  = sx  > tx  ? sx  : tx;
+		int iy  = sy  > ty  ? sy  : ty;
+		int ixe = sxe < txe ? sxe : txe;
+		int iye = sye < tye ? sye : tye;
+		if (ixe <= ix || iye <= iy) continue;
+		/* Load t's FB into ACTIVE so do_blit_copy reads from it. */
+		load_window_fb_to_o1(t);
+		asm volatile("orefst o1, %0(o12)"
+		             :: "i"(WM_ACTIVE_FB_SLOT_OFFSET));
+		int srcx = ix - tx, srcy = iy - ty;
+		int rw = ixe - ix, rh = iye - iy;
+		int packed_src = ((srcx & 0xFFFF) << 16) | (srcy & 0xFFFF);
+		int packed_dst = ((ix & 0xFFFF) << 16) | (iy & 0xFFFF);
+		int packed_wh  = ((rw & 0xFFFF) << 16) | (rh & 0xFFFF);
+		do_blit_copy_active_to_screen(packed_src, packed_dst, packed_wh);
+	}
 }
 
 /* Composite the entire window backing store onto the screen FB.
@@ -867,7 +1004,7 @@ fill_rect_window(int packed_xy, int packed_wh, int color)
 		"nop"
 		:
 		: "r"(packed_xy), "r"(packed_wh), "r"(color),
-		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
 		: "r1", "r2", "r4", "r5", "r6",
 		  "r8", "r9", "r10"
 	);
@@ -906,7 +1043,7 @@ blit_title_text(int start_col, int n_chars)
 		:
 		: "r"(packed_xy), "r"(packed_shape),
 		  "r"(font_off),  "r"(text_off),
-		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
 		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
 		  "r8", "r9", "r10", "r11"
 	);
@@ -1652,10 +1789,9 @@ alloc_window_grid(int wid)
  * On success, returns wid in R6, geometry packed in R4/R5.
  *
  * Phase 58: also ObjAllocs a TAG_SERVICE object for the window's
- * CONSOLE service and attaches a queue.  Hardcoded N=1 for CONSOLE
- * in this milestone — second NEW_WINDOW(CONSOLE) returns E_NOSPC.
- * Multi-window tiling lifts this in a follow-up.  GRAPHICAL returns
- * E_NOTIMPL. */
+ * CONSOLE service and attaches a queue.  Phase 60 step 11: lifted
+ * the N=1 CONSOLE restriction; multiple windows now coexist with
+ * cascade positioning + z-order.  GRAPHICAL still returns E_NOTIMPL. */
 static void
 handle_new_window(int wtype)
 {
@@ -1668,14 +1804,6 @@ handle_new_window(int wtype)
 	if (wtype != WIN_TYPE_CONSOLE) {
 		wm_reply(E_INVAL, 0, 0, 0);
 		return;
-	}
-
-	/* Hardcoded N=1: refuse if any CONSOLE window is alive. */
-	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
-		if (window_type[wid - 1] == WIN_TYPE_CONSOLE) {
-			wm_reply(E_NOSPC, 0, 0, 0);
-			return;
-		}
 	}
 
 	/* Find a free slot. */
@@ -1743,11 +1871,11 @@ handle_new_window(int wtype)
 		return;
 	}
 
-	/* Phase 60 step 7 — per-window backing store.  CONSOLE / GRID
-	 * writes land here; the WM composites the touched region onto
-	 * the screen FB after each paint.  Single global slot in this
-	 * milestone (N=1 CONSOLE windows enforced above). */
-	status = alloc_window_fb();
+	/* Phase 60 step 11 — per-wid backing store.  CONSOLE / GRID /
+	 * VECTOR / RASTER writes all paint into this offscreen FB; the
+	 * WM ObjBlitCopy-composites the touched region (intersected with
+	 * each window in z-order) onto the screen after every paint. */
+	status = alloc_window_fb(wid);
 	if (status != 0) {
 		WM_PRINT("oriscwm: alloc_window_fb failed: ");
 		WM_PRINT_INT(status);
@@ -1759,6 +1887,29 @@ handle_new_window(int wtype)
 		wm_reply(E_IO, 0, 0, 0);
 		return;
 	}
+
+	/* Phase 60 step 11 — assign cascade position.  Each new window
+	 * lands CASCADE_OFFSET_PX further right and down than its
+	 * predecessor, modulo the screen so we don't fall off-screen.
+	 * Window 1 starts top-left at (0, 0).  No active windows means
+	 * we're back to position 0 even if previous windows lived
+	 * elsewhere. */
+#define CASCADE_OFFSET_PX 32
+	{
+		int idx = wid - 1;
+		int n   = window_z_count;
+		int px  = (n * CASCADE_OFFSET_PX) % (FB_W - USABLE_W_PX + 1);
+		int py  = (n * CASCADE_OFFSET_PX) % (FB_H - USABLE_H_PX + 1);
+		if (px < 0) px = 0;
+		if (py < 0) py = 0;
+		window_pos_x[idx] = px;
+		window_pos_y[idx] = py;
+	}
+
+	/* Push to top of z-stack and mark active for the title-bar paint. */
+	window_z[window_z_count] = wid;
+	window_z_count += 1;
+	set_active_window(wid);
 
 	/* Phase 60 step 8 — paint the title bar so the window is visibly
 	 * framed from creation.  Title is initially empty; the client
@@ -1779,6 +1930,23 @@ handle_new_window(int wtype)
 	int geom_a = ((DEFAULT_W_PX & 0xFFFF) << 16) | (DEFAULT_H_PX & 0xFFFF);
 	int geom_b = ((DEFAULT_W_CELLS & 0xFFFF) << 16) | (DEFAULT_H_CELLS & 0xFFFF);
 	wm_reply(0, geom_a, geom_b, wid);
+}
+
+/* Phase 60 step 11 — z-stack remove.  Called from
+ * handle_destroy_window and the auto-destroy scan.  O(N) compaction
+ * over the live array; bounded since window_z_count <= MAX_WINDOWS. */
+static void
+window_z_remove(int wid)
+{
+	int i, found = -1;
+	for (i = 0; i < window_z_count; i++) {
+		if (window_z[i] == wid) { found = i; break; }
+	}
+	if (found < 0) return;
+	for (i = found; i < window_z_count - 1; i++) {
+		window_z[i] = window_z[i + 1];
+	}
+	window_z_count -= 1;
 }
 
 /* Free the per-window CONSOLE service: ObjFree the underlying object
@@ -2130,12 +2298,16 @@ handle_destroy_window(int wid)
 	free_window_grid(wid);
 	free_window_vector(wid);
 	free_window_raster(wid);
-	free_window_fb();
+	free_window_fb(wid);
+	window_z_remove(wid);
 	window_type[wid - 1] = 0;
 	window_subscribe_op[wid - 1] = 0;
 	/* Owner-ref stash is left in place; future allocations will
 	 * overwrite it.  No SEND fires for the close — the WM doesn't
-	 * push events to subscribers yet. */
+	 * push events to subscribers yet.
+	 * TODO: re-composite the screen so vacated pixels don't linger
+	 * (currently the destroyed window's content stays painted on
+	 * screen until something else paints over it). */
 	wm_reply(0, 0, 0, 0);
 }
 
@@ -2216,6 +2388,7 @@ handle_set_title(int wid, int packed_len_off)
 			window_title[i] = fetch_buf[i];
 	}
 	window_title_len = len;
+	set_active_window(wid);
 	paint_title_bar();
 	wm_reply(0, 0, 0, 0);
 }
@@ -2369,7 +2542,8 @@ scan_owner_exits(void)
 			free_window_grid(wid);
 			free_window_vector(wid);
 			free_window_raster(wid);
-			free_window_fb();
+			free_window_fb(wid);
+			window_z_remove(wid);
 			window_type[wid - 1] = 0;
 			window_subscribe_op[wid - 1] = 0;
 			/* The owner-ref slot stays populated; it'll get
@@ -2468,7 +2642,7 @@ fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 		"call  #0x109\n"        /* ObjStoreBytes */
 		"nop"
 		:
-		: "i"(WM_WINDOW_FB_SLOT_OFFSET),
+		: "i"(WM_ACTIVE_FB_SLOT_OFFSET),
 		  "r"(src_off), "r"(dst_off), "r"(n_pixels)
 		: "r1", "r2", "r3", "r4", "r5", "r6",
 		  "r7", "r8", "r9"
@@ -2729,7 +2903,7 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 		:
 		: "r"(packed_xy), "r"(packed_shape),
 		  "r"(font_off),  "r"(text_off),
-		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
 		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
 		  "r8", "r9", "r10", "r11"
 	);
@@ -2777,7 +2951,7 @@ fb_scroll_up_one_cell(void)
 		"nop"
 		:
 		: "r"(packed_xy), "r"(packed_wh), "r"(packed_dy_fill),
-		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
 		: "r1", "r2", "r4", "r5", "r6",
 		  "r8", "r9", "r10"
 	);
@@ -2816,6 +2990,11 @@ maybe_scroll(int *row)
 static void
 render_buffer(int wid, const unsigned char *buf, int count)
 {
+	/* Phase 60 step 11: install this wid's FB as the painting target
+	 * so flush_strip / maybe_scroll / fb_scroll_up_one_cell all hit
+	 * the right window. */
+	set_active_window(wid);
+
 	int col = window_cur_col[wid - 1];
 	int row = window_cur_row[wid - 1];
 
@@ -3116,6 +3295,7 @@ poll_window_consoles(void)
 			/* O2 (source) and O3 (reply_cap) survive the call —
 			 * pcc-orisc treats OPRs as scratch but our asm reloads
 			 * them from the stash slots inside forward_console_write. */
+			set_active_window(wid);
 			forward_console_write(wid, offset, count);
 		}
 	}
@@ -3166,6 +3346,7 @@ poll_window_grids(void)
 			: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
 		);
 		if (_wm_grid_poll_status == 0) {
+			set_active_window(wid);
 			forward_grid_write(g_offset, g_count, g_col, g_row);
 		}
 	}
@@ -3285,6 +3466,7 @@ poll_window_vectors(void)
 			: "r1", "r2", "r3", "r4", "r5", "memory"
 		);
 		if (_wm_vector_poll_status == 0) {
+			set_active_window(wid);
 			forward_vector_write(wid, op, packed1, packed2);
 		}
 	}
@@ -3377,7 +3559,7 @@ forward_raster_write(int op, int packed1, int packed2, int byte_offset)
 			"call  #0x109\n"
 			"nop"
 			:
-			: "i"(WM_WINDOW_FB_SLOT_OFFSET),
+			: "i"(WM_ACTIVE_FB_SLOT_OFFSET),
 			  "r"(scratch_data_off), "r"(dst_off), "r"(w)
 			: "r1", "r2", "r3", "r4", "r5", "r6"
 		);
@@ -3416,6 +3598,7 @@ poll_window_rasters(void)
 			: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
 		);
 		if (_wm_raster_poll_status == 0) {
+			set_active_window(wid);
 			forward_raster_write(op, packed1, packed2, byte_off);
 		}
 	}

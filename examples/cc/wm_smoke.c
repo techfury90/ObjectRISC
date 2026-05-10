@@ -183,14 +183,28 @@ main(void)
 	if (rc != 0) { fail("set_title", rc); return 6; }
 	WP("wm_smoke: set_title OK\n");
 
-	/* Step 7: second CONSOLE allocation — must fail WIN_E_NOSPC. */
-	int dummy_wid = 0, dummy_w = 0, dummy_h = 0;
+	/* Step 7 (Phase 60 step 11): second CONSOLE allocation — N=1
+	 * restriction is gone; expect a fresh wid != the first.  Both
+	 * windows live on the screen with cascade-positioned z-stacking. */
+	int wid_b = 0, dummy_w = 0, dummy_h = 0;
 	asm volatile("onull o1");
-	rc = wm_new_window(WIN_TYPE_CONSOLE, &dummy_wid, &dummy_w, &dummy_h);
-	if (rc != WIN_E_NOSPC) {
-		fail("new_window CONSOLE #2 expected WIN_E_NOSPC", rc); return 7;
-	}
-	WP("wm_smoke: second CONSOLE refused (expected)\n");
+	rc = wm_new_window(WIN_TYPE_CONSOLE, &wid_b, &dummy_w, &dummy_h);
+	if (rc != 0)        { fail("new_window CONSOLE #2", rc); return 7; }
+	if (wid_b == wid)   { fail("new_window CONSOLE #2 wid collision", wid_b); return 7; }
+	if (wid_b < 1)      { fail("new_window CONSOLE #2 wid invalid", wid_b); return 7; }
+	WP("wm_smoke: second CONSOLE OK (wid=");
+	WP_INT(wid_b);
+	WP(")\n");
+
+	/* Set a distinct title on the second window. */
+	rc = wm_set_title(wid_b, "secondary");
+	if (rc != 0) { fail("set_title #2", rc); return 7; }
+
+	/* Tear down the second window before the rest of the test
+	 * proceeds — keeps the slot-reuse check at step 10 deterministic. */
+	rc = wm_destroy_window(wid_b);
+	if (rc != 0) { fail("destroy_window #2", rc); return 7; }
+	int dummy_wid = 0;
 
 	/* Step 8: GRAPHICAL — must fail WIN_E_NOTIMPL. */
 	asm volatile("onull o1");
