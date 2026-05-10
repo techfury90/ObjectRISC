@@ -243,6 +243,52 @@ int  raster_init_from_dir_result(void);
 int  raster_blit(int packed_xy, int packed_wh, const unsigned char *pixels);
 int  raster_clear(void);
 
+/* ---- pointer.c — WM-mediated pointer events (Phase 59 / WM γ.13) ---
+ *
+ * The WM subscribes to /sys/term/0/pointer at boot and forwards
+ * events to a single client subscriber slot.  Clients
+ * wm_bind_surface(WSURF_POINTER), copy DIR_RESULT_SLOT into
+ * WM_POINTER_CAP_SLOT, then SEND through it once with O2 = a reply
+ * ref where they want events delivered.  v1 supports a single
+ * subscriber per WM; multi-subscriber + per-window focus routing are
+ * post-multi-window work.
+ *
+ * Event payload (the WM's onward SEND to the subscriber):
+ *   R4 = PTR_EVT_* (motion / down / up)
+ *   R5 = packed (x << 16) | y    — canvas-space coordinates
+ *   R6 = button (PTR_BTN_* — only meaningful for DOWN / UP)
+ *   R7 = button-state mask (1 << button per pressed button)
+ *
+ * Subscribers typically allocate a TAG_SERVICE mailbox + queue,
+ * derive an R|W sub-cap, and pass that as the reply ref.  Same
+ * pattern term.c uses for keyboard. */
+
+#define PTR_EVT_MOTION  0x00
+#define PTR_EVT_DOWN    0x01
+#define PTR_EVT_UP      0x02
+
+#define PTR_BTN_LEFT   1
+#define PTR_BTN_MIDDLE 2
+#define PTR_BTN_RIGHT  3
+
+/* Subscribe / receive flow:
+ *   1. wm_init + wm_new_window + wm_bind_surface(wid, WSURF_POINTER).
+ *   2. pointer_init_from_dir_result() — DIR_RESULT_SLOT →
+ *      WM_POINTER_CAP_SLOT.
+ *   3. pointer_subscribe() — allocate a TAG_SERVICE mailbox into
+ *      O10, ReceiveQueueAttach (depth 16), derive an R|S sub-cap,
+ *      and SEND it to the WM-mediated pointer cap.
+ *   4. pointer_getevent(&evt_type, &packed_xy, &button, &btn_state)
+ *      polls the O10 mailbox with timeout=0; returns 0 if an event
+ *      was delivered, -1 otherwise.
+ * Call pointer_unsubscribe() to clear the WM's subscriber slot
+ * before exit. */
+int  pointer_init_from_dir_result(void);
+int  pointer_subscribe(void);
+int  pointer_unsubscribe(void);
+int  pointer_getevent(int *evt_type, int *packed_xy,
+                       int *button, int *btn_state);
+
 /* term_getkey: blocks until the next keystroke arrives. Returns
  * the codepoint (ASCII for printable, ≥0x100 for special — see
  * KEY_* in tools/devices/oriscterm). Modifier mask written to

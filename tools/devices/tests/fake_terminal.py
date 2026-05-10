@@ -596,6 +596,9 @@ def main():
         send_inline_register(s, args.pid, args.directory_pid,
                              FRAMEBUFFER_INDEX, f"{base}/framebuffer",
                              caps=CAP_R | CAP_W | CAP_V)
+        # Phase 59 / WM γ.13 — publish pointer for the WM to walk.
+        send_inline_register(s, args.pid, args.directory_pid,
+                             POINTER_INDEX, f"{base}/pointer")
 
     print(f"fake_terminal READY pid={args.pid}", flush=True)
     s.setblocking(False)

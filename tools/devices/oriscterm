@@ -583,6 +583,7 @@ class Terminal:
         self._send_inline_register(f"{base}/console",     CONSOLE_INDEX)
         self._send_inline_register(f"{base}/keyboard",    KEYBOARD_INDEX)
         self._send_inline_register(f"{base}/grid",        GRID_INDEX)
+        self._send_inline_register(f"{base}/pointer",     POINTER_INDEX)
         self._send_inline_register(f"{base}/framebuffer", FRAMEBUFFER_INDEX,
                                     caps=CAP_R | CAP_W | CAP_V)
 

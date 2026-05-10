@@ -215,6 +215,14 @@
 #define WM_VECTOR_BASE_OFFSET           848
 #define WM_RASTER_BASE_OFFSET           984
 
+/* Phase 59 / WM γ.13 — pointer mediation.  Single global subscriber
+ * for v1; multi-window focus is post-multi-window WM work. */
+#define WM_POINTER_CAP_SLOT_OFFSET      1112  /* libc-visible bound cap */
+#define WM_POINTER_SVC_SLOT_OFFSET      1120  /* TAG_SERVICE clients SEND to */
+#define WM_PTR_SUB_SLOT_OFFSET          1128  /* current subscriber's reply ref */
+#define WM_PTR_EVENTS_SLOT_OFFSET       1136  /* mailbox: WM polls term events */
+#define WM_SURF_POINTER_SLOT_OFFSET     1144  /* /sys/term/0/pointer cap */
+
 /* === Glyph rendering ==================================================
  *
  * The framebuffer is row-major, one byte per pixel (palette index;
@@ -511,6 +519,135 @@ walk_framebuffer_to_slot(void)
 		: "r1"
 	);
 	return 0;
+}
+
+/* Same shape as walk_framebuffer_to_slot but for /sys/term/0/pointer
+ * (Phase 59 / WM γ.13).  The WM subscribes a private mailbox to it
+ * at boot via subscribe_term_pointer below. */
+static int
+walk_pointer_to_slot(void)
+{
+	int kind;
+	char rem[16];
+	int rc = dir_walk("/sys/term/0/pointer", &kind, rem, sizeof(rem));
+	if (rc != 0) return rc;
+	if (kind != DIR_KIND_LEAF) return -1;
+	asm volatile(
+		"orefld o1, 616(o12)\n"
+		"orefst o1, %0(o12)"
+		:
+		: "i"(WM_SURF_POINTER_SLOT_OFFSET)
+		: "r1"
+	);
+	return 0;
+}
+
+/* Phase 59 / WM γ.13 — boot helper that:
+ *   1. ObjAllocs a TAG_SERVICE event mailbox + ReceiveQueueAttach
+ *      (depth 64 — larger than the ~8-event-per-Tk-tick burst the
+ *      pointer can produce during fast drags).
+ *   2. Stashes the mailbox into WM_PTR_EVENTS_SLOT.
+ *   3. Derives an R|S sub-cap and SENDs it to /sys/term/0/pointer
+ *      with the standard "non-null O2 = subscribe" wire shape.
+ *
+ * After this returns 0, the underlying terminal will SEND every
+ * pointer event it observes to our event mailbox.  poll_pointer_events
+ * picks them up and forwards them on to the WM-mediated subscriber.
+ *
+ * The pointer service object the WM allocates separately
+ * (alloc_pointer_service) is the one CLIENTS SEND to in order to
+ * subscribe — distinct from this event mailbox. */
+static int
+subscribe_term_pointer(void)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, 16\n"
+		"addiu r5, r0, %1\n"
+		"addiu r6, r0, %2\n"
+		"call  #0x100\n"                  /* ObjAlloc → O1 */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(TAG_SERVICE),
+		  "i"(CAP_R | CAP_W | CAP_S | CAP_V | CAP_C)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	if (status != 0) return status;
+
+	asm volatile("orefst o1, %0(o12)"
+	             :: "i"(WM_PTR_EVENTS_SLOT_OFFSET));
+
+	asm volatile(
+		"addiu r4, r0, 64\n"
+		"call  #0x203\n"                  /* ReceiveQueueAttach */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	if (status != 0) return status;
+
+	/* Derive R|S sub-cap and SEND it to /sys/term/0/pointer.  Wire:
+	 * O2 = sub-cap, R4..R7 = 0 (subscribe). */
+	asm volatile(
+		"orefld o1, %0(o12)\n"
+		"addiu  r4, r0, %2\n"             /* R|S */
+		"call   #0x103\n"                 /* ObjDerive → O1 = sub-cap */
+		"nop\n"
+		"omov   o2, o1\n"
+		"orefld o1, %1(o12)\n"            /* O1 = /sys/term/0/pointer */
+		"onull  o3\n"
+		"addiu  r4, r0, 0\n"
+		"addiu  r5, r0, 0\n"
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1"
+		:
+		: "i"(WM_PTR_EVENTS_SLOT_OFFSET),
+		  "i"(WM_SURF_POINTER_SLOT_OFFSET),
+		  "i"(CAP_R | CAP_S)
+		: "r1", "r2", "r4", "r5", "r6", "r7"
+	);
+	return 0;
+}
+
+/* Allocate the WM-side pointer SERVICE object — clients SEND to a
+ * derived R|S sub-cap of this when they subscribe via
+ * wm_bind_surface(WSURF_POINTER).  ReceiveQueueAttach depth 16 is
+ * generous: subscribe SENDs are rare. */
+static int
+alloc_pointer_service(void)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, 16\n"
+		"addiu r5, r0, %1\n"
+		"addiu r6, r0, %2\n"
+		"call  #0x100\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(TAG_SERVICE),
+		  "i"(CAP_R | CAP_W | CAP_S | CAP_V | CAP_C)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	if (status != 0) return status;
+
+	asm volatile("orefst o1, %0(o12)"
+	             :: "i"(WM_POINTER_SVC_SLOT_OFFSET));
+
+	asm volatile(
+		"addiu r4, r0, 16\n"
+		"call  #0x203\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	return status;
 }
 
 /* === Self-register at /sys/wm/0 ======================================= */
@@ -1296,7 +1433,8 @@ handle_bind_surface(int wid, int kind)
 	if (kind != WSURF_CONSOLE && kind != WSURF_KEYBOARD
 	                          && kind != WSURF_GRID
 	                          && kind != WSURF_VECTOR
-	                          && kind != WSURF_RASTER) {
+	                          && kind != WSURF_RASTER
+	                          && kind != WSURF_POINTER) {
 		wm_reply(E_INVAL, 0, 0, 0);
 		return;
 	}
@@ -1377,6 +1515,30 @@ handle_bind_surface(int wid, int kind)
 			"addu  %0, r2, r0"
 			: "=r"(derive_status)
 			: "i"(CAP_R | CAP_S)
+			: "r1", "r2", "r4"
+		);
+		if (derive_status != 0) {
+			wm_reply(E_IO, 0, 0, 0);
+			return;
+		}
+		wm_reply_with_ref_o14(0);
+		return;
+	}
+
+	if (kind == WSURF_POINTER) {
+		/* Single WM-wide pointer service (no per-window for v1).
+		 * Derive R|S sub-cap of WM_POINTER_SVC_SLOT and return it. */
+		int derive_status;
+		asm volatile(
+			"orefld o1, %1(o12)\n"
+			"addiu  r4, r0, %2\n"
+			"call   #0x103\n"
+			"nop\n"
+			"omov   o14, o1\n"
+			"addu   %0, r2, r0"
+			: "=r"(derive_status)
+			: "i"(WM_POINTER_SVC_SLOT_OFFSET),
+			  "i"(CAP_R | CAP_S)
 			: "r1", "r2", "r4"
 		);
 		if (derive_status != 0) {
@@ -2489,6 +2651,124 @@ poll_window_rasters(void)
 	}
 }
 
+/* Phase 59 / WM γ.13 — pointer mediation polls.
+ *
+ * poll_pointer_subscribes: drain any subscribe SENDs queued on the
+ * WM-side pointer service.  Wire: O2 = subscriber's reply ref (0 to
+ * unsubscribe).  Single-subscriber v1 — replace whatever's in
+ * WM_PTR_SUB_SLOT.
+ *
+ * poll_pointer_events: drain events from the underlying terminal.
+ * Wire from oriscterm: int_payload[0..3] = (evt_type, packed_xy,
+ * button, btn_state).  Forward each to the current subscriber if
+ * any. */
+static int _wm_ptr_sub_poll_status;
+
+static void
+poll_pointer_subscribes(void)
+{
+	asm volatile("orefld o1, %0(o12)"
+	             :: "i"(WM_POINTER_SVC_SLOT_OFFSET));
+	asm volatile(
+		"addiu r4, r0, 0\n"
+		"call  #0x204\n"                   /* ReceiveQueuePoll */
+		"nop\n"
+		"la    r1, _wm_ptr_sub_poll_status\n"
+		"sw    r2, 0(r1)"
+		:
+		:
+		: "r1", "r2", "memory"
+	);
+	if (_wm_ptr_sub_poll_status != 0) return;
+
+	/* Subscribe SENDs land sender's O2 → our O2 (the receive-queue
+	 * overlay maps wire slot 1 → O2; same convention stash_owner_o2
+	 * uses on the main service queue).  Stash that ref into
+	 * WM_PTR_SUB_SLOT.  Null O2 from the sender means
+	 * unsubscribe-all → null the slot. */
+	asm volatile(
+		"orefst o2, %0(o12)"
+		:
+		: "i"(WM_PTR_SUB_SLOT_OFFSET)
+		: "memory"
+	);
+}
+
+static int _wm_ptr_evt_poll_status;
+
+static void
+poll_pointer_events(void)
+{
+	/* If no subscriber, leave events queued in the underlying
+	 * mailbox (depth 64) so they aren't lost during the window
+	 * between WM boot and the client's subscribe SEND landing —
+	 * which is large enough to swallow several events from a
+	 * --event sequence at default --delay.  When a subscriber
+	 * appears, we'll start draining naturally.  Queue overflow
+	 * past 64 deep is a silent drop, acceptable for this test
+	 * shape. */
+	int sub_isn;
+	asm volatile(
+		"orefld o1, %1(o12)\n"
+		"oisn   %0, o1"
+		: "=r"(sub_isn)
+		: "i"(WM_PTR_SUB_SLOT_OFFSET)
+		: "r1"
+	);
+	if (sub_isn) return;
+
+	asm volatile("orefld o1, %0(o12)"
+	             :: "i"(WM_PTR_EVENTS_SLOT_OFFSET));
+	int evt_type, packed_xy, button, btn_state;
+	asm volatile(
+		"addiu r4, r0, 0\n"
+		"call  #0x204\n"
+		"nop\n"
+		"la    r1, _wm_ptr_evt_poll_status\n"
+		"sw    r2, 0(r1)\n"
+		"addu  %0, r3, r0\n"
+		"addu  %1, r4, r0\n"
+		"addu  %2, r5, r0\n"
+		"addu  %3, r6, r0"
+		: "=r"(evt_type), "=r"(packed_xy),
+		  "=r"(button),   "=r"(btn_state)
+		:
+		: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+	);
+	if (_wm_ptr_evt_poll_status != 0) return;
+
+	/* Forward the event: SEND to subscriber's ref with the same
+	 * int_payload[0..3] = (evt_type, packed_xy, button, btn_state).
+	 * No source ref.
+	 *
+	 * pcc-orisc doesn't always honour r4..r7 in the clobber list
+	 * when picking input regs — it can place an input operand in
+	 * r4 (or r5), then the first `addu r4, %x, r0` stomps that
+	 * input before the later `addu r6, %y, r0` reads it.  Save
+	 * all four inputs into safe temps (r8..r11) FIRST, then move
+	 * them into the ABI registers for the SEND. */
+	asm volatile(
+		"addu   r8,  %1, r0\n"        /* save evt_type */
+		"addu   r9,  %2, r0\n"        /* save packed_xy */
+		"addu   r10, %3, r0\n"        /* save button */
+		"addu   r11, %4, r0\n"        /* save btn_state */
+		"orefld o1, %0(o12)\n"
+		"onull  o2\n"
+		"onull  o3\n"
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r10, r0\n"
+		"addu   r7, r11, r0\n"
+		"send   o1"
+		:
+		: "i"(WM_PTR_SUB_SLOT_OFFSET),
+		  "r"(evt_type), "r"(packed_xy),
+		  "r"(button),   "r"(btn_state)
+		: "r1", "r4", "r5", "r6", "r7",
+		  "r8", "r9", "r10", "r11"
+	);
+}
+
 const char banner_boot[]            = "oriscwm: booting\n";
 const char banner_console_walk_ok[] = "oriscwm: /sys/term/0/console acquired\n";
 const char banner_keyboard_walk_ok[]= "oriscwm: /sys/term/0/keyboard acquired\n";
@@ -2557,6 +2837,34 @@ main(void)
 		WM_PRINT("oriscwm: /sys/term/0/framebuffer walk failed: ");
 		WM_PRINT_INT(status);
 		WM_PRINT(" — glyph rendering disabled\n");
+	}
+
+	/* Phase 59 / WM γ.13 — pointer mediation.  Walk the underlying
+	 * /sys/term/0/pointer cap, allocate the WM-side pointer service
+	 * (clients SEND here to subscribe via wm_bind_surface), and
+	 * subscribe a private mailbox so events flow into us. */
+	status = walk_pointer_to_slot();
+	if (status == 0) {
+		WM_PRINT("oriscwm: /sys/term/0/pointer acquired\n");
+		status = alloc_pointer_service();
+		if (status != 0) {
+			WM_PRINT("oriscwm: alloc_pointer_service failed: ");
+			WM_PRINT_INT(status);
+			WM_PRINT("\n");
+		} else {
+			status = subscribe_term_pointer();
+			if (status != 0) {
+				WM_PRINT("oriscwm: subscribe_term_pointer failed: ");
+				WM_PRINT_INT(status);
+				WM_PRINT("\n");
+			} else {
+				WM_PRINT("oriscwm: pointer mediation ready\n");
+			}
+		}
+	} else {
+		WM_PRINT("oriscwm: /sys/term/0/pointer walk failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT(" — pointer mediation disabled\n");
 	}
 
 	/* Self-register at /sys/wm/0. */
@@ -2633,5 +2941,7 @@ main(void)
 		poll_window_grids();
 		poll_window_vectors();
 		poll_window_rasters();
+		poll_pointer_subscribes();
+		poll_pointer_events();
 	}
 }
