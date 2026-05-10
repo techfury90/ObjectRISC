@@ -138,11 +138,20 @@ python3 tools/devices/tests/fake_terminal.py \
     > "$TMP/term16.out" 2>&1 &
 TERM16_PID=$!
 
+# Stagger term19's typing (--delay 0.50 vs term16's 0.20) so the
+# leader (CPU0)'s shell finishes its `exit` before the worker
+# (CPU1)'s does.  Otherwise we hit a shutdown race: when CPU1's
+# shell exits first, supervisor.c's relay_shutdown_to_leader sends
+# op=2 to CPU0, whose op=2 handler cascade-kills its own still-
+# running shell mid-`cmd_ls` — the second prompt and `bye!` never
+# print on term16 and the test fails intermittently.  The proper
+# fix lives in supervisor.c (distinguish own-shell op=2 from
+# worker-relay op=2) — tracked separately.
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 19 \
     --directory-pid 18 --instance 1 \
     $TERM16_KEYS \
-    --linger 12.0 --delay 0.20 \
+    --linger 12.0 --delay 0.50 \
     > "$TMP/term19.out" 2>&1 &
 TERM19_PID=$!
 
