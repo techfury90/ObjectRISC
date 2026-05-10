@@ -32,11 +32,16 @@ winhello_read_line(char *buf, int max)
 		int mods = 0;
 		int c = term_getkey(&mods);
 		if (c < 0) continue;
-		if (c == '\r' || c == '\n') {
+		/* TK_RETURN is the host display worker's Tk-side keycode for
+		 * the Enter key — 0x10D, distinct from ASCII '\r' / '\n'.  Tk
+		 * delivers keysyms verbatim through the input-sink queue; the
+		 * libc liborisc.h defines TK_RETURN / TK_BACKSPACE / TK_TAB /
+		 * TK_ESCAPE / arrow keys etc. for clients to check against. */
+		if (c == TK_RETURN || c == '\r' || c == '\n') {
 			term_print_char('\n');
 			break;
 		}
-		if (c == 0x08) {       /* backspace */
+		if (c == TK_BACKSPACE || c == 0x08) {
 			if (n > 0) {
 				n--;
 				term_print_char('\b');

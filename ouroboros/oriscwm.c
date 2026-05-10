@@ -1929,6 +1929,17 @@ handle_new_window(int wtype)
 	window_title_len = 0;
 	paint_title_bar();
 
+	/* Phase 60 step 13 — composite the full window onto the screen
+	 * so the (zero-filled = bg-colored) content area replaces
+	 * whatever underlying window's pixels were at this screen
+	 * position.  Without this, a new window stacked on top of an
+	 * older one leaves the older one's text "shining through" the
+	 * un-painted parts of the new content area until something
+	 * actually renders there.  The composite walks z-order so
+	 * higher-z windows still correctly overpaint. */
+	composite_window_region(0, TITLE_BAR_PX,
+	                        USABLE_W_PX, CELL_CONTENT_PX);
+
 	window_type[wid - 1] = WIN_TYPE_CONSOLE;
 	window_subscribe_op[wid - 1] = 0;
 	window_cur_col[wid - 1] = 0;
