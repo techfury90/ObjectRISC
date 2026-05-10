@@ -6590,6 +6590,60 @@ Scrolling stays out of scope here — `render_buffer` still drops
 content past row 46.  Scrollback needs a per-window pixel backing
 store; that's a follow-up phase.
 
+## Phase 60 step 6 — terminal scrolling
+
+Step 5 left scroll as the last gap from the user-visible "windows
+have no chrome / unknown size / no scrolling" trio.  Without it,
+`render_buffer` simply dropped content past the bottom row — text
+became invisible the moment the cursor walked off the screen.
+
+New firmware op `#0x10E ObjFbScroll`:
+
+- O1 = TAG_FRAMEBUFFER ref (must be local).
+- R4 = packed `(x << 16) | y` — top-left of region.
+- R5 = packed `(w << 16) | h` — region size in pixels.
+- R6 = packed `(dy << 8) | fill` — `dy` is signed 24 bits, positive
+  shifts content toward y=0; `fill` is the palette index used to
+  clear the freshly-exposed strip.
+
+Region clips to FB bounds; `|dy| >= h` is "fill the whole region
+with `fill`."  The Python implementation does a bytearray
+memmove + byte-fill; same "blitter device" pattern as
+`ObjBlitGlyphs` and `ObjFillRect` — zero simulated WM cycles for
+the work.
+
+`oriscwm` adds `fb_scroll_up_one_cell()` (one firmware call) and
+`maybe_scroll(int *row)` that loops it until `*row < N_ROWS`.
+Each `row += 1` site in `render_buffer` (`\n`, non-printable wrap,
+printable wrap) follows up with `maybe_scroll` so the cursor
+always sits on a paintable row.  Multiple newlines past the
+bottom legitimately scroll once per newline — same semantics as
+a real terminal.  The chrome (border + outer-ring margin) is
+left untouched: only the inner pixel rectangle scrolls.
+
+`fb_local_smoke` gains step 6: scroll a 16×16 FB up by 4 px with
+fill=0xAB, fetch the bytes back, and byte-compare against the
+expected post-scroll layout (rows 0..11 ← rows 4..15, rows
+12..15 ← 0xAB).  Catches both the firmware op's correctness and
+the WM-side packed-arg encoding.
+
+Caveat — pcc-orisc input-clobber bug strikes again: under
+register pressure pcc allocated one of the asm-block "r" inputs
+into r8, then the "save inputs to safe temps" prelude stomped
+it before the firmware call read it.  Worked around by pinning
+the three packed args to specific high-numbered registers
+(`register int xy asm("r12") = ...`).  See
+`examples/cc/fb_local_smoke.c` for the idiom.  The WM-side
+`fb_scroll_up_one_cell` doesn't trip the bug because the
+function is small enough that pcc happens to allocate inputs
+into r2..r4.
+
+User-visible: `help`, multi-page `cat`, `ps -l`, anything that
+spits more than 46 lines now scrolls correctly instead of
+silently truncating.  Scroll-back history is still not stored —
+content shifted off the top of the inner area is lost (no
+per-window backing store yet).  That's the next milestone.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

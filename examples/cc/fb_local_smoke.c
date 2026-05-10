@@ -154,6 +154,98 @@ main(void)
 		}
 	}
 
+	/* Step 6 (Phase 60 step 6): ObjFbScroll the whole 16×16 region up
+	 * by 4 pixels with fill=0xAB.  After the scroll:
+	 *   rows  0..11 ← previous rows  4..15
+	 *   rows 12..15 ← 0xAB
+	 * Verify by re-fetching and checking those bands. */
+	int scroll_status;
+	{
+		/* pcc-orisc input-clobber dance: under register pressure pcc
+		 * may allocate one of the "r" inputs into r8/r9/r10, then the
+		 * "save inputs to safe temps" prelude stomps it before we
+		 * read it.  Pin each input to a high-numbered register pcc
+		 * doesn't touch (r12..r14 are safe — fp is r29, sp is r30,
+		 * ra is r31, and pcc never picks r12+ for ordinary spills). */
+		register int xy   asm("r12") = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
+		register int wh   asm("r13") = ((FB_W & 0xFFFF) << 16) | (FB_H & 0xFFFF);
+		register int dyfl asm("r14") = ((4 & 0xFFFFFF) << 8) | (0xAB & 0xFF);
+		asm volatile(
+			"omov o1, o5\n"
+			"addu r4, r12, r0\n"
+			"addu r5, r13, r0\n"
+			"addu r6, r14, r0\n"
+			"call #0x10E\n"             /* ObjFbScroll */
+			"nop\n"
+			"addu %0, r2, r0"
+			: "=r"(scroll_status)
+			: "r"(xy), "r"(wh), "r"(dyfl)
+			: "r1", "r2", "r4", "r5", "r6"
+		);
+	}
+	if (scroll_status != 0) {
+		fail("ObjFbScroll", scroll_status); return 5;
+	}
+	WP("fb_local_smoke: scroll OK\n");
+
+	/* Re-fetch and verify the post-scroll FB matches expectation. */
+	unsigned char post[FB_BYTES];
+	int post_off = (int)((unsigned int)post - 0x001f0000U);
+	int post_status;
+	asm volatile(
+		"addu  r8, %1, r0\n"
+		"omov  o1, o5\n"
+		"omov  o2, o11\n"
+		"addiu r4, r0, 0\n"
+		"addu  r5, r8, r0\n"
+		"addiu r6, r0, %2\n"
+		"call  #0x108\n"                /* ObjFetchBytes */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(post_status)
+		: "r"(post_off), "i"(FB_BYTES)
+		: "r1", "r2", "r3", "r4", "r5", "r6", "r8"
+	);
+	if (post_status != 0) {
+		fail("ObjFetchBytes post-scroll", post_status); return 6;
+	}
+	/* Top 12 rows: must match src[(y+4) ...]. Bottom 4 rows: must be 0xAB. */
+	int y, x;
+	for (y = 0; y < FB_H - 4; y++) {
+		for (x = 0; x < FB_W; x++) {
+			int got  = post[y * FB_W + x];
+			int want = src[(y + 4) * FB_W + x];
+			if (got != want) {
+				restore_or_state();
+				print_str("FAIL: scroll-up mismatch y=");
+				print_int(y);
+				print_str(" x=");
+				print_int(x);
+				print_str(" got=");
+				print_int(got);
+				print_str(" want=");
+				print_int(want);
+				print_str("\n");
+				return 7;
+			}
+		}
+	}
+	for (y = FB_H - 4; y < FB_H; y++) {
+		for (x = 0; x < FB_W; x++) {
+			int got = post[y * FB_W + x];
+			if (got != 0xAB) {
+				restore_or_state();
+				print_str("FAIL: scroll-fill mismatch y=");
+				print_int(y);
+				print_str(" got=");
+				print_int(got);
+				print_str("\n");
+				return 8;
+			}
+		}
+	}
+	WP("fb_local_smoke: scroll verify OK\n");
+
 	WP("fb_local_smoke: PASS\n");
 	return 0;
 }
