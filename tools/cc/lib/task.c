@@ -217,22 +217,29 @@
  *          (Tk-fed by the host display worker).  Phase 60 step 3
  *          replaced the legacy oriscterm-walked keyboard ref with
  *          this in-process sink.)
- *     + 8 (WM_WINDOW_FB_SLOT: WM-only — single offscreen
- *          TAG_FRAMEBUFFER backing the active CONSOLE window.  The
- *          WM renders text + scrolls into here, then ObjBlitCopy-
- *          composites onto the screen FB (WM_SURF_FRAMEBUFFER).
- *          Single slot for v1 since handle_new_window enforces N=1
- *          CONSOLE; when multi-window lands this becomes a 16-entry
- *          per-wid array (128 bytes) and ORX_STATE_BYTES bumps.
- *          Phase 60 step 7.)
+ *     + 128 (WM_WINDOW_FB_BASE: WM-only — per-wid offscreen
+ *          TAG_FRAMEBUFFER backing the matching CONSOLE window.
+ *          Renders + scrolls + title-bar paints land in the wid's
+ *          FB; the WM ObjBlitCopy-composites the touched region in
+ *          z-order onto the screen FB (WM_SURF_FRAMEBUFFER).  16
+ *          entries × 8 bytes.  Phase 60 step 7 introduced a single
+ *          slot here; step 11 lifted it to a per-wid array when the
+ *          N=1 CONSOLE restriction came down.)
+ *     + 8 (WM_ACTIVE_FB_SLOT: WM-only — copy of the currently-
+ *          active wid's window FB ref.  The painting helpers
+ *          (flush_strip, fb_blit_row, fill_rect_window, etc.)
+ *          target this slot so they don't have to thread a wid
+ *          argument through every asm block; the caller calls
+ *          set_active_window(wid) to install the right per-wid FB
+ *          before any paint.  Phase 60 step 11.)
  *
  * Total: 720 standard + 128 WM_GRID_BASE + 128 WM_VECTOR_BASE +
  * 8 WM_RASTER_CAP_SLOT + 128 WM_RASTER_BASE + 8 WM_POINTER_CAP_SLOT
- * + 32 WM_POINTER_INTERNAL + 24 WM_KEYBOARD_INTERNAL + 8
- * WM_WINDOW_FB_SLOT = 1184.  The libc oversizes ORX_STATE_BYTES so
- * the WM's task-table objstore covers all of its slot map; non-WM
- * programs leave the tail dead. */
-#define ORX_STATE_BYTES   1184
+ * + 32 WM_POINTER_INTERNAL + 24 WM_KEYBOARD_INTERNAL + 128
+ * WM_WINDOW_FB_BASE + 8 WM_ACTIVE_FB_SLOT = 1312.  The libc
+ * oversizes ORX_STATE_BYTES so the WM's task-table objstore covers
+ * all of its slot map; non-WM programs leave the tail dead. */
+#define ORX_STATE_BYTES   1312
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8

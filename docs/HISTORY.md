@@ -6845,6 +6845,91 @@ half of step 7).  Next milestones: lift the N=1 CONSOLE
 restriction and add z-order/composite ordering, which is what
 opaque overlapping windows actually requires.
 
+## Phase 60 step 11 — multi-window with z-order
+
+The unlock the user's been asking for since step 7: actual
+overlapping opaque windows.  N=1 CONSOLE is gone; the WM now
+keeps a per-wid backing store, a per-wid screen position, and a
+z-order stack, and composites the affected region of any paint
+through the stack so higher-z windows correctly overlay
+lower-z ones.
+
+Slot map:
+- `WM_WINDOW_FB_BASE` (offset 1176, 16 × 8 bytes) — per-wid
+  offscreen TAG_FRAMEBUFFER.  `load_window_fb_to_o1(wid)` /
+  `stash_window_fb_o1(wid)` are 16-case switches (pcc-orisc
+  rejects computed-offset OREFLD/OREFST) baking the per-wid
+  offset into each `case`.
+- `WM_ACTIVE_FB_SLOT` (offset 1304) — copy of the currently-
+  painted wid's FB ref.  All painting helpers (flush_strip,
+  fb_blit_row, fill_rect_window, blit_title_text,
+  fb_scroll_up_one_cell) target this slot; callers invoke
+  `set_active_window(wid)` before any paint to install the
+  right per-wid FB.  Saves us from threading a wid arg through
+  every asm block.
+- `ORX_STATE_BYTES` bumps 1184 → 1312.
+
+C state:
+- `window_pos_x[MAX_WINDOWS]` / `window_pos_y[MAX_WINDOWS]` —
+  screen position of each window's top-left corner.
+- `window_z[MAX_WINDOWS]` + `window_z_count` — bottom-to-top
+  ordering.  `window_z_remove(wid)` compacts in place on
+  destroy.
+- `active_wid` — read by composite_window_region to compute the
+  affected screen rect.
+
+Composite:
+- `composite_window_region(wx, wy, w, h)` translates the active
+  window's local rect into screen space, then walks `window_z`
+  bottom to top: each window's intersection with that rect is
+  blitted from its FB onto the screen.  Windows above the active
+  one therefore overpaint correctly; lower windows show through
+  any uncovered portions.
+- `do_blit_copy_active_to_screen(packed_src_xy, packed_dst_xy,
+  packed_wh)` — 3-arg packed signature (dodges pcc-orisc's 4-arg
+  ceiling) wraps the underlying #0x10F ObjBlitCopy.
+
+Window lifecycle:
+- `handle_new_window` no longer rejects on N=1.  Allocates a
+  per-wid FB, assigns a cascade position
+  `(n*32 % residue, n*32 % residue)` where `n =
+  window_z_count`, pushes wid to z-top, and paints the title
+  bar.
+- `handle_destroy_window` + `scan_owner_exits` free the per-wid
+  FB and call `window_z_remove(wid)`.  TODO: re-composite the
+  screen so vacated pixels don't linger; punted to a follow-up.
+
+Dispatch sites:
+- `poll_window_consoles` / `_grids` / `_vectors` / `_rasters`
+  call `set_active_window(wid)` before invoking the matching
+  `forward_*` so painting always lands in the right window.
+- `render_buffer` re-confirms its wid as active at entry.
+- `handle_set_title` sets active before `paint_title_bar`.
+
+Tests:
+- wm_smoke step 7 rewritten for the new behaviour: second
+  CONSOLE allocation now succeeds with a fresh wid (≠ first),
+  gets its own title, then destroys cleanly.
+- vec_smoke + raster_smoke + fb_local_smoke + ssm green.
+
+Visible result on boot.sh: each terminal still shows one window
+at boot (the supervisor's own), but a program calling
+`wm_new_window` gets a freshly cascaded window stacked on top.
+Programs that paint into different wids see independent backing
+stores, and overlapping windows render with proper z-order.
+
+Known caveats:
+- Title text storage is still a single global buffer — the LAST
+  wm_set_title's bytes leak into the next-painted window's
+  title bar until that window calls wm_set_title with its own
+  text.  Per-wid title strings is a small follow-up.
+- Destroy doesn't recompose the screen; vacated pixels linger
+  until something else paints over them.
+- Cascade offset is bounded by the gap between FB and window
+  size (~16 px horizontal, ~32 px vertical with current
+  fullscreen-ish windows), so two cascaded windows mostly
+  overlap.  That changes naturally once window resize is in.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
