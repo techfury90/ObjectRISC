@@ -3276,6 +3276,146 @@ def primitive_ObjAllocFramebuffer(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
 
 
+def primitive_ObjBlitGlyphs(cpu: CPU) -> None:
+    """Phase 60 step 4 — bulk-render a strip of 8x16 monochrome
+    glyphs into a TAG_FRAMEBUFFER.  Replaces oriscwm's flush_strip
+    inner loop (per-pixel decode + 16 ObjStoreBytes per strip)
+    with a single Python-side render — cuts the rendering cost
+    of one 80-char strip from ~80K simulated WM instructions to
+    one firmware-call's worth.
+
+    Models a 1bpp-source blitter device: glyph bytes are 8 pixels
+    each, MSB-first; output pixels are palette indices (fg if bit
+    set, bg otherwise).  The font is laid out as 16 bytes per
+    glyph (1 byte per row), 95 glyphs starting at codepoint 32 —
+    same shape oriscwm's font_8x16[] uses.
+
+    Inputs:
+      O1 = framebuffer ref      (TAG_FRAMEBUFFER, must be local)
+      O2 = font ref             (any tag with R caps, must be local;
+                                 for oriscwm this is its boot data
+                                 ref O15)
+      O3 = text ref             (any tag with R caps, must be local;
+                                 for oriscwm this is its boot stack O11)
+      R4 = packed (cell_x << 16) | cell_y     — destination cell
+                                                position in the FB
+                                                (cell = 8x16 px)
+      R5 = packed (n_chars << 16) | (fg << 8) | bg — render shape
+      R6 = font_off                            — byte offset of font
+                                                table in O2
+      R7 = text_off                            — byte offset of glyph
+                                                bytes in O3
+
+    Outputs:
+      R2 = status (ERR_OK / ERR_EFAULT / ERR_EPERM / ERR_EREMOTE /
+                   ERR_ESTALE / ERR_EINVAL)
+      R3 = number of glyphs actually rendered (<= n_chars; clipped
+           to the framebuffer)
+
+    Off-screen rows / cells drop silently.  Non-printable bytes
+    (ch < 32 or ch > 126) render as a space.  Caller is responsible
+    for stashing source data in O11/O15 before invoking — the WM
+    pre-builds its strip on the stack and uses the boot OPRs
+    directly. """
+    fb_ref   = cpu.get_opr(1)
+    font_ref = cpu.get_opr(2)
+    text_ref = cpu.get_opr(3)
+    if fb_ref == 0 or font_ref == 0 or text_ref == 0:
+        cpu.set_gpr(2, ERR_EFAULT); cpu.set_gpr(3, 0); return
+
+    r4 = cpu.get_gpr(4)
+    cell_x = (r4 >> 16) & 0xFFFF
+    cell_y = r4 & 0xFFFF
+    r5 = cpu.get_gpr(5)
+    n_chars = (r5 >> 16) & 0xFFFF
+    fg      = (r5 >> 8)  & 0xFF
+    bg      = r5 & 0xFF
+    font_off = sext32(cpu.get_gpr(6))
+    text_off = sext32(cpu.get_gpr(7))
+
+    # Validate caps.  Both fonts and text need R; FB needs W.
+    if (ref_caps(fb_ref)   & CAP_W) == 0 or \
+       (ref_caps(font_ref) & CAP_R) == 0 or \
+       (ref_caps(text_ref) & CAP_R) == 0:
+        cpu.set_gpr(2, ERR_EPERM); cpu.set_gpr(3, 0); return
+    # Locality: all three must be local.  Cross-CPU blits would
+    # need a wire round-trip per source byte — defeats the purpose.
+    if ref_home(fb_ref)   != cpu.pid or \
+       ref_home(font_ref) != cpu.pid or \
+       ref_home(text_ref) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); cpu.set_gpr(3, 0); return
+
+    fb_idx   = ref_index(fb_ref)
+    font_idx = ref_index(font_ref)
+    text_idx = ref_index(text_ref)
+    for idx, ref in ((fb_idx, fb_ref), (font_idx, font_ref),
+                     (text_idx, text_ref)):
+        if idx <= 0 or idx >= len(cpu.descriptors) \
+                or cpu.descriptors[idx] is None:
+            cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+        d = cpu.descriptors[idx]
+        if not d.live or d.generation != ref_generation(ref):
+            cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+
+    fb_desc   = cpu.descriptors[fb_idx]
+    font_desc = cpu.descriptors[font_idx]
+    text_desc = cpu.descriptors[text_idx]
+    if fb_desc.type_tag != TAG_FRAMEBUFFER:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+
+    fb_w = fb_desc.fb_width
+    fb_h = fb_desc.fb_height
+    base_x = cell_x * 8
+    base_y = cell_y * 16
+    if base_y < 0 or base_y >= fb_h:
+        cpu.set_gpr(2, ERR_OK); cpu.set_gpr(3, 0); return
+
+    # Bounds-check inputs against descriptor lengths.
+    text_end = text_off + n_chars
+    if text_off < 0 or text_end > text_desc.length:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+    # Each glyph: 16 bytes.  Need (last_codepoint - 32 + 1) * 16
+    # bytes available at font_off, but we'd have to scan the text
+    # to know.  Cheap upper bound: enough room for codepoint 126.
+    font_max_end = font_off + 95 * 16
+    if font_off < 0 or font_max_end > font_desc.length:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+
+    fb_storage   = fb_desc.storage
+    font_storage = font_desc.storage
+    text_storage = text_desc.storage
+
+    rendered = 0
+    for g in range(n_chars):
+        ch = text_storage[text_off + g]
+        if ch < 32 or ch > 126:
+            ch = 32  # space
+        glyph_off = font_off + (ch - 32) * 16
+        cell_left = base_x + g * 8
+        if cell_left >= fb_w:
+            break
+        for r in range(16):
+            row_y = base_y + r
+            if row_y < 0 or row_y >= fb_h:
+                continue
+            byte = font_storage[glyph_off + r]
+            row_base = row_y * fb_w + cell_left
+            # Emit each of the 8 pixels.  Inner loop in Python is
+            # still ~500K assignments/sec, fast enough that an
+            # 80-char strip renders in single-digit ms.
+            for x in range(8):
+                px = cell_left + x
+                if px >= fb_w:
+                    break
+                bit = (byte >> (7 - x)) & 1
+                fb_storage[row_base + x] = fg if bit else bg
+        rendered += 1
+
+    fb_desc.fb_dirty = True
+    cpu.set_gpr(2, ERR_OK)
+    cpu.set_gpr(3, rendered)
+
+
 def primitive_ObjAllocInputSink(cpu: CPU) -> None:
     """Phase 60 step 3 — allocate a TAG_INPUT_SINK object that
     receives synthetic SEND_DELIVER events from simorisc's host
@@ -3960,6 +4100,7 @@ PRIMITIVE_MIN_MODE = {
     0x101: MODE_USER,        # ObjFree
     0x102: MODE_USER,        # ObjAllocFramebuffer (Phase 60)
     0x10B: MODE_USER,        # ObjAllocInputSink (Phase 60 step 3)
+    0x10C: MODE_USER,        # ObjBlitGlyphs (Phase 60 step 4)
     0x107: MODE_USER,        # ObjFreeDeferred — drain-window wrapper
     0x103: MODE_USER,        # ObjDerive
     0x106: MODE_USER,        # ObjAllocStore
@@ -4016,6 +4157,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjAllocFramebuffer(cpu)
     elif prim == 0x10B:
         primitive_ObjAllocInputSink(cpu)
+    elif prim == 0x10C:
+        primitive_ObjBlitGlyphs(cpu)
     elif prim == 0x107:
         primitive_ObjFreeDeferred(cpu)
     elif prim == 0x103:

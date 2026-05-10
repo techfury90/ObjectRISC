@@ -285,22 +285,38 @@ def main(argv) -> int:
     procs = []   # list of (name, Popen)
 
     def cleanup_and_exit(rc: int) -> int:
-        # Tear down in reverse order: CPUs first (they may still be
-        # waiting on socket I/O), then devices, then the crossbar.
+        # Tear down: SIGTERM everything in parallel, give the whole
+        # group ~2s to exit, then SIGKILL stragglers in parallel.
+        # Parallel rather than per-process serial — under Phase 60
+        # we have multiple long-running display CPUs (oriscwm with
+        # --display tk) that don't always respond instantly to
+        # SIGTERM (Tcl/Tk's runloop on macOS can sit on signals
+        # briefly), and per-process 2s timeouts compound to >10s
+        # total when the user just wants `exit` to mean exit.
         for name, p in reversed(procs):
             if p.poll() is None:
                 try:
                     p.terminate()
                 except ProcessLookupError:
                     pass
+        deadline = time.time() + 2.0
         for name, p in reversed(procs):
+            remaining = max(0.0, deadline - time.time())
             try:
-                p.wait(timeout=2.0)
+                p.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
+                pass
+        for name, p in reversed(procs):
+            if p.poll() is None:
                 try:
                     p.kill()
                 except ProcessLookupError:
                     pass
+        for name, p in reversed(procs):
+            try:
+                p.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
         try:
             os.unlink(sock_path)
         except FileNotFoundError:
