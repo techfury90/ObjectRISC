@@ -3091,9 +3091,15 @@ render_buffer(int wid, const unsigned char *buf, int count)
 		if (ch == '\b') {
 			flush_strip(strip, strip_len, strip_row, strip_col_start);
 			if (col > 0) col -= 1;
-			/* Backspace doesn't erase the rendered glyph — the
-			 * next char at this position will overwrite it.  For
-			 * a pure erase we'd need to render a space here. */
+			/* Phase 60 step 14: destructive backspace — render
+			 * a space at the new cursor position so the erased
+			 * glyph actually disappears.  Previously the WM just
+			 * moved the cursor back, leaving the old glyph on
+			 * screen; the shell's read_line expects backspace
+			 * to visually delete and was sending '\b' for that
+			 * effect. */
+			unsigned char space = ' ';
+			flush_strip(&space, 1, row, col);
 			strip_len       = 0;
 			strip_row       = row;
 			strip_col_start = col;
