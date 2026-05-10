@@ -195,12 +195,20 @@
  * size — but for the wire-mediated phase, hardcoding is good
  * enough. */
 
+/* Cell dims set by gen_wm_font.py — don't change without regenerating
+ * the embedded font_8x16 array. */
 #define CELL_W   8
 #define CELL_H   16
-#define N_COLS   80
-#define N_ROWS   24
-#define FB_W    (CELL_W * N_COLS)   /* 640 */
-#define FB_H    (CELL_H * N_ROWS)   /* 384 */
+
+/* 160 cols × 48 rows × 8×16 cells = 1280 × 768 framebuffer.  Text
+ * stays at native font size; the larger grid gives the leader's
+ * 80-col session room to breathe and leaves space on the right /
+ * bottom for future multi-window tiling.  oriscterm displays the
+ * framebuffer 1:1 — no scaling anywhere. */
+#define N_COLS   160
+#define N_ROWS   48
+#define FB_W    (CELL_W * N_COLS)   /* 1280 */
+#define FB_H    (CELL_H * N_ROWS)   /* 768  */
 
 /* Palette indices (matching VEC_PALETTE in tools/devices/oriscterm). */
 #define WM_BG_COLOR  0    /* dark navy background */
@@ -1102,7 +1110,7 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 	int cell_x        = col_start * CELL_W;
 	int cell_y        = cell_row  * CELL_H;
 	int strip_pixels  = n_glyphs  * CELL_W;
-	unsigned char pixel_row[N_COLS * CELL_W];   /* 640-byte scratch */
+	unsigned char pixel_row[N_COLS * CELL_W];   /* 1280-byte scratch */
 
 	int r;
 	for (r = 0; r < CELL_H; r++) {
