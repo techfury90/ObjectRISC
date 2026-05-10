@@ -6478,6 +6478,56 @@ relaying spawns.
 `walk_console_to_slot` / `WM_SURF_*` slots are dead but defined
 (future cleanup).
 
+## Phase 60 step 4 — `ObjBlitGlyphs` firmware op
+
+Step 3 left text rendering as the visible perf cliff: `flush_strip`
+decoded each glyph in interpreted WM C (~80K simulated WM
+instructions per 80-char strip), and simorisc executes those one
+Python step at a time, so a help-text dump took 10+ seconds.  This
+step pushes the rasterisation into the simulator natively.
+
+New firmware op `#0x10C ObjBlitGlyphs`.  Models a 1bpp-source
+blitter device:
+
+- O1 = TAG_FRAMEBUFFER ref (must be local).
+- O2 = font ref (any local readable object; the WM passes its boot
+  data ref O15 since `font_8x16[]` lives in its data segment).
+- O3 = text ref (any local readable object; WM passes its boot
+  stack O11 since the strip buffer is on its stack).
+- R4 = packed `(cell_x << 16) | cell_y` — destination in 8×16 cells.
+- R5 = packed `(n_chars << 16) | (fg << 8) | bg` — palette indices.
+- R6 = `font_off` — byte offset of the font table in O2.
+- R7 = `text_off` — byte offset of the glyph string in O3.
+
+Returns `R3` = number of glyphs actually rendered (clipped to FB).
+Off-screen rows / cells drop silently; non-printable bytes render
+as space (matches `flush_strip`'s previous behaviour).  Marks the
+FB descriptor `dirty` once for the whole strip (one repaint flag,
+not 16).
+
+`oriscwm`'s `flush_strip` collapses to a single `call #0x10C` —
+the strip-build loop, the per-pixel decode, and the 16
+`ObjStoreBytes` calls all go away.  ~80K simulated insns per
+strip drops to one firmware-call's worth (a few hundred Python
+ops in `primitive_ObjBlitGlyphs`).  User-confirmed: `help` text
+now displays in <1s instead of 10s+ — same order of magnitude as
+real interactive use.
+
+This is the cleanest "blitter device" abstraction the architecture
+has so far — a periphery that does pixel work in zero simulated
+WM cycles, with the WM's role limited to saying "render these
+characters here in this color."  Future scope (`ObjBlitFill` for
+vector primitives, `ObjBlitCopy` for raster, etc.) follows the
+same pattern.
+
+Also in this commit: parallelised `oriscrun`'s `cleanup_and_exit`.
+Previously each child process got a serial 2 s SIGTERM-wait
+budget; with the post-Phase-60 boot's 4 CPUs + 2 device daemons,
+that summed to 12+ s of "shell exited but the WM windows
+linger."  Now SIGTERM fans out in parallel, the whole group
+shares a 2 s budget, then any stragglers SIGKILL together with
+1 s grace.  Worst-case teardown drops to ~3 s.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

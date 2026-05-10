@@ -2159,15 +2159,17 @@ draw_oval_outline(int x, int y, int w, int h)
 }
 
 /* Flush a strip of `n_glyphs` printable chars at cell (row, col_start)
- * to the framebuffer.  All glyphs in the strip share the same cell
- * row, so they project to CELL_H contiguous pixel rows in the
- * framebuffer; each pixel row is the byte-concatenation of their
- * per-row pixels.  Pushing one ObjStoreBytes per pixel row
- * (CELL_H = 16 calls, regardless of strip width) is the WM γ.4
- * trick — drops the wire RTT count from 16N (one per glyph row)
- * to 16 for any run of printable chars on the same cell row.
+ * to the framebuffer.  All glyphs share the same cell row, so they
+ * project to CELL_H contiguous pixel rows.
  *
- * Off-screen rows (>= N_ROWS) drop silently — no scroll yet. */
+ * Phase 60 step 4: rasterisation moves into simorisc via the
+ * #0x10C ObjBlitGlyphs primitive.  Pre-step-4 this function did
+ * the bit-decode in interpreted WM C (~80K simulated insns per
+ * 80-char strip = ~1s wallclock at simorisc's interpretation rate),
+ * which dominated text-output latency.  Now the WM emits one
+ * firmware-call per strip; simorisc does the decode + writes
+ * natively in Python.  Off-screen clipping handled simorisc-side
+ * via the FB descriptor's own width/height. */
 static void
 flush_strip(const unsigned char *glyphs, int n_glyphs,
             int cell_row, int col_start)
@@ -2175,58 +2177,42 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 	if (n_glyphs <= 0)        return;
 	if (cell_row < 0)         return;
 	if (cell_row >= N_ROWS)   return;
+	if (col_start < 0)        return;
+	if (col_start >= N_COLS)  return;
+	if (n_glyphs > N_COLS - col_start) n_glyphs = N_COLS - col_start;
+	if (n_glyphs > 0xFFFF)    n_glyphs = 0xFFFF;
 
-	int cell_x        = col_start * CELL_W;
-	int cell_y        = cell_row  * CELL_H;
-	int strip_pixels  = n_glyphs  * CELL_W;
-	unsigned char pixel_row[N_COLS * CELL_W];   /* 1280-byte scratch */
+	int text_off = (int)((unsigned int)glyphs - STACK_BOTTOM);
+	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
+	int packed_xy = ((col_start & 0xFFFF) << 16) | (cell_row & 0xFFFF);
+	int packed_shape = ((n_glyphs & 0xFFFF) << 16)
+	                 | ((WM_FG_COLOR & 0xFF) << 8)
+	                 | (WM_BG_COLOR & 0xFF);
 
-	int r;
-	for (r = 0; r < CELL_H; r++) {
-		int g;
-		for (g = 0; g < n_glyphs; g++) {
-			/* font_8x16 is uint32[4] per glyph: 4 big-endian
-			 * words holding 4 pixel rows each, MSB = earlier row.
-			 * Cast to byte pointer and index by row; the BE
-			 * packing maps byte layout 1:1 to row order. */
-			const unsigned char *glyph =
-				(const unsigned char *)font_8x16[glyphs[g] - 32];
-			unsigned char glyph_byte = glyph[r];
-			int base = g * CELL_W;
-			int x;
-			for (x = 0; x < CELL_W; x++) {
-				int bit = (glyph_byte >> (7 - x)) & 1;
-				pixel_row[base + x] = bit ? WM_FG_COLOR
-				                          : WM_BG_COLOR;
-			}
-		}
-		int src_off = (int)((unsigned int)pixel_row - STACK_BOTTOM);
-		int dst_off = (cell_y + r) * FB_W + cell_x;
-		/* pcc-orisc doesn't always honor r4/r5/r6 clobbers when
-		 * picking input regs — if it places one of our %1/%2/%3
-		 * inputs in (say) r4, then the first `addu r4, %x, r0`
-		 * stomps that input before the later `addu r6, %3, r0`
-		 * reads it.  Capture all three inputs into safe temps
-		 * (r7..r9) FIRST, then move them into the ABI registers
-		 * for the call.  r7..r9 added to clobbers. */
-		asm volatile(
-			"addu  r7, %1, r0\n"        /* save src_off */
-			"addu  r8, %2, r0\n"        /* save dst_off */
-			"addu  r9, %3, r0\n"        /* save strip_pixels */
-			"omov  o1, o11\n"           /* boot stack ref */
-			"orefld o2, %0(o12)\n"      /* framebuffer cap */
-			"addu  r4, r7, r0\n"
-			"addu  r5, r8, r0\n"
-			"addu  r6, r9, r0\n"
-			"call  #0x109\n"            /* ObjStoreBytes */
-			"nop"
-			:
-			: "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET),
-			  "r"(src_off), "r"(dst_off), "r"(strip_pixels)
-			: "r1", "r2", "r3", "r4", "r5", "r6",
-			  "r7", "r8", "r9"
-		);
-	}
+	/* pcc-orisc input-clobber dance: copy the four "r" inputs to
+	 * safe temps (r8..r11) before the body's first store of
+	 * r4..r7. */
+	asm volatile(
+		"addu   r8,  %0, r0\n"      /* save packed_xy */
+		"addu   r9,  %1, r0\n"      /* save packed_shape */
+		"addu   r10, %2, r0\n"      /* save font_off */
+		"addu   r11, %3, r0\n"      /* save text_off */
+		"orefld o1, %4(o12)\n"      /* O1 = framebuffer */
+		"omov   o2, o15\n"          /* O2 = boot data (font) */
+		"omov   o3, o11\n"          /* O3 = boot stack (text) */
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r10, r0\n"
+		"addu   r7, r11, r0\n"
+		"call   #0x10C\n"           /* ObjBlitGlyphs */
+		"nop"
+		:
+		: "r"(packed_xy), "r"(packed_shape),
+		  "r"(font_off),  "r"(text_off),
+		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET)
+		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+		  "r8", "r9", "r10", "r11"
+	);
 }
 
 /* Render `count` bytes from `buf` to window `wid`'s framebuffer
