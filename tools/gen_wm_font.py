@@ -188,15 +188,34 @@ def main():
     print(f" * Point size: {POINT_SIZE}, cell {CELL_W}×{CELL_H}, "
           f"threshold {THRESHOLD}.")
     print(f" * 95 printable ASCII chars (codepoints {CHAR_LO}..{CHAR_HI - 1}),")
-    print(f" * 16 bytes per char (one row per byte, MSB = leftmost pixel).")
+    print(f" * 16 pixel rows per char packed into 4 big-endian 32-bit")
+    print(f" * words.  Each word holds 4 consecutive rows, MSB = earlier")
+    print(f" * row.  Within a row, MSB = leftmost pixel.")
+    print(f" *")
+    print(f" * Why uint32 not uint8?  pcc-orisc serializes char[] inits")
+    print(f" * via .ascii with C-style octal escapes; for some byte")
+    print(f" * sequences it emits malformed escapes (e.g. \\\\08 or \\\\208)")
+    print(f" * that the GAS-compatible assembler parses as a shorter octal")
+    print(f" * followed by a literal digit, dropping bytes from the")
+    print(f" * assembled .data section.  .word emission has no such")
+    print(f" * ambiguity.")
     print(f" */")
-    print(f"static const unsigned char font_8x16"
-          f"[{CHAR_HI - CHAR_LO}][{CELL_H}] = {{")
+    print(f"static const unsigned int font_8x16"
+          f"[{CHAR_HI - CHAR_LO}][{CELL_H // 4}] = {{")
     for c in range(CHAR_LO, CHAR_HI):
         rows = render_char(c)
-        hex_bytes = ", ".join(f"0x{b:02x}" for b in rows)
+        # Pack 16 bytes into 4 big-endian uint32_t words.
+        words = []
+        for w in range(CELL_H // 4):
+            base = w * 4
+            v = ((rows[base]     << 24) |
+                 (rows[base + 1] << 16) |
+                 (rows[base + 2] << 8)  |
+                  rows[base + 3])
+            words.append(v)
+        hex_words = ", ".join(f"0x{w:08x}" for w in words)
         comment = repr(chr(c)) if 32 < c < 127 else f"\\x{c:02x}"
-        print(f"    /* {comment:>5} */ {{ {hex_bytes} }},")
+        print(f"    /* {comment:>5} */ {{ {hex_words} }},")
     print(f"}};")
 
 
