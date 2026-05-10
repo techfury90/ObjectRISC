@@ -54,7 +54,7 @@ def parse_cpu_spec(spec: str) -> dict:
         raise SystemExit(f"oriscrun: --cpu must start with pid=N, got {spec!r}")
     out = {"pid": int(head[len("pid="):]), "program": None,
            "services": [], "serve": False, "reset": False,
-           "init_r4": 0}
+           "init_r4": 0, "display": "none"}
     for part in rest.split(","):
         part = part.strip()
         if not part:
@@ -65,6 +65,12 @@ def parse_cpu_spec(spec: str) -> dict:
             out["services"].append(part[len("service="):])
         elif part.startswith("init-r4="):
             out["init_r4"] = int(part[len("init-r4="):])
+        elif part.startswith("display="):
+            v = part[len("display="):]
+            if v not in ("none", "tk"):
+                raise SystemExit(f"oriscrun: bad display value {v!r} "
+                                 f"(want none|tk)")
+            out["display"] = v
         elif part == "serve":
             out["serve"] = True
         elif part == "reset":
@@ -466,6 +472,8 @@ def main(argv) -> int:
             cmd.extend(["--service", svc])
         if cspec["init_r4"]:
             cmd.extend(["--init-r4", str(cspec["init_r4"])])
+        if cspec["display"] != "none":
+            cmd.extend(["--display", cspec["display"]])
         if cspec["serve"]:
             cmd.append("--serve")
         if cspec["reset"]:

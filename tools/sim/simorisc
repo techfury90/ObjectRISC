@@ -2175,6 +2175,15 @@ class TkDisplayWorker:
         self._tk = None        # tkinter module (lazy import)
         self._root = None
         self._tracked = {}     # idx → {win, image, width, height, desc}
+        # Pending registrations: (cpu_pid, idx, desc).  Filled by
+        # register_framebuffer (called from inside the firmware
+        # primitive — must return fast so the WM doesn't stall while
+        # supervisors are racing wm_init retries) and drained by
+        # tick() off the firmware-critical path.  Tk root + Toplevel
+        # creation is hundreds of ms, enough to push the WM's
+        # /sys/wm/<N>/0 dir_register past the supervisor's retry
+        # budget.
+        self._pending = []
         self._lut = _build_palette_lut()
         self._last_repaint = 0.0
         self._min_repaint_interval = 1.0 / 60.0
@@ -2195,25 +2204,36 @@ class TkDisplayWorker:
         self._root.withdraw()  # FB windows are Toplevels; root invisible
 
     def register_framebuffer(self, cpu, idx, desc):
+        # Fast path: just record.  tick() does the heavy Tk init.
+        self._pending.append((cpu.pid, idx, desc))
+
+    def _drain_pending(self):
+        if not self._pending:
+            return
         self._ensure_root()
         if self._root is None:
+            self._pending.clear()  # Tk unavailable; drop without retry
             return
-        if idx in self._tracked:
-            return
-        win = self._tk.Toplevel(self._root)
-        win.title(f"{self.title_prefix} pid={cpu.pid} fb#{idx}")
-        img = self._tk.PhotoImage(width=desc.fb_width, height=desc.fb_height)
-        canvas = self._tk.Canvas(win,
-                                 width=desc.fb_width,
-                                 height=desc.fb_height,
-                                 borderwidth=0, highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
-        canvas.create_image(0, 0, image=img, anchor="nw")
-        self._tracked[idx] = {
-            "win": win, "image": img,
-            "width": desc.fb_width, "height": desc.fb_height,
-            "desc": desc,
-        }
+        while self._pending:
+            cpu_pid, idx, desc = self._pending.pop(0)
+            if idx in self._tracked:
+                continue
+            win = self._tk.Toplevel(self._root)
+            win.title(f"{self.title_prefix} pid={cpu_pid} fb#{idx}")
+            img = self._tk.PhotoImage(width=desc.fb_width,
+                                      height=desc.fb_height)
+            canvas = self._tk.Canvas(win,
+                                     width=desc.fb_width,
+                                     height=desc.fb_height,
+                                     borderwidth=0,
+                                     highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            canvas.create_image(0, 0, image=img, anchor="nw")
+            self._tracked[idx] = {
+                "win": win, "image": img,
+                "width": desc.fb_width, "height": desc.fb_height,
+                "desc": desc,
+            }
 
     def _repaint(self, info):
         desc = info["desc"]
@@ -2228,16 +2248,29 @@ class TkDisplayWorker:
             pass
 
     def tick(self):
+        # System.run calls tick() once per simulated CPU instruction —
+        # too often for any actual Tk work, so wallclock-throttle the
+        # whole body to ~60 Hz.  Early-return on the throttle keeps
+        # the per-cycle overhead to a single time.time() + compare,
+        # which restores the WM CPU's effective rate after Phase 60
+        # step 2 hooked us into the cycle loop.
+        if not self._pending and self._root is None:
+            return  # no Tk yet AND nothing pending — pure no-op
+        now = time.time()
+        if now - self._last_repaint < self._min_repaint_interval:
+            return
+        # Drain any pending Tk window registrations first — they
+        # arrive from primitive_ObjAllocFramebuffer, which has to
+        # return fast for the WM's boot sequence.
+        self._drain_pending()
         if self._root is None:
             return
-        now = time.time()
-        if now - self._last_repaint >= self._min_repaint_interval:
-            for info in self._tracked.values():
-                desc = info["desc"]
-                if desc.fb_dirty:
-                    self._repaint(info)
-                    desc.fb_dirty = False
-            self._last_repaint = now
+        for info in self._tracked.values():
+            desc = info["desc"]
+            if desc.fb_dirty:
+                self._repaint(info)
+                desc.fb_dirty = False
+        self._last_repaint = now
         try:
             self._root.update()
         except Exception:
