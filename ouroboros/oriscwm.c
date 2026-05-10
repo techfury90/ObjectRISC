@@ -156,7 +156,7 @@
  *                                   in forward_console_write.
  *     456  WM_FORWARD_REPLY_SLOT    transient stash for the client's
  *                                   reply_cap on a console write.
- *     712..840  WM_GRID_BASE         per-window GRID service refs
+ *     720..848  WM_GRID_BASE         per-window GRID service refs
  *                                   (16 windows × 8 bytes).  Same
  *                                   shape as WM_CONSOLE_BASE — clients
  *                                   that wm_bind_surface(WSURF_GRID)
@@ -166,14 +166,21 @@
  *                                   and forward_grid_write rasterises
  *                                   the bytes into the framebuffer at
  *                                   the (col, row) the SEND specifies.
- *                                   Phase 59 / WM γ.9.
+ *                                   Phase 59 / WM γ.9.  (Was 712..840
+ *                                   before WM_VECTOR_CAP_SLOT pushed
+ *                                   ORX_STATE_BYTES to 720 in γ.11.)
+ *     848..976  WM_VECTOR_BASE       per-window VECTOR service refs
+ *                                   (16 windows × 8 bytes).  Mirrors
+ *                                   WM_GRID_BASE for line / rect /
+ *                                   oval rasterisation through the
+ *                                   WM.  Phase 59 / WM γ.11.
  *
- * task.c reserves up to offset 712 (WM_LEADER_GRID_SLOT for the
- * supervisor), and the orx-manifest area runs 152..535 — we land
- * safely inside it for the slots up to 464.  WM_GRID_BASE sits past
- * the supervisor's scratch slots; the libc bumps ORX_STATE_BYTES to
- * 712 so the table covers it.  The WM never invokes orx_spawn so
- * the orx-manifest area's nominal use is moot.
+ * task.c reserves up to offset 720 (post-γ.11: WM_LEADER_CONSOLE_SLOT
+ * 696, WM_LEADER_GRID_SLOT 704, WM_VECTOR_CAP_SLOT 712), and the
+ * orx-manifest area runs 152..535 — we land safely inside it for the
+ * slots up to 464.  WM_GRID_BASE / WM_VECTOR_BASE sit past the
+ * supervisor's scratch slots.  The WM never invokes orx_spawn so the
+ * orx-manifest area's nominal use is moot.
  */
 
 #define BOOT_PARENT_SLOT_OFFSET     544
@@ -188,7 +195,8 @@
 #define WM_SURF_FRAMEBUFFER_SLOT_OFFSET 440
 #define WM_FORWARD_SRC_SLOT_OFFSET      448
 #define WM_FORWARD_REPLY_SLOT_OFFSET    456
-#define WM_GRID_BASE_OFFSET             712
+#define WM_GRID_BASE_OFFSET             720
+#define WM_VECTOR_BASE_OFFSET           848
 
 /* === Glyph rendering ==================================================
  *
@@ -364,6 +372,7 @@ static int    window_type[MAX_WINDOWS];        /* WIN_TYPE_* (0 = free) */
 static int    window_subscribe_op[MAX_WINDOWS]; /* notify_op (0 = none) */
 static int    window_cur_col[MAX_WINDOWS];      /* cursor col within cell grid */
 static int    window_cur_row[MAX_WINDOWS];      /* cursor row within cell grid */
+static unsigned char window_vec_color[MAX_WINDOWS]; /* current pen palette idx */
 
 /* The owner task ref and subscriber notify_cap live in OPR slots
  * (WM_OWNER_BASE_OFFSET + id*8 and WM_SUBSCRIBE_BASE_OFFSET + id*8)
@@ -710,22 +719,22 @@ static void
 stash_grid_o1(int wid)
 {
 	switch (wid) {
-	case  1: asm volatile("orefst o1, 712(o12)"); break;
-	case  2: asm volatile("orefst o1, 720(o12)"); break;
-	case  3: asm volatile("orefst o1, 728(o12)"); break;
-	case  4: asm volatile("orefst o1, 736(o12)"); break;
-	case  5: asm volatile("orefst o1, 744(o12)"); break;
-	case  6: asm volatile("orefst o1, 752(o12)"); break;
-	case  7: asm volatile("orefst o1, 760(o12)"); break;
-	case  8: asm volatile("orefst o1, 768(o12)"); break;
-	case  9: asm volatile("orefst o1, 776(o12)"); break;
-	case 10: asm volatile("orefst o1, 784(o12)"); break;
-	case 11: asm volatile("orefst o1, 792(o12)"); break;
-	case 12: asm volatile("orefst o1, 800(o12)"); break;
-	case 13: asm volatile("orefst o1, 808(o12)"); break;
-	case 14: asm volatile("orefst o1, 816(o12)"); break;
-	case 15: asm volatile("orefst o1, 824(o12)"); break;
-	case 16: asm volatile("orefst o1, 832(o12)"); break;
+	case  1: asm volatile("orefst o1, 720(o12)"); break;
+	case  2: asm volatile("orefst o1, 728(o12)"); break;
+	case  3: asm volatile("orefst o1, 736(o12)"); break;
+	case  4: asm volatile("orefst o1, 744(o12)"); break;
+	case  5: asm volatile("orefst o1, 752(o12)"); break;
+	case  6: asm volatile("orefst o1, 760(o12)"); break;
+	case  7: asm volatile("orefst o1, 768(o12)"); break;
+	case  8: asm volatile("orefst o1, 776(o12)"); break;
+	case  9: asm volatile("orefst o1, 784(o12)"); break;
+	case 10: asm volatile("orefst o1, 792(o12)"); break;
+	case 11: asm volatile("orefst o1, 800(o12)"); break;
+	case 12: asm volatile("orefst o1, 808(o12)"); break;
+	case 13: asm volatile("orefst o1, 816(o12)"); break;
+	case 14: asm volatile("orefst o1, 824(o12)"); break;
+	case 15: asm volatile("orefst o1, 832(o12)"); break;
+	case 16: asm volatile("orefst o1, 840(o12)"); break;
 	default: break;
 	}
 }
@@ -734,22 +743,75 @@ static void
 load_grid_to_o1(int wid)
 {
 	switch (wid) {
-	case  1: asm volatile("orefld o1, 712(o12)"); break;
-	case  2: asm volatile("orefld o1, 720(o12)"); break;
-	case  3: asm volatile("orefld o1, 728(o12)"); break;
-	case  4: asm volatile("orefld o1, 736(o12)"); break;
-	case  5: asm volatile("orefld o1, 744(o12)"); break;
-	case  6: asm volatile("orefld o1, 752(o12)"); break;
-	case  7: asm volatile("orefld o1, 760(o12)"); break;
-	case  8: asm volatile("orefld o1, 768(o12)"); break;
-	case  9: asm volatile("orefld o1, 776(o12)"); break;
-	case 10: asm volatile("orefld o1, 784(o12)"); break;
-	case 11: asm volatile("orefld o1, 792(o12)"); break;
-	case 12: asm volatile("orefld o1, 800(o12)"); break;
-	case 13: asm volatile("orefld o1, 808(o12)"); break;
-	case 14: asm volatile("orefld o1, 816(o12)"); break;
-	case 15: asm volatile("orefld o1, 824(o12)"); break;
-	case 16: asm volatile("orefld o1, 832(o12)"); break;
+	case  1: asm volatile("orefld o1, 720(o12)"); break;
+	case  2: asm volatile("orefld o1, 728(o12)"); break;
+	case  3: asm volatile("orefld o1, 736(o12)"); break;
+	case  4: asm volatile("orefld o1, 744(o12)"); break;
+	case  5: asm volatile("orefld o1, 752(o12)"); break;
+	case  6: asm volatile("orefld o1, 760(o12)"); break;
+	case  7: asm volatile("orefld o1, 768(o12)"); break;
+	case  8: asm volatile("orefld o1, 776(o12)"); break;
+	case  9: asm volatile("orefld o1, 784(o12)"); break;
+	case 10: asm volatile("orefld o1, 792(o12)"); break;
+	case 11: asm volatile("orefld o1, 800(o12)"); break;
+	case 12: asm volatile("orefld o1, 808(o12)"); break;
+	case 13: asm volatile("orefld o1, 816(o12)"); break;
+	case 14: asm volatile("orefld o1, 824(o12)"); break;
+	case 15: asm volatile("orefld o1, 832(o12)"); break;
+	case 16: asm volatile("orefld o1, 840(o12)"); break;
+	default: asm volatile("onull o1"); break;
+	}
+}
+
+/* === Per-window VECTOR service slot helpers ===========================
+ *
+ * Same shape as the GRID helpers above, just at WM_VECTOR_BASE
+ * (848..968).  Phase 59 / WM γ.11. */
+
+static void
+stash_vector_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefst o1, 848(o12)"); break;
+	case  2: asm volatile("orefst o1, 856(o12)"); break;
+	case  3: asm volatile("orefst o1, 864(o12)"); break;
+	case  4: asm volatile("orefst o1, 872(o12)"); break;
+	case  5: asm volatile("orefst o1, 880(o12)"); break;
+	case  6: asm volatile("orefst o1, 888(o12)"); break;
+	case  7: asm volatile("orefst o1, 896(o12)"); break;
+	case  8: asm volatile("orefst o1, 904(o12)"); break;
+	case  9: asm volatile("orefst o1, 912(o12)"); break;
+	case 10: asm volatile("orefst o1, 920(o12)"); break;
+	case 11: asm volatile("orefst o1, 928(o12)"); break;
+	case 12: asm volatile("orefst o1, 936(o12)"); break;
+	case 13: asm volatile("orefst o1, 944(o12)"); break;
+	case 14: asm volatile("orefst o1, 952(o12)"); break;
+	case 15: asm volatile("orefst o1, 960(o12)"); break;
+	case 16: asm volatile("orefst o1, 968(o12)"); break;
+	default: break;
+	}
+}
+
+static void
+load_vector_to_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefld o1, 848(o12)"); break;
+	case  2: asm volatile("orefld o1, 856(o12)"); break;
+	case  3: asm volatile("orefld o1, 864(o12)"); break;
+	case  4: asm volatile("orefld o1, 872(o12)"); break;
+	case  5: asm volatile("orefld o1, 880(o12)"); break;
+	case  6: asm volatile("orefld o1, 888(o12)"); break;
+	case  7: asm volatile("orefld o1, 896(o12)"); break;
+	case  8: asm volatile("orefld o1, 904(o12)"); break;
+	case  9: asm volatile("orefld o1, 912(o12)"); break;
+	case 10: asm volatile("orefld o1, 920(o12)"); break;
+	case 11: asm volatile("orefld o1, 928(o12)"); break;
+	case 12: asm volatile("orefld o1, 936(o12)"); break;
+	case 13: asm volatile("orefld o1, 944(o12)"); break;
+	case 14: asm volatile("orefld o1, 952(o12)"); break;
+	case 15: asm volatile("orefld o1, 960(o12)"); break;
+	case 16: asm volatile("orefld o1, 968(o12)"); break;
 	default: asm volatile("onull o1"); break;
 	}
 }
@@ -936,10 +998,26 @@ handle_new_window(int wtype)
 		return;
 	}
 
+	/* And again for VECTOR (Phase 59 / WM γ.11). */
+	status = alloc_window_vector(wid);
+	if (status != 0) {
+		WM_PRINT("oriscwm: alloc_window_vector failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT("\n");
+		free_window_grid(wid);
+		free_window_console(wid);
+		wm_reply(E_IO, 0, 0, 0);
+		return;
+	}
+
 	window_type[wid - 1] = WIN_TYPE_CONSOLE;
 	window_subscribe_op[wid - 1] = 0;
 	window_cur_col[wid - 1] = 0;
 	window_cur_row[wid - 1] = 0;
+	{
+		int wvc_slot = wid - 1;   /* avoids `la sym+-1` codegen */
+		window_vec_color[wvc_slot] = WM_FG_COLOR;
+	}
 
 	int geom_a = ((DEFAULT_W_PX & 0xFFFF) << 16) | (DEFAULT_H_PX & 0xFFFF);
 	int geom_b = ((DEFAULT_W_CELLS & 0xFFFF) << 16) | (DEFAULT_H_CELLS & 0xFFFF);
@@ -984,6 +1062,63 @@ free_window_grid(int wid)
 	stash_grid_o1(wid);
 }
 
+/* Mirror of alloc_window_grid for the VECTOR surface (Phase 59 / WM
+ * γ.11).  Same lifetime: allocated alongside its CONSOLE / GRID peers
+ * in handle_new_window and freed by free_window_vector in
+ * handle_destroy_window. */
+static int
+alloc_window_vector(int wid)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, 16\n"
+		"addiu r5, r0, %1\n"
+		"addiu r6, r0, %2\n"
+		"call  #0x100\n"               /* ObjAlloc → O1 */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(TAG_SERVICE),
+		  "i"(CAP_R | CAP_W | CAP_S | CAP_V | CAP_C)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	if (status != 0) return status;
+
+	stash_vector_o1(wid);
+
+	/* Same depth-256 reasoning as the CONSOLE / GRID queues —
+	 * vector SENDs are fire-and-forget; clients don't wait for an
+	 * ack between vec_line / vec_rect_fill calls. */
+	asm volatile(
+		"addiu r4, r0, 256\n"
+		"call  #0x203\n"               /* ReceiveQueueAttach */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	return status;
+}
+
+/* Mirror for the VECTOR service. */
+static void
+free_window_vector(int wid)
+{
+	load_vector_to_o1(wid);
+	int isn;
+	asm volatile("oisn %0, o1" : "=r"(isn));
+	if (isn) return;
+	asm volatile(
+		"addiu r4, r0, 0\n"
+		"call  #0x101\n"
+		"nop"
+		: : : "r1", "r2", "r4"
+	);
+	asm volatile("onull o1");
+	stash_vector_o1(wid);
+}
+
 /* WM_OP_BIND_SURFACE — return a surface cap for a window.
  *   R4 = wid  (already-validated by dispatch)
  *   R5 = surface kind
@@ -1018,7 +1153,8 @@ handle_bind_surface(int wid, int kind)
 		return;
 	}
 	if (kind != WSURF_CONSOLE && kind != WSURF_KEYBOARD
-	                          && kind != WSURF_GRID) {
+	                          && kind != WSURF_GRID
+	                          && kind != WSURF_VECTOR) {
 		wm_reply(E_INVAL, 0, 0, 0);
 		return;
 	}
@@ -1067,6 +1203,27 @@ handle_bind_surface(int wid, int kind)
 		return;
 	}
 
+	if (kind == WSURF_VECTOR) {
+		load_vector_to_o1(wid);
+		int derive_status;
+		asm volatile(
+			"addiu r4, r0, %1\n"
+			"call  #0x103\n"
+			"nop\n"
+			"omov  o14, o1\n"
+			"addu  %0, r2, r0"
+			: "=r"(derive_status)
+			: "i"(CAP_R | CAP_S)
+			: "r1", "r2", "r4"
+		);
+		if (derive_status != 0) {
+			wm_reply(E_IO, 0, 0, 0);
+			return;
+		}
+		wm_reply_with_ref_o14(0);
+		return;
+	}
+
 	/* WSURF_KEYBOARD: passthrough to the underlying terminal cap
 	 * walked at WM startup. */
 	load_surface_to_o14(kind);
@@ -1093,6 +1250,7 @@ handle_destroy_window(int wid)
 	}
 	free_window_console(wid);
 	free_window_grid(wid);
+	free_window_vector(wid);
 	window_type[wid - 1] = 0;
 	window_subscribe_op[wid - 1] = 0;
 	/* Owner-ref stash is left in place; future allocations will
@@ -1212,6 +1370,7 @@ scan_owner_exits(void)
 		if (state == TASK_STATE_EXITED) {
 			free_window_console(wid);
 			free_window_grid(wid);
+			free_window_vector(wid);
 			window_type[wid - 1] = 0;
 			window_subscribe_op[wid - 1] = 0;
 			/* The owner-ref slot stays populated; it'll get
@@ -1251,6 +1410,261 @@ poll_one_request(int *out_op, int *out_wid, int *out_arg)
 	*out_wid = wid;
 	*out_arg = arg;
 	return status;
+}
+
+/* === Vector rasterisation =============================================
+ *
+ * Phase 59 / WM γ.11 — rasterise VEC_OP_* into the framebuffer
+ * directly (no intermediate per-window backing store yet).  All
+ * primitives share one ObjStoreBytes-per-row helper, fb_blit_row,
+ * and clip to FB_W × FB_H themselves.  Coordinates are pixel-space
+ * (NOT cell-space); the caller already passes 16-bit signed halves
+ * unpacked from the wire's packed (x, y) / (w, h) words.
+ *
+ * Performance note: VEC_OP_LINE and VEC_OP_*_OUTLINE drop into
+ * per-pixel writes via fb_blit_row(y, x, &c, 1).  That's one wire
+ * RTT per pixel — fine for a smoke test (lines stay under a few
+ * hundred pixels) and well under the rate the framebuffer-repaint
+ * timer fires anyway.  Run-batching along the Bresenham trace is a
+ * follow-up.  Fill primitives (RECT_FILL / OVAL_FILL) already pay
+ * one RTT per row regardless of width. */
+
+/* Same calling convention as flush_strip's inner ObjStoreBytes:
+ * %0 = WM_SURF_FRAMEBUFFER_SLOT_OFFSET, %1..%3 = src_off / dst_off /
+ * n_pixels.  Boot-stack ref in O11 — pixel buffer must live on our
+ * stack so STACK_BOTTOM-relative offsets are valid.
+ *
+ * No clipping inside the asm — the caller does it.  Empty / fully
+ * off-screen rows are dropped before we get here. */
+static void
+fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
+{
+	if (y < 0 || y >= FB_H) return;
+	if (n_pixels <= 0)      return;
+	if (x < 0) {
+		if (n_pixels + x <= 0) return;
+		pixels   -= x;        /* skip leading off-screen */
+		n_pixels += x;
+		x         = 0;
+	}
+	if (x >= FB_W)              return;
+	if (x + n_pixels > FB_W)    n_pixels = FB_W - x;
+
+	int src_off = (int)((unsigned int)pixels - STACK_BOTTOM);
+	int dst_off = y * FB_W + x;
+	asm volatile(
+		"addu  r7, %1, r0\n"
+		"addu  r8, %2, r0\n"
+		"addu  r9, %3, r0\n"
+		"omov  o1, o11\n"
+		"orefld o2, %0(o12)\n"
+		"addu  r4, r7, r0\n"
+		"addu  r5, r8, r0\n"
+		"addu  r6, r9, r0\n"
+		"call  #0x109\n"        /* ObjStoreBytes */
+		"nop"
+		:
+		: "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET),
+		  "r"(src_off), "r"(dst_off), "r"(n_pixels)
+		: "r1", "r2", "r3", "r4", "r5", "r6",
+		  "r7", "r8", "r9"
+	);
+}
+
+/* Forward decl — vec_scratch_row + prep_scratch_row are defined
+ * after the rasterisers because the oval helpers use the same
+ * scratch buffer too. */
+static unsigned char *prep_scratch_row(int n, unsigned char color);
+
+/* Single-pixel store.  Bresenham line and oval-outline plot pixel-
+ * by-pixel; this is just a one-byte fb_blit_row.  Caller's `c`
+ * lives on the stack across the call so the byte address is valid
+ * for ObjStoreBytes. */
+static void
+fb_set_pixel(int x, int y, unsigned char color)
+{
+	unsigned char one = color;
+	fb_blit_row(y, x, &one, 1);
+}
+
+/* pcc-orisc passes only 4 args in registers and trips ("adrput:
+ * illegal op 57") on calls with five-or-more args.  Each rasteriser
+ * therefore takes ≤4 args and reads the current pen color from
+ * `cur_vec_color`, which forward_vector_write seeds before every
+ * draw call. */
+static unsigned char cur_vec_color;
+
+/* Bresenham line.  Standard integer algorithm; signs of dx/dy give
+ * the step direction, the error term governs which axis advances
+ * each iteration.  Plots inclusive endpoints (x1,y1)..(x2,y2). */
+static void
+draw_line(int x1, int y1, int x2, int y2)
+{
+	unsigned char color = cur_vec_color;
+	int dx = (x2 > x1) ? (x2 - x1) : (x1 - x2);
+	int dy = (y2 > y1) ? (y2 - y1) : (y1 - y2);
+	int sx = (x1 < x2) ? 1 : -1;
+	int sy = (y1 < y2) ? 1 : -1;
+	int err = (dx > dy ? dx : -dy) / 2;
+	int x = x1, y = y1;
+	for (;;) {
+		fb_set_pixel(x, y, color);
+		if (x == x2 && y == y2) break;
+		int e2 = err;
+		if (e2 > -dx) { err -= dy; x += sx; }
+		if (e2 <  dy) { err += dx; y += sy; }
+	}
+}
+
+/* Filled rect.  One pre-built row of `color` bytes, then h ObjStoreBytes
+ * calls — h wire RTTs total regardless of width. */
+static void
+draw_rect_fill(int x, int y, int w, int h)
+{
+	if (w <= 0 || h <= 0) return;
+	unsigned char *rp = prep_scratch_row(w, cur_vec_color);
+	int dy;
+	for (dy = 0; dy < h; dy++) fb_blit_row(y + dy, x, rp, w);
+}
+
+/* Outline rect — top + bottom rows in two ObjStoreBytes, then per-pixel
+ * vertical edges (degree(h) RTTs). */
+static void
+draw_rect_outline(int x, int y, int w, int h)
+{
+	if (w <= 0 || h <= 0) return;
+	unsigned char color = cur_vec_color;
+	int top    = y;
+	int bottom = y + h - 1;
+	int left   = x;
+	int right  = x + w - 1;
+	unsigned char *rp = prep_scratch_row(w, color);
+	fb_blit_row(top, x, rp, w);
+	if (bottom != top) fb_blit_row(bottom, x, rp, w);
+	int dy;
+	for (dy = 1; dy < h - 1; dy++) {
+		fb_set_pixel(left, y + dy, color);
+		if (right != left) fb_set_pixel(right, y + dy, color);
+	}
+}
+
+/* Filled ellipse — scanline approach.  For each row dy in [-ry, ry],
+ * find the largest hx with `hx² · ry² + dy² · rx² ≤ rx² · ry²`, then
+ * blit (2·hx + 1) pixels at (cx - hx, cy + dy).  No sqrt: linear scan
+ * starting from 0 is O(rx) per row, O(rx · ry) total — fine for the
+ * sizes a smoke test exercises (a 200×100 oval is 20K iterations on
+ * the WM CPU, no wire traffic).  Inner blits already pay one RTT per
+ * row, which dominates wallclock. */
+/* Per-oval scratch — moved out of the function locals because
+ * pcc-orisc's codegen hits "adrput: illegal op 57" when chained
+ * three-way multiplies coexist with multiple in-scope locals and
+ * 4-arg helper calls in the same function.  Single-threaded WM
+ * means a single static set is fine; saves us from passing six
+ * args through every helper. */
+static int oval_rx;
+static int oval_cx;
+static int oval_cy;
+static int oval_rx2;
+static int oval_ry2;
+static int oval_rxy2;
+
+/* Stack-resident scratch row used by all fill primitives, also
+ * static for the same register-pressure reason. */
+static unsigned char vec_scratch_row[FB_W];
+
+/* Fill vec_scratch_row[0..n] with `color` and return its base. */
+static unsigned char *
+prep_scratch_row(int n, unsigned char color)
+{
+	if (n > FB_W) n = FB_W;
+	int i;
+	for (i = 0; i < n; i++) vec_scratch_row[i] = color;
+	return vec_scratch_row;
+}
+
+/* Largest hx with `hx² · oval_ry2 + dy_term ≤ oval_rxy2`.  Linear
+ * scan from 0; O(oval_rx) per call. */
+static int
+ellipse_hx_for(int dy_term)
+{
+	int hx = 0;
+	int dx;
+	for (dx = 0; dx <= oval_rx; dx++) {
+		int dxsq = dx * dx;
+		int term = dxsq * oval_ry2;
+		if (term + dy_term > oval_rxy2) break;
+		hx = dx;
+	}
+	return hx;
+}
+
+/* Init oval_* statics from (x, y, w, h).  Returns 0 if degenerate
+ * (caller should fall back to rect_*), 1 otherwise. */
+static int
+oval_setup(int x, int y, int w, int h)
+{
+	if (w <= 0 || h <= 0) return 0;
+	int rx = w / 2;
+	int ry = h / 2;
+	if (rx <= 0 || ry <= 0) return 0;
+	oval_rx   = rx;
+	oval_cx   = x + rx;
+	oval_cy   = y + ry;
+	oval_rx2  = rx * rx;
+	oval_ry2  = ry * ry;
+	oval_rxy2 = oval_rx2 * oval_ry2;
+	return 1;
+}
+
+/* Plot one filled scanline of the current oval (statics) at offset
+ * dy, painting through `rp`. */
+static void
+oval_fill_scanline(int dy, unsigned char *rp)
+{
+	int dy_term = dy * dy * oval_rx2;
+	int hx = ellipse_hx_for(dy_term);
+	fb_blit_row(oval_cy + dy, oval_cx - hx, rp, 2 * hx + 1);
+}
+
+static void
+draw_oval_fill(int x, int y, int w, int h)
+{
+	if (!oval_setup(x, y, w, h)) {
+		draw_rect_fill(x, y, w, h);
+		return;
+	}
+	int ry = h / 2;
+	unsigned char *rp = prep_scratch_row(2 * oval_rx + 1, cur_vec_color);
+	int dy;
+	for (dy = -ry; dy <= ry; dy++) oval_fill_scanline(dy, rp);
+}
+
+/* Outline ellipse — same per-row hx computation as draw_oval_fill
+ * but plot only the leftmost and rightmost pixels per row.  Result
+ * is a single-pixel outline that can have small gaps where the
+ * curve is steepest (between rows where hx changes by more than 1);
+ * acceptable for v1.  Midpoint ellipse with 4-quadrant symmetry is
+ * the canonical fix and a follow-up. */
+static void
+oval_outline_scanline(int dy)
+{
+	unsigned char color = cur_vec_color;
+	int dy_term = dy * dy * oval_rx2;
+	int hx = ellipse_hx_for(dy_term);
+	fb_set_pixel(oval_cx - hx, oval_cy + dy, color);
+	if (hx != 0) fb_set_pixel(oval_cx + hx, oval_cy + dy, color);
+}
+
+static void
+draw_oval_outline(int x, int y, int w, int h)
+{
+	if (!oval_setup(x, y, w, h)) {
+		draw_rect_outline(x, y, w, h);
+		return;
+	}
+	int ry = h / 2;
+	int dy;
+	for (dy = -ry; dy <= ry; dy++) oval_outline_scanline(dy);
 }
 
 /* Flush a strip of `n_glyphs` printable chars at cell (row, col_start)
@@ -1684,6 +2098,112 @@ poll_window_grids(void)
 	}
 }
 
+/* Unpack a signed 16-bit half from a 32-bit packed word.  Top bit
+ * sign-extends; matches oriscterm's unpack_pair so negative
+ * coordinates round-trip end-to-end. */
+static int
+vec_unpack_hi(int packed)
+{
+	int v = (packed >> 16) & 0xFFFF;
+	if (v & 0x8000) v |= ~0xFFFF;
+	return v;
+}
+
+static int
+vec_unpack_lo(int packed)
+{
+	int v = packed & 0xFFFF;
+	if (v & 0x8000) v |= ~0xFFFF;
+	return v;
+}
+
+/* WSURF_VECTOR forward.  Wire payload:
+ *   R3 = op (VEC_OP_*)
+ *   R4 = packed1 — for LINE: (x1<<16)|y1, for RECT/OVAL: (x<<16)|y,
+ *                  for SET_COLOR: palette index in low half
+ *   R5 = packed2 — for LINE: (x2<<16)|y2, for RECT/OVAL: (w<<16)|h,
+ *                  unused for CLEAR / SET_COLOR
+ *
+ * No source bytes ref — vector ops carry their full payload in
+ * int_payload.  Per-window pen color lives in window_vec_color[];
+ * SET_COLOR mutates it, draw ops read it.  CLEAR is a no-op for
+ * the same reason WSURF_GRID's clear sentinel is — no per-window
+ * backing store yet (full-FB clear would also wipe console + grid
+ * rendering).  Pending the per-window backing-store milestone. */
+static void
+forward_vector_write(int wid, int op, int packed1, int packed2)
+{
+	if (wid < 1 || wid > MAX_WINDOWS) return;
+	int slot = wid - 1;       /* avoids `la sym+-1` codegen pcc emits
+	                           * for window_vec_color[wid - 1] */
+	cur_vec_color = window_vec_color[slot];
+
+	if (op == VEC_OP_SET_COLOR) {
+		int idx = vec_unpack_lo(packed1);
+		if (idx < 0)   idx = 0;
+		if (idx > 255) idx = 255;
+		window_vec_color[slot] = (unsigned char)idx;
+		return;
+	}
+	if (op == VEC_OP_CLEAR) {
+		/* TODO: per-window backing store.  See note above. */
+		return;
+	}
+	if (op == VEC_OP_LINE) {
+		int x1 = vec_unpack_hi(packed1);
+		int y1 = vec_unpack_lo(packed1);
+		int x2 = vec_unpack_hi(packed2);
+		int y2 = vec_unpack_lo(packed2);
+		draw_line(x1, y1, x2, y2);
+		return;
+	}
+	int x = vec_unpack_hi(packed1);
+	int y = vec_unpack_lo(packed1);
+	int w = vec_unpack_hi(packed2);
+	int h = vec_unpack_lo(packed2);
+	if (op == VEC_OP_RECT_FILL)    { draw_rect_fill(x, y, w, h);    return; }
+	if (op == VEC_OP_RECT_OUTLINE) { draw_rect_outline(x, y, w, h); return; }
+	if (op == VEC_OP_OVAL_FILL)    { draw_oval_fill(x, y, w, h);    return; }
+	if (op == VEC_OP_OVAL_OUTLINE) { draw_oval_outline(x, y, w, h); return; }
+	/* Unknown op: drop silently — clients see no error since vector
+	 * SENDs are fire-and-forget anyway. */
+}
+
+/* See poll_window_grids — same status-via-global trick, capped at 4
+ * regular outputs by pcc-orisc.  Vector wire only carries 3 int
+ * payload values (op + 2 packed words) so we'd fit in 4 outputs
+ * naturally, but using the same idiom as grid keeps both polls
+ * symmetrical. */
+static int _wm_vector_poll_status;
+
+static void
+poll_window_vectors(void)
+{
+	int wid;
+	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
+		if (window_type[wid - 1] != WIN_TYPE_CONSOLE) continue;
+
+		load_vector_to_o1(wid);
+		int op, packed1, packed2;
+		asm volatile(
+			"addiu r4, r0, 0\n"
+			"call  #0x204\n"           /* ReceiveQueuePoll */
+			"nop\n"
+			"la    r1, _wm_vector_poll_status\n"
+			"sw    r2, 0(r1)\n"
+			"addu  %0, r3, r0\n"
+			"addu  %1, r4, r0\n"
+			"addu  %2, r5, r0"
+			: "=r"(op), "=r"(packed1), "=r"(packed2)
+			:
+			: "r1", "r2", "r3", "r4", "r5", "memory"
+		);
+		if (_wm_vector_poll_status == 0) {
+			forward_vector_write(wid, op, packed1, packed2);
+		}
+	}
+}
+
 const char banner_boot[]            = "oriscwm: booting\n";
 const char banner_console_walk_ok[] = "oriscwm: /sys/term/0/console acquired\n";
 const char banner_keyboard_walk_ok[]= "oriscwm: /sys/term/0/keyboard acquired\n";
@@ -1826,5 +2346,6 @@ main(void)
 		/* Drain any pending per-window CONSOLE writes. */
 		poll_window_consoles();
 		poll_window_grids();
+		poll_window_vectors();
 	}
 }

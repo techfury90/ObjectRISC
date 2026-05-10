@@ -170,12 +170,30 @@
  *          spawned children write positioned text through the WM's
  *          GRID rasteriser instead of /sys/term/<idx>/grid.
  *          Phase 59 / WM γ.9.)
+ *     + 8 (WM_VECTOR_CAP_SLOT: persistent — holds the WM-mediated
+ *          VECTOR sub-cap that vec.c OREFLDs into O1 on each
+ *          vec_*() SEND.  Unlike WM_LEADER_CONSOLE/GRID this isn't
+ *          leader-only: any task that has run wm_bind_surface
+ *          (WSURF_VECTOR) and stashed the result here can use the
+ *          libc vec_*() helpers.  Null on tasks without WM
+ *          mediation; vec_*() returns -1 in that case.  Phase 59 /
+ *          WM γ.11.  Supervisor-level leader→child propagation is
+ *          a follow-up; for now the smoke test seeds this slot
+ *          itself from DIR_RESULT_SLOT.)
  *     + 128 (WM_GRID_BASE: WM-only — per-window GRID service refs
  *          (16 windows × 8 bytes).  Mirrors WM_CONSOLE_BASE but for
  *          positioned-text SENDs.  Other programs leave this dead;
  *          the libc allocates the space so the WM doesn't have to
- *          claim its own OPR slot for a separate objstore.) */
-#define ORX_STATE_BYTES   712
+ *          claim its own OPR slot for a separate objstore.)
+ *     + 128 (WM_VECTOR_BASE: WM-only — per-window VECTOR service
+ *          refs (16 windows × 8 bytes).  Same shape as WM_GRID_BASE.
+ *          Phase 59 / WM γ.11.)
+ *
+ * Total: 720 standard region + 128 WM_GRID_BASE + 128 WM_VECTOR_BASE
+ * = 848.  The libc oversizes ORX_STATE_BYTES so the WM's task-table
+ * objstore covers all of its slot map; non-WM programs leave the
+ * tail dead. */
+#define ORX_STATE_BYTES   848
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8
