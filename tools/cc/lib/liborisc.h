@@ -690,6 +690,22 @@ int wm_bind_surface(int wid, int kind);
 /* wm_destroy_window — release a window. */
 int wm_destroy_window(int wid);
 
+/* wm_open_session — allocate a fresh WM-mediated window for the
+ * caller, replacing the inherited parent-window CONSOLE / KEYBOARD /
+ * GRID caps (O5 / O6 / O7) with caps for the new window.  After this
+ * returns, term_print / term_read / grid_write target the new
+ * window rather than the parent's; print_str / firmware ConsoleWrite
+ * (which writes to the simorisc process's stdout) is unaffected.
+ *
+ * `title` may be NULL to skip setting a title bar string.  On
+ * success *out_wid (if non-NULL) holds the new window id; the caller
+ * should wm_destroy_window(wid) before returning from main so the
+ * WM doesn't leak the window object.  Returns negative on any of
+ * wm_init / wm_new_window / wm_bind_surface failing.
+ *
+ * Phase 60 step 12. */
+int wm_open_session(const char *title, int *out_wid);
+
 /* wm_set_title — set the text displayed in `wid`'s title bar.
  * The string is copied into a stack-local buffer before SEND, so
  * callers can pass any nul-terminated source.  Pass `wid = 0` to
