@@ -104,10 +104,11 @@ ERR_ESTALE   = 10
 ERR_EREMOTE  = 11
 
 # Type tags reserved by the contract loader.
-TAG_CODE    = 0x4100
-TAG_STACK   = 0x4101
-TAG_DATA    = 0x4102
-TAG_SERVICE = 0x4103
+TAG_CODE        = 0x4100
+TAG_STACK       = 0x4101
+TAG_DATA        = 0x4102
+TAG_SERVICE     = 0x4103
+TAG_FRAMEBUFFER = 0x4104   # Phase 60 — host-display-backed pixel object
 TAG_TASK    = 0x4104   # task object (Volume VI Section 4)
 
 # Task lifecycle states (Volume VI Section 4.2). Internal numbering;
@@ -200,6 +201,14 @@ class Descriptor:
     # bounds the queue length; arrivals beyond it are dropped.
     queue: Optional[List] = None
     queue_max_depth: int = 0
+    # Phase 60 — host-display backing.  Set on TAG_FRAMEBUFFER objects
+    # by primitive_ObjAllocFramebuffer.  fb_dirty is toggled by
+    # ObjStoreBytes; the --display worker repaints when it sees the
+    # flag set, then clears it.  fb_width/fb_height let the worker
+    # build a Tk PhotoImage of the right shape.
+    fb_width:  int = 0
+    fb_height: int = 0
+    fb_dirty:  bool = False
 
 
 def make_ref(generation: int, home: int, index: int, caps: int) -> int:
@@ -2063,9 +2072,24 @@ class System:
                         break
                     time.sleep(0.001)
                     ticks += 1
+                    # Phase 60 — pump the host display worker on idle
+                    # ticks too, so a screen with no firmware activity
+                    # still processes Tk events (window-close, expose,
+                    # etc.).
+                    for cpu in self.cpus:
+                        w = getattr(cpu, "display_worker", None)
+                        if w is not None:
+                            w.tick()
                     continue
                 break
             ticks += 1
+            # Phase 60 — pump host display workers each progress tick.
+            # Internally throttled to ~60 Hz so rapid bursts of
+            # ObjStoreBytes don't repaint per cycle.
+            for cpu in self.cpus:
+                w = getattr(cpu, "display_worker", None)
+                if w is not None:
+                    w.tick()
         else:
             print(f"simorisc: max cycles exceeded ({max_cycles})", file=sys.stderr)
             return 2
@@ -2091,6 +2115,133 @@ def sext32(v: int) -> int:
 
 def to_u32(v: int) -> int:
     return v & 0xFFFFFFFF
+
+
+# ---------------------------------------------------------------------------
+# Phase 60 — host display worker (--display tk)
+# ---------------------------------------------------------------------------
+#
+# When simorisc runs with --display tk, every TAG_FRAMEBUFFER object the
+# CPU allocates (via primitive_ObjAllocFramebuffer) gets mirrored into a
+# host Tk window.  Stores via ObjStoreBytes flag the descriptor dirty;
+# the worker repaints on its next tick.  No wire round-trips — the
+# pixel bytes live in the same Python process as the simulator.
+#
+# Headless (default `--display none`) keeps the firmware op working
+# (TAG_FRAMEBUFFER is just a plain bytearray) but skips Tk; lets CI
+# and smoke tests exercise the same firmware path without a display.
+
+VEC_PALETTE_HEX = {
+    0: "#0a0a14", 1: "#d8d8d8", 2: "#ff5555", 3: "#55ff55",
+    4: "#5599ff", 5: "#ffd866", 6: "#66ddff", 7: "#ff66ff",
+    8: "#ffffff",
+}
+
+
+def _build_palette_lut():
+    """Per-index 3-byte RGB lookup, used by the b\"\".join repaint loop.
+    Indices outside VEC_PALETTE_HEX fall through to bg (idx 0).  Same
+    shape γ.10 used in oriscterm — repaints land in the tens of ms even
+    at 1280×768 because the inner loop is C-level (`b\"\".join`)."""
+    bg = VEC_PALETTE_HEX[0]
+    bg_rgb = bytes((int(bg[1:3], 16), int(bg[3:5], 16), int(bg[5:7], 16)))
+    lut = []
+    for i in range(256):
+        h = VEC_PALETTE_HEX.get(i)
+        if h is None:
+            lut.append(bg_rgb)
+        else:
+            lut.append(bytes((int(h[1:3], 16), int(h[3:5], 16),
+                              int(h[5:7], 16))))
+    return lut
+
+
+class TkDisplayWorker:
+    """Bind host Tk windows to TAG_FRAMEBUFFER objects.  Lifetime
+    matches the parent simorisc process; per-CPU instance.
+
+    The worker is no-op when Tk import fails (CI / headless) — the
+    framebuffer object still exists, the firmware path still works,
+    just nothing visible appears.
+
+    tick() is called from System.run after each progress pass.  It
+    pumps Tk's event loop and repaints any framebuffer whose
+    desc.fb_dirty is set.  Repaints throttle at ~60 Hz to keep the
+    simulator from spending its budget repainting on rapid bursts of
+    small writes."""
+
+    def __init__(self, title_prefix="oriscwm fb"):
+        self.title_prefix = title_prefix
+        self._tk = None        # tkinter module (lazy import)
+        self._root = None
+        self._tracked = {}     # idx → {win, image, width, height, desc}
+        self._lut = _build_palette_lut()
+        self._last_repaint = 0.0
+        self._min_repaint_interval = 1.0 / 60.0
+
+    def _ensure_root(self):
+        if self._root is not None:
+            return
+        try:
+            import tkinter as tk
+        except ImportError:
+            return
+        try:
+            self._root = tk.Tk()
+        except Exception:
+            self._root = None
+            return
+        self._tk = tk
+        self._root.withdraw()  # FB windows are Toplevels; root invisible
+
+    def register_framebuffer(self, cpu, idx, desc):
+        self._ensure_root()
+        if self._root is None:
+            return
+        if idx in self._tracked:
+            return
+        win = self._tk.Toplevel(self._root)
+        win.title(f"{self.title_prefix} pid={cpu.pid} fb#{idx}")
+        img = self._tk.PhotoImage(width=desc.fb_width, height=desc.fb_height)
+        canvas = self._tk.Canvas(win,
+                                 width=desc.fb_width,
+                                 height=desc.fb_height,
+                                 borderwidth=0, highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        canvas.create_image(0, 0, image=img, anchor="nw")
+        self._tracked[idx] = {
+            "win": win, "image": img,
+            "width": desc.fb_width, "height": desc.fb_height,
+            "desc": desc,
+        }
+
+    def _repaint(self, info):
+        desc = info["desc"]
+        W, H = info["width"], info["height"]
+        lut = self._lut
+        rgb = b"".join([lut[b] for b in desc.storage])
+        ppm = (b"P6\n" + str(W).encode() + b" "
+               + str(H).encode() + b"\n255\n" + rgb)
+        try:
+            info["image"].configure(data=ppm)
+        except Exception:
+            pass
+
+    def tick(self):
+        if self._root is None:
+            return
+        now = time.time()
+        if now - self._last_repaint >= self._min_repaint_interval:
+            for info in self._tracked.values():
+                desc = info["desc"]
+                if desc.fb_dirty:
+                    self._repaint(info)
+                    desc.fb_dirty = False
+            self._last_repaint = now
+        try:
+            self._root.update()
+        except Exception:
+            self._root = None
 
 
 # ---------------------------------------------------------------------------
@@ -2910,6 +3061,52 @@ def primitive_ObjAlloc(cpu: CPU) -> None:
         cpu.set_gpr(2, ERR_ENOMEM); cpu.set_opr(1, 0); return
     cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
 
+def primitive_ObjAllocFramebuffer(cpu: CPU) -> None:
+    """Phase 60 — allocate a TAG_FRAMEBUFFER object backed by a host
+    display surface (when --display tk is on; just a plain bytearray
+    otherwise).  The WM normally writes pixels into this object via
+    ObjStoreBytes; the host display worker mirrors the bytes into a
+    Tk PhotoImage with no wire round-trip — replaces the per-pixel /
+    per-row ObjStoreBytes-to-oriscterm path with a same-CPU store.
+
+    Inputs:
+      R4 = width  (pixels, 1..4096)
+      R5 = height (pixels, 1..4096)
+      R6 = caps mask (typically R|W|C for the WM's own use)
+
+    Outputs:
+      R2 = status (ERR_OK / ERR_EINVAL / ERR_ENOMEM)
+      O1 = ref to the new object on success, null on failure
+
+    Object size = width × height bytes (1 byte per palette index,
+    matching the existing oriscterm framebuffer convention).  The
+    palette interpretation lives entirely in the host display worker;
+    the firmware only sees raw bytes. """
+    width  = cpu.get_gpr(4) & 0xFFFF
+    height = cpu.get_gpr(5) & 0xFFFF
+    init_caps = cpu.get_gpr(6) & 0xFF
+    if width == 0 or height == 0 or width > 4096 or height > 4096:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_opr(1, 0); return
+    size = width * height
+    try:
+        ref = cpu.alloc_object(size, type_tag=TAG_FRAMEBUFFER,
+                               max_caps=init_caps)
+    except Exception:
+        cpu.set_gpr(2, ERR_ENOMEM); cpu.set_opr(1, 0); return
+    idx = ref_index(ref)
+    desc = cpu.descriptors[idx]
+    desc.fb_width  = width
+    desc.fb_height = height
+    desc.fb_dirty  = True   # initial paint
+    # Notify the host display worker (if any) so it can create a Tk
+    # window for this framebuffer.  Headless / no-display runs leave
+    # the object as a plain bytearray; ObjStoreBytes still works.
+    worker = getattr(cpu, "display_worker", None)
+    if worker is not None:
+        worker.register_framebuffer(cpu, idx, desc)
+    cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
+
+
 def primitive_ObjAllocStore(cpu: CPU) -> None:
     """Like ObjAlloc but the new object's storage is OR-typed: OREFLD/
     OREFST may access it; integer OL/OS trap. Length must be a multiple
@@ -3184,6 +3381,11 @@ def primitive_ObjStoreBytes(cpu: CPU) -> None:
         if dst_off < 0 or dst_off + n > dst_desc.length:
             cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
         dst_desc.storage[dst_off:dst_off + n] = data
+        # Phase 60: TAG_FRAMEBUFFER objects mirror their bytes into a
+        # host display surface — flag the descriptor so the display
+        # worker repaints on its next tick.
+        if dst_desc.type_tag == TAG_FRAMEBUFFER:
+            dst_desc.fb_dirty = True
         cpu.set_gpr(2, ERR_OK)
         cpu.set_gpr(3, n)
         return
@@ -3539,6 +3741,7 @@ PRIMITIVE_MIN_MODE = {
     0x00A: MODE_USER,        # TaskKill         — external termination by ref
     0x100: MODE_USER,        # ObjAlloc
     0x101: MODE_USER,        # ObjFree
+    0x102: MODE_USER,        # ObjAllocFramebuffer (Phase 60)
     0x107: MODE_USER,        # ObjFreeDeferred — drain-window wrapper
     0x103: MODE_USER,        # ObjDerive
     0x106: MODE_USER,        # ObjAllocStore
@@ -3591,6 +3794,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjAlloc(cpu)
     elif prim == 0x101:
         primitive_ObjFree(cpu)
+    elif prim == 0x102:
+        primitive_ObjAllocFramebuffer(cpu)
     elif prim == 0x107:
         primitive_ObjFreeDeferred(cpu)
     elif prim == 0x103:
@@ -4367,6 +4572,16 @@ def main(argv: List[str]) -> int:
                          "owned by the crossbar lifecycle, not by an "
                          "instruction count. Pass an explicit value to "
                          "override either default.")
+    ap.add_argument("--display", choices=["none", "tk"], default="none",
+                    help="Phase 60 — host display backend for "
+                         "TAG_FRAMEBUFFER objects (allocated via "
+                         "ObjAllocFramebuffer). 'tk' opens a Tk "
+                         "window per framebuffer this CPU allocates "
+                         "and mirrors stores into it; 'none' (default) "
+                         "leaves framebuffers as plain bytearrays — "
+                         "the firmware path still works, just nothing "
+                         "appears on screen.  Headless CI keeps the "
+                         "default; interactive boots pass --display tk.")
     ap.add_argument("--init-r4", type=int, default=0,
                     help="initial R4 value for the loaded program. "
                          "Read by libc task_init via crt0's "
@@ -4431,6 +4646,8 @@ def main(argv: List[str]) -> int:
         install_external_services(cpu, args.service)
         snapshot_boot_state(cpu)
         cpu.mode = initial_mode
+        if args.display == "tk":
+            cpu.display_worker = TkDisplayWorker()
     else:
         system.crossbar.trace_enabled = args.trace
         for cpu in system.cpus:
@@ -4440,6 +4657,8 @@ def main(argv: List[str]) -> int:
             if args.init_r4:
                 cpu.set_gpr(4, args.init_r4 & 0xFFFFFFFF)
             cpu.mode = initial_mode
+            if args.display == "tk":
+                cpu.display_worker = TkDisplayWorker()
         populate_service_objects(system)
         for cpu in system.cpus:
             snapshot_boot_state(cpu)

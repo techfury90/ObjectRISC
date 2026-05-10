@@ -6317,6 +6317,52 @@ oriscterm's Tk overlay code is reachable only via direct
 `/sys/term/<idx>/*` walks from no-WM clients (smoke-only
 fallback).  Plug pulled.
 
+## Phase 60 — terminal-firmware unification
+
+Step 1 of folding the display surface into the same CPU as oriscwm.
+The current architecture has the WM SEND every glyph / line / blit
+to oriscterm via `ObjStoreBytes` over the wire — one round-trip per
+row / per pixel — even though the WM and oriscterm are both on the
+host.  γ.10 papered over the per-repaint cost with a faster palette
+LUT, but the per-pixel wire RTT is structural: it can't go away while
+the framebuffer is a remote object.
+
+The endpoint is "terminal firmware" — one simorisc process hosts
+oriscwm.orx and presents the host display, with the framebuffer as
+plain memory.  Step 1 lands the *mechanism*: a new firmware op
+`ObjAllocFramebuffer` (#0x102) that returns a `TAG_FRAMEBUFFER`
+object backed by a host-visible bytearray, plus a
+`simorisc --display tk` mode that mirrors any TAG_FRAMEBUFFER
+into a Tk window via PhotoImage.  No WM changes yet — that's
+step 2.
+
+Mechanism details:
+
+- **`primitive_ObjAllocFramebuffer(W, H, caps) -> ref`**: allocates
+  a W×H byte object with type tag `TAG_FRAMEBUFFER` (0x4104).  Same
+  ObjStoreBytes / ObjFetchBytes path as any other object — no new
+  wire ops.  Stores into a TAG_FRAMEBUFFER mark `desc.fb_dirty` so
+  the host worker knows when to repaint.
+- **`TkDisplayWorker`**: lazy-init Tk root + Toplevel-per-FB.
+  `tick()` runs from `System.run` after each progress pass; pumps
+  Tk's event loop and repaints any dirty FB.  Throttled to ~60 Hz
+  so bursty stores don't repaint per cycle.  Tk import failure or
+  no `$DISPLAY` leaves the worker as a no-op — the firmware path
+  still works, just nothing visible.
+- **`simorisc --display {none,tk}`** (default `none`): mode-gates
+  the worker.  Headless tests / CI keep the default; interactive
+  boots will pass `--display tk` once step 2 rewires the WM.
+
+Smoke test (`fb_local_smoke.c` + `test_fb_local_smoke.sh`) runs
+simorisc *standalone* — no oriscbar, no oriscterm, no oriscdir.
+Allocates a 16×16 framebuffer, ObjStoreBytes a known pattern,
+ObjFetchBytes back, byte-compares.  This is the first regression
+test that doesn't go through the crossbar at all.
+
+Hit the pcc-orisc input-clobber bug from γ.13 again in the smoke
+test asm — the safe-temps workaround (copy `"r"` inputs to r8+
+before the body's first store of r4..r6) is becoming ritual.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
