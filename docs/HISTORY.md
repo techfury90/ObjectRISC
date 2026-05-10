@@ -6709,6 +6709,61 @@ The user-visible result is still "looks the same as before" —
 this is foundation.  Title bars, opaque overlap, scrollback all
 build on top.
 
+## Phase 60 step 8 — window title bars
+
+Foundation work from step 7 enables actual window decoration: each
+window FB can now hold chrome that travels with the content.  This
+step puts the first piece of chrome — a title bar — at the top of
+every window.  Visible result: every WM-mediated window now has a
+clearly framed top with the title text centred, in inverse video
+(gray bar, navy text).
+
+oriscwm:
+- One cell-row reserved at the top of the window FB for the title
+  bar.  N_ROWS drops from 46 to 45 to make room; pixel coords
+  inside the window FB are offset by TITLE_BAR_PX (=CELL_H = 16
+  px) for cell content.
+- `paint_title_bar()` paints the bar bg + centres the current
+  title (via #0x10D ObjFillRect + #0x10C ObjBlitGlyphs), then
+  composites the bar region onto the screen FB.  Called at
+  handle_new_window time (empty title — visible bar appears
+  immediately) and after every wm_set_title.
+- `flush_strip` adds TITLE_BAR_CELLS to the cell-row coord so
+  rendered text always lands below the bar.  Composite y-pixel
+  uses the same offset.
+- `fb_scroll_up_one_cell` scrolls only the cell-content region
+  ([TITLE_BAR_PX..USABLE_H_PX)) so the title stays anchored
+  during fast output; composite only the touched cell area
+  rather than the whole window.
+- New wire op WM_OP_SET_TITLE (R5=wid (0=first live), R6=packed
+  (len:high16, src_off:low16), O2=source ref).  Boot-data ref
+  caveat: oriscwm's data ref is R|C (no CAP_W) so ObjFetchBytes
+  can't write directly into the `window_title[]` BSS slot — we
+  fetch into a stack-local buf first (boot stack ref is R|W|C),
+  then memcpy through the data mapping's VA-level W bit.  Same
+  trick forward_console_write uses for its sender-bytes copy.
+
+libc:
+- `wm_set_title(wid, title)` — copies the nul-terminated title
+  into a stack-local buffer, then SENDs to the WM with O2 = boot
+  stack and R6 packed.  Passes wid=0 to target the first live
+  window.
+
+Tests:
+- wm_smoke gains step 6c: `wm_set_title("wm_smoke")` after
+  wm_new_window; checks status only (no FB-snapshot path yet),
+  visual correctness verified on boot.sh.
+- wm_smoke + supervisor_session_manager + fb_local_smoke green.
+
+Deferred to follow-ups:
+- Supervisor / shell don't yet call wm_set_title, so production
+  windows show an empty (gray) bar at boot.  That's an integration
+  point — the API is wired, callers haven't been updated yet.
+- VECTOR / RASTER ops still target the screen FB (step 7's
+  deferred work); migrating them so they land in the window FB
+  too would make the per-window backing store fully owned by
+  the window.  That's the next milestone.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

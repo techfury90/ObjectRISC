@@ -690,6 +690,14 @@ int wm_bind_surface(int wid, int kind);
 /* wm_destroy_window — release a window. */
 int wm_destroy_window(int wid);
 
+/* wm_set_title — set the text displayed in `wid`'s title bar.
+ * The string is copied into a stack-local buffer before SEND, so
+ * callers can pass any nul-terminated source.  Pass `wid = 0` to
+ * target the first live window.  Returns 0 on success; negative
+ * values mean the WM rejected the request (invalid wid / no such
+ * window / fetch failed). */
+int wm_set_title(int wid, const char *title);
+
 /* wm_subscribe_events — register a notify cap for window-lifecycle
  * events (resize, focus, close-request).  Stub on the WM side
  * today — accepted and stored, no events fire yet — but the wire
