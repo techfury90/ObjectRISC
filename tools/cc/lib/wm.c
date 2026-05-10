@@ -405,22 +405,24 @@ int
 wm_open_session(const char *title, int *out_wid)
 {
 	int wid = 0, w_cells = 0, h_cells = 0;
+	int rc;
+
 	asm volatile("onull o1");
-	int rc = wm_new_window(WIN_TYPE_CONSOLE, &wid, &w_cells, &h_cells);
-	if (rc != 0) return rc;
+	rc = wm_new_window(WIN_TYPE_CONSOLE, &wid, &w_cells, &h_cells);
+	if (rc != 0) goto restore_or;
 
 	rc = wm_bind_surface(wid, 1 /*WSURF_CONSOLE*/);
-	if (rc != 0) { wm_destroy_window(wid); return rc; }
+	if (rc != 0) goto destroy_and_restore;
 	asm volatile("orefld o5, %0(o12)"
 	             :: "i"(DIR_RESULT_SLOT_OFFSET) : "r1");
 
 	rc = wm_bind_surface(wid, 2 /*WSURF_KEYBOARD*/);
-	if (rc != 0) { wm_destroy_window(wid); return rc; }
+	if (rc != 0) goto destroy_and_restore;
 	asm volatile("orefld o6, %0(o12)"
 	             :: "i"(DIR_RESULT_SLOT_OFFSET) : "r1");
 
 	rc = wm_bind_surface(wid, 3 /*WSURF_GRID*/);
-	if (rc != 0) { wm_destroy_window(wid); return rc; }
+	if (rc != 0) goto destroy_and_restore;
 	asm volatile("orefld o7, %0(o12)"
 	             :: "i"(DIR_RESULT_SLOT_OFFSET) : "r1");
 
@@ -430,7 +432,28 @@ wm_open_session(const char *title, int *out_wid)
 	}
 
 	if (out_wid) *out_wid = wid;
-	return 0;
+	rc = 0;
+	goto restore_or;
+
+destroy_and_restore:
+	wm_destroy_window(wid);
+	/* fall through */
+restore_or:
+	/* Restore boot O2 (stack) and O3 (data) from the task_init-parked
+	 * O11 / O15 before returning.  EVERY exit path runs this — the
+	 * wm_init / wm_new_window / wm_bind_surface / wm_set_title round-
+	 * trips have clobbered O2/O3 with SEND/poll scratch even on the
+	 * failure paths (wm_init's dir_walk runs first and is the most
+	 * common failure point on no-WM systems).  If we left O2/O3 in
+	 * that state, a caller calling term_init next would copy the
+	 * garbage back into O11 / O15 (term_init's first omovs blindly
+	 * re-save from O2/O3/O4), corrupting the boot-OR save and
+	 * breaking subsequent term_print stack-relative ObjStoreBytes.
+	 * Requires the caller to have run task_init first — which any
+	 * program that gets here already has. */
+	asm volatile("omov o2, o11");
+	asm volatile("omov o3, o15");
+	return rc;
 }
 
 /* OP_DESTROY_WINDOW: SEND with R4=op, R5=wid. */

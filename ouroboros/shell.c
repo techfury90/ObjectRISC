@@ -719,10 +719,18 @@ cmd_edit(const char *cwd, const char *arg)
 		term_print("\n");
 		return;
 	}
-	term_print(run_bg_pre);
-	term_print_int(t);
-	term_print(run_bg_post);
-	task_yield();
+	/* Phase 60 step 13 — edit now opens its own window and takes
+	 * keyboard focus.  Wait for it to exit, then re-subscribe to
+	 * reclaim the keyboard for the next shell prompt.  Pre-multi-
+	 * window this was a fire-and-forget bg spawn; that no longer
+	 * works because edit's subscription would supersede ours and
+	 * never get cleaned up, so we'd block on the next read_line
+	 * forever. */
+	int code = orx_unload(t);
+	term_resubscribe();
+	term_print(run_done_pre);
+	term_print_int(code);
+	term_print(run_done_post);
 }
 
 static void
