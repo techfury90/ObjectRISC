@@ -441,6 +441,25 @@ render_term_path(int n, const char *suffix, char *buf)
 	return p;
 }
 
+/* Render "/sys/wm/<n>/leader-" + suffix into buf — used by the
+ * leader-side dir_register and the worker-side dir_walk for
+ * acquiring the WM-mediated CONSOLE / GRID sub-caps for terminal n.
+ * Phase 59 / WM γ.15: each WM instance publishes under its own
+ * /sys/wm/<n>/ subtree so a multi-WM boot has unambiguous paths. */
+static int
+render_wm_leader_path(int n, const char *suffix, char *buf)
+{
+	const char prefix[] = "/sys/wm/";
+	const char mid[]    = "/leader-";
+	int i, p = 0;
+	for (i = 0; prefix[i]; i++) buf[p++] = prefix[i];
+	p = append_decimal(n, buf, p);
+	for (i = 0; mid[i]; i++) buf[p++] = mid[i];
+	for (i = 0; suffix[i]; i++) buf[p++] = suffix[i];
+	buf[p] = '\0';
+	return p;
+}
+
 /* Phase 47: walk a path in oriscdir; if it resolves to a LEAF, the
  * resolved ref is in DIR_RESULT_SLOT (offset 616) per dir_walk's
  * contract. Returns 0 on a successful LEAF resolution, -6 when no
@@ -750,20 +769,43 @@ wm_leader_grid_isn(void)
  * boot O5/O6/O7 are wired to ITS terminal, which is the wrong one
  * — but it's better than null for programs that never use the
  * service in question (e.g., a CPU-bound background task). */
+/* Phase 59 / WM γ.15 — multi-WM aware wiring.  Try a per-terminal
+ * dir_walk for /sys/wm/<term_idx>/leader-<suffix>; on a LEAF hit
+ * the resolved cap is in DIR_RESULT_SLOT, ready for the caller to
+ * OREFLD.  Returns 0 on success, -1 on any failure (no such WM,
+ * not yet published, NOT_FOUND).
+ *
+ * No caching: dir_walk is a single wire RTT (cheap) and per-spawn
+ * call frequency is low.  γ.14's WM_LEADER_*_SLOT pre-populated
+ * cache only worked for one terminal; under multi-WM each spawn
+ * may target a different one, so we just walk the right path each
+ * time. */
+static int
+try_walk_wm_leader_path(int term_idx, const char *suffix)
+{
+	char path[40];
+	render_wm_leader_path(term_idx, suffix, path);
+	int kind;
+	char rem[16];
+	int rc = dir_walk(path, &kind, rem, sizeof(rem));
+	if (rc != 0 || kind != DIR_KIND_LEAF) return -1;
+	return 0;
+}
+
 static void
 populate_child_term_slots(int term_idx)
 {
 	char path[PEER_PATH_BUF_SIZE];
 
+	/* CONSOLE: try /sys/wm/<term_idx>/leader-console first; fall
+	 * back to direct /sys/term/<idx>/console. */
 	int wired_console = 0;
-	if (term_idx == task_my_terminal_idx()
-	    && wm_leader_console_isn() == 0) {
-		/* WM-mediated CONSOLE for the leader's own terminal. */
+	if (try_walk_wm_leader_path(term_idx, "console") == 0) {
 		asm volatile(
 			"orefld o14, %0(o12)\n"
 			"orefst o14, %1(o12)"
 			:
-			: "i"(WM_LEADER_CONSOLE_SLOT_OFFSET),
+			: "i"(DIR_RESULT_SLOT_OFFSET),
 			  "i"(ORX_SLOT_CHILD_O5_OFFSET)
 			: "r14"
 		);
@@ -781,6 +823,8 @@ populate_child_term_slots(int term_idx)
 			);
 		}
 	}
+	/* KEYBOARD stays direct — WM doesn't mediate keyboard input
+	 * yet (passthrough from γ.0). */
 	render_term_path(term_idx, "keyboard", path);
 	if (sup_walk_for_opr(path) == 0) {
 		asm volatile(
@@ -791,17 +835,14 @@ populate_child_term_slots(int term_idx)
 			  "i"(ORX_SLOT_CHILD_O6_OFFSET)
 		);
 	}
+	/* GRID: same pattern as CONSOLE. */
 	int wired_grid = 0;
-	if (term_idx == task_my_terminal_idx()
-	    && wm_leader_grid_isn() == 0) {
-		/* WM-mediated GRID for the leader's own terminal —
-		 * positioned text rasterises into the framebuffer
-		 * through the WM, just like console output. */
+	if (try_walk_wm_leader_path(term_idx, "grid") == 0) {
 		asm volatile(
 			"orefld o14, %0(o12)\n"
 			"orefst o14, %1(o12)"
 			:
-			: "i"(WM_LEADER_GRID_SLOT_OFFSET),
+			: "i"(DIR_RESULT_SLOT_OFFSET),
 			  "i"(ORX_SLOT_CHILD_O7_OFFSET)
 			: "r14"
 		);
@@ -1780,16 +1821,21 @@ main(void)
 	 * supervisor never EXITs (it's a long-running daemon), so
 	 * task_query auto-destroy isn't useful here.  The window stays
 	 * alive for the supervisor's lifetime.  */
-	if (is_leader) {
-		/* Boot race: the WM lives on its own CPU and may still be
-		 * mid-init when we get here.  Retry wm_init briefly on
-		 * WIN_E_NOENT (-2 = "/sys/wm/0 didn't resolve yet"); same
-		 * cadence as sup_walk_for_opr's per-CPU /sys/term retry.
-		 * On systems with no WM at all, the directory walk
-		 * returns NOT_FOUND every time and we exit the loop after
-		 * 5 attempts to fall back to direct terminal — adds a few
-		 * task_yields of latency for the no-WM case, which is
-		 * cheap. */
+	/* Phase 59 / WM γ.15 — every supervisor binds its own
+	 * terminal's WM (one WM instance per terminal under the
+	 * multi-WM model; libc wm_init walks /sys/wm/<my_term>/0).
+	 * This used to be `if (is_leader)` because there was only one
+	 * WM and only the leader knew about it; now each CPU sets up
+	 * WM mediation for ITS terminal, then publishes
+	 * /sys/wm/<my_term>/leader-{console,grid} so populate_child_term_-
+	 * slots on this CPU (and on any peer relaying spawns to this
+	 * terminal) can dir_walk the cap.
+	 *
+	 * Boot race: the WM lives on its own CPU and may still be
+	 * mid-init.  Retry wm_init briefly on WIN_E_NOENT.  No-WM
+	 * systems return NOT_FOUND every attempt; we fall through to
+	 * direct terminal after 5 task_yields. */
+	{
 		int wm_status, attempt;
 		for (attempt = 0; attempt < 5; attempt++) {
 			wm_status = wm_init();
@@ -1806,15 +1852,12 @@ main(void)
 				/* Bind console + keyboard.  The resolved cap
 				 * lands in DIR_RESULT_SLOT (offset 616 — wm.c
 				 * shares the slot with dir_walk's result).
-				 * OREFLD into the supervisor's working OPR.
-				 *
-				 * For CONSOLE we ALSO stash the resolved cap
-				 * into WM_LEADER_CONSOLE_SLOT so populate_child_-
-				 * term_slots can hand it down to spawned children
-				 * (login, shell) targeting the leader's own
-				 * terminal.  Without that, children walk
-				 * /sys/term/0/console directly and their output
-				 * bypasses the WM. */
+				 * OREFLD into the supervisor's working OPR
+				 * AND stash + dir_register for downstream
+				 * populate_child_term_slots lookups. */
+				char wm_path[40];
+				int my_term = task_my_terminal_idx();
+				if (my_term < 0) my_term = 0;
 				if (wm_bind_surface(wid, WSURF_CONSOLE) == 0) {
 					asm volatile(
 						"orefld o5, %0(o12)\n"
@@ -1823,14 +1866,25 @@ main(void)
 						: "i"(DIR_RESULT_SLOT_OFFSET),
 						  "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
 					);
+					/* Publish at /sys/wm/<my_term>/leader-console
+					 * for cross-CPU walks (γ.14 multi-WM γ.15). */
+					asm volatile("orefld o1, %0(o12)"
+					             :: "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
+					             : "r1");
+					render_wm_leader_path(my_term, "console", wm_path);
+					int reg_rc = dir_register(wm_path);
+					if (reg_rc != 0) {
+						SUP_PRINT("supervisor: dir_register ");
+						SUP_PRINT(wm_path);
+						SUP_PRINT(" failed: ");
+						SUP_PRINT_INT(reg_rc);
+						SUP_PRINT("\n");
+					}
 				}
 				if (wm_bind_surface(wid, WSURF_KEYBOARD) == 0) {
 					asm volatile("orefld o6, %0(o12)"
 					             :: "i"(DIR_RESULT_SLOT_OFFSET));
 				}
-				/* GRID: same dance as CONSOLE — stash the
-				 * resolved cap so populate_child_term_slots
-				 * routes ORX_SLOT_CHILD_O7 through it. */
 				if (wm_bind_surface(wid, WSURF_GRID) == 0) {
 					asm volatile(
 						"orefld o7, %0(o12)\n"
@@ -1839,9 +1893,23 @@ main(void)
 						: "i"(DIR_RESULT_SLOT_OFFSET),
 						  "i"(WM_LEADER_GRID_SLOT_OFFSET)
 					);
+					asm volatile("orefld o1, %0(o12)"
+					             :: "i"(WM_LEADER_GRID_SLOT_OFFSET)
+					             : "r1");
+					render_wm_leader_path(my_term, "grid", wm_path);
+					int reg_rc = dir_register(wm_path);
+					if (reg_rc != 0) {
+						SUP_PRINT("supervisor: dir_register ");
+						SUP_PRINT(wm_path);
+						SUP_PRINT(" failed: ");
+						SUP_PRINT_INT(reg_rc);
+						SUP_PRINT("\n");
+					}
 				}
-				SUP_PRINT("supervisor: WM-mediated leader "
-				          "session (wid=");
+				SUP_PRINT("supervisor: WM-mediated session "
+				          "(term=");
+				SUP_PRINT_INT(my_term);
+				SUP_PRINT(", wid=");
 				SUP_PRINT_INT(wid);
 				SUP_PRINT(")\n");
 			} else {
@@ -1850,9 +1918,6 @@ main(void)
 				SUP_PRINT(") — using direct terminal\n");
 			}
 		} else if (wm_status != WIN_E_NOENT && wm_status != WIN_E_IO) {
-			/* WIN_E_NOENT (-2) and WIN_E_IO (-6) are the expected
-			 * "no WM available" returns; quiet.  Anything else
-			 * is unexpected. */
 			SUP_PRINT("supervisor: wm_init returned ");
 			SUP_PRINT_INT(wm_status);
 			SUP_PRINT(" — using direct terminal\n");

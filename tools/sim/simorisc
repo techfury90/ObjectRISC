@@ -2277,6 +2277,9 @@ def reset_cpu(cpu: CPU) -> None:
     cpu.tasks          = {}
     cpu.runnable       = []
     init_cpu(cpu, args["text"], args["data"], args["entry"], args["stack_size"])
+    init_r4 = args.get("init_r4", 0)
+    if init_r4:
+        cpu.set_gpr(4, init_r4 & 0xFFFFFFFF)
     populate_self_service(cpu)
     install_external_services(cpu, args["services"])
     snapshot_boot_state(cpu)
@@ -4364,6 +4367,14 @@ def main(argv: List[str]) -> int:
                          "owned by the crossbar lifecycle, not by an "
                          "instruction count. Pass an explicit value to "
                          "override either default.")
+    ap.add_argument("--init-r4", type=int, default=0,
+                    help="initial R4 value for the loaded program. "
+                         "Read by libc task_init via crt0's "
+                         "_orisc_init_r4 stash; programs use it to "
+                         "carry a small int from boot args (e.g., "
+                         "oriscwm uses it as its terminal index). "
+                         "Defaults to 0 (== task_my_terminal_idx() "
+                         "of -1 'no info' for libc-aware programs).")
     ap.add_argument("--mode", choices=["user", "supervisor", "firmware"],
                     default="supervisor",
                     help="initial privilege mode of the loaded task "
@@ -4409,10 +4420,13 @@ def main(argv: List[str]) -> int:
             "entry":      entry,
             "stack_size": stack_size,
             "services":   args.service,
+            "init_r4":    args.init_r4,
         }
         cpu.reset_on_exit = args.reset_on_exit
         cpu.initial_mode  = initial_mode
         init_cpu(cpu, text_bytes, data_bytes, entry, stack_size)
+        if args.init_r4:
+            cpu.set_gpr(4, args.init_r4 & 0xFFFFFFFF)
         populate_self_service(cpu)
         install_external_services(cpu, args.service)
         snapshot_boot_state(cpu)
@@ -4423,6 +4437,8 @@ def main(argv: List[str]) -> int:
             cpu.trace_enabled = args.trace
             cpu.initial_mode  = initial_mode
             init_cpu(cpu, text_bytes, data_bytes, entry, stack_size)
+            if args.init_r4:
+                cpu.set_gpr(4, args.init_r4 & 0xFFFFFFFF)
             cpu.mode = initial_mode
         populate_service_objects(system)
         for cpu in system.cpus:

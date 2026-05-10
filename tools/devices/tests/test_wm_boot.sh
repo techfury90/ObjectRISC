@@ -171,7 +171,7 @@ echo "--- term rendered ---"
 sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term.out"
 
 # Assertions.
-grep -q "WM-mediated leader session" "$TMP/cpu0.out" \
+grep -q "WM-mediated session (term=0" "$TMP/cpu0.out" \
     || { echo "FAIL: leader didn't go through the WM" >&2; exit 1; }
 
 grep -q "hello-from-wm-session" "$TMP/cpu0.out" \
