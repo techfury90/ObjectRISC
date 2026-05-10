@@ -718,8 +718,16 @@ alloc_window_console(int wid)
 	/* Stash the full cap (now in O1) per-window. */
 	stash_console_o1(wid);
 
+	/* Queue depth 256 — clients (shell.c's term_print_char) fire
+	 * console SENDs with no reply_cap (fire-and-forget), so they
+	 * don't block per-write.  At depth 8 we'd overflow under any
+	 * sustained burst (e.g. shell echoing typed chars while the
+	 * WM is busy in render_buffer's 16 wire RTTs per strip), and
+	 * the simulator silently drops on overflow.  256 absorbs the
+	 * largest burst we see in practice (a long term_print of
+	 * help text) plus comfortable headroom. */
 	asm volatile(
-		"addiu r4, r0, 8\n"            /* depth = 8 */
+		"addiu r4, r0, 256\n"          /* depth = 256 */
 		"call  #0x203\n"               /* ReceiveQueueAttach */
 		"nop\n"
 		"addu  %0, r2, r0"
@@ -1060,95 +1068,144 @@ poll_one_request(int *out_op, int *out_wid, int *out_arg)
 	return status;
 }
 
-/* Render one glyph for character `ch` at the current cursor position
- * of window `wid`.  '\n' advances the cursor without rendering;
- * other unprintable chars are silently dropped.  Cursor wraps at
- * column N_COLS; rows past N_ROWS stop rendering (no scroll yet —
- * future milestone work).
+/* Flush a strip of `n_glyphs` printable chars at cell (row, col_start)
+ * to the framebuffer.  All glyphs in the strip share the same cell
+ * row, so they project to CELL_H contiguous pixel rows in the
+ * framebuffer; each pixel row is the byte-concatenation of their
+ * per-row pixels.  Pushing one ObjStoreBytes per pixel row
+ * (CELL_H = 16 calls, regardless of strip width) is the WM γ.4
+ * trick — drops the wire RTT count from 16N (one per glyph row)
+ * to 16 for any run of printable chars on the same cell row.
  *
- * Each glyph requires CELL_H = 16 row writes to the framebuffer.
- * Each row is CELL_W = 8 bytes built on the local stack and pushed
- * via ObjStoreBytes (1 wire RTT per row, 16 RTTs per glyph).  Bulk
- * push + per-row pack is what makes interactive text rendering
- * tractable in the wire-mediated phase — without ObjStoreBytes
- * we'd need 128 RTTs per glyph (one per OSB byte). */
+ * Off-screen rows (>= N_ROWS) drop silently — no scroll yet. */
 static void
-render_glyph(int wid, int ch)
+flush_strip(const unsigned char *glyphs, int n_glyphs,
+            int cell_row, int col_start)
 {
-	int col = window_cur_col[wid - 1];
-	int row = window_cur_row[wid - 1];
+	if (n_glyphs <= 0)        return;
+	if (cell_row < 0)         return;
+	if (cell_row >= N_ROWS)   return;
 
-	if (ch == '\n') {
-		window_cur_col[wid - 1] = 0;
-		window_cur_row[wid - 1] = row + 1;
-		return;
-	}
-	if (ch == '\r') {
-		window_cur_col[wid - 1] = 0;
-		return;
-	}
-	if (ch == '\b') {
-		if (col > 0) window_cur_col[wid - 1] = col - 1;
-		/* Backspace doesn't erase the rendered glyph in milestone
-		 * γ — the next-char render at this position will overwrite
-		 * it.  For a pure backspace-and-leave-blank, we'd need to
-		 * render a space at (col-1, row). */
-		return;
-	}
-	/* Out-of-range chars: skip render but advance cursor (so the
-	 * source byte position is preserved visually). */
-	if (ch < 32 || ch > 126) {
-		window_cur_col[wid - 1] = (col + 1 >= N_COLS) ? 0 : col + 1;
-		if (col + 1 >= N_COLS) window_cur_row[wid - 1] = row + 1;
-		return;
-	}
-	if (row >= N_ROWS) return;     /* off-screen — drop, no scroll */
+	int cell_x        = col_start * CELL_W;
+	int cell_y        = cell_row  * CELL_H;
+	int strip_pixels  = n_glyphs  * CELL_W;
+	unsigned char pixel_row[N_COLS * CELL_W];   /* 640-byte scratch */
 
-	/* Glyph data: 16 bytes from the embedded font.  Index by
-	 * (ch - 32) since the font array starts at codepoint 32.
-	 *
-	 * For each row, build 8 palette-index bytes (foreground for set
-	 * bits, background for clear) on the stack, then ObjStoreBytes
-	 * them to the framebuffer at the right pixel offset. */
-	const unsigned char *glyph = font_8x16[ch - 32];
-	int cell_x = col * CELL_W;
-	int cell_y = row * CELL_H;
 	int r;
 	for (r = 0; r < CELL_H; r++) {
-		unsigned char glyph_byte = glyph[r];
-		unsigned char row_pixels[CELL_W];
-		int x;
-		for (x = 0; x < CELL_W; x++) {
-			int bit = (glyph_byte >> (7 - x)) & 1;
-			row_pixels[x] = bit ? WM_FG_COLOR : WM_BG_COLOR;
+		int g;
+		for (g = 0; g < n_glyphs; g++) {
+			unsigned char glyph_byte = font_8x16[glyphs[g] - 32][r];
+			int base = g * CELL_W;
+			int x;
+			for (x = 0; x < CELL_W; x++) {
+				int bit = (glyph_byte >> (7 - x)) & 1;
+				pixel_row[base + x] = bit ? WM_FG_COLOR
+				                          : WM_BG_COLOR;
+			}
 		}
-		int src_off = (int)((unsigned int)row_pixels - STACK_BOTTOM);
+		int src_off = (int)((unsigned int)pixel_row - STACK_BOTTOM);
 		int dst_off = (cell_y + r) * FB_W + cell_x;
-		/* ObjStoreBytes(O1=src, O2=dst, R4=src_off, R5=dst_off,
-		 * R6=count). */
 		asm volatile(
 			"omov  o1, o11\n"           /* boot stack ref */
 			"orefld o2, %0(o12)\n"      /* framebuffer cap */
 			"addu  r4, %1, r0\n"
 			"addu  r5, %2, r0\n"
-			"addiu r6, r0, %3\n"        /* CELL_W */
+			"addu  r6, %3, r0\n"        /* strip_pixels */
 			"call  #0x109\n"            /* ObjStoreBytes */
 			"nop"
 			:
 			: "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET),
-			  "r"(src_off), "r"(dst_off),
-			  "i"(CELL_W)
+			  "r"(src_off), "r"(dst_off), "r"(strip_pixels)
 			: "r1", "r2", "r3", "r4", "r5", "r6"
 		);
 	}
+}
 
-	/* Advance cursor; wrap at column N_COLS. */
-	if (col + 1 >= N_COLS) {
-		window_cur_col[wid - 1] = 0;
-		window_cur_row[wid - 1] = row + 1;
-	} else {
-		window_cur_col[wid - 1] = col + 1;
+/* Render `count` bytes from `buf` to window `wid`'s framebuffer
+ * surface, accumulating runs of printable chars on the same cell
+ * row into strips and flushing each strip in 16 wire RTTs total.
+ * Control chars ('\n' / '\r' / '\b') boundary the strip and adjust
+ * the cursor; non-printable chars (other than those three) advance
+ * the cursor without rendering, also boundarying the strip.
+ *
+ * No scroll — rows past N_ROWS stop rendering, but the cursor
+ * still advances so subsequent newlines bring future content back
+ * on screen if some clears arrive (future milestone work).
+ *
+ * Cursor state in window_cur_col/row[] is updated on return. */
+static void
+render_buffer(int wid, const unsigned char *buf, int count)
+{
+	int col = window_cur_col[wid - 1];
+	int row = window_cur_row[wid - 1];
+
+	unsigned char strip[N_COLS];
+	int strip_len       = 0;
+	int strip_row       = row;
+	int strip_col_start = col;
+
+	int i;
+	for (i = 0; i < count; i++) {
+		int ch = (int)buf[i];
+
+		if (ch == '\n') {
+			flush_strip(strip, strip_len, strip_row, strip_col_start);
+			col = 0;
+			row += 1;
+			strip_len       = 0;
+			strip_row       = row;
+			strip_col_start = 0;
+			continue;
+		}
+		if (ch == '\r') {
+			flush_strip(strip, strip_len, strip_row, strip_col_start);
+			col = 0;
+			strip_len       = 0;
+			strip_row       = row;
+			strip_col_start = 0;
+			continue;
+		}
+		if (ch == '\b') {
+			flush_strip(strip, strip_len, strip_row, strip_col_start);
+			if (col > 0) col -= 1;
+			/* Backspace doesn't erase the rendered glyph — the
+			 * next char at this position will overwrite it.  For
+			 * a pure erase we'd need to render a space here. */
+			strip_len       = 0;
+			strip_row       = row;
+			strip_col_start = col;
+			continue;
+		}
+		if (ch < 32 || ch > 126) {
+			/* Non-printable: drop, advance cursor, boundary the
+			 * strip so the next printable run starts fresh. */
+			flush_strip(strip, strip_len, strip_row, strip_col_start);
+			col += 1;
+			if (col >= N_COLS) { col = 0; row += 1; }
+			strip_len       = 0;
+			strip_row       = row;
+			strip_col_start = col;
+			continue;
+		}
+
+		/* Printable: append to strip, advance cursor.  On wrap,
+		 * flush the strip and start a fresh one on the next row. */
+		strip[strip_len++] = (unsigned char)ch;
+		col += 1;
+		if (col >= N_COLS) {
+			flush_strip(strip, strip_len, strip_row, strip_col_start);
+			col = 0;
+			row += 1;
+			strip_len       = 0;
+			strip_row       = row;
+			strip_col_start = 0;
+		}
 	}
+	flush_strip(strip, strip_len, strip_row, strip_col_start);
+
+	window_cur_col[wid - 1] = col;
+	window_cur_row[wid - 1] = row;
 }
 
 /* Forward an incoming per-window CONSOLE write to the underlying
@@ -1171,18 +1228,20 @@ render_glyph(int wid, int ch)
  * Step-by-step:
  *   1. Stash O2 (source ref) and O3 (reply_cap) into per-request
  *      slots so subsequent asm can stomp on them.
- *   2. Re-emit the SEND to the underlying terminal CONSOLE with the
- *      original (source, offset, count, reply_cap) — fires the
- *      console-pane update first, in parallel with our render.  The
- *      terminal's OBJ_READ_REQ goes back to the leader's source ref
- *      directly (the leader's still blocked waiting for the
- *      terminal's reply, so the source stays alive).
- *   3. ObjFetchBytes the bytes from the same source into a stack-
- *      local buffer (one wire RTT).
- *   4. Iterate the buffer, render_glyph each byte → 16N OBJ_WRITE_REQs
- *      to the framebuffer.  These arrive at oriscterm after the
- *      SEND_DELIVER, so the console pane is current before the
- *      framebuffer pane catches up.
+ *   2. ObjFetchBytes a private copy of the source bytes into a
+ *      stack-local buffer (one wire RTT).  This MUST happen before
+ *      we forward the SEND — once the terminal replies, the leader
+ *      unblocks and may reuse its stack, racing any later read.
+ *   3. Re-emit the SEND to the underlying terminal CONSOLE with the
+ *      original (source, offset, count, reply_cap).  Terminal does
+ *      its own OBJ_READ_REQ for the source; it lands while the
+ *      leader is still blocked, so it sees the same bytes we did.
+ *   4. Pass our private copy to render_buffer, which splits it into
+ *      runs of printable chars on the same cell row and flushes each
+ *      as one strip — CELL_H = 16 OBJ_WRITE_REQs per strip regardless
+ *      of how many chars it contains.  These arrive at oriscterm
+ *      after the SEND_DELIVER, so the console pane is current before
+ *      the framebuffer pane catches up.
  * When the γ-stage migration retires the underlying console pane,
  * step 2 goes away (the render becomes the only output path — text
  * becomes pixels only). */
@@ -1199,45 +1258,18 @@ forward_console_write(int wid, int offset, int count)
 	asm volatile("orefst o3, %0(o12)"
 	             :: "i"(WM_FORWARD_REPLY_SLOT_OFFSET));
 
-	/* Forward FIRST.  Re-emit the SEND with the original source /
-	 * offset / count / reply_cap so the underlying terminal can
-	 * start processing — OBJ_READ_REQ to the source, console-pane
-	 * update, reply to the original reply_cap — all in parallel
-	 * with our render below.
-	 *
-	 * Doing the forward first puts the SEND_DELIVER on the wire
-	 * before the 16N OBJ_WRITE_REQs that render_glyph emits.
-	 * Oriscterm processes inbound packets in arrival order, so the
-	 * console pane updates first and the framebuffer pane fills in
-	 * pixel-row by pixel-row afterwards.  The leader's source ref
-	 * stays alive because it's blocked waiting for the terminal's
-	 * reply (which goes direct, not back through the WM), so we can
-	 * still ObjFetchBytes from it below.  When the γ-stage migration
-	 * retires the underlying console pane this forward step goes
-	 * away. */
-	asm volatile(
-		"orefld o1, %0(o12)\n"          /* O1 = underlying CONSOLE cap */
-		"orefld o2, %1(o12)\n"          /* O2 = original source ref */
-		"orefld o3, %2(o12)\n"          /* O3 = client's reply_cap */
-		"addu   r4, %3, r0\n"           /* R4 = offset */
-		"addu   r5, %4, r0\n"           /* R5 = count */
-		"addiu  r6, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(WM_SURF_CONSOLE_SLOT_OFFSET),
-		  "i"(WM_FORWARD_SRC_SLOT_OFFSET),
-		  "i"(WM_FORWARD_REPLY_SLOT_OFFSET),
-		  "r"(offset), "r"(count)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
-
-	/* ObjFetchBytes from the client's source into a stack-local
-	 * buffer, then render each byte to the framebuffer.  Clamp to
-	 * 256 bytes — the standard term_print path batches per-string,
-	 * so a typical write is short.  Anything larger gets the leading
-	 * 256 rendered (the full count was already forwarded above so
-	 * the underlying terminal still got all the bytes). */
+	/* ObjFetchBytes FIRST.  Pull a private copy of the source bytes
+	 * before any other work.  The leader's source ref points into
+	 * its stack — once the leader's task unblocks (when the
+	 * terminal's reply lands at the reply_cap), it will reuse that
+	 * stack region for the next print, and any later read of the
+	 * source ref returns garbage.  We have to capture our copy
+	 * while the leader is still blocked on this SEND, which is
+	 * before we forward.  Clamp to 256 bytes — the standard
+	 * term_print path batches per-string, so a typical write is
+	 * short.  Anything larger gets the leading 256 rendered (the
+	 * full count is forwarded below so the terminal still gets all
+	 * the bytes). */
 	unsigned char buf[256];
 	int fetch_count = (count > 256) ? 256 : count;
 	if (fetch_count > 0) {
@@ -1255,11 +1287,36 @@ forward_console_write(int wid, int offset, int count)
 			  "r"(offset), "r"(buf_off), "r"(fetch_count)
 			: "r1", "r2", "r3", "r4", "r5", "r6"
 		);
+	}
 
-		int i;
-		for (i = 0; i < fetch_count; i++) {
-			render_glyph(wid, (int)buf[i]);
-		}
+	/* Now forward the SEND.  The terminal does its own OBJ_READ_REQ
+	 * to the leader's source — the leader's still blocked, so the
+	 * source is valid.  After we forward, oriscterm will process the
+	 * SEND_DELIVER, then process the OBJ_WRITE_REQs from
+	 * render_buffer below — console pane updates before the
+	 * framebuffer pane fills in. */
+	asm volatile(
+		"orefld o1, %0(o12)\n"          /* O1 = underlying CONSOLE cap */
+		"orefld o2, %1(o12)\n"          /* O2 = original source ref */
+		"orefld o3, %2(o12)\n"          /* O3 = client's reply_cap */
+		"addu   r4, %3, r0\n"           /* R4 = offset */
+		"addu   r5, %4, r0\n"           /* R5 = count */
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		:
+		: "i"(WM_SURF_CONSOLE_SLOT_OFFSET),
+		  "i"(WM_FORWARD_SRC_SLOT_OFFSET),
+		  "i"(WM_FORWARD_REPLY_SLOT_OFFSET),
+		  "r"(offset), "r"(count)
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+
+	/* Render against our private buf copy.  The source ref may
+	 * already be racing the leader's stack reuse here, but we
+	 * don't care — we're working from buf, which is on our stack. */
+	if (fetch_count > 0) {
+		render_buffer(wid, buf, fetch_count);
 	}
 }
 
