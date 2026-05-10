@@ -1,12 +1,18 @@
 /*
  * fb_smoke.c — smoke test for oriscterm's framebuffer service
- * (FRAMEBUFFER_INDEX = 7, milestone-3-α).
+ * (FRAMEBUFFER_INDEX = 7).
  *
- * Walks /sys/term/0/framebuffer to get the framebuffer cap, writes a
- * byte pattern via OSB, reads it back via OLBU, and verifies each
- * byte round-trips.  OSB / OLBU on a remote ref auto-trigger
- * OBJ_WRITE_REQ / OBJ_READ_REQ wire round-trips to oriscterm, which
- * is what this test exercises.
+ * Two flavours of round-trip:
+ *
+ *   - Per-byte OSB / OLBU on the framebuffer's remote ref —
+ *     auto-triggers OBJ_WRITE_REQ / OBJ_READ_REQ wire round-trips,
+ *     one per instruction.  Original α-stage path.
+ *
+ *   - Bulk ObjStoreBytes (#0x109) / ObjFetchBytes (#0x108) — same
+ *     wire packets but with arbitrary widths in a single RTT.
+ *     Phase 59: the WM's eventual glyph renderer needs this to
+ *     push 8×16 = 128-byte font cells in one round-trip instead
+ *     of 128.
  *
  * Boot environment (set up by test_framebuffer.sh's --service args):
  *
@@ -121,11 +127,79 @@ main(void)
 	WP_INT(b3);
 	WP(")\n");
 
-	/* Step 4: bounds check — write past end of framebuffer should
-	 * fail.  oriscterm's bounds enforcement returns RESP_BOUNDS,
-	 * which simorisc translates to a CPU-side fault.  We can't
-	 * easily catch the fault from C, so skip this check for now;
-	 * the bounds check is exercised by oriscterm's own logging. */
+	/* Step 4: ObjStoreBytes round-trip.  Build a 16-byte pattern
+	 * on the stack, push to framebuffer at offset 100, fetch back
+	 * into a separate stack buffer, verify each byte matches.
+	 *
+	 * Stack VAs run [STACK_BOTTOM, STACK_TOP) where STACK_BOTTOM
+	 * = 0x001f0000.  C local arrays land here at runtime; we
+	 * compute their offset within the boot stack object (O11) by
+	 * subtracting STACK_BOTTOM. */
+	#define STACK_BOTTOM 0x001f0000
+
+	unsigned char src_buf[16];
+	int i;
+	for (i = 0; i < 16; i++) src_buf[i] = (unsigned char)(0x80 + i);
+
+	int src_offset_i = (int)((unsigned int)(unsigned long)src_buf - STACK_BOTTOM);
+
+	/* ObjStoreBytes: O1 = stack source (boot stack ref in O11),
+	 * O2 = framebuffer remote dest, R4 = src_off, R5 = dst_off,
+	 * R6 = count.  Returns R2 = status, R3 = bytes copied. */
+	int store_status, store_count;
+	asm volatile(
+		"omov  o1, o11\n"
+		"omov  o2, o5\n"
+		"addu  r4, %2, r0\n"
+		"addiu r5, r0, 100\n"
+		"addiu r6, r0, 16\n"
+		"call  #0x109\n"            /* ObjStoreBytes */
+		"nop\n"
+		"addu  %0, r2, r0\n"
+		"addu  %1, r3, r0"
+		: "=r"(store_status), "=r"(store_count)
+		: "r"(src_offset_i)
+		: "r1", "r2", "r3", "r4", "r5", "r6"
+	);
+	restore_or_state();
+	if (store_status != 0)  { fail("ObjStoreBytes status", store_status, 0); return 4; }
+	if (store_count != 16)  { fail("ObjStoreBytes count", store_count, 16); return 4; }
+	WP("fb_smoke: ObjStoreBytes 16-byte push OK\n");
+
+	/* ObjFetchBytes: pull the same bytes back into a fresh stack
+	 * buffer, verify the pattern round-trips. */
+	unsigned char dst_buf[16];
+	for (i = 0; i < 16; i++) dst_buf[i] = 0;   /* clear */
+
+	int dst_offset_i = (int)((unsigned int)(unsigned long)dst_buf - STACK_BOTTOM);
+
+	int fetch_status, fetch_count;
+	asm volatile(
+		"omov  o1, o5\n"            /* source = framebuffer */
+		"omov  o2, o11\n"           /* dest = boot stack */
+		"addiu r4, r0, 100\n"
+		"addu  r5, %2, r0\n"
+		"addiu r6, r0, 16\n"
+		"call  #0x108\n"            /* ObjFetchBytes */
+		"nop\n"
+		"addu  %0, r2, r0\n"
+		"addu  %1, r3, r0"
+		: "=r"(fetch_status), "=r"(fetch_count)
+		: "r"(dst_offset_i)
+		: "r1", "r2", "r3", "r4", "r5", "r6"
+	);
+	restore_or_state();
+	if (fetch_status != 0) { fail("ObjFetchBytes status", fetch_status, 0); return 5; }
+	if (fetch_count != 16) { fail("ObjFetchBytes count", fetch_count, 16); return 5; }
+
+	for (i = 0; i < 16; i++) {
+		if (dst_buf[i] != (unsigned char)(0x80 + i)) {
+			fail("ObjStoreBytes round-trip byte mismatch",
+			     dst_buf[i], 0x80 + i);
+			return 5;
+		}
+	}
+	WP("fb_smoke: ObjStoreBytes round-trip OK\n");
 
 	WP("fb_smoke: PASS\n");
 	return 0;
