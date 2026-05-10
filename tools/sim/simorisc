@@ -394,6 +394,19 @@ class BlockedOnObjFetch(BlockedSignal):
         self.byte_count = byte_count
 
 
+class BlockedOnObjStore(BlockedSignal):
+    """Phase 59 (Object RISC Vol VI #0x109). Raised by
+    primitive_ObjStoreBytes when the destination ref is remote.
+    The CALL holds PC until the matching OBJ_WRITE_RESP arrives;
+    on resume R2 = ERR_OK / ERR_*, R3 = byte_count on OK or 0 on
+    fault, PC advances.  Mirror of BlockedOnObjFetch for the write
+    direction — used by the WM's glyph renderer to push bitmap-font
+    rows to a remote framebuffer in a single wire RTT."""
+    def __init__(self, trans_id: int, byte_count: int):
+        self.trans_id = trans_id
+        self.byte_count = byte_count
+
+
 # ---------------------------------------------------------------------------
 # Wire-level packet format (Volume IV §3, §4)
 # ---------------------------------------------------------------------------
@@ -1671,6 +1684,8 @@ class System:
                                                 deliver_r3=False)
         if isinstance(b, BlockedOnObjFetch):
             return self._try_unblock_obj_fetch(cpu, b)
+        if isinstance(b, BlockedOnObjStore):
+            return self._try_unblock_obj_store(cpu, b)
         return False
 
     def _try_unblock_queue(self, cpu: CPU, b: 'BlockedOnQueue') -> bool:
@@ -1786,6 +1801,43 @@ class System:
                     desc.storage[b.dst_off:b.dst_off+b.byte_count] = raw
                     cpu.set_gpr(2, ERR_OK)
                     cpu.set_gpr(3, b.byte_count)
+            cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.blocked_on = None
+            return True
+        return False
+
+    def _try_unblock_obj_store(self, cpu: CPU, b: 'BlockedOnObjStore') -> bool:
+        """Phase 59. Mirror of _try_unblock_obj_fetch for ObjStoreBytes.
+        The response is an OBJ_WRITE_RESP — no payload, just a flags
+        byte.  On RESP_OK: R2 = ERR_OK, R3 = byte_count.  On fault:
+        R2 = mapped ERR_*, R3 = 0.  Same RESP_* → ERR_* mapping
+        ObjFetchBytes uses, since the failure modes (stale ref,
+        out-of-bounds offset, missing W cap, etc.) are symmetric
+        across read and write."""
+        for i, packet in enumerate(cpu.responses):
+            try:
+                pkt = unpack_packet(packet)
+            except ValueError:
+                continue
+            if pkt['type'] != PKT_OBJ_WRITE_RESP:
+                continue
+            if pkt['trans_id'] != b.trans_id:
+                continue
+            cpu.responses.pop(i)
+            flags = pkt['flags'] & 0x3F
+            if flags != RESP_OK:
+                err_map = {
+                    RESP_STALE:     ERR_ESTALE,
+                    RESP_BOUNDS:    ERR_EINVAL,
+                    RESP_CAP:       ERR_EPERM,
+                    RESP_BUS_ERROR: ERR_EFAULT,
+                }
+                cpu.set_gpr(2, err_map.get(flags, ERR_EFAULT))
+                cpu.set_gpr(3, 0)
+            else:
+                cpu.set_gpr(2, ERR_OK)
+                cpu.set_gpr(3, b.byte_count)
             cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
             cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
             cpu.blocked_on = None
@@ -3049,6 +3101,100 @@ def primitive_ObjFetchBytes(cpu: CPU) -> None:
     raise BlockedOnObjFetch(trans_id, dst_idx, dst_off, n)
 
 
+def primitive_ObjStoreBytes(cpu: CPU) -> None:
+    """Vol VI #0x109 (Phase 59).  Mirror of ObjFetchBytes for the
+    write direction.  Copy R6 bytes from O1+R4 (must be local) to
+    O2+R5 (may be local or remote).
+
+    The WM's glyph renderer is the headline consumer: drawing one
+    8×16 bitmap-font cell to the remote framebuffer = 128 byte
+    writes; per-byte OSB on a remote ref would block the CPU on
+    128 wire RTTs.  ObjStoreBytes packs the whole 128-byte row into
+    one OBJ_WRITE_REQ → one RTT.  Symmetric counterpart of
+    ObjFetchBytes (#0x108): together they cover bulk transfers in
+    either direction as long as one side is local.
+
+    Args:
+      O1: source object ref (CAP_R required, must be local, must
+          not be objstore — we'd otherwise be reading OR-typed
+          storage as plain bytes)
+      O2: destination object ref (CAP_W required, may be local or
+          remote)
+      R4: source offset (signed 32-bit)
+      R5: destination offset (signed 32-bit)
+      R6: byte count (unsigned 32-bit)
+
+    Returns:
+      R2: status (OK / EFAULT / EREMOTE / EPERM / ESTALE / EINVAL)
+      R3: bytes actually written (R6 on success, 0 on error)
+
+    Wire behaviour: when ref_home(O2) != cpu.pid, issues a single
+    OBJ_WRITE_REQ carrying all R6 bytes and raises BlockedOnObjStore.
+    The matching OBJ_WRITE_RESP delivers the status; RESP_* fault
+    flags map to ERR_* the same way ObjFetchBytes maps OBJ_READ_RESP
+    faults."""
+    src = cpu.get_opr(1)
+    dst = cpu.get_opr(2)
+    src_off = cpu.get_gpr(4)
+    if src_off & 0x80000000: src_off -= 0x100000000
+    dst_off = cpu.get_gpr(5)
+    if dst_off & 0x80000000: dst_off -= 0x100000000
+    n = cpu.get_gpr(6) & 0xFFFFFFFF
+
+    if src == 0 or dst == 0:
+        cpu.set_gpr(2, ERR_EFAULT); cpu.set_gpr(3, 0); return
+    if (ref_caps(src) & CAP_R) == 0:
+        cpu.set_gpr(2, ERR_EPERM); cpu.set_gpr(3, 0); return
+    if (ref_caps(dst) & CAP_W) == 0:
+        cpu.set_gpr(2, ERR_EPERM); cpu.set_gpr(3, 0); return
+    if ref_home(src) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); cpu.set_gpr(3, 0); return
+
+    # Validate source locally and read the bytes.
+    src_idx = ref_index(src)
+    if src_idx <= 0 or src_idx >= len(cpu.descriptors) \
+            or cpu.descriptors[src_idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+    src_desc = cpu.descriptors[src_idx]
+    if not src_desc.live or src_desc.generation != ref_generation(src):
+        cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+    if src_desc.objstore:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+    if n == 0:
+        cpu.set_gpr(2, ERR_OK); cpu.set_gpr(3, 0); return
+    if src_off < 0 or src_off + n > src_desc.length:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+
+    data = bytes(src_desc.storage[src_off:src_off + n])
+
+    if cpu.system is None or ref_home(dst) == cpu.pid:
+        # Local destination: validate, then bytes copy.
+        dst_idx = ref_index(dst)
+        if dst_idx <= 0 or dst_idx >= len(cpu.descriptors) \
+                or cpu.descriptors[dst_idx] is None:
+            cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+        dst_desc = cpu.descriptors[dst_idx]
+        if not dst_desc.live or dst_desc.generation != ref_generation(dst):
+            cpu.set_gpr(2, ERR_ESTALE); cpu.set_gpr(3, 0); return
+        if dst_desc.objstore:
+            cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+        if dst_off < 0 or dst_off + n > dst_desc.length:
+            cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+        dst_desc.storage[dst_off:dst_off + n] = data
+        cpu.set_gpr(2, ERR_OK)
+        cpu.set_gpr(3, n)
+        return
+
+    # Remote destination: issue OBJ_WRITE_REQ with all the bytes,
+    # block. The home processes and replies with OBJ_WRITE_RESP.
+    trans_id = cpu.next_trans_id & 0xFFFF
+    cpu.next_trans_id = (cpu.next_trans_id + 1) & 0xFFFF
+    packet = build_obj_write_req(cpu.pid, ref_home(dst), trans_id,
+                                 dst, dst_off, n, data)
+    cpu.system.crossbar.send_packet(packet)
+    raise BlockedOnObjStore(trans_id, n)
+
+
 def primitive_ReceiveQueueAttach(cpu: CPU) -> None:
     """Replace handler-dispatch behaviour on a target object with a
     queue. Subsequent SENDs to the object are appended to the queue
@@ -3394,6 +3540,7 @@ PRIMITIVE_MIN_MODE = {
     0x103: MODE_USER,        # ObjDerive
     0x106: MODE_USER,        # ObjAllocStore
     0x108: MODE_USER,        # ObjFetchBytes (Phase 45e)
+    0x109: MODE_USER,        # ObjStoreBytes (Phase 59)
     0x110: MODE_SUPERVISOR,  # MapObject        — manipulates VA layout
     0x111: MODE_SUPERVISOR,  # Unmap            — manipulates VA layout
     0x200: MODE_SUPERVISOR,  # InstallHandler   — registers trap-like callback
@@ -3449,6 +3596,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjAllocStore(cpu)
     elif prim == 0x108:
         primitive_ObjFetchBytes(cpu)
+    elif prim == 0x109:
+        primitive_ObjStoreBytes(cpu)
     elif prim == 0x110:
         primitive_MapObject(cpu)
     elif prim == 0x111:
