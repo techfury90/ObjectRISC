@@ -429,6 +429,19 @@ wm_open_session(const char *title, int *out_wid)
 		wm_set_title(wid, title);
 	}
 
+	/* Restore boot O2 (stack) and O3 (data) from the task_init-parked
+	 * O11 / O15 before returning.  The wm_init / wm_new_window /
+	 * wm_bind_surface / wm_set_title round-trips have clobbered them
+	 * with SEND/poll scratch; if we left them in that state, a
+	 * caller calling term_init next would copy the garbage back into
+	 * O11 / O15 (term_init's first omovs blindly re-save from O2/O3/
+	 * O4), corrupting the boot-OR save and breaking subsequent
+	 * term_print stack-relative ObjStoreBytes.  Requires the caller
+	 * to have run task_init first — which any program that gets here
+	 * already has. */
+	asm volatile("omov o2, o11");
+	asm volatile("omov o3, o15");
+
 	if (out_wid) *out_wid = wid;
 	return 0;
 }
