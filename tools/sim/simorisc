@@ -2146,21 +2146,27 @@ VEC_PALETTE_HEX = {
 # of oriscterm's KEY_* constants — receivers (oriscwm + libc term.c)
 # already know these.  Printable characters use their plain byte
 # value (event.char); special keys map via KEYSYM_TO_CODE below.
+# Must match liborisc.h's TK_* defines so client programs (edit,
+# shell read_line, winhello, etc.) recognise them.  Pre-step-14
+# this file used a different numbering inherited from oriscterm's
+# legacy protocol; arrow keys silently dropped because TK_UP
+# (0x180) and the WM-emitted 0x126 didn't match in any edit-style
+# `if (key == TK_UP)` check.
 KEY_BACKSPACE = 0x108
 KEY_TAB       = 0x109
 KEY_RETURN    = 0x10D
 KEY_FOCUS_IN  = 0x10E
 KEY_ESCAPE    = 0x11B
-KEY_DELETE    = 0x12E
-KEY_UP        = 0x126
-KEY_DOWN      = 0x127
-KEY_LEFT      = 0x125
-KEY_RIGHT     = 0x128
-KEY_HOME      = 0x124
-KEY_END       = 0x123
-KEY_PAGE_UP   = 0x121
-KEY_PAGE_DOWN = 0x122
-KEY_F1        = 0x131
+KEY_DELETE    = 0x17F
+KEY_UP        = 0x180
+KEY_DOWN      = 0x181
+KEY_LEFT      = 0x182
+KEY_RIGHT     = 0x183
+KEY_HOME      = 0x184
+KEY_END       = 0x185
+KEY_PAGE_UP   = 0x186
+KEY_PAGE_DOWN = 0x187
+KEY_F1        = 0x190
 
 # Pointer event types (kind=1).  Mirror of oriscterm's PTR_*.
 PTR_MOTION = 0x00

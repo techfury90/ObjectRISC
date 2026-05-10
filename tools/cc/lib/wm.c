@@ -109,8 +109,10 @@
  * the title bytes inside the caller's stack ref O11. */
 #define STACK_BOTTOM              0x001f0000U
 
-/* wm_set_title hard cap.  Must match oriscwm.c's MAX_TITLE_LEN. */
-#define WM_MAX_TITLE_LEN          158
+/* wm_set_title hard cap.  Must match oriscwm.c's MAX_TITLE_LEN
+ * (= N_COLS — the title can fill the whole bar with no horizontal
+ * padding).  Phase 60 step 14 dropped N_COLS to 80. */
+#define WM_MAX_TITLE_LEN          80
 
 /* OISN-style probe of WM_SLOT.  Returns 1 if null. */
 static int

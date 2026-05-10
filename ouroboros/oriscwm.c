@@ -128,10 +128,10 @@
  * are defined alongside the cell-grid constants further down.  We
  * forward-declare them as numeric literals here; if those change, so
  * must these. */
-#define DEFAULT_W_CELLS  158
-#define DEFAULT_H_CELLS  45    /* matches N_ROWS post-Phase-60-step-8 */
-#define DEFAULT_W_PX     (DEFAULT_W_CELLS * 8)   /* 1264 */
-#define DEFAULT_H_PX     (DEFAULT_H_CELLS * 16)  /* 720  */
+#define DEFAULT_W_CELLS  80
+#define DEFAULT_H_CELLS  24    /* matches N_ROWS post-Phase-60-step-14 */
+#define DEFAULT_W_PX     (DEFAULT_W_CELLS * 8)   /* 640 */
+#define DEFAULT_H_PX     (DEFAULT_H_CELLS * 16)  /* 384 */
 
 /* ObjAlloc tags / cap bits. */
 #define TAG_SERVICE 0x4103
@@ -328,18 +328,23 @@
 #define TITLE_BAR_CELLS 1
 #define TITLE_BAR_PX    (CELL_H * TITLE_BAR_CELLS)   /* 16 */
 
-#define N_COLS          158
-#define N_ROWS          45     /* was 46; one cell row went to title bar */
-#define FB_CELLS_W      (N_COLS + 2 * BORDER_CELLS)
-#define FB_CELLS_H      (N_ROWS + 2 * BORDER_CELLS + TITLE_BAR_CELLS)
-#define FB_W            (CELL_W * FB_CELLS_W)   /* 1280 */
-#define FB_H            (CELL_H * FB_CELLS_H)   /* 768  */
+/* Phase 60 step 14 — windows are no longer fullscreen.  The SCREEN
+ * stays 1280 × 768 (host display surface); each window is a smaller
+ * 80 × 24 cell grid plus title bar — the classic mid-80s terminal
+ * size, with room for cascade.  Slack = (FB - window - 2*chrome)
+ * = (1280 - 640 - 16) = 624 px horizontal, (768 - 400 - 32) = 336
+ * px vertical, plenty of room to spread multiple windows. */
+#define FB_W            1280
+#define FB_H            768
 #define CELL_ORIGIN_X   (CELL_W * BORDER_CELLS)  /* 8  */
 #define CELL_ORIGIN_Y   (CELL_H * BORDER_CELLS)  /* 16 */
-#define USABLE_W_PX     (CELL_W * N_COLS)        /* 1264 */
+
+#define N_COLS          80     /* per-window cell columns */
+#define N_ROWS          24     /* per-window cell rows (content area) */
+#define USABLE_W_PX     (CELL_W * N_COLS)                 /* 640 */
 /* Window FB height covers title bar + cell content. */
-#define USABLE_H_PX     (TITLE_BAR_PX + CELL_H * N_ROWS)   /* 736 */
-#define CELL_CONTENT_PX (CELL_H * N_ROWS)                  /* 720 */
+#define USABLE_H_PX     (TITLE_BAR_PX + CELL_H * N_ROWS)  /* 400 */
+#define CELL_CONTENT_PX (CELL_H * N_ROWS)                 /* 384 */
 
 /* Palette indices (matching VEC_PALETTE in tools/devices/oriscterm). */
 #define WM_BG_COLOR  0    /* dark navy background */
@@ -927,13 +932,19 @@ do_blit_copy_active_to_screen(int packed_src_xy, int packed_dst_xy,
 	);
 }
 
+/* Forward decl — fill_rect_packed lives further down (alongside the
+ * paint_window_chrome helpers) but recompose_after_destroy needs it
+ * to clear the destroyed-window screen rect to bg before
+ * compositing the remaining z-stack. */
+static void fill_rect_packed(int packed_xy, int packed_wh, int color);
+
+/* Composite an arbitrary screen rect by walking z-order bottom-to-
+ * top: each window's intersection with the rect is blitted from its
+ * FB.  Used by composite_window_region (for paint-after-write) and
+ * recompose_after_destroy (for vacated-pixel cleanup). */
 static void
-composite_window_region(int wx, int wy, int w, int h)
+composite_screen_rect(int sx, int sy, int w, int h)
 {
-	int wid = active_wid;
-	if (wid < 1 || wid > MAX_WINDOWS) return;
-	int sx  = window_pos_x[wid - 1] + wx;
-	int sy  = window_pos_y[wid - 1] + wy;
 	int sxe = sx + w;
 	int sye = sy + h;
 	int z;
@@ -960,6 +971,32 @@ composite_window_region(int wx, int wy, int w, int h)
 		int packed_wh  = ((rw & 0xFFFF) << 16) | (rh & 0xFFFF);
 		do_blit_copy_active_to_screen(packed_src, packed_dst, packed_wh);
 	}
+}
+
+static void
+composite_window_region(int wx, int wy, int w, int h)
+{
+	int wid = active_wid;
+	if (wid < 1 || wid > MAX_WINDOWS) return;
+	int sx = window_pos_x[wid - 1] + wx;
+	int sy = window_pos_y[wid - 1] + wy;
+	composite_screen_rect(sx, sy, w, h);
+}
+
+/* Phase 60 step 14 — vacated-pixel cleanup after a window is
+ * destroyed.  Fills the destroyed window's screen rect with bg
+ * (clears its content), then composites the rect from the
+ * remaining z-stack so any windows beneath show through their
+ * intersections.  Without this, closing a window leaves its
+ * content painted on the screen until something else happens
+ * to paint over those pixels. */
+static void
+recompose_after_destroy(int sx, int sy, int w, int h)
+{
+	int packed_xy = ((sx & 0xFFFF) << 16) | (sy & 0xFFFF);
+	int packed_wh = ((w  & 0xFFFF) << 16) | (h  & 0xFFFF);
+	fill_rect_packed(packed_xy, packed_wh, WM_BG_COLOR);
+	composite_screen_rect(sx, sy, w, h);
 }
 
 /* Composite the entire window backing store onto the screen FB.
@@ -2316,6 +2353,8 @@ handle_destroy_window(int wid)
 		wm_reply(E_NOENT, 0, 0, 0);
 		return;
 	}
+	int sx = window_pos_x[wid - 1];
+	int sy = window_pos_y[wid - 1];
 	free_window_console(wid);
 	free_window_grid(wid);
 	free_window_vector(wid);
@@ -2326,10 +2365,8 @@ handle_destroy_window(int wid)
 	window_subscribe_op[wid - 1] = 0;
 	/* Owner-ref stash is left in place; future allocations will
 	 * overwrite it.  No SEND fires for the close — the WM doesn't
-	 * push events to subscribers yet.
-	 * TODO: re-composite the screen so vacated pixels don't linger
-	 * (currently the destroyed window's content stays painted on
-	 * screen until something else paints over it). */
+	 * push events to subscribers yet. */
+	recompose_after_destroy(sx, sy, USABLE_W_PX, USABLE_H_PX);
 	wm_reply(0, 0, 0, 0);
 }
 
@@ -2560,6 +2597,8 @@ scan_owner_exits(void)
 		/* low 8 bits = state per Vol VI §4.2's packed return. */
 		int state = state_word & 0xFF;
 		if (state == TASK_STATE_EXITED) {
+			int sx = window_pos_x[wid - 1];
+			int sy = window_pos_y[wid - 1];
 			free_window_console(wid);
 			free_window_grid(wid);
 			free_window_vector(wid);
@@ -2568,6 +2607,8 @@ scan_owner_exits(void)
 			window_z_remove(wid);
 			window_type[wid - 1] = 0;
 			window_subscribe_op[wid - 1] = 0;
+			recompose_after_destroy(sx, sy,
+			                        USABLE_W_PX, USABLE_H_PX);
 			/* The owner-ref slot stays populated; it'll get
 			 * overwritten by the next allocation in this slot.
 			 * No SEND fires for the close — the WM doesn't push
