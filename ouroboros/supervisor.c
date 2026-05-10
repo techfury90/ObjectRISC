@@ -750,15 +750,80 @@ wm_leader_grid_isn(void)
  * boot O5/O6/O7 are wired to ITS terminal, which is the wrong one
  * — but it's better than null for programs that never use the
  * service in question (e.g., a CPU-bound background task). */
+/* Phase 59 / WM γ.14 — lazy worker-side acquisition of the leader's
+ * WM-mediated CONSOLE / GRID sub-caps.  The leader publishes them at
+ * /sys/wm/leader-console and /sys/wm/leader-grid after a successful
+ * wm_bind_surface; workers (which can't wm_new_window themselves —
+ * the WM caps CONSOLE at N=1) walk those paths the first time they
+ * actually need to wire a child.  By the time populate_child_term_-
+ * slots fires (a real spawn — login, a shell command, anything),
+ * the leader has long since published, so a single walk almost
+ * always wins.
+ *
+ * Idempotent: if a slot is already non-null (leader's case, or a
+ * previous walk succeeded), the corresponding branch fast-returns.
+ * On dir_walk failure (no WM in this system, or an unfortunate boot
+ * race), the slot stays null and the existing direct-terminal
+ * fallback in populate_child_term_slots takes over.  No-cost in the
+ * already-acquired path; one dir_walk RTT in the cold path. */
+static void
+maybe_acquire_leader_wm_caps(void)
+{
+	int kind;
+	char rem[16];
+	if (wm_leader_console_isn() != 0) {
+		int rc = dir_walk("/sys/wm/leader-console",
+		                  &kind, rem, sizeof(rem));
+		if (rc == 0 && kind == DIR_KIND_LEAF) {
+			asm volatile(
+				"orefld o1, %0(o12)\n"
+				"orefst o1, %1(o12)"
+				:
+				: "i"(DIR_RESULT_SLOT_OFFSET),
+				  "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
+				: "r1"
+			);
+		}
+	}
+	if (wm_leader_grid_isn() != 0) {
+		int rc = dir_walk("/sys/wm/leader-grid",
+		                  &kind, rem, sizeof(rem));
+		if (rc == 0 && kind == DIR_KIND_LEAF) {
+			asm volatile(
+				"orefld o1, %0(o12)\n"
+				"orefst o1, %1(o12)"
+				:
+				: "i"(DIR_RESULT_SLOT_OFFSET),
+				  "i"(WM_LEADER_GRID_SLOT_OFFSET)
+				: "r1"
+			);
+		}
+	}
+}
+
 static void
 populate_child_term_slots(int term_idx)
 {
 	char path[PEER_PATH_BUF_SIZE];
 
+	/* Fast no-op on the leader (slots already populated by its own
+	 * wm_bind_surface) or on any system without a WM.  One-shot
+	 * dir_walk on workers' first spawn after the leader publishes. */
+	maybe_acquire_leader_wm_caps();
+
 	int wired_console = 0;
-	if (term_idx == task_my_terminal_idx()
+	/* Phase 59 / WM γ.14 — gate the WM-mediation branch on the
+	 * WM's terminal (=0, the one oriscwm walks), NOT on
+	 * task_my_terminal_idx().  On workers (where my_terminal_idx ==
+	 * procid), the latter would only fire for spawns targeting the
+	 * worker's own terminal — but our acquired WM_LEADER_*_SLOT
+	 * always points at the leader's terminal-0 window, regardless
+	 * of which CPU is running.  Hard-coded 0 because oriscwm only
+	 * walks /sys/term/0/* at boot; multi-WM (one per terminal) is
+	 * future work. */
+	if (term_idx == 0
 	    && wm_leader_console_isn() == 0) {
-		/* WM-mediated CONSOLE for the leader's own terminal. */
+		/* WM-mediated CONSOLE for the WM's terminal. */
 		asm volatile(
 			"orefld o14, %0(o12)\n"
 			"orefst o14, %1(o12)"
@@ -792,11 +857,12 @@ populate_child_term_slots(int term_idx)
 		);
 	}
 	int wired_grid = 0;
-	if (term_idx == task_my_terminal_idx()
+	if (term_idx == 0
 	    && wm_leader_grid_isn() == 0) {
-		/* WM-mediated GRID for the leader's own terminal —
-		 * positioned text rasterises into the framebuffer
-		 * through the WM, just like console output. */
+		/* WM-mediated GRID for the WM's terminal — positioned
+		 * text rasterises into the framebuffer through the WM,
+		 * just like console output.  Same `term_idx == 0` gate
+		 * as the CONSOLE branch above (see γ.14 note). */
 		asm volatile(
 			"orefld o14, %0(o12)\n"
 			"orefst o14, %1(o12)"
@@ -1823,6 +1889,24 @@ main(void)
 						: "i"(DIR_RESULT_SLOT_OFFSET),
 						  "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
 					);
+					/* Phase 59 / WM γ.14 — also publish the
+					 * cap so worker supervisors (which can't
+					 * wm_new_window themselves; the WM caps
+					 * CONSOLE at N=1) walk it at boot and
+					 * populate their own WM_LEADER_CONSOLE_SLOT.
+					 * That makes their populate_child_term_slots
+					 * wire ORX_SLOT_CHILD_O5 through the WM
+					 * just like the leader's does. */
+					asm volatile("orefld o1, %0(o12)"
+					             :: "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
+					             : "r1");
+					int reg_rc = dir_register("/sys/wm/leader-console");
+					if (reg_rc != 0) {
+						SUP_PRINT("supervisor: dir_register "
+						          "/sys/wm/leader-console failed: ");
+						SUP_PRINT_INT(reg_rc);
+						SUP_PRINT("\n");
+					}
 				}
 				if (wm_bind_surface(wid, WSURF_KEYBOARD) == 0) {
 					asm volatile("orefld o6, %0(o12)"
@@ -1839,6 +1923,18 @@ main(void)
 						: "i"(DIR_RESULT_SLOT_OFFSET),
 						  "i"(WM_LEADER_GRID_SLOT_OFFSET)
 					);
+					/* γ.14 — publish the GRID cap for workers,
+					 * same shape as CONSOLE above. */
+					asm volatile("orefld o1, %0(o12)"
+					             :: "i"(WM_LEADER_GRID_SLOT_OFFSET)
+					             : "r1");
+					int reg_rc = dir_register("/sys/wm/leader-grid");
+					if (reg_rc != 0) {
+						SUP_PRINT("supervisor: dir_register "
+						          "/sys/wm/leader-grid failed: ");
+						SUP_PRINT_INT(reg_rc);
+						SUP_PRINT("\n");
+					}
 				}
 				SUP_PRINT("supervisor: WM-mediated leader "
 				          "session (wid=");
@@ -1858,6 +1954,16 @@ main(void)
 			SUP_PRINT(" — using direct terminal\n");
 		}
 	}
+	/* Workers don't try a boot-time dir_walk for the leader's
+	 * published WM caps — the leader is still mid-bind at this
+	 * point (its own wm_init retries + multiple SEND-and-poll
+	 * round-trips), so any boot-time retry budget short enough to
+	 * not stall the worker is also too short to consistently win
+	 * the race.  Instead, populate_child_term_slots does a
+	 * one-shot lazy dir_walk the first time it sees a null
+	 * WM_LEADER_*_SLOT — by the time a spawn actually happens
+	 * (login → shell, or any user command), the leader has long
+	 * since published.  See worker_try_acquire_wm_caps below. */
 
 	hf_init();
 	orx_init();

@@ -687,19 +687,16 @@ cmd_run(const char *cwd, const char *arg)
  * and resolves relative paths against cwd just like the cmd_run
  * path does.
  *
- * Phase 59 / WM γ.9: pin to the local CPU instead of round-robin
- * (default sup_spawn behaviour).  Edit renders into the grid
- * surface, and only the LEADER's supervisor has WM mediation
- * wired — a worker that received a relayed spawn would
- * populate_child_term_slots from the direct /sys/term/0/grid
- * walk, sending edit's output through oriscterm's Tk-overlay
- * grid handler instead of the WM's framebuffer rasteriser.
- * Same logic login uses to pin the shell. */
+ * Phase 59 / WM γ.14: round-robin spawn is fine again — workers
+ * now lazy-acquire the leader's published WM-mediated GRID cap on
+ * first spawn (see populate_child_term_slots in supervisor.c), so
+ * edit on a worker rasterises through the framebuffer just like
+ * on the leader.  Was pinned to SUP_TARGET_LOCAL in γ.9 because
+ * worker WM mediation didn't exist yet. */
 static void
 cmd_edit(const char *cwd, const char *arg)
 {
-	task_t t = sup_spawn_at(SUP_TARGET_LOCAL,
-	                        "/programs/edit.orx", arg, cwd);
+	task_t t = sup_spawn("/programs/edit.orx", arg, cwd);
 	if (t < 0) {
 		term_print("spawn failed: ");
 		term_print_int(t);

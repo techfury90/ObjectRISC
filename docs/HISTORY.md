@@ -6199,6 +6199,76 @@ its windows, and oriscterm's Tk overlay items are dead code
 ready to retire as soon as workers can also bind WM surfaces (or
 spawn-relay propagates the leader's caps).
 
+### γ.14 — Workers pick up WM-mediated CONSOLE + GRID
+
+The bitmapped-overlays migration left a hole: only the leader CPU's
+supervisor wired ORX_SLOT_CHILD_O5 / O7 to WM-mediated caps for
+spawned children.  Workers — non-leader supervisors hosting
+round-robin'd spawns and `run @N` relays — couldn't `wm_new_window()`
+of their own because the WM caps CONSOLE at N=1.  Children spawned
+onto a worker therefore fell back to `/sys/term/<idx>/{console,grid}`
+walks; their output bypassed the WM and rendered through oriscterm's
+legacy Tk overlays instead of the WM's framebuffer rasteriser.  This
+was the open blocker for retiring the overlays.
+
+Fix in three pieces:
+
+**Leader publishes.**  Right after each successful
+`wm_bind_surface(CONSOLE)` / `wm_bind_surface(GRID)`, the leader
+also `dir_register`s the resulting sub-cap at well-known paths:
+`/sys/wm/leader-console`, `/sys/wm/leader-grid`.  Flat under
+`/sys/wm/` (rather than nested, e.g. `/sys/wm/0/leader/...`) to
+avoid intermediate-directory creation logic in oriscdir.
+
+**Workers acquire lazily.**  First instinct was a boot-time retry
+loop on workers, but the leader is still mid-bind at that point
+(its own `wm_init` retries + multiple SEND-and-poll round-trips),
+so any retry budget short enough not to stall the worker is also
+too short to consistently win the race.  Switched to lazy
+on-first-need acquisition:
+`populate_child_term_slots` calls `maybe_acquire_leader_wm_caps`,
+which `dir_walk`s each path *only when its slot is null*.
+Idempotent — leader's own pre-populated slots fast-return; once a
+worker walk succeeds, subsequent calls also fast-return.  By the
+time any spawn actually happens (login → shell, then any user
+command), the leader has long since published, so a single walk
+almost always wins.  No-WM systems get NOT_FOUND every walk and
+fall through to the existing direct-terminal fallback.
+
+**Gate on the WM's terminal, not ours.**  The original
+`populate_child_term_slots` checked
+`term_idx == task_my_terminal_idx()` — fine on the leader (its
+own `my_terminal_idx == 0`, so the check passed for every
+`term_idx == 0` spawn).  But on a worker, `my_terminal_idx ==
+procid` (set by `task_set_my_terminal_idx(procid)` early in
+supervisor `main`), so the check only fired for spawns targeting
+the worker's *own* terminal — even though the worker's acquired
+WM cap is for the leader's terminal-0 window.  Fix: gate on
+`term_idx == 0` (the WM's terminal — oriscwm only walks
+`/sys/term/0/*` at boot).  Multi-WM (one per terminal) is future
+work and would need a per-terminal gate; for the current
+single-WM model, hard-coding 0 is correct.
+
+`cmd_edit`'s `SUP_TARGET_LOCAL` pin from γ.9 (the band-aid that
+let edit work on the leader at the cost of losing round-robin) is
+now unnecessary and reverts to plain `sup_spawn`.  Edit
+round-robins to any CPU; output rasterises through the WM either
+way.
+
+Vector / raster / pointer don't need this propagation: their
+client-side APIs already require an explicit
+`wm_bind_surface(WSURF_*)` per process, so a worker child that
+wants line-drawing or pixel blits or pointer subscriptions issues
+its own WM call after `wm_init` (which works on workers — they
+walk `/sys/wm/0` like any other client).  The N=1 console limit
+only blocks the *boot-OPR* surfaces (CONSOLE in O5, GRID in O7).
+
+This concludes the migration of all visible rendering paths through
+the WM on every CPU.  oriscterm's Tk overlay code is now reachable
+only via direct `/sys/term/<idx>/{console,grid,vector,raster}`
+walks from clients with no WM in their world — the smoke-only
+fallback path.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
