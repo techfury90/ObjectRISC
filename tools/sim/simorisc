@@ -109,6 +109,7 @@ TAG_STACK       = 0x4101
 TAG_DATA        = 0x4102
 TAG_SERVICE     = 0x4103
 TAG_FRAMEBUFFER = 0x4104   # Phase 60 — host-display-backed pixel object
+TAG_INPUT_SINK  = 0x4105   # Phase 60 step 3 — host-input-event sink
 TAG_TASK    = 0x4104   # task object (Volume VI Section 4)
 
 # Task lifecycle states (Volume VI Section 4.2). Internal numbering;
@@ -209,6 +210,10 @@ class Descriptor:
     fb_width:  int = 0
     fb_height: int = 0
     fb_dirty:  bool = False
+    # Phase 60 step 3 — host-input-event sink.  Set on TAG_INPUT_SINK
+    # objects allocated via primitive_ObjAllocInputSink.
+    # input_kind: 0 = keyboard, 1 = pointer.
+    input_kind: int = -1
 
 
 def make_ref(generation: int, home: int, index: int, caps: int) -> int:
@@ -2137,6 +2142,48 @@ VEC_PALETTE_HEX = {
     8: "#ffffff",
 }
 
+# Key codepoints sent to TAG_INPUT_SINK (kind=0) subscribers.  Mirror
+# of oriscterm's KEY_* constants — receivers (oriscwm + libc term.c)
+# already know these.  Printable characters use their plain byte
+# value (event.char); special keys map via KEYSYM_TO_CODE below.
+KEY_BACKSPACE = 0x108
+KEY_TAB       = 0x109
+KEY_RETURN    = 0x10D
+KEY_FOCUS_IN  = 0x10E
+KEY_ESCAPE    = 0x11B
+KEY_DELETE    = 0x12E
+KEY_UP        = 0x126
+KEY_DOWN      = 0x127
+KEY_LEFT      = 0x125
+KEY_RIGHT     = 0x128
+KEY_HOME      = 0x124
+KEY_END       = 0x123
+KEY_PAGE_UP   = 0x121
+KEY_PAGE_DOWN = 0x122
+KEY_F1        = 0x131
+
+# Pointer event types (kind=1).  Mirror of oriscterm's PTR_*.
+PTR_MOTION = 0x00
+PTR_DOWN   = 0x01
+PTR_UP     = 0x02
+
+KEYSYM_TO_CODE = {
+    "BackSpace": KEY_BACKSPACE,
+    "Tab":       KEY_TAB,
+    "Return":    KEY_RETURN,
+    "Escape":    KEY_ESCAPE,
+    "Delete":    KEY_DELETE,
+    "Up":        KEY_UP,
+    "Down":      KEY_DOWN,
+    "Left":      KEY_LEFT,
+    "Right":     KEY_RIGHT,
+    "Home":      KEY_HOME,
+    "End":       KEY_END,
+    "Prior":     KEY_PAGE_UP,
+    "Next":      KEY_PAGE_DOWN,
+    **{f"F{i}": KEY_F1 + (i - 1) for i in range(1, 13)},
+}
+
 
 def _build_palette_lut():
     """Per-index 3-byte RGB lookup, used by the b\"\".join repaint loop.
@@ -2205,7 +2252,8 @@ class TkDisplayWorker:
 
     def register_framebuffer(self, cpu, idx, desc):
         # Fast path: just record.  tick() does the heavy Tk init.
-        self._pending.append((cpu.pid, idx, desc))
+        # cpu reference goes along for input event lookup later.
+        self._pending.append((cpu, idx, desc))
 
     def _drain_pending(self):
         if not self._pending:
@@ -2215,25 +2263,113 @@ class TkDisplayWorker:
             self._pending.clear()  # Tk unavailable; drop without retry
             return
         while self._pending:
-            cpu_pid, idx, desc = self._pending.pop(0)
+            cpu, idx, desc = self._pending.pop(0)
             if idx in self._tracked:
                 continue
             win = self._tk.Toplevel(self._root)
-            win.title(f"{self.title_prefix} pid={cpu_pid} fb#{idx}")
+            win.title(f"{self.title_prefix} pid={cpu.pid} fb#{idx}")
             img = self._tk.PhotoImage(width=desc.fb_width,
                                       height=desc.fb_height)
+            # Phase 60 step 3 — Canvas takes focus so <Key> events
+            # actually route to its handler.  Toplevel <Key> bindings
+            # don't fire (Toplevel isn't a focus-capturing widget);
+            # the Canvas is, so bind there.  takefocus=1 +
+            # focus_set on creation + click-to-focus binding so
+            # users get input when they click the window.
             canvas = self._tk.Canvas(win,
                                      width=desc.fb_width,
                                      height=desc.fb_height,
                                      borderwidth=0,
-                                     highlightthickness=0)
+                                     highlightthickness=0,
+                                     takefocus=1)
             canvas.pack(fill="both", expand=True)
             canvas.create_image(0, 0, image=img, anchor="nw")
+            canvas.bind("<Key>", lambda ev, c=cpu: self._on_key(c, ev))
+            canvas.bind("<Motion>",
+                        lambda ev, c=cpu: self._on_pointer(c, ev,
+                                                           PTR_MOTION, 0))
+            canvas.bind("<ButtonPress>",
+                        lambda ev, c=cpu, cv=canvas: (
+                            cv.focus_set(),
+                            self._on_pointer(c, ev, PTR_DOWN, ev.num),
+                        ))
+            canvas.bind("<ButtonRelease>",
+                        lambda ev, c=cpu: self._on_pointer(c, ev,
+                                                           PTR_UP,
+                                                           ev.num))
+            canvas.focus_set()
             self._tracked[idx] = {
                 "win": win, "image": img,
                 "width": desc.fb_width, "height": desc.fb_height,
-                "desc": desc,
+                "desc": desc, "cpu": cpu,
             }
+
+    @staticmethod
+    def _key_codepoint(event):
+        """Tk event → a portable codepoint matching oriscterm's
+        protocol.  Returns None for keys we don't translate
+        (pure modifier presses, dead keys, etc.). """
+        sym = event.keysym
+        if sym in KEYSYM_TO_CODE:
+            return KEYSYM_TO_CODE[sym]
+        ch = event.char
+        if not ch:
+            return None
+        b = ord(ch)
+        if b == 0:
+            return None
+        return b
+
+    def _enqueue_sink(self, cpu, kind, int_payload):
+        """Construct a SEND_DELIVER packet and append it to the
+        registered TAG_INPUT_SINK queue for this kind, if any.
+        No-op if no sink is registered or its queue is full."""
+        sinks = getattr(cpu, "input_sinks", None)
+        if sinks is None:
+            return
+        idx = sinks.get(kind)
+        if idx is None:
+            return
+        if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+            return
+        desc = cpu.descriptors[idx]
+        if not desc.live or desc.queue is None:
+            return
+        if len(desc.queue) >= desc.queue_max_depth:
+            return  # silent drop; queue full
+        recipient_ref = make_ref(generation=desc.generation,
+                                 home=cpu.pid, index=idx,
+                                 caps=desc.max_caps)
+        pkt = build_send_deliver(
+            src_pid=cpu.pid, dst_pid=cpu.pid, trans_id=0,
+            recipient_ref=recipient_ref,
+            int_payload=int_payload,
+            or_payload=[recipient_ref, 0, 0, 0],
+        )
+        desc.queue.append(pkt)
+
+    def _on_key(self, cpu, event):
+        code = self._key_codepoint(event)
+        if code is None:
+            return
+        # mods bits: 1=Shift, 2=Ctrl, 4=Alt — same as oriscterm.
+        st = event.state
+        mods = ((1 if (st & 0x01) else 0)
+                | (2 if (st & 0x04) else 0)
+                | (4 if (st & 0x08) else 0))
+        self._enqueue_sink(cpu, 0, [code, mods, 0, 0])
+
+    def _on_pointer(self, cpu, event, evt_type, button):
+        x = max(0, min(0xFFFF, int(event.x)))
+        y = max(0, min(0xFFFF, int(event.y)))
+        packed_xy = ((x & 0xFFFF) << 16) | (y & 0xFFFF)
+        # button-state mask uses bit (1 << button); event.state
+        # carries Tk's mouse-button bits at 0x100 (Btn1) etc.,
+        # but we just synthesize from the current down/up event
+        # for v1 — matches oriscterm's coarse behaviour.
+        btn_state = (1 << button) if evt_type != PTR_UP else 0
+        self._enqueue_sink(cpu, 1,
+                           [evt_type, packed_xy, button, btn_state])
 
     def _repaint(self, info):
         desc = info["desc"]
@@ -3140,6 +3276,54 @@ def primitive_ObjAllocFramebuffer(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
 
 
+def primitive_ObjAllocInputSink(cpu: CPU) -> None:
+    """Phase 60 step 3 — allocate a TAG_INPUT_SINK object that
+    receives synthetic SEND_DELIVER events from simorisc's host
+    display worker.  When --display tk is on and a Toplevel
+    framebuffer window has focus, Tk key / pointer events are
+    translated and enqueued into the matching sink (one per kind
+    per CPU).  The receiver (oriscwm) polls via the standard
+    ReceiveQueuePoll path — same shape as receiving events from
+    a remote oriscterm, just constructed in-process.
+
+    This is the firmware piece of the "terminal-firmware" step:
+    the simorisc instance hosting the WM also owns its display +
+    input, eliminating the wire round-trip to a separate oriscterm
+    process.
+
+    Inputs:
+      R4 = kind (0 = keyboard, 1 = pointer)
+      R5 = caps mask (typically R|W|S for the WM's own use)
+
+    Outputs:
+      R2 = status (ERR_OK / ERR_EINVAL / ERR_ENOMEM)
+      O1 = ref to the new sink object on success, null on failure
+
+    The sink object has a queue auto-attached at depth 64; the
+    caller does NOT need to ReceiveQueueAttach.  Subsequent
+    ObjAllocInputSink calls for the same kind on the same CPU
+    REPLACE the registered sink (the previous one stays alive and
+    polleable but new events route to the new one). """
+    kind = cpu.get_gpr(4) & 0xFF
+    init_caps = cpu.get_gpr(5) & 0xFF
+    if kind not in (0, 1):
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_opr(1, 0); return
+    try:
+        ref = cpu.alloc_object(0, type_tag=TAG_INPUT_SINK,
+                               max_caps=init_caps)
+    except Exception:
+        cpu.set_gpr(2, ERR_ENOMEM); cpu.set_opr(1, 0); return
+    idx = ref_index(ref)
+    desc = cpu.descriptors[idx]
+    desc.queue = []
+    desc.queue_max_depth = 64
+    desc.input_kind = kind
+    if not hasattr(cpu, "input_sinks"):
+        cpu.input_sinks = {0: None, 1: None}
+    cpu.input_sinks[kind] = idx
+    cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
+
+
 def primitive_ObjAllocStore(cpu: CPU) -> None:
     """Like ObjAlloc but the new object's storage is OR-typed: OREFLD/
     OREFST may access it; integer OL/OS trap. Length must be a multiple
@@ -3775,6 +3959,7 @@ PRIMITIVE_MIN_MODE = {
     0x100: MODE_USER,        # ObjAlloc
     0x101: MODE_USER,        # ObjFree
     0x102: MODE_USER,        # ObjAllocFramebuffer (Phase 60)
+    0x10B: MODE_USER,        # ObjAllocInputSink (Phase 60 step 3)
     0x107: MODE_USER,        # ObjFreeDeferred — drain-window wrapper
     0x103: MODE_USER,        # ObjDerive
     0x106: MODE_USER,        # ObjAllocStore
@@ -3829,6 +4014,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjFree(cpu)
     elif prim == 0x102:
         primitive_ObjAllocFramebuffer(cpu)
+    elif prim == 0x10B:
+        primitive_ObjAllocInputSink(cpu)
     elif prim == 0x107:
         primitive_ObjFreeDeferred(cpu)
     elif prim == 0x103:

@@ -217,7 +217,7 @@
  * + 32 WM_POINTER_INTERNAL = 1152.  The libc oversizes
  * ORX_STATE_BYTES so the WM's task-table objstore covers all of its
  * slot map; non-WM programs leave the tail dead. */
-#define ORX_STATE_BYTES   1152
+#define ORX_STATE_BYTES   1184
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8
