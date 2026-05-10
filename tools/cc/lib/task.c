@@ -211,12 +211,27 @@
  *          single subscriber ref, internal events-mailbox ref, and
  *          the ref to /sys/term/0/pointer the WM walks at boot.
  *          Other programs leave these dead.  Phase 59 / WM γ.13.)
+ *     + 24 (WM_KEYBOARD_INTERNAL: WM-only — three 8-byte slots for
+ *          the keyboard-mediation broker: TAG_SERVICE clients SEND to,
+ *          current subscriber's reply ref, and TAG_INPUT_SINK kind=0
+ *          (Tk-fed by the host display worker).  Phase 60 step 3
+ *          replaced the legacy oriscterm-walked keyboard ref with
+ *          this in-process sink.)
+ *     + 8 (WM_WINDOW_FB_SLOT: WM-only — single offscreen
+ *          TAG_FRAMEBUFFER backing the active CONSOLE window.  The
+ *          WM renders text + scrolls into here, then ObjBlitCopy-
+ *          composites onto the screen FB (WM_SURF_FRAMEBUFFER).
+ *          Single slot for v1 since handle_new_window enforces N=1
+ *          CONSOLE; when multi-window lands this becomes a 16-entry
+ *          per-wid array (128 bytes) and ORX_STATE_BYTES bumps.
+ *          Phase 60 step 7.)
  *
- * Total: 720 standard region + 128 WM_GRID_BASE + 128 WM_VECTOR_BASE
- * + 8 WM_RASTER_CAP_SLOT + 128 WM_RASTER_BASE + 8 WM_POINTER_CAP_SLOT
- * + 32 WM_POINTER_INTERNAL = 1152.  The libc oversizes
- * ORX_STATE_BYTES so the WM's task-table objstore covers all of its
- * slot map; non-WM programs leave the tail dead. */
+ * Total: 720 standard + 128 WM_GRID_BASE + 128 WM_VECTOR_BASE +
+ * 8 WM_RASTER_CAP_SLOT + 128 WM_RASTER_BASE + 8 WM_POINTER_CAP_SLOT
+ * + 32 WM_POINTER_INTERNAL + 24 WM_KEYBOARD_INTERNAL + 8
+ * WM_WINDOW_FB_SLOT = 1184.  The libc oversizes ORX_STATE_BYTES so
+ * the WM's task-table objstore covers all of its slot map; non-WM
+ * programs leave the tail dead. */
 #define ORX_STATE_BYTES   1184
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
