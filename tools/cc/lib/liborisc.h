@@ -204,6 +204,45 @@ int  vec_oval_outline(int x, int y, int w, int h);
 int  vec_clear(void);
 int  vec_set_color(int palette_idx);
 
+/* ---- raster.c — WM-mediated raster blit (Phase 59 / WM γ.12) ----
+ *
+ * Blit a w×h palette-indexed pixel buffer into the framebuffer at
+ * (x, y).  Pixels are 1 byte each, row-major, packed (w bytes per
+ * row, no padding).  The WM ObjFetchBytes one row at a time from
+ * the caller's source ref into a WM-side scratch buffer, then
+ * ObjStoreBytes the row into the framebuffer.  2 wire RTTs per
+ * row — for h rows total = 2h RTTs.
+ *
+ * Boot prerequisites mirror vec.c: task_init, wm_init,
+ * wm_new_window, wm_bind_surface(WSURF_RASTER), then
+ * raster_init_from_dir_result() to seed WM_RASTER_CAP_SLOT.
+ *
+ * Wire SEND payload:
+ *   O1 = raster cap (read from WM_RASTER_CAP_SLOT)
+ *   O2 = source pixel buffer ref (caller chooses; raster_blit picks
+ *        boot-stack vs boot-data based on the buffer's VA)
+ *   R4 = RST_OP_*
+ *   R5 = (x << 16) | y
+ *   R6 = (w << 16) | h
+ *   R7 = byte offset within source where pixel data starts
+ *
+ * Returns 0 on success, -1 if WM_RASTER_CAP_SLOT is null. */
+
+#define RST_OP_BLIT   0x00
+#define RST_OP_CLEAR  0x01
+
+/* Pack two 16-bit halves into one 32-bit word, matching the WM's
+ * wire format for (x, y) and (w, h) pairs.  Used at raster_blit
+ * call sites because pcc-orisc passes only 4 args in registers and
+ * trips on 5-arg function calls — rolling x/y and w/h into single
+ * ints keeps the call shape compatible. */
+#define WM_PACK_XY(x, y) (((((int)(x)) & 0xFFFF) << 16) | (((int)(y)) & 0xFFFF))
+#define WM_PACK_WH(w, h) (((((int)(w)) & 0xFFFF) << 16) | (((int)(h)) & 0xFFFF))
+
+int  raster_init_from_dir_result(void);
+int  raster_blit(int packed_xy, int packed_wh, const unsigned char *pixels);
+int  raster_clear(void);
+
 /* term_getkey: blocks until the next keystroke arrives. Returns
  * the codepoint (ASCII for printable, ≥0x100 for special — see
  * KEY_* in tools/devices/oriscterm). Modifier mask written to

@@ -188,12 +188,24 @@
  *     + 128 (WM_VECTOR_BASE: WM-only — per-window VECTOR service
  *          refs (16 windows × 8 bytes).  Same shape as WM_GRID_BASE.
  *          Phase 59 / WM γ.11.)
+ *     + 8 (WM_RASTER_CAP_SLOT: persistent — holds the WM-mediated
+ *          RASTER sub-cap that raster.c OREFLDs into O1 on each
+ *          raster_*() SEND.  Same role as WM_VECTOR_CAP_SLOT.  Lives
+ *          past WM_VECTOR_BASE rather than alongside WM_VECTOR_CAP_SLOT
+ *          to avoid renumbering 32 hardcoded offsets in oriscwm's
+ *          stash_grid_o1 / load_grid_to_o1 / stash_vector_o1 /
+ *          load_vector_to_o1 switch tables (pcc-orisc rejects
+ *          computed-offset OREFLDs so each wid has its own case).
+ *          Phase 59 / WM γ.12.)
+ *     + 128 (WM_RASTER_BASE: WM-only — per-window RASTER service
+ *          refs (16 windows × 8 bytes).  Same shape as WM_GRID_BASE
+ *          / WM_VECTOR_BASE.  Phase 59 / WM γ.12.)
  *
  * Total: 720 standard region + 128 WM_GRID_BASE + 128 WM_VECTOR_BASE
- * = 848.  The libc oversizes ORX_STATE_BYTES so the WM's task-table
- * objstore covers all of its slot map; non-WM programs leave the
- * tail dead. */
-#define ORX_STATE_BYTES   848
+ * + 8 WM_RASTER_CAP_SLOT + 128 WM_RASTER_BASE = 1112.  The libc
+ * oversizes ORX_STATE_BYTES so the WM's task-table objstore covers
+ * all of its slot map; non-WM programs leave the tail dead. */
+#define ORX_STATE_BYTES   984
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8
