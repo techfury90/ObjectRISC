@@ -443,8 +443,18 @@ class Terminal:
         # pane), and the standalone window-1 graphics canvas retires.
         # Grid coordinates are still 8×16 cells; an 80×24 grid fills
         # a 640×384 corner of the 1280×768 canvas.
+        # Phase 60 step 2 — oriscwm now owns the live framebuffer
+        # display via simorisc's --display tk + ObjAllocFramebuffer
+        # (a same-process bytearray mirrored into a Tk window from
+        # the WM CPU itself, no wire RTT).  oriscterm's FB Toplevel
+        # stays in the codebase so the framebuffer SERVICE the WM
+        # used to walk via /sys/term/<N>/framebuffer remains alive
+        # for fb_smoke / test_framebuffer.sh, but the window stays
+        # hidden — the WM never writes to it anymore, and showing
+        # it would just confuse users with an empty extra Toplevel.
         self.fb_window       = tk.Toplevel(self.root)
-        self.fb_window.title(f"Object RISC Framebuffer · pid={my_pid}")
+        self.fb_window.withdraw()
+        self.fb_window.title(f"Object RISC Framebuffer (legacy) · pid={my_pid}")
         self.fb_window_image = tk.PhotoImage(width=self.fb_w,
                                              height=self.fb_h)
         self.fb_window_canvas = tk.Canvas(self.fb_window,

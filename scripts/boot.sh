@@ -124,8 +124,8 @@ exec python3 tools/oriscrun \
     --terminal "pid=16,instance=0" \
     --terminal "pid=19,instance=1" \
     --hostfsd "pid=17,instance=0,root=$ROOT" \
-    --cpu "pid=2:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=1" \
-    --cpu "pid=3:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=2" \
+    --cpu "pid=2:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=1,display=tk" \
+    --cpu "pid=3:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=2,display=tk" \
     --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
     --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
     --leader 0 --leader-timeout 600

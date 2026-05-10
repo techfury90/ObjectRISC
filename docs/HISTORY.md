@@ -6363,6 +6363,66 @@ Hit the pcc-orisc input-clobber bug from γ.13 again in the smoke
 test asm — the safe-temps workaround (copy `"r"` inputs to r8+
 before the body's first store of r4..r6) is becoming ritual.
 
+### Phase 60 step 2 — WM allocates its framebuffer locally
+
+The WM stops walking `/sys/term/<N>/framebuffer` and instead allocates
+its own framebuffer in-process via the `ObjAllocFramebuffer`
+primitive from step 1.  All `flush_strip` / `forward_raster_write` /
+`fb_blit_row` calls now hit a same-CPU bytearray; ObjStoreBytes
+takes the local-destination branch (one Python slice assignment, no
+wire packet).  oriscrun gains a `display=tk` field on the `--cpu`
+spec, forwarded to `simorisc --display tk`; `scripts/boot.sh`
+enables it for both WM CPUs.  oriscterm's framebuffer Toplevel is
+withdrawn (the underlying bytearray + service stay alive so
+`fb_smoke` / `test_framebuffer.sh` keep working unchanged).
+
+Two boot-race fixes the rewire surfaced:
+
+1. **Tk window creation in the firmware primitive blocked the WM
+   long enough to break supervisors' `wm_init` retries.**
+   `primitive_ObjAllocFramebuffer` originally called
+   `register_framebuffer` synchronously, which created a Tk root +
+   Toplevel inline (~hundreds of ms).  By the time the WM finished
+   `dir_register("/sys/wm/<N>/0")`, supervisors had exhausted their
+   5-attempt budget on NOENT and fallen back to direct terminal —
+   no client → no rendering → black framebuffers.  Fixed:
+   `register_framebuffer` just enqueues a pending registration; the
+   actual Tk init runs from `TkDisplayWorker.tick()` off the
+   firmware-critical path.
+2. **Even with deferred Tk init, the WM's overall boot is longer
+   than 5 supervisor task_yields.** Bumped the supervisor's
+   `wm_init` retry budget from 5 to 100.  No-WM systems still pay
+   only the bounded delay before falling through to direct
+   terminal.
+
+Throttling: `tick()` was originally hooked into `System.run`'s
+per-CPU-instruction loop, calling `root.update()` every cycle.
+Each call is fast individually but the cumulative cost
+roughly halved the WM CPU's effective rate.  Now tick() early-
+returns in O(time.time + compare) when the 60 Hz repaint window
+hasn't elapsed; only when a repaint is actually due does it touch
+Tk.
+
+Performance: visible parity with the pre-step-2 path, not the
+speedup the local FB might suggest.  The bottleneck moved — it's
+no longer WM↔display (now in-process), but client↔WM: each
+console write still pays one wire RTT for the SEND and one for
+the WM's `ObjFetchBytes` of the source bytes.  The next
+architectural step (supervisor + WM on the same simorisc instance,
+"terminal firmware") is what would erase those.
+
+Known limitation: keyboard input doesn't reach the shell when
+focused on the new framebuffer window.  oriscterm still owns the
+keyboard listener (`root.bind("<Key>", ...)`) but the visible
+framebuffer Toplevel now lives in a different process (simorisc
+with `--display tk`).  Tk routes key events to whichever window
+has focus — clicking the FB window directs them to simorisc, which
+has no key bindings, so they're dropped.  The fix is the same
+architectural step that erases the client↔WM RTTs: route keyboard
+through the WM so the terminal-firmware CPU owns both display and
+input.  Workaround for now: focus oriscterm's legacy text-widget
+window (still visible alongside the FB) to type.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

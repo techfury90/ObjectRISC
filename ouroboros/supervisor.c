@@ -769,6 +769,78 @@ wm_leader_grid_isn(void)
  * boot O5/O6/O7 are wired to ITS terminal, which is the wrong one
  * — but it's better than null for programs that never use the
  * service in question (e.g., a CPU-bound background task). */
+/* Phase 60 step 2 — lazy supervisor-side WM bind.  Replaces the
+ * boot-time wm_init retry loop with on-demand binding:
+ *   - At boot: do nothing.
+ *   - First populate_child_term_slots call (or any subsequent one
+ *     if the WM wasn't ready yet): one wm_init attempt; on success,
+ *     wm_new_window + wm_bind_surface(CONSOLE/KEYBOARD/GRID) for
+ *     OUR terminal, then dir_register at /sys/wm/<my_term>/leader-{
+ *     console,grid} so peer supervisors relaying spawns to our
+ *     terminal can dir_walk the cap.
+ *   - Idempotent: WM_LEADER_CONSOLE_SLOT non-null fast-returns.
+ *
+ * Why lazy: by the time anything actually spawns a child (login →
+ * shell, hot-attach, run @N), the WM has had plenty of wallclock
+ * time to come up, so the first call usually binds on its single
+ * wm_init attempt.  No-WM systems pay one wm_init RTT per spawn
+ * (still bounded) and fall through to the existing direct-terminal
+ * path.  Avoids the boot-time 100×task_yield delay that shifted
+ * test_supervisor_session_manager's race window. */
+static void
+maybe_lazy_wm_bind(void)
+{
+	if (wm_leader_console_isn() == 0) return;  /* already bound */
+	if (wm_init() != 0)               return;  /* WM not up yet */
+
+	int wid, w_cells, h_cells;
+	asm volatile("onull o1");
+	int rc = wm_new_window(WIN_TYPE_CONSOLE, &wid, &w_cells, &h_cells);
+	if (rc != 0) return;
+
+	int my_term = task_my_terminal_idx();
+	if (my_term < 0) my_term = 0;
+
+	char wm_path[40];
+	if (wm_bind_surface(wid, WSURF_CONSOLE) == 0) {
+		asm volatile(
+			"orefld o5, %0(o12)\n"
+			"orefst o5, %1(o12)"
+			:
+			: "i"(DIR_RESULT_SLOT_OFFSET),
+			  "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
+		);
+		asm volatile("orefld o1, %0(o12)"
+		             :: "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
+		             : "r1");
+		render_wm_leader_path(my_term, "console", wm_path);
+		dir_register(wm_path);
+	}
+	if (wm_bind_surface(wid, WSURF_KEYBOARD) == 0) {
+		asm volatile("orefld o6, %0(o12)"
+		             :: "i"(DIR_RESULT_SLOT_OFFSET));
+	}
+	if (wm_bind_surface(wid, WSURF_GRID) == 0) {
+		asm volatile(
+			"orefld o7, %0(o12)\n"
+			"orefst o7, %1(o12)"
+			:
+			: "i"(DIR_RESULT_SLOT_OFFSET),
+			  "i"(WM_LEADER_GRID_SLOT_OFFSET)
+		);
+		asm volatile("orefld o1, %0(o12)"
+		             :: "i"(WM_LEADER_GRID_SLOT_OFFSET)
+		             : "r1");
+		render_wm_leader_path(my_term, "grid", wm_path);
+		dir_register(wm_path);
+	}
+	SUP_PRINT("supervisor: WM-mediated session (term=");
+	SUP_PRINT_INT(my_term);
+	SUP_PRINT(", wid=");
+	SUP_PRINT_INT(wid);
+	SUP_PRINT(")\n");
+}
+
 /* Phase 59 / WM γ.15 — multi-WM aware wiring.  Try a per-terminal
  * dir_walk for /sys/wm/<term_idx>/leader-<suffix>; on a LEAF hit
  * the resolved cap is in DIR_RESULT_SLOT, ready for the caller to
@@ -796,6 +868,10 @@ static void
 populate_child_term_slots(int term_idx)
 {
 	char path[PEER_PATH_BUF_SIZE];
+
+	/* Phase 60 step 2 — lazy bind for our own terminal's WM.  No-op
+	 * fast-path if we've already bound (or no WM in this system). */
+	maybe_lazy_wm_bind();
 
 	/* CONSOLE: try /sys/wm/<term_idx>/leader-console first; fall
 	 * back to direct /sys/term/<idx>/console. */
@@ -1821,20 +1897,22 @@ main(void)
 	 * supervisor never EXITs (it's a long-running daemon), so
 	 * task_query auto-destroy isn't useful here.  The window stays
 	 * alive for the supervisor's lifetime.  */
-	/* Phase 59 / WM γ.15 — every supervisor binds its own
-	 * terminal's WM (one WM instance per terminal under the
-	 * multi-WM model; libc wm_init walks /sys/wm/<my_term>/0).
-	 * This used to be `if (is_leader)` because there was only one
-	 * WM and only the leader knew about it; now each CPU sets up
-	 * WM mediation for ITS terminal, then publishes
-	 * /sys/wm/<my_term>/leader-{console,grid} so populate_child_term_-
-	 * slots on this CPU (and on any peer relaying spawns to this
-	 * terminal) can dir_walk the cap.
+	/* Phase 60 step 2 — eager bind at boot, with lazy bind in
+	 * populate_child_term_slots as a fallback for the (usually
+	 * narrow) boot-race window where the WM hasn't registered
+	 * yet.  Eager binding here makes our boot OPRs (O5, O7) point
+	 * at the WM-mediated caps so subsequent orx_spawn'd children
+	 * (sysinit, login, hot-attached terminals) inherit
+	 * WM-mediation without any per-spawn dance.  Lazy bind only
+	 * fires when both eager bind missed AND a populate_child_term_-
+	 * slots-using spawn happens later (relayed @N spawns).
 	 *
-	 * Boot race: the WM lives on its own CPU and may still be
-	 * mid-init.  Retry wm_init briefly on WIN_E_NOENT.  No-WM
-	 * systems return NOT_FOUND every attempt; we fall through to
-	 * direct terminal after 5 task_yields. */
+	 * The 5-attempt budget assumes the WM published /sys/wm/<N>/0
+	 * BEFORE its slow per-surface walks (Phase 60 step 2 moved the
+	 * self_register up).  No-WM systems return NOENT every attempt
+	 * and pay a small bounded delay before falling through to
+	 * direct terminal — small enough not to shift session-manager
+	 * race timing. */
 	{
 		int wm_status, attempt;
 		for (attempt = 0; attempt < 5; attempt++) {
@@ -1844,83 +1922,7 @@ main(void)
 			task_yield();
 		}
 		if (wm_status == 0) {
-			int wid, w_cells, h_cells;
-			asm volatile("onull o1");
-			int rc = wm_new_window(WIN_TYPE_CONSOLE, &wid,
-			                       &w_cells, &h_cells);
-			if (rc == 0) {
-				/* Bind console + keyboard.  The resolved cap
-				 * lands in DIR_RESULT_SLOT (offset 616 — wm.c
-				 * shares the slot with dir_walk's result).
-				 * OREFLD into the supervisor's working OPR
-				 * AND stash + dir_register for downstream
-				 * populate_child_term_slots lookups. */
-				char wm_path[40];
-				int my_term = task_my_terminal_idx();
-				if (my_term < 0) my_term = 0;
-				if (wm_bind_surface(wid, WSURF_CONSOLE) == 0) {
-					asm volatile(
-						"orefld o5, %0(o12)\n"
-						"orefst o5, %1(o12)"
-						:
-						: "i"(DIR_RESULT_SLOT_OFFSET),
-						  "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
-					);
-					/* Publish at /sys/wm/<my_term>/leader-console
-					 * for cross-CPU walks (γ.14 multi-WM γ.15). */
-					asm volatile("orefld o1, %0(o12)"
-					             :: "i"(WM_LEADER_CONSOLE_SLOT_OFFSET)
-					             : "r1");
-					render_wm_leader_path(my_term, "console", wm_path);
-					int reg_rc = dir_register(wm_path);
-					if (reg_rc != 0) {
-						SUP_PRINT("supervisor: dir_register ");
-						SUP_PRINT(wm_path);
-						SUP_PRINT(" failed: ");
-						SUP_PRINT_INT(reg_rc);
-						SUP_PRINT("\n");
-					}
-				}
-				if (wm_bind_surface(wid, WSURF_KEYBOARD) == 0) {
-					asm volatile("orefld o6, %0(o12)"
-					             :: "i"(DIR_RESULT_SLOT_OFFSET));
-				}
-				if (wm_bind_surface(wid, WSURF_GRID) == 0) {
-					asm volatile(
-						"orefld o7, %0(o12)\n"
-						"orefst o7, %1(o12)"
-						:
-						: "i"(DIR_RESULT_SLOT_OFFSET),
-						  "i"(WM_LEADER_GRID_SLOT_OFFSET)
-					);
-					asm volatile("orefld o1, %0(o12)"
-					             :: "i"(WM_LEADER_GRID_SLOT_OFFSET)
-					             : "r1");
-					render_wm_leader_path(my_term, "grid", wm_path);
-					int reg_rc = dir_register(wm_path);
-					if (reg_rc != 0) {
-						SUP_PRINT("supervisor: dir_register ");
-						SUP_PRINT(wm_path);
-						SUP_PRINT(" failed: ");
-						SUP_PRINT_INT(reg_rc);
-						SUP_PRINT("\n");
-					}
-				}
-				SUP_PRINT("supervisor: WM-mediated session "
-				          "(term=");
-				SUP_PRINT_INT(my_term);
-				SUP_PRINT(", wid=");
-				SUP_PRINT_INT(wid);
-				SUP_PRINT(")\n");
-			} else {
-				SUP_PRINT("supervisor: wm_new_window failed (");
-				SUP_PRINT_INT(rc);
-				SUP_PRINT(") — using direct terminal\n");
-			}
-		} else if (wm_status != WIN_E_NOENT && wm_status != WIN_E_IO) {
-			SUP_PRINT("supervisor: wm_init returned ");
-			SUP_PRINT_INT(wm_status);
-			SUP_PRINT(" — using direct terminal\n");
+			maybe_lazy_wm_bind();
 		}
 	}
 

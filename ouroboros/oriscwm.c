@@ -475,7 +475,11 @@ allocate_service_mailbox(void)
 static int my_term_idx;
 static char path_console[40];        /* /sys/term/<N>/console */
 static char path_keyboard[40];
-static char path_framebuffer[40];
+/* No path_framebuffer — Phase 60 step 2 dropped the
+ * /sys/term/<N>/framebuffer walk in favour of local allocation
+ * via ObjAllocFramebuffer.  oriscterm still publishes the path
+ * for fb_smoke / test_framebuffer.sh back-compat, but oriscwm
+ * doesn't walk it. */
 static char path_pointer[40];
 static char path_self_register[40];  /* /sys/wm/<N>/0 */
 
@@ -521,11 +525,6 @@ init_per_term_paths(void)
 	p = wm_append_decimal(idx, path_keyboard, p);
 	p = wm_append_str("/keyboard", path_keyboard, p);
 	path_keyboard[p] = '\0';
-
-	p = wm_append_str("/sys/term/", path_framebuffer, 0);
-	p = wm_append_decimal(idx, path_framebuffer, p);
-	p = wm_append_str("/framebuffer", path_framebuffer, p);
-	path_framebuffer[p] = '\0';
 
 	p = wm_append_str("/sys/term/", path_pointer, 0);
 	p = wm_append_decimal(idx, path_pointer, p);
@@ -580,22 +579,33 @@ walk_keyboard_to_slot(void)
 	return 0;
 }
 
+/* Phase 60 step 2 — allocate the framebuffer LOCALLY via the new
+ * #0x102 ObjAllocFramebuffer primitive.  The resulting TAG_FRAMEBUFFER
+ * object is backed by host memory in our own simorisc process; when
+ * the parent ran us with `--display tk`, the host worker mirrors
+ * stores into a Tk window with no wire RTT.  Replaces the prior
+ * walk_framebuffer_to_slot which dir_walk'd /sys/term/<N>/framebuffer
+ * to get a remote object on oriscterm — every glyph / line / blit
+ * paid a wire RTT through that path; γ.10 papered over the per-paint
+ * cost in oriscterm but the per-write trip was structural. */
 static int
-walk_framebuffer_to_slot(void)
+alloc_local_framebuffer(void)
 {
-	int kind;
-	char rem[16];
-	int rc = dir_walk(path_framebuffer, &kind, rem, sizeof(rem));
-	if (rc != 0) return rc;
-	if (kind != DIR_KIND_LEAF) return -1;
+	int status;
 	asm volatile(
-		"orefld o1, 616(o12)\n"
-		"orefst o1, %0(o12)"
-		:
-		: "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET)
-		: "r1"
+		"addiu r4, r0, %1\n"           /* width = FB_W */
+		"addiu r5, r0, %2\n"           /* height = FB_H */
+		"addiu r6, r0, 3\n"            /* CAP_R | CAP_W */
+		"call  #0x102\n"               /* ObjAllocFramebuffer */
+		"nop\n"
+		"orefst o1, %3(o12)\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(FB_W), "i"(FB_H),
+		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6"
 	);
-	return 0;
+	return status;
 }
 
 /* Same shape as walk_framebuffer_to_slot but for /sys/term/0/pointer
@@ -2911,6 +2921,27 @@ main(void)
 		: "r1"
 	);
 
+	/* Phase 60 step 2 — register at /sys/wm/<my_term>/0 EARLY,
+	 * before the slow per-surface walks + pointer-mediation
+	 * setup.  Supervisors retry wm_init briefly at boot; with
+	 * registration deferred until after all the slow steps,
+	 * supervisors timed out before the WM appeared and fell
+	 * through to direct terminal — sysinit / login then inherited
+	 * direct boot OPRs and rendered to oriscterm's text widget
+	 * instead of the framebuffer.  Registering up-front lets
+	 * supervisors' first wm_init succeed; subsequent SENDs queue
+	 * in our mailbox and dispatch from the main loop after we
+	 * finish the rest of init. */
+	status = self_register();
+	if (status != 0) {
+		WM_PRINT("oriscwm: dir_register ");
+		WM_PRINT(path_self_register);
+		WM_PRINT(" failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT("\n");
+		return 1;
+	}
+
 	/* Walk the directory for our underlying surface caps. */
 	status = walk_console_to_slot();
 	if (status == 0) wm_print_walk_ok(path_console);
@@ -2920,9 +2951,19 @@ main(void)
 	status = walk_keyboard_to_slot();
 	if (status == 0) wm_print_walk_ok(path_keyboard);
 	else             wm_print_walk_fail(path_keyboard, status);
-	status = walk_framebuffer_to_slot();
-	if (status == 0) wm_print_walk_ok(path_framebuffer);
-	else             wm_print_walk_fail(path_framebuffer, status);
+	/* Phase 60 step 2 — framebuffer is local now (no /sys/term walk). */
+	status = alloc_local_framebuffer();
+	if (status == 0) {
+		WM_PRINT("oriscwm: framebuffer allocated locally (");
+		WM_PRINT_INT(FB_W);
+		WM_PRINT("x");
+		WM_PRINT_INT(FB_H);
+		WM_PRINT(")\n");
+	} else {
+		WM_PRINT("oriscwm: ObjAllocFramebuffer failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT(" — glyph rendering disabled\n");
+	}
 
 	/* Phase 59 / WM γ.13 — pointer mediation. */
 	status = walk_pointer_to_slot();
@@ -2947,16 +2988,6 @@ main(void)
 		wm_print_walk_fail(path_pointer, status);
 	}
 
-	/* Self-register at /sys/wm/<my_term>/0. */
-	status = self_register();
-	if (status != 0) {
-		WM_PRINT("oriscwm: dir_register ");
-		WM_PRINT(path_self_register);
-		WM_PRINT(" failed: ");
-		WM_PRINT_INT(status);
-		WM_PRINT("\n");
-		return 1;
-	}
 	WM_PRINT("oriscwm: registered at ");
 	WM_PRINT(path_self_register);
 	WM_PRINT("\n");
