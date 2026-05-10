@@ -2350,13 +2350,25 @@ class TkDisplayWorker:
 
     def _on_key(self, cpu, event):
         code = self._key_codepoint(event)
-        if code is None:
-            return
         # mods bits: 1=Shift, 2=Ctrl, 4=Alt — same as oriscterm.
         st = event.state
         mods = ((1 if (st & 0x01) else 0)
                 | (2 if (st & 0x04) else 0)
                 | (4 if (st & 0x08) else 0))
+        # macOS Aqua Tk doesn't fill event.char for Ctrl+letter
+        # combos (event.char comes back empty), so _key_codepoint
+        # returns None and the event would otherwise drop on the
+        # floor — meaning ^X / ^S / etc. in editors silently fail.
+        # When Ctrl is held and the keysym is a single ASCII letter,
+        # synthesize the ASCII control character ourselves: ^X is
+        # 'x' & 0x1F = 0x18, ^S is 's' & 0x1F = 0x13, etc.  Matches
+        # what X11 / Linux Tk delivers in event.char natively.
+        if code is None and (mods & 2):
+            sym = event.keysym
+            if len(sym) == 1 and sym.isalpha():
+                code = ord(sym.lower()) & 0x1F
+        if code is None:
+            return
         self._enqueue_sink(cpu, 0, [code, mods, 0, 0])
 
     def _on_pointer(self, cpu, event, evt_type, button):
