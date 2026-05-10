@@ -833,6 +833,18 @@ composite_whole_window(void)
 	composite_window_region(0, 0, USABLE_W_PX, USABLE_H_PX);
 }
 
+/* Phase 60 step 10 — composite the cell-content area only, leaving
+ * the title bar pixels on the screen FB untouched.  Used by the
+ * vector / raster forwarders, which paint into the window FB at
+ * client-visible (0..USABLE_W_PX × 0..CELL_CONTENT_PX) coords; they
+ * call this once per request rather than once per inner blit. */
+static void
+composite_content_area(void)
+{
+	composite_window_region(0, TITLE_BAR_PX,
+	                        USABLE_W_PX, CELL_CONTENT_PX);
+}
+
 /* fill_rect_packed targets the screen FB (paint_window_chrome's
  * one caller).  fill_rect_window targets the window backing store —
  * same wire shape, different OPR slot.  Duplicated rather than
@@ -2416,29 +2428,34 @@ poll_one_request(int *out_op, int *out_wid, int *out_arg)
  * follow-up.  Fill primitives (RECT_FILL / OVAL_FILL) already pay
  * one RTT per row regardless of width. */
 
-/* Same calling convention as flush_strip's inner ObjStoreBytes:
- * %0 = WM_SURF_FRAMEBUFFER_SLOT_OFFSET, %1..%3 = src_off / dst_off /
- * n_pixels.  Boot-stack ref in O11 — pixel buffer must live on our
- * stack so STACK_BOTTOM-relative offsets are valid.
+/* Phase 60 step 10 — fb_blit_row now writes into the WINDOW backing
+ * store rather than the screen FB.  Coordinates (x, y) are in the
+ * client-visible content area (0..USABLE_W_PX × 0..CELL_CONTENT_PX),
+ * matching what wm_get_geometry advertises; we add TITLE_BAR_PX to y
+ * before computing the destination offset so the title bar is never
+ * touched.  Composite of the touched region happens once per
+ * forward_* call (composite_content_area) — calling it per-row would
+ * thrash the screen FB, and clients always paint a complete shape
+ * before the next request anyway.
  *
- * No clipping inside the asm — the caller does it.  Empty / fully
- * off-screen rows are dropped before we get here. */
+ * Pixel buffer must live on our stack (STACK_BOTTOM-relative
+ * offsets) — same as before. */
 static void
 fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 {
-	if (y < 0 || y >= FB_H) return;
-	if (n_pixels <= 0)      return;
+	if (y < 0 || y >= CELL_CONTENT_PX) return;
+	if (n_pixels <= 0)                 return;
 	if (x < 0) {
 		if (n_pixels + x <= 0) return;
 		pixels   -= x;        /* skip leading off-screen */
 		n_pixels += x;
 		x         = 0;
 	}
-	if (x >= FB_W)              return;
-	if (x + n_pixels > FB_W)    n_pixels = FB_W - x;
+	if (x >= USABLE_W_PX)            return;
+	if (x + n_pixels > USABLE_W_PX)  n_pixels = USABLE_W_PX - x;
 
 	int src_off = (int)((unsigned int)pixels - STACK_BOTTOM);
-	int dst_off = y * FB_W + x;
+	int dst_off = (y + TITLE_BAR_PX) * USABLE_W_PX + x;
 	asm volatile(
 		"addu  r7, %1, r0\n"
 		"addu  r8, %2, r0\n"
@@ -2451,7 +2468,7 @@ fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 		"call  #0x109\n"        /* ObjStoreBytes */
 		"nop"
 		:
-		: "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET),
+		: "i"(WM_WINDOW_FB_SLOT_OFFSET),
 		  "r"(src_off), "r"(dst_off), "r"(n_pixels)
 		: "r1", "r2", "r3", "r4", "r5", "r6",
 		  "r7", "r8", "r9"
@@ -2556,14 +2573,16 @@ static int oval_ry2;
 static int oval_rxy2;
 
 /* Stack-resident scratch row used by all fill primitives, also
- * static for the same register-pressure reason. */
-static unsigned char vec_scratch_row[FB_W];
+ * static for the same register-pressure reason.  Sized to the
+ * client-visible content width since fb_blit_row clips at
+ * USABLE_W_PX anyway. */
+static unsigned char vec_scratch_row[USABLE_W_PX];
 
 /* Fill vec_scratch_row[0..n] with `color` and return its base. */
 static unsigned char *
 prep_scratch_row(int n, unsigned char color)
 {
-	if (n > FB_W) n = FB_W;
+	if (n > USABLE_W_PX) n = USABLE_W_PX;
 	int i;
 	for (i = 0; i < n; i++) vec_scratch_row[i] = color;
 	return vec_scratch_row;
@@ -3200,27 +3219,40 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		return;
 	}
 	if (op == VEC_OP_CLEAR) {
-		/* TODO: per-window backing store.  See note above. */
+		/* Repaint the cell-content area to bg via ObjFillRect on
+		 * the window FB, then composite once.  Phase 60 step 10:
+		 * with per-window backing stores this no longer wipes
+		 * console + grid output — the content area is the
+		 * vector/raster space, distinct from chrome and title. */
+		int xy = ((0 & 0xFFFF) << 16) | (TITLE_BAR_PX & 0xFFFF);
+		int wh = ((USABLE_W_PX & 0xFFFF) << 16)
+		       | (CELL_CONTENT_PX & 0xFFFF);
+		fill_rect_window(xy, wh, WM_BG_COLOR);
+		composite_content_area();
 		return;
 	}
+
+	int painted = 0;
 	if (op == VEC_OP_LINE) {
 		int x1 = vec_unpack_hi(packed1);
 		int y1 = vec_unpack_lo(packed1);
 		int x2 = vec_unpack_hi(packed2);
 		int y2 = vec_unpack_lo(packed2);
 		draw_line(x1, y1, x2, y2);
-		return;
+		painted = 1;
+	} else {
+		int x = vec_unpack_hi(packed1);
+		int y = vec_unpack_lo(packed1);
+		int w = vec_unpack_hi(packed2);
+		int h = vec_unpack_lo(packed2);
+		if      (op == VEC_OP_RECT_FILL)    { draw_rect_fill(x, y, w, h);    painted = 1; }
+		else if (op == VEC_OP_RECT_OUTLINE) { draw_rect_outline(x, y, w, h); painted = 1; }
+		else if (op == VEC_OP_OVAL_FILL)    { draw_oval_fill(x, y, w, h);    painted = 1; }
+		else if (op == VEC_OP_OVAL_OUTLINE) { draw_oval_outline(x, y, w, h); painted = 1; }
+		/* Unknown op: drop silently — clients see no error since
+		 * vector SENDs are fire-and-forget anyway. */
 	}
-	int x = vec_unpack_hi(packed1);
-	int y = vec_unpack_lo(packed1);
-	int w = vec_unpack_hi(packed2);
-	int h = vec_unpack_lo(packed2);
-	if (op == VEC_OP_RECT_FILL)    { draw_rect_fill(x, y, w, h);    return; }
-	if (op == VEC_OP_RECT_OUTLINE) { draw_rect_outline(x, y, w, h); return; }
-	if (op == VEC_OP_OVAL_FILL)    { draw_oval_fill(x, y, w, h);    return; }
-	if (op == VEC_OP_OVAL_OUTLINE) { draw_oval_outline(x, y, w, h); return; }
-	/* Unknown op: drop silently — clients see no error since vector
-	 * SENDs are fire-and-forget anyway. */
+	if (painted) composite_content_area();
 }
 
 /* See poll_window_grids — same status-via-global trick, capped at 4
@@ -3281,8 +3313,14 @@ static void
 forward_raster_write(int op, int packed1, int packed2, int byte_offset)
 {
 	if (op == RST_OP_CLEAR) {
-		/* TODO: per-window backing store — same blocker as
-		 * VEC_OP_CLEAR / GRID's clear sentinel. */
+		/* Phase 60 step 10: same per-window backing-store treatment
+		 * as VEC_OP_CLEAR — fill the cell-content area with bg and
+		 * composite once. */
+		int xy = ((0 & 0xFFFF) << 16) | (TITLE_BAR_PX & 0xFFFF);
+		int wh = ((USABLE_W_PX & 0xFFFF) << 16)
+		       | (CELL_CONTENT_PX & 0xFFFF);
+		fill_rect_window(xy, wh, WM_BG_COLOR);
+		composite_content_area();
 		return;
 	}
 	if (op != RST_OP_BLIT) return;
@@ -3292,7 +3330,7 @@ forward_raster_write(int op, int packed1, int packed2, int byte_offset)
 	int w = vec_unpack_hi(packed2);
 	int h = vec_unpack_lo(packed2);
 	if (w <= 0 || h <= 0)        return;
-	if (w > FB_W) w = FB_W;
+	if (w > USABLE_W_PX) w = USABLE_W_PX;
 
 	/* Stash sender's source ref so we can OREFLD it again on each
 	 * per-row ObjFetchBytes. */
@@ -3301,13 +3339,16 @@ forward_raster_write(int op, int packed1, int packed2, int byte_offset)
 
 	int scratch_data_off = (int)((unsigned int)vec_scratch_row - DATA_VA);
 
+	int painted = 0;
 	int row;
 	for (row = 0; row < h; row++) {
 		int dst_y = y + row;
-		if (dst_y < 0 || dst_y >= FB_H) continue;
+		if (dst_y < 0 || dst_y >= CELL_CONTENT_PX) continue;
 
 		int src_off = byte_offset + row * w;
-		int dst_off = dst_y * FB_W + x;
+		/* dst_off lands in the WINDOW FB, with TITLE_BAR_PX added to
+		 * the y coord and USABLE_W_PX as the row stride. */
+		int dst_off = (dst_y + TITLE_BAR_PX) * USABLE_W_PX + x;
 
 		/* ObjFetchBytes from sender's source (O2 ← slot) into
 		 * our vec_scratch_row via boot data ref (O15). */
@@ -3326,7 +3367,7 @@ forward_raster_write(int op, int packed1, int packed2, int byte_offset)
 		);
 
 		/* ObjStoreBytes from O15 (boot data, holds vec_scratch_row)
-		 * into the framebuffer slot. */
+		 * into the WINDOW FB slot. */
 		asm volatile(
 			"omov  o1, o15\n"
 			"orefld o2, %0(o12)\n"
@@ -3336,11 +3377,13 @@ forward_raster_write(int op, int packed1, int packed2, int byte_offset)
 			"call  #0x109\n"
 			"nop"
 			:
-			: "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET),
+			: "i"(WM_WINDOW_FB_SLOT_OFFSET),
 			  "r"(scratch_data_off), "r"(dst_off), "r"(w)
 			: "r1", "r2", "r3", "r4", "r5", "r6"
 		);
+		painted = 1;
 	}
+	if (painted) composite_content_area();
 }
 
 /* See poll_window_grids — same status-via-global trick.  Wire here

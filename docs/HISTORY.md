@@ -6794,6 +6794,57 @@ Visible result: at boot, both terminal windows show their default
 "Terminal 0" / "Terminal 1" titles centered in the gray bar.
 `title hello` from inside the shell rewrites the bar live.
 
+## Phase 60 step 10 — VECTOR / RASTER → window FB
+
+Step 7 deferred VECTOR / RASTER drawing to the screen FB while
+flush_strip + scroll moved into the window backing store.  This
+step closes that gap: every drawing surface a client paints into
+now lands in the window FB and composites once per request onto
+the screen, so the backing-store model is uniform across all
+client-visible drawing.
+
+oriscwm:
+- `fb_blit_row` retargeted from screen FB → window FB.  Pixel
+  coords (x, y) are now client-relative — y in [0..CELL_CONTENT_PX),
+  x in [0..USABLE_W_PX) — and the helper adds TITLE_BAR_PX to y
+  before computing the byte offset so the title-bar pixels are
+  never touched.  Stride is USABLE_W_PX (the window FB's row
+  width).
+- `vec_scratch_row` resized from FB_W (1280) to USABLE_W_PX
+  (1264) — fb_blit_row's clip already capped at USABLE_W_PX so
+  the extra bytes were dead.
+- `forward_raster_write` mirrors the change: per-row
+  ObjStoreBytes writes go to the window FB at
+  `(y + TITLE_BAR_PX) * USABLE_W_PX + x`.  Width clamp is
+  `USABLE_W_PX` rather than `FB_W`.
+- New `composite_content_area()` — composites
+  `(0, TITLE_BAR_PX) → (USABLE_W_PX, CELL_CONTENT_PX)` onto the
+  screen FB.  Called once per `forward_vector_write` /
+  `forward_raster_write` request that actually painted, rather
+  than per-row, so a 200-row blit costs one #0x10F ObjBlitCopy
+  instead of 200.
+- `VEC_OP_CLEAR` and `RST_OP_CLEAR` were no-ops with TODO
+  comments because the screen FB held console + grid output
+  that a clear would wipe.  With per-window backing stores that
+  conflict goes away — both now ObjFillRect the cell-content
+  area with WM_BG_COLOR and composite.  Clients can clear their
+  canvas without losing chrome or text.
+
+Tests:
+- vec_smoke + raster_smoke + wm_smoke + supervisor_session_manager
+  green.  No new tests; the existing smoke surfaces exercise the
+  retargeted paths.
+
+Visible result on boot.sh: nothing changes for the typical CONSOLE
+session, but `vec_smoke` and `raster_smoke` now draw inside the
+window's content area only, without touching the title bar — and
+their "clear" ops actually clear instead of being silent no-ops.
+
+This finishes the per-window backing-store pipeline (the deferred
+half of step 7).  Next milestones: lift the N=1 CONSOLE
+restriction and add z-order/composite ordering, which is what
+opaque overlapping windows actually requires.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
