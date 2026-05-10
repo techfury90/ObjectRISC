@@ -175,6 +175,14 @@ main(void)
 		WP(" px)\n");
 	}
 
+	/* Step 6c (Phase 60 step 8): wm_set_title round-trip on the live
+	 * window.  We don't verify the rendered output here (no FB
+	 * snapshot path in the smoke harness yet) — just that the SEND
+	 * returns success.  Visual correctness gets checked on boot.sh. */
+	rc = wm_set_title(wid, "wm_smoke");
+	if (rc != 0) { fail("set_title", rc); return 6; }
+	WP("wm_smoke: set_title OK\n");
+
 	/* Step 7: second CONSOLE allocation — must fail WIN_E_NOSPC. */
 	int dummy_wid = 0, dummy_w = 0, dummy_h = 0;
 	asm volatile("onull o1");

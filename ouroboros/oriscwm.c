@@ -48,6 +48,11 @@
  *                          Reply: R3=status, R4=geom_a, R5=geom_b,
  *                                 R6=resolved wid
  *
+ *   WM_OP_SET_TITLE        R4 = wid (or 0 = first live)
+ *                          R5 = packed (len:high16, src_off:low16)
+ *                          O2 = source ref containing title bytes
+ *                          Reply: R3=status
+ *
  * Window types:
  *   WIN_CONSOLE   = 1   (console + keyboard)
  *   WIN_GRAPHICAL = 2   (E_NOTIMPL — same as milestone 1; surfaces
@@ -95,6 +100,7 @@
 #define WM_OP_DESTROY_WINDOW     3
 #define WM_OP_SUBSCRIBE_EVENTS   4
 #define WM_OP_QUERY_GEOMETRY     5
+#define WM_OP_SET_TITLE          6
 
 #define WIN_TYPE_CONSOLE   1
 #define WIN_TYPE_GRAPHICAL 2
@@ -118,10 +124,14 @@
  * outer ring of cells is reserved for the window border / padding,
  * so programs see a slightly smaller cell grid (see N_COLS / N_ROWS
  * below). */
+/* DEFAULT_*_CELLS / DEFAULT_*_PX must track N_COLS / N_ROWS, which
+ * are defined alongside the cell-grid constants further down.  We
+ * forward-declare them as numeric literals here; if those change, so
+ * must these. */
 #define DEFAULT_W_CELLS  158
-#define DEFAULT_H_CELLS  46
+#define DEFAULT_H_CELLS  45    /* matches N_ROWS post-Phase-60-step-8 */
 #define DEFAULT_W_PX     (DEFAULT_W_CELLS * 8)   /* 1264 */
-#define DEFAULT_H_PX     (DEFAULT_H_CELLS * 16)  /* 736  */
+#define DEFAULT_H_PX     (DEFAULT_H_CELLS * 16)  /* 720  */
 
 /* ObjAlloc tags / cap bits. */
 #define TAG_SERVICE 0x4103
@@ -299,21 +309,43 @@
  * usable cell area's outer edge cleanly. */
 #define BORDER_CELLS    1
 #define BORDER_LINE_PX  2
+
+/* Phase 60 step 8 — per-window title bar.  Lives at the top of each
+ * window's backing store (pixel rows [0..TITLE_BAR_PX)); the cell
+ * content area follows at [TITLE_BAR_PX..USABLE_H_PX).  Eats one
+ * cell-row's worth of vertical space, so the cell grid client
+ * programs see drops from 46 to 45 rows.  16-px tall fits the
+ * 16-px glyph with zero vertical padding — tight but unambiguous;
+ * a future polish pass can widen it. */
+#define TITLE_BAR_CELLS 1
+#define TITLE_BAR_PX    (CELL_H * TITLE_BAR_CELLS)   /* 16 */
+
 #define N_COLS          158
-#define N_ROWS          46
+#define N_ROWS          45     /* was 46; one cell row went to title bar */
 #define FB_CELLS_W      (N_COLS + 2 * BORDER_CELLS)
-#define FB_CELLS_H      (N_ROWS + 2 * BORDER_CELLS)
+#define FB_CELLS_H      (N_ROWS + 2 * BORDER_CELLS + TITLE_BAR_CELLS)
 #define FB_W            (CELL_W * FB_CELLS_W)   /* 1280 */
 #define FB_H            (CELL_H * FB_CELLS_H)   /* 768  */
 #define CELL_ORIGIN_X   (CELL_W * BORDER_CELLS)  /* 8  */
 #define CELL_ORIGIN_Y   (CELL_H * BORDER_CELLS)  /* 16 */
 #define USABLE_W_PX     (CELL_W * N_COLS)        /* 1264 */
-#define USABLE_H_PX     (CELL_H * N_ROWS)        /* 736 */
+/* Window FB height covers title bar + cell content. */
+#define USABLE_H_PX     (TITLE_BAR_PX + CELL_H * N_ROWS)   /* 736 */
+#define CELL_CONTENT_PX (CELL_H * N_ROWS)                  /* 720 */
 
 /* Palette indices (matching VEC_PALETTE in tools/devices/oriscterm). */
 #define WM_BG_COLOR  0    /* dark navy background */
 #define WM_FG_COLOR  1    /* light gray foreground */
 #define WM_BORDER_COLOR 1 /* same fg gray for the chrome line */
+/* Title bar uses inverse-video: bar bg = fg-gray, text = bg-navy. */
+#define WM_TITLE_BAR_BG WM_FG_COLOR
+#define WM_TITLE_BAR_FG WM_BG_COLOR
+
+/* Title string storage — single window for v1, becomes per-wid when
+ * multi-window lands.  Sized to the max title that fits the bar with
+ * no horizontal padding (158 cells × 1 byte).  ASCII only — same
+ * font_8x16 constraint as the rest of the WM's text rendering. */
+#define MAX_TITLE_LEN   N_COLS
 
 /* Stack VA layout (CONTRACT.md §2).  Used for stack-relative offsets
  * passed to ObjFetchBytes / ObjStoreBytes — the boot stack ref lives
@@ -456,6 +488,14 @@ static int    window_subscribe_op[MAX_WINDOWS]; /* notify_op (0 = none) */
 static int    window_cur_col[MAX_WINDOWS];      /* cursor col within cell grid */
 static int    window_cur_row[MAX_WINDOWS];      /* cursor row within cell grid */
 static unsigned char window_vec_color[MAX_WINDOWS]; /* current pen palette idx */
+
+/* Phase 60 step 8 — title bar text storage.  Single buffer for v1
+ * (N=1 CONSOLE window); becomes per-wid when multi-window lands.
+ * Lives in the data segment so the WM can pass O3 = boot data (O15)
+ * to ObjBlitGlyphs without copying to the stack.  Initialised empty;
+ * wm_set_title overwrites + repaints. */
+static unsigned char window_title[MAX_TITLE_LEN];
+static int           window_title_len;
 
 /* The owner task ref and subscriber notify_cap live in OPR slots
  * (WM_OWNER_BASE_OFFSET + id*8 and WM_SUBSCRIBE_BASE_OFFSET + id*8)
@@ -791,6 +831,98 @@ static void
 composite_whole_window(void)
 {
 	composite_window_region(0, 0, USABLE_W_PX, USABLE_H_PX);
+}
+
+/* fill_rect_packed targets the screen FB (paint_window_chrome's
+ * one caller).  fill_rect_window targets the window backing store —
+ * same wire shape, different OPR slot.  Duplicated rather than
+ * parametrised because pcc-orisc requires the slot offset to be a
+ * compile-time immediate inside the asm. */
+static void
+fill_rect_window(int packed_xy, int packed_wh, int color)
+{
+	if (((packed_wh >> 16) & 0xFFFF) == 0) return;
+	if ((packed_wh & 0xFFFF) == 0)         return;
+	asm volatile(
+		"addu   r8,  %0, r0\n"
+		"addu   r9,  %1, r0\n"
+		"addu   r10, %2, r0\n"
+		"orefld o1, %3(o12)\n"
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r10, r0\n"
+		"call   #0x10D\n"           /* ObjFillRect */
+		"nop"
+		:
+		: "r"(packed_xy), "r"(packed_wh), "r"(color),
+		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6",
+		  "r8", "r9", "r10"
+	);
+}
+
+/* Render `n` chars of `window_title` into the window FB's title-bar
+ * region.  The title is centred horizontally; if n exceeds N_COLS,
+ * extra chars truncate.  Source ref is the WM's boot data O15 since
+ * window_title[] lives in our data segment.
+ *
+ * pcc-orisc input-clobber dance same as flush_strip. */
+static void
+blit_title_text(int start_col, int n_chars)
+{
+	if (n_chars <= 0) return;
+	int text_off = (int)((unsigned int)window_title - DATA_VA);
+	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
+	int packed_xy = ((start_col & 0xFFFF) << 16) | (0 & 0xFFFF);
+	int packed_shape = ((n_chars & 0xFFFF) << 16)
+	                 | ((WM_TITLE_BAR_FG & 0xFF) << 8)
+	                 | (WM_TITLE_BAR_BG & 0xFF);
+	asm volatile(
+		"addu   r8,  %0, r0\n"
+		"addu   r9,  %1, r0\n"
+		"addu   r10, %2, r0\n"
+		"addu   r11, %3, r0\n"
+		"orefld o1, %4(o12)\n"      /* O1 = window FB */
+		"omov   o2, o15\n"          /* O2 = boot data (font) */
+		"omov   o3, o15\n"          /* O3 = boot data (title) */
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r10, r0\n"
+		"addu   r7, r11, r0\n"
+		"call   #0x10C\n"           /* ObjBlitGlyphs */
+		"nop"
+		:
+		: "r"(packed_xy), "r"(packed_shape),
+		  "r"(font_off),  "r"(text_off),
+		  "i"(WM_WINDOW_FB_SLOT_OFFSET)
+		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+		  "r8", "r9", "r10", "r11"
+	);
+}
+
+/* Phase 60 step 8 — paint the title bar at the top of the window FB.
+ * Bar bg = WM_TITLE_BAR_BG (inverse video — light gray); title text
+ * (centred) renders in WM_TITLE_BAR_FG (dark navy).  After painting
+ * the window-local title bar region we composite it onto the screen.
+ *
+ * Called once at handle_new_window time (empty title — visible
+ * bar) and after every wm_set_title to refresh the displayed
+ * text. */
+static void
+paint_title_bar(void)
+{
+	int bar_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
+	int bar_wh = ((USABLE_W_PX & 0xFFFF) << 16) | (TITLE_BAR_PX & 0xFFFF);
+	fill_rect_window(bar_xy, bar_wh, WM_TITLE_BAR_BG);
+
+	int n = window_title_len;
+	if (n > N_COLS) n = N_COLS;
+	if (n > 0) {
+		int start_col = (N_COLS - n) / 2;
+		blit_title_text(start_col, n);
+	}
+
+	composite_window_region(0, 0, USABLE_W_PX, TITLE_BAR_PX);
 }
 
 /* Phase 60 step 5 — fill a rectangle in the framebuffer with a single
@@ -1616,6 +1748,13 @@ handle_new_window(int wtype)
 		return;
 	}
 
+	/* Phase 60 step 8 — paint the title bar so the window is visibly
+	 * framed from creation.  Title is initially empty; the client
+	 * (typically the shell or the spawning supervisor) wm_set_title's
+	 * to fill it in. */
+	window_title_len = 0;
+	paint_title_bar();
+
 	window_type[wid - 1] = WIN_TYPE_CONSOLE;
 	window_subscribe_op[wid - 1] = 0;
 	window_cur_col[wid - 1] = 0;
@@ -1985,6 +2124,87 @@ handle_destroy_window(int wid)
 	/* Owner-ref stash is left in place; future allocations will
 	 * overwrite it.  No SEND fires for the close — the WM doesn't
 	 * push events to subscribers yet. */
+	wm_reply(0, 0, 0, 0);
+}
+
+/* Phase 60 step 8 — WM_OP_SET_TITLE.  Wire shape:
+ *   R5 = wid (0 = first live window)
+ *   R6 = packed (len:high16, src_off:low16)
+ *   O2 = source ref containing the title bytes
+ *
+ * ObjFetchBytes the bytes into window_title[], repaint the title bar,
+ * reply with status.  Same source-ref stash dance as
+ * forward_console_write — pcc-orisc may spill R4..R6 to stack across
+ * a function-call boundary but OPRs survive, so O2 is still the
+ * caller's source ref at handler entry. */
+static void
+handle_set_title(int wid, int packed_len_off)
+{
+	if (wid == 0) {
+		int i;
+		for (i = 1; i <= MAX_WINDOWS; i++) {
+			if (window_type[i - 1] != 0) { wid = i; break; }
+		}
+	}
+	if (wid < 1 || wid > MAX_WINDOWS) {
+		wm_reply(E_INVAL, 0, 0, 0);
+		return;
+	}
+	if (window_type[wid - 1] == 0) {
+		wm_reply(E_NOENT, 0, 0, 0);
+		return;
+	}
+
+	int len     = (packed_len_off >> 16) & 0xFFFF;
+	int src_off = packed_len_off & 0xFFFF;
+	if (len < 0 || len > MAX_TITLE_LEN) {
+		wm_reply(E_INVAL, 0, 0, 0);
+		return;
+	}
+
+	/* Stash source ref before any subsequent asm clobbers O2. */
+	asm volatile("orefst o2, %0(o12)"
+	             :: "i"(WM_FORWARD_SRC_SLOT_OFFSET));
+
+	if (len > 0) {
+		/* The WM's boot data ref (O15) is allocated with caps R|C —
+		 * no CAP_W at the ref level (its VA mapping is R|W, but
+		 * ObjFetchBytes checks ref caps, not mapping perms).  So we
+		 * fetch into a stack-local buffer first (boot stack O11 has
+		 * CAP_W at the ref level), then memcpy through the data
+		 * mapping's W bit into the persistent window_title.  Same
+		 * trick forward_console_write uses. */
+		unsigned char fetch_buf[MAX_TITLE_LEN];
+		int dst_off = (int)((unsigned int)fetch_buf - STACK_BOTTOM);
+		int fetch_status;
+		asm volatile(
+			"addu  r8, %1, r0\n"
+			"addu  r9, %2, r0\n"
+			"addu  r10, %3, r0\n"
+			"orefld o1, %4(o12)\n"      /* O1 = caller's source */
+			"omov   o2, o11\n"          /* O2 = boot stack (dest) */
+			"addu  r4, r8,  r0\n"       /* src_off */
+			"addu  r5, r9,  r0\n"       /* dst_off */
+			"addu  r6, r10, r0\n"       /* count */
+			"call  #0x108\n"            /* ObjFetchBytes */
+			"nop\n"
+			"addu  %0, r2, r0"
+			: "=r"(fetch_status)
+			: "r"(src_off), "r"(dst_off), "r"(len),
+			  "i"(WM_FORWARD_SRC_SLOT_OFFSET)
+			: "r1", "r2", "r3", "r4", "r5", "r6",
+			  "r8", "r9", "r10"
+		);
+		if (fetch_status != 0) {
+			wm_reply(E_IO, 0, 0, 0);
+			return;
+		}
+		int i;
+		for (i = 0; i < len; i++)
+			window_title[i] = fetch_buf[i];
+	}
+	window_title_len = len;
+	paint_title_bar();
 	wm_reply(0, 0, 0, 0);
 }
 
@@ -2460,11 +2680,12 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 
 	int text_off = (int)((unsigned int)glyphs - STACK_BOTTOM);
 	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
-	/* Phase 60 step 7: render coords are now WINDOW-local — the window
-	 * backing store is sized to the usable cell area exactly, so
-	 * (col*CELL_W, row*CELL_H) lands in-bounds without the
-	 * BORDER_CELLS offset previous steps required. */
-	int packed_xy = ((col_start & 0xFFFF) << 16) | (cell_row & 0xFFFF);
+	/* Phase 60 step 8: cell content sits below the title bar in the
+	 * window FB, so we add TITLE_BAR_CELLS to the cell-row coord.
+	 * `col_start` stays as-is (no horizontal padding); `cell_row` is
+	 * the client's logical row within the N_ROWS-tall content area. */
+	int fb_row = cell_row + TITLE_BAR_CELLS;
+	int packed_xy = ((col_start & 0xFFFF) << 16) | (fb_row & 0xFFFF);
 	int packed_shape = ((n_glyphs & 0xFFFF) << 16)
 	                 | ((WM_FG_COLOR & 0xFF) << 8)
 	                 | (WM_BG_COLOR & 0xFF);
@@ -2496,8 +2717,9 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 
 	/* Composite the just-painted strip onto the screen FB so the
 	 * change is visible.  Strip pixel rect in window-local coords:
-	 * (col_start*CELL_W, cell_row*CELL_H) → (n_glyphs*CELL_W, CELL_H). */
-	composite_window_region(col_start * CELL_W, cell_row * CELL_H,
+	 * (col_start*CELL_W, fb_row*CELL_H) → (n_glyphs*CELL_W, CELL_H).
+	 * fb_row already includes the TITLE_BAR_CELLS offset. */
+	composite_window_region(col_start * CELL_W, fb_row * CELL_H,
 	                        n_glyphs   * CELL_W, CELL_H);
 }
 
@@ -2515,16 +2737,13 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 static void
 fb_scroll_up_one_cell(void)
 {
-	/* Phase 60 step 7: scroll happens in WINDOW-local coords inside
-	 * the window backing store — the full backing-store region
-	 * (0..USABLE_W_PX × 0..USABLE_H_PX).  After the in-FB shift we
-	 * composite the whole window onto the screen so the user sees
-	 * the new state.  Two firmware calls total per scroll
-	 * (ObjFbScroll + ObjBlitCopy) — still cheap compared to
-	 * per-row blits. */
-	int packed_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
+	/* Phase 60 step 8: scroll the cell-content region only.  The
+	 * title bar at y ∈ [0..TITLE_BAR_PX) stays put so the window
+	 * identity doesn't smear during fast output.  Region covers
+	 * y ∈ [TITLE_BAR_PX..USABLE_H_PX) — i.e. CELL_CONTENT_PX rows. */
+	int packed_xy = ((0 & 0xFFFF) << 16) | (TITLE_BAR_PX & 0xFFFF);
 	int packed_wh = ((USABLE_W_PX & 0xFFFF) << 16)
-	              | (USABLE_H_PX & 0xFFFF);
+	              | (CELL_CONTENT_PX & 0xFFFF);
 	int packed_dy_fill = ((CELL_H & 0xFFFFFF) << 8)
 	                   | (WM_BG_COLOR & 0xFF);
 	asm volatile(
@@ -2543,7 +2762,9 @@ fb_scroll_up_one_cell(void)
 		: "r1", "r2", "r4", "r5", "r6",
 		  "r8", "r9", "r10"
 	);
-	composite_whole_window();
+	/* Only the cell-content area changed; title bar is untouched. */
+	composite_window_region(0, TITLE_BAR_PX,
+	                        USABLE_W_PX, CELL_CONTENT_PX);
 }
 
 /* Hoist `*row` back into [0, N_ROWS) by scrolling the inner cell
@@ -3558,6 +3779,8 @@ main(void)
 				handle_subscribe_events(wid_or_zero, arg);
 			} else if (op == WM_OP_QUERY_GEOMETRY) {
 				handle_query_geometry(wid_or_zero);
+			} else if (op == WM_OP_SET_TITLE) {
+				handle_set_title(wid_or_zero, arg);
 			} else {
 				wm_reply(E_INVAL, 0, 0, 0);
 			}
