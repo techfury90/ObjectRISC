@@ -6039,6 +6039,15 @@ recording because they'll bite again:
    subtraction into a separate `int slot = wid - 1;` so pcc emits
    a runtime `sub` instead of a compile-time fold.
 
+3. **r4..r7 in clobber-list aren't always honoured for inputs.**
+   pcc places `"r"`-class input operands in r4/r5 sometimes, then
+   the asm body's first `addu r4, %x, r0` stomps that input
+   before later `addu r6, %y, r0` reads it.  Workaround: copy
+   each `"r"` input into a safe temp (r8..r11) at the *top* of the
+   asm body, then move from the temps into the ABI registers.
+   (Same workaround already used in flush_strip; γ.13 hit it
+   again in pointer-event forwarding.)
+
 ### γ.12 — WM-mediated raster blit
 
 Step 3 of 4 in the bitmapped-overlays migration.  Same shape as γ.9
@@ -6108,6 +6117,87 @@ Smoke test (`raster_smoke.c` + `test_raster_smoke.sh`) blits a
 16×16 static checkerboard via the boot-data path and an 8×8
 stack-local pattern via the boot-stack path, verifies both
 return 0, then exercises CLEAR + DESTROY.
+
+### γ.13 — WM-mediated pointer events
+
+Final step of the four-surface bitmapped-overlays migration (after
+GRID γ.9, vector γ.11, raster γ.12).  Pointer is a *subscription*
+flow rather than a write flow: clients subscribe through the WM,
+and the WM forwards mouse events from the underlying terminal.
+
+Topology:
+
+- Boot: WM walks `/sys/term/0/pointer`, allocates two TAG_SERVICE
+  objects — one for clients to SEND subscribe-requests to (the
+  "pointer service", returned by `wm_bind_surface(WSURF_POINTER)`),
+  one for incoming events (the "events mailbox").  Derives an R|S
+  sub-cap of the events mailbox and SENDs it to
+  `/sys/term/0/pointer` to subscribe.
+- Steady state: oriscterm SENDs each pointer event to the WM's
+  events mailbox.  Clients SEND once to the pointer service with
+  O2 = their reply ref to subscribe.  WM polls both queues from
+  its main loop; on a successful event-mailbox poll, it forwards
+  the int_payload (evt_type, packed_xy, button, btn_state) onward
+  to the current subscriber.
+- v1 limits: single subscriber slot WM-wide (not per-window — a
+  window-focus router waits on multi-window WM work).  Coarse
+  unsubscribe-all (null O2 from sender clears the slot).
+
+`pointer.c` libc helpers: `pointer_init_from_dir_result`,
+`pointer_subscribe` (allocates a TAG_SERVICE mailbox into O10,
+attaches a queue depth-16, derives an R|S sub-cap, SENDs it),
+`pointer_unsubscribe`, `pointer_getevent` (timeout=0 poll of O10,
+returns the four int_payload words via out params).
+
+Slot-map deltas:
+
+- `task.c`: `ORX_STATE_BYTES` 984 → 1152.  New
+  `WM_POINTER_CAP_SLOT` at 1112 (libc-visible bound cap) plus a
+  32-byte WM-only block at 1120..1144 holding the pointer service
+  ref, single subscriber ref, events mailbox ref, and the
+  walked `/sys/term/0/pointer` cap.
+
+Race-condition fix: events from oriscterm fire as soon as the WM
+subscribes (before the smoke client has had time to subscribe to
+the WM in turn).  `poll_pointer_events` early-returns when there's
+no subscriber yet, leaving events in the underlying ReceiveQueue
+(depth 64) until the subscribe SEND is captured — at which point
+the queue drains naturally.  Past 64 buffered events the kernel
+silently drops new ones; acceptable for v1.
+
+### Three pcc-orisc gotchas worth recording
+
+1. **`ObjAlloc` cap-mask must include `0x40`.**  Unset, `ObjDerive`
+   on the resulting object returns status 3.  Discovered by
+   diffing `term.c`'s mailbox alloc (`0x5b`) against the
+   "obvious" `CAP_R|CAP_W|CAP_S|CAP_V|CAP_C` (`0x1F`) — the
+   missing bit at 0x40 is some derive-rights bit not present in
+   the public CAP_* defs.  `pointer.c` and any future libc
+   client-side mailboxes should use the literal `0x5b`.
+2. **The receive overlay puts sender's O2 into our O2** (not O3
+   or O4 — got that wrong on the first cut).  Same wire-slot →
+   OPR mapping `stash_owner_o2` uses on the WM main service queue:
+   wire slots 0/1/2 (sender's O1/O2/O3) → handler O1/O2/O3.
+3. **r4..r7 in the asm clobber list aren't always honoured for
+   `"r"` inputs.**  pcc-orisc sometimes places an input operand
+   in r4 or r5 — when the asm body then writes r4 first (per the
+   wire ABI), it stomps the input before later `addu r6, %y, r0`
+   reads it.  Workaround: copy each `"r"` input into a safe temp
+   (r8..r11) at the *top* of the asm body, then move from the
+   temps into the ABI registers.  Same trick `flush_strip` uses;
+   γ.13's pointer-event forwarder needed it again.
+
+Smoke (`ptr_smoke.c` + `test_ptr_smoke.sh`) uses fake_terminal's
+`--event` injection to send 5 motion / down / up events; the
+test PASSes when smoke receives ≥3 (slack against the
+buffer-flush-ordering window).
+
+This closes out the bitmapped-overlays migration.  Every visible
+WM surface — console, grid, vector, raster, pointer — is now
+WM-mediated: the WM is the single point of pixel composition for
+its windows, and oriscterm's Tk overlay items are dead code
+ready to retire as soon as workers can also bind WM surfaces (or
+spawn-relay propagates the leader's caps).
 
 ## Where things stand now
 

@@ -200,12 +200,24 @@
  *     + 128 (WM_RASTER_BASE: WM-only — per-window RASTER service
  *          refs (16 windows × 8 bytes).  Same shape as WM_GRID_BASE
  *          / WM_VECTOR_BASE.  Phase 59 / WM γ.12.)
+ *     + 8 (WM_POINTER_CAP_SLOT: persistent — holds the WM-mediated
+ *          POINTER service sub-cap that pointer.c SENDs to in order
+ *          to subscribe for pointer events.  Unlike vector / raster
+ *          which are per-window, the v1 pointer service is one
+ *          WM-wide instance (multi-window focus is post-multi-window
+ *          WM work).  Phase 59 / WM γ.13.)
+ *     + 32 (WM_POINTER_INTERNAL: WM-only — four 8-byte slots used by
+ *          the WM's pointer-mediation logic: pointer service ref,
+ *          single subscriber ref, internal events-mailbox ref, and
+ *          the ref to /sys/term/0/pointer the WM walks at boot.
+ *          Other programs leave these dead.  Phase 59 / WM γ.13.)
  *
  * Total: 720 standard region + 128 WM_GRID_BASE + 128 WM_VECTOR_BASE
- * + 8 WM_RASTER_CAP_SLOT + 128 WM_RASTER_BASE = 1112.  The libc
- * oversizes ORX_STATE_BYTES so the WM's task-table objstore covers
- * all of its slot map; non-WM programs leave the tail dead. */
-#define ORX_STATE_BYTES   984
+ * + 8 WM_RASTER_CAP_SLOT + 128 WM_RASTER_BASE + 8 WM_POINTER_CAP_SLOT
+ * + 32 WM_POINTER_INTERNAL = 1152.  The libc oversizes
+ * ORX_STATE_BYTES so the WM's task-table objstore covers all of its
+ * slot map; non-WM programs leave the tail dead. */
+#define ORX_STATE_BYTES   1152
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8
