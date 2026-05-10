@@ -72,6 +72,7 @@
 #define WM_OP_BIND_SURFACE       2
 #define WM_OP_DESTROY_WINDOW     3
 #define WM_OP_SUBSCRIBE_EVENTS   4
+#define WM_OP_QUERY_GEOMETRY     5
 
 /* WM error codes — also surface in liborisc.h.  Mirrored locally for
  * the no-WM fallback short-circuit. */
@@ -421,6 +422,69 @@ wm_destroy_window(int wid)
 	);
 	if (poll_status != 0) return poll_status;
 	return status;
+}
+
+/* OP_QUERY_GEOMETRY: SEND with R4=op, R5=wid (0 = first live window).
+ * Reply: R3=status, R4=geom_a (w_px:h_px), R5=geom_b (w_cells:h_cells),
+ * R6=resolved_wid.  Used by tasks that inherited a window via
+ * supervisor handoff (no wm_new_window call of their own) and need to
+ * know the cell-grid extent of the surface they're rendering into.
+ *
+ * Output is packed into a 4-int array `out[4]` (avoids the pcc-orisc
+ * 4-arg call ceiling that bites on 5-pointer signatures):
+ *   out[0] = w_cells, out[1] = h_cells,
+ *   out[2] = w_px,    out[3] = h_px. */
+int
+wm_get_geometry(int wid, int *out)
+{
+	int rc = wm_init();
+	if (rc != 0) return rc;
+	rc = wm_reply_mailbox_init();
+	if (rc != 0) return rc;
+	rc = wm_derive_reply_subcap();
+	if (rc != 0) return rc;
+
+	asm volatile(
+		"orefld o1, %0(o12)\n"
+		"onull  o2\n"
+		"orefld o3, %1(o12)\n"
+		"addu   r5, %3, r0\n"           /* wid FIRST */
+		"addiu  r4, r0, %2\n"           /* op */
+		"addiu  r6, r0, 0\n"
+		"addiu  r7, r0, 0\n"
+		"send   o1\n"
+		:
+		: "i"(WM_SLOT_OFFSET),
+		  "i"(DIR_REPLY_SCRATCH_OFFSET),
+		  "i"(WM_OP_QUERY_GEOMETRY),
+		  "r"(wid)
+		: "r1", "r4", "r5", "r6", "r7"
+	);
+
+	int status, geom_a, geom_b, poll_status;
+	asm volatile(
+		"orefld o1, %4(o12)\n"
+		"addiu r4, r0, -1\n"
+		"call  #0x204\n"
+		"nop\n"
+		"addu  %0, r2, r0\n"
+		"addu  %1, r3, r0\n"
+		"addu  %2, r4, r0\n"
+		"addu  %3, r5, r0"
+		: "=r"(poll_status), "=r"(status),
+		  "=r"(geom_a), "=r"(geom_b)
+		: "i"(REPLY_MB_SLOT_OFFSET)
+		: "r1", "r2", "r3", "r4", "r5", "r6"
+	);
+	if (poll_status != 0) return poll_status;
+	if (status != 0)      return status;
+	if (out) {
+		out[0] = (geom_b >> 16) & 0xFFFF;   /* w_cells */
+		out[1] = geom_b & 0xFFFF;           /* h_cells */
+		out[2] = (geom_a >> 16) & 0xFFFF;   /* w_px */
+		out[3] = geom_a & 0xFFFF;           /* h_px */
+	}
+	return 0;
 }
 
 /* OP_SUBSCRIBE_EVENTS: SEND with R4=op, R5=wid, R6=notify_op,

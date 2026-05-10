@@ -702,6 +702,30 @@ int wm_destroy_window(int wid);
  * mailbox. */
 int wm_subscribe_events(int wid, int notify_op);
 
+/* wm_get_geometry — read back the cell-grid + pixel extents of a
+ * window.  Pass `wid = 0` to query the first live window; useful for
+ * leader-spawned children that inherited a CONSOLE/GRID cap from the
+ * supervisor and need to know the cell dims of the surface they're
+ * rendering into without having called wm_new_window themselves.
+ *
+ * `out` MUST point to a 4-int array; on success it's filled with
+ * the *usable* (inside-the-border) extents:
+ *     out[0] = w_cells,  out[1] = h_cells,
+ *     out[2] = w_px,     out[3] = h_px
+ * The 4-array form avoids the pcc-orisc 5-arg-call codegen bug; for
+ * a more conventional API a wrapper macro / inline can pull each
+ * field out into named locals at the call site.
+ *
+ * Returns 0 on success; WM_NO_* if the WM is unreachable; -1/-2 if
+ * the wid is invalid or no live window exists. */
+int wm_get_geometry(int wid, int *out);
+
+/* Convenience indices into the wm_get_geometry out[] array. */
+#define WM_GEOM_W_CELLS  0
+#define WM_GEOM_H_CELLS  1
+#define WM_GEOM_W_PX     2
+#define WM_GEOM_H_PX     3
+
 /* ----- VFS helpers (Phase 45g) ----------------------------------------
  *
  * `vfs.c` is the path-aware front door programs should prefer over

@@ -6528,6 +6528,68 @@ linger."  Now SIGTERM fans out in parallel, the whole group
 shares a 2 s budget, then any stragglers SIGKILL together with
 1 s grace.  Worst-case teardown drops to ~3 s.
 
+## Phase 60 step 5 — window borders + queryable geometry
+
+Step 4 left three obvious user-visible gaps: windows had no chrome
+(every framebuffer was a flush black void), programs couldn't ask
+"how big is my window?", and full screens had no scroll mechanism.
+This step closes the first two.
+
+New firmware op `#0x10D ObjFillRect`:
+
+- O1 = TAG_FRAMEBUFFER ref (must be local).
+- R4 = packed `(x << 16) | y` — top-left pixel.
+- R5 = packed `(w << 16) | h` — rectangle size.
+- R6 = colour (low byte = palette index).
+
+Bytearray-fill in Python rather than per-row `ObjStoreBytes` from
+the WM.  Same "blitter device" pattern as `ObjBlitGlyphs`: zero
+simulated WM cycles for the work, the WM's role narrows to "fill
+this region with this colour."
+
+`oriscwm` uses the new op once at boot to paint the window chrome:
+solid background + a 2-pixel border line just inside the outer
+cell ring.  The cell grid itself shrinks one cell on each side
+(160×48 FB stays 160×48 cells in pixel terms, but the WM only
+renders into the inner 158×46 cells; the outer ring is reserved
+for the chrome).  `flush_strip` adds a `BORDER_CELLS` offset
+before passing to `ObjBlitGlyphs` so client `(col, row)`
+coordinates always land inside the border.  The `paint_window_-
+chrome` helper draws four lines straddling the cell boundary so
+the corners overlap cleanly.
+
+New WM op `WM_OP_QUERY_GEOMETRY` (R5 = wid; 0 = first live window):
+
+```
+Reply: R3 = status, R4 = (w_px:h_px), R5 = (w_cells:h_cells),
+       R6 = resolved_wid
+```
+
+Pairs with libc `wm_get_geometry(wid, int out[4])` — fills
+`out[0..3]` with `{w_cells, h_cells, w_px, h_px}` (4-int array
+form sidesteps pcc-orisc's 5-arg-call bug; named indices
+`WM_GEOM_W_CELLS` etc. live in `liborisc.h`).  The wid=0
+"default to the first live window" case lets supervisor-spawned
+children — which inherit a CONSOLE/GRID cap from the leader and
+never call `wm_new_window` themselves — find out what extent
+they're rendering into.
+
+Reported geometry is the *usable* (inside-the-border) cell area:
+158 cells × 46 cells = 1264 × 736 px.  Programs see those
+extents from `wm_new_window` and `wm_get_geometry` consistently;
+the outer ring (reserved for chrome) is invisible to them.
+
+`wm_smoke` exercises the new op as step 6b — checks that
+`get_geometry(wid=0)` returns the same cells as the immediate
+`wm_new_window` reply and that pixel extents are non-zero.
+User-confirmed: borders show on both terminal windows; programs
+that read `wm_get_geometry` see 158×46 even though the FB is
+160×48 in pixel terms.
+
+Scrolling stays out of scope here — `render_buffer` still drops
+content past row 46.  Scrollback needs a per-window pixel backing
+store; that's a follow-up phase.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
