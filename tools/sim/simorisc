@@ -3478,6 +3478,111 @@ def primitive_ObjFillRect(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK)
 
 
+def primitive_ObjFbScroll(cpu: CPU) -> None:
+    """Phase 60 step 6 — shift a rectangular region of a TAG_FRAMEBUFFER
+    vertically by `dy` pixels and fill the freshly-exposed strip with
+    a single palette index.  Used by oriscwm's render_buffer to
+    scroll the inner cell area up by one cell when text overflows
+    the bottom row.
+
+    Inputs:
+      O1 = framebuffer ref            (TAG_FRAMEBUFFER, must be local)
+      R4 = packed (x << 16) | y       — top-left of region
+      R5 = packed (w << 16) | h       — region size in pixels
+      R6 = packed (dy << 8) | fill    — dy is signed 24-bit, positive
+                                         shifts content UP toward y=0;
+                                         fill is the palette index
+                                         used to clear the dy pixel
+                                         rows freshly exposed at the
+                                         bottom (or top, for negative
+                                         dy).
+
+    Outputs:
+      R2 = status (ERR_OK / ERR_EFAULT / ERR_EPERM / ERR_EREMOTE /
+                   ERR_ESTALE / ERR_EINVAL)
+
+    Region clips to FB bounds.  |dy| >= h is equivalent to "fill the
+    whole region with `fill`."  dy == 0 is a no-op. """
+    fb_ref = cpu.get_opr(1)
+    if fb_ref == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if (ref_caps(fb_ref) & CAP_W) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return
+    if ref_home(fb_ref) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+    fb_idx = ref_index(fb_ref)
+    if fb_idx <= 0 or fb_idx >= len(cpu.descriptors) \
+            or cpu.descriptors[fb_idx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); return
+    fb_desc = cpu.descriptors[fb_idx]
+    if not fb_desc.live or fb_desc.generation != ref_generation(fb_ref):
+        cpu.set_gpr(2, ERR_ESTALE); return
+    if fb_desc.type_tag != TAG_FRAMEBUFFER:
+        cpu.set_gpr(2, ERR_EINVAL); return
+
+    r4 = cpu.get_gpr(4)
+    rx = sext32((r4 >> 16) & 0xFFFF)
+    ry = sext32(r4 & 0xFFFF)
+    r5 = cpu.get_gpr(5)
+    rw = (r5 >> 16) & 0xFFFF
+    rh = r5 & 0xFFFF
+    r6 = cpu.get_gpr(6)
+    fill = r6 & 0xFF
+    # dy is the upper 24 bits, sign-extended.
+    dy_raw = (r6 >> 8) & 0xFFFFFF
+    if dy_raw & 0x800000:
+        dy = dy_raw - 0x1000000
+    else:
+        dy = dy_raw
+
+    fb_w = fb_desc.fb_width
+    fb_h = fb_desc.fb_height
+    # Clip region to FB.
+    x0 = max(0, rx)
+    y0 = max(0, ry)
+    x1 = min(fb_w, rx + rw)
+    y1 = min(fb_h, ry + rh)
+    if x1 <= x0 or y1 <= y0:
+        cpu.set_gpr(2, ERR_OK); return
+    cw = x1 - x0
+    ch = y1 - y0
+
+    if dy == 0:
+        cpu.set_gpr(2, ERR_OK); return
+
+    fb_storage = fb_desc.storage
+    fill_row = bytes((fill,)) * cw
+
+    if abs(dy) >= ch:
+        # Whole region clears.
+        for y in range(y0, y1):
+            base = y * fb_w + x0
+            fb_storage[base:base + cw] = fill_row
+    elif dy > 0:
+        # Shift up: dst[y] = src[y + dy] for y in [y0, y1 - dy).
+        # Iterate top-down so we don't trample reads.
+        for y in range(y0, y1 - dy):
+            src = (y + dy) * fb_w + x0
+            dst = y * fb_w + x0
+            fb_storage[dst:dst + cw] = fb_storage[src:src + cw]
+        for y in range(y1 - dy, y1):
+            base = y * fb_w + x0
+            fb_storage[base:base + cw] = fill_row
+    else:
+        # Shift down: dst[y] = src[y - |dy|], iterate bottom-up.
+        absdy = -dy
+        for y in range(y1 - 1, y0 + absdy - 1, -1):
+            src = (y - absdy) * fb_w + x0
+            dst = y * fb_w + x0
+            fb_storage[dst:dst + cw] = fb_storage[src:src + cw]
+        for y in range(y0, y0 + absdy):
+            base = y * fb_w + x0
+            fb_storage[base:base + cw] = fill_row
+
+    fb_desc.fb_dirty = True
+    cpu.set_gpr(2, ERR_OK)
+
+
 def primitive_ObjAllocInputSink(cpu: CPU) -> None:
     """Phase 60 step 3 — allocate a TAG_INPUT_SINK object that
     receives synthetic SEND_DELIVER events from simorisc's host
@@ -4164,6 +4269,7 @@ PRIMITIVE_MIN_MODE = {
     0x10B: MODE_USER,        # ObjAllocInputSink (Phase 60 step 3)
     0x10C: MODE_USER,        # ObjBlitGlyphs (Phase 60 step 4)
     0x10D: MODE_USER,        # ObjFillRect (Phase 60 step 5)
+    0x10E: MODE_USER,        # ObjFbScroll (Phase 60 step 6)
     0x107: MODE_USER,        # ObjFreeDeferred — drain-window wrapper
     0x103: MODE_USER,        # ObjDerive
     0x106: MODE_USER,        # ObjAllocStore
@@ -4224,6 +4330,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjBlitGlyphs(cpu)
     elif prim == 0x10D:
         primitive_ObjFillRect(cpu)
+    elif prim == 0x10E:
+        primitive_ObjFbScroll(cpu)
     elif prim == 0x107:
         primitive_ObjFreeDeferred(cpu)
     elif prim == 0x103:

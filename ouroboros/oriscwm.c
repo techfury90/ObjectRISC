@@ -2365,6 +2365,60 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 	);
 }
 
+/* Phase 60 step 6 — shift the inner cell area up by one cell row
+ * (CELL_H pixels) and clear the freshly-exposed bottom row to the
+ * background colour.  Used by render_buffer when the cursor advances
+ * past the last usable row.  The chrome (border + outer-ring
+ * margin) is left untouched: only the inner pixel rectangle scrolls.
+ *
+ * One firmware call (#0x10E ObjFbScroll) does the whole thing —
+ * Python-side memmove + byte-fill, no per-pixel work in interpreted
+ * WM code.  For an 80-char output the cost is ~CELL_H wallclock-ms
+ * regardless of how many rows we're shifting; well below the
+ * per-strip ObjBlitGlyphs cost. */
+static void
+fb_scroll_up_one_cell(void)
+{
+	int packed_xy = ((CELL_ORIGIN_X & 0xFFFF) << 16)
+	              | (CELL_ORIGIN_Y & 0xFFFF);
+	int packed_wh = ((USABLE_W_PX & 0xFFFF) << 16)
+	              | (USABLE_H_PX & 0xFFFF);
+	/* dy:fill — dy occupies the upper 24 bits (signed); positive
+	 * shifts content toward y=0.  fill is the bottom 8 bits. */
+	int packed_dy_fill = ((CELL_H & 0xFFFFFF) << 8)
+	                   | (WM_BG_COLOR & 0xFF);
+	asm volatile(
+		"addu   r8,  %0, r0\n"      /* save packed_xy */
+		"addu   r9,  %1, r0\n"      /* save packed_wh */
+		"addu   r10, %2, r0\n"      /* save packed_dy_fill */
+		"orefld o1, %3(o12)\n"
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r10, r0\n"
+		"call   #0x10E\n"           /* ObjFbScroll */
+		"nop"
+		:
+		: "r"(packed_xy), "r"(packed_wh), "r"(packed_dy_fill),
+		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6",
+		  "r8", "r9", "r10"
+	);
+}
+
+/* Hoist `*row` back into [0, N_ROWS) by scrolling the inner cell
+ * area up one cell-row at a time.  Called from render_buffer after
+ * any branch that increments the cursor row.  Multiple newlines past
+ * the bottom legitimately scroll once per newline — same semantics
+ * as a real terminal. */
+static void
+maybe_scroll(int *row)
+{
+	while (*row >= N_ROWS) {
+		fb_scroll_up_one_cell();
+		*row -= 1;
+	}
+}
+
 /* Render `count` bytes from `buf` to window `wid`'s framebuffer
  * surface, accumulating runs of printable chars on the same cell
  * row into strips and flushing each strip in 16 wire RTTs total.
@@ -2372,9 +2426,10 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
  * the cursor; non-printable chars (other than those three) advance
  * the cursor without rendering, also boundarying the strip.
  *
- * No scroll — rows past N_ROWS stop rendering, but the cursor
- * still advances so subsequent newlines bring future content back
- * on screen if some clears arrive (future milestone work).
+ * Phase 60 step 6: the cursor scrolls when it advances past the last
+ * usable row — fb_scroll_up_one_cell does the FB-internal pixel
+ * shift, and `row` is rolled back to N_ROWS-1 so the next strip
+ * lands on the fresh blank row.
  *
  * Cursor state in window_cur_col/row[] is updated on return. */
 static void
@@ -2396,6 +2451,7 @@ render_buffer(int wid, const unsigned char *buf, int count)
 			flush_strip(strip, strip_len, strip_row, strip_col_start);
 			col = 0;
 			row += 1;
+			maybe_scroll(&row);
 			strip_len       = 0;
 			strip_row       = row;
 			strip_col_start = 0;
@@ -2425,7 +2481,7 @@ render_buffer(int wid, const unsigned char *buf, int count)
 			 * strip so the next printable run starts fresh. */
 			flush_strip(strip, strip_len, strip_row, strip_col_start);
 			col += 1;
-			if (col >= N_COLS) { col = 0; row += 1; }
+			if (col >= N_COLS) { col = 0; row += 1; maybe_scroll(&row); }
 			strip_len       = 0;
 			strip_row       = row;
 			strip_col_start = col;
@@ -2440,6 +2496,7 @@ render_buffer(int wid, const unsigned char *buf, int count)
 			flush_strip(strip, strip_len, strip_row, strip_col_start);
 			col = 0;
 			row += 1;
+			maybe_scroll(&row);
 			strip_len       = 0;
 			strip_row       = row;
 			strip_col_start = 0;
