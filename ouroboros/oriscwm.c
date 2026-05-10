@@ -932,11 +932,13 @@ do_blit_copy_active_to_screen(int packed_src_xy, int packed_dst_xy,
 	);
 }
 
-/* Forward decl — fill_rect_packed lives further down (alongside the
- * paint_window_chrome helpers) but recompose_after_destroy needs it
- * to clear the destroyed-window screen rect to bg before
- * compositing the remaining z-stack. */
+/* Forward decls — fill_rect_packed + paint_window_chrome_border live
+ * further down (alongside the paint_window_chrome helpers) but
+ * recompose_after_destroy needs both: fill_rect_packed to clear the
+ * destroyed-window screen rect to bg, paint_window_chrome_border to
+ * re-establish any border pixels the destroyed rect overlapped. */
 static void fill_rect_packed(int packed_xy, int packed_wh, int color);
+static void paint_window_chrome_border(void);
 
 /* Composite an arbitrary screen rect by walking z-order bottom-to-
  * top: each window's intersection with the rect is blitted from its
@@ -997,6 +999,11 @@ recompose_after_destroy(int sx, int sy, int w, int h)
 	int packed_wh = ((w  & 0xFFFF) << 16) | (h  & 0xFFFF);
 	fill_rect_packed(packed_xy, packed_wh, WM_BG_COLOR);
 	composite_screen_rect(sx, sy, w, h);
+	/* If the destroyed rect overlapped any chrome border pixels
+	 * (deep cascade, manually-positioned windows, etc.) the bg
+	 * fill erased them — re-paint the border so the screen frame
+	 * stays intact.  Cheap (four fill_rects); always safe. */
+	paint_window_chrome_border();
 }
 
 /* Composite the entire window backing store onto the screen FB.
@@ -1150,30 +1157,33 @@ fill_rect_packed(int packed_xy, int packed_wh, int color)
 	);
 }
 
-/* Paint the window chrome: solid bg fill + a 2-pixel border line just
- * inside the outer cell ring.  Called once after alloc_local_framebuffer
- * so the FB never appears as a black void to the user — they see the
- * border before the first glyph lands.
+/* Paint the screen chrome: a 2-pixel border line just inside the
+ * outer pixel edges of the screen FB.  Frames the whole desktop —
+ * windows live inside the chrome's inner area.
  *
- * Border layout (BORDER_LINE_PX=2, BORDER_CELLS=1):
- *   top:    y ∈ [CELL_ORIGIN_Y - BORDER_LINE_PX, CELL_ORIGIN_Y)
- *   bottom: y ∈ [CELL_ORIGIN_Y + USABLE_H_PX, +BORDER_LINE_PX)
- *   left:   x ∈ [CELL_ORIGIN_X - BORDER_LINE_PX, CELL_ORIGIN_X)
- *   right:  x ∈ [CELL_ORIGIN_X + USABLE_W_PX, +BORDER_LINE_PX)
- * Lines extend across the full inner-cell-area width/height so the
- * four corners overlap and form a clean rectangle. */
+ * Phase 60 step 14: was using USABLE_W_PX / USABLE_H_PX (the
+ * per-window size) which post-step-14 are 640/400 rather than the
+ * screen-sized 1280/768.  Result: chrome was a small 644×404 frame
+ * stuck in the top-left, and any window whose cascade offset
+ * crossed its right/bottom edges would erase part of it on destroy.
+ * Now uses FB_W/FB_H so the frame surrounds the whole screen.
+ *
+ * Border layout (BORDER_LINE_PX=2, CELL_ORIGIN=8/16):
+ *   top:    y ∈ [14, 16)         left:  x ∈ [6, 8)
+ *   bottom: y ∈ [752, 754)       right: x ∈ [1272, 1274)
+ * Lines extend across the full screen so the four corners overlap
+ * and form a clean rectangle. */
+/* Just the four border lines — split out so recompose_after_destroy
+ * can re-paint them without first wiping the screen to bg.  Cheap
+ * (four fill_rects); called whenever the chrome could have been
+ * touched by a destroyed window's rect. */
 static void
-paint_window_chrome(void)
+paint_window_chrome_border(void)
 {
-	/* Background. */
-	fill_rect_packed(((0 & 0xFFFF) << 16) | (0 & 0xFFFF),
-	                 ((FB_W & 0xFFFF) << 16) | (FB_H & 0xFFFF),
-	                 WM_BG_COLOR);
-
 	int top_y    = CELL_ORIGIN_Y - BORDER_LINE_PX;
-	int bottom_y = CELL_ORIGIN_Y + USABLE_H_PX;
+	int bottom_y = FB_H - CELL_ORIGIN_Y;
 	int left_x   = CELL_ORIGIN_X - BORDER_LINE_PX;
-	int right_x  = CELL_ORIGIN_X + USABLE_W_PX;
+	int right_x  = FB_W - CELL_ORIGIN_X;
 	int frame_w  = (right_x + BORDER_LINE_PX) - left_x;
 	int frame_h  = (bottom_y + BORDER_LINE_PX) - top_y;
 	int hline_wh = ((frame_w & 0xFFFF) << 16) | (BORDER_LINE_PX & 0xFFFF);
@@ -1187,6 +1197,18 @@ paint_window_chrome(void)
 	                 vline_wh, WM_BORDER_COLOR);
 	fill_rect_packed(((right_x & 0xFFFF) << 16) | (top_y & 0xFFFF),
 	                 vline_wh, WM_BORDER_COLOR);
+}
+
+/* Boot-time chrome paint: bg fill + border lines.  Subsequent
+ * partial re-paints (after destroying a window) use
+ * paint_window_chrome_border alone. */
+static void
+paint_window_chrome(void)
+{
+	fill_rect_packed(((0 & 0xFFFF) << 16) | (0 & 0xFFFF),
+	                 ((FB_W & 0xFFFF) << 16) | (FB_H & 0xFFFF),
+	                 WM_BG_COLOR);
+	paint_window_chrome_border();
 }
 
 /* Phase 60 step 3 superseded subscribe_term_pointer (the
