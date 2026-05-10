@@ -159,6 +159,51 @@ void grid_print(int col, int row, const char *s);
 void grid_print_n(int col, int row, const char *buf, int count);
 void grid_clear(void);
 
+/* ---- vec.c — WM-mediated vector graphics client (Phase 59 / WM γ.11) ----
+ *
+ * Pixel-space line / rect / oval rasterisation through the window
+ * manager.  Wire op + two packed (x<<16)|y / (w<<16)|h words; the
+ * WM's per-window VECTOR queue dispatches each op into the
+ * framebuffer at native 1280×768 (FB_W × FB_H — see oriscwm.c).
+ *
+ * Boot prerequisites:
+ *   1. task_init() has run.
+ *   2. wm_init() returned 0.
+ *   3. wm_new_window(WIN_TYPE_CONSOLE) succeeded.
+ *   4. wm_bind_surface(wid, WSURF_VECTOR) succeeded — the resolved
+ *      cap lands in DIR_RESULT_SLOT (offset 616) and the caller
+ *      MUST stash it into WM_VECTOR_CAP_SLOT before the first
+ *      vec_*() call.  vec_init_from_dir_result() is the convenience
+ *      helper that does the copy.
+ *
+ * All vec_*() return 0 on success, -1 if WM_VECTOR_CAP_SLOT is null
+ * (no surface bound).  Coordinates are signed 16-bit (clamped /
+ * clipped by the WM); colors are palette indices 0..8 (matching
+ * oriscterm's VEC_PALETTE).
+ *
+ * `vec_clear` is currently a no-op on the WM side (pending a
+ * per-window backing store; see oriscwm.c).  The libc still emits
+ * the SEND so future WM versions don't need a client recompile. */
+
+/* Vector op codes (must match oriscterm's VEC_* and oriscwm's
+ * forward_vector_write dispatch). */
+#define VEC_OP_LINE         0x00
+#define VEC_OP_RECT_FILL    0x01
+#define VEC_OP_RECT_OUTLINE 0x02
+#define VEC_OP_OVAL_FILL    0x03
+#define VEC_OP_OVAL_OUTLINE 0x04
+#define VEC_OP_CLEAR        0x05
+#define VEC_OP_SET_COLOR    0x06
+
+int  vec_init_from_dir_result(void);                 /* DIR_RESULT_SLOT → WM_VECTOR_CAP_SLOT */
+int  vec_line(int x1, int y1, int x2, int y2);
+int  vec_rect_fill(int x, int y, int w, int h);
+int  vec_rect_outline(int x, int y, int w, int h);
+int  vec_oval_fill(int x, int y, int w, int h);
+int  vec_oval_outline(int x, int y, int w, int h);
+int  vec_clear(void);
+int  vec_set_color(int palette_idx);
+
 /* term_getkey: blocks until the next keystroke arrives. Returns
  * the codepoint (ASCII for printable, ≥0x100 for special — see
  * KEY_* in tools/devices/oriscterm). Modifier mask written to

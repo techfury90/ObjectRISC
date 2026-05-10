@@ -5969,6 +5969,76 @@ small enough to leave for if/when the overlay traffic itself
 shrinks (per-window backing stores, batched cell strips beyond
 γ.4).
 
+### γ.11 — WM-mediated vector graphics
+
+Step 2 of 4 in the bitmapped-overlays migration.  The WM gains a
+per-window VECTOR service alongside the CONSOLE (γ.3) and GRID
+(γ.9) ones, and rasterises line / rect / oval primitives directly
+into the framebuffer instead of routing them through oriscterm's
+Tk overlay items.  Same per-window `TAG_SERVICE` + ReceiveQueue
+shape, same `WSURF_*`-bound R|S sub-cap, same dispatch-loop poll.
+
+Wire payload: `int_payload[0..2] = (op, packed1, packed2)`.  The
+two packed words carry signed 16-bit halves — for `VEC_OP_LINE`,
+`(x1<<16)|y1` and `(x2<<16)|y2`; for rect / oval, `(x<<16)|y` and
+`(w<<16)|h`; for `VEC_OP_SET_COLOR`, the palette index in
+`packed1`'s low half.  No source-bytes ref — all vector ops carry
+their full payload inline, unlike GRID which fetches user bytes.
+
+Slot-map deltas:
+
+- `task.c`: `ORX_STATE_BYTES` 712 → 848 (covers the new
+  `WM_VECTOR_BASE` per-window cap region).  New
+  `WM_VECTOR_CAP_SLOT` at offset 712 holds the WM-mediated VECTOR
+  sub-cap that the libc OREFLDs into O1 on each `vec_*()` SEND.
+  `WM_GRID_BASE` shifts 712 → 720 to make room.
+- `oriscwm.c`: `WM_GRID_BASE_OFFSET` 712 → 720, new
+  `WM_VECTOR_BASE_OFFSET` = 848.  Per-wid `stash_vector_o1` /
+  `load_vector_to_o1` helpers mirror the GRID switches; allocation
+  / free / bind / destroy paths get a third surface.
+
+Cap delivery: unlike CONSOLE (boot O5) and GRID (boot O7), there's
+no legacy O-register convention for vector — paint programs were
+never run inside Ouroboros.  The libc reads from
+`WM_VECTOR_CAP_SLOT` on each call, and clients seed that slot
+themselves after a successful `wm_bind_surface(WSURF_VECTOR)` via
+`vec_init_from_dir_result()`.  Supervisor-level leader→child
+propagation (so children inherit the cap automatically) is a
+follow-up; for the smoke test, the test program does the seeding
+itself.
+
+WM-side rasterisers, all single-threaded:
+
+- `draw_line` — Bresenham, per-pixel `fb_set_pixel` writes.
+- `draw_rect_fill` / `draw_rect_outline` — pre-build a row of color
+  bytes in `vec_scratch_row`, blit per row.
+- `draw_oval_fill` / `draw_oval_outline` — scanline approach using
+  the implicit ellipse equation.  Per-row hx is found by linear
+  scan from 0; midpoint ellipse with 4-quadrant symmetry would be
+  the canonical fix, future work.
+
+`VEC_OP_CLEAR` is a no-op for the same reason GRID's clear
+sentinel is — without per-window backing stores, a full-FB clear
+would also wipe console + grid rendering.  The libc still emits
+the SEND so future WM versions don't need a client recompile.
+
+This phase tripped two new pcc-orisc codegen quirks worth
+recording because they'll bite again:
+
+1. **5-arg function calls don't compile.**  Initial rasterisers
+   took `(x, y, w, h, color)` — pcc emits `adrput: illegal op 57`
+   anywhere a 5-arg call appears.  Workaround: the rasterisers all
+   take ≤4 args and read the current pen colour from a static
+   `cur_vec_color` that `forward_vector_write` seeds before each
+   draw call.  pcc passes 4 args in registers and isn't wired for
+   stack-spilled args.
+2. **`la sym + -1` is invalid asm.**  Indexing a global array with
+   `arr[wid - 1]` makes pcc fold the `-1` into the symbol address
+   and emit `la r5, sym+-1`, which `asmorisc` rejects ("expected
+   label, got multi-token operand").  Workaround: hoist the
+   subtraction into a separate `int slot = wid - 1;` so pcc emits
+   a runtime `sub` instead of a compile-time fold.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
