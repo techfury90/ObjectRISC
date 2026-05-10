@@ -129,6 +129,14 @@
  * terminal than the supervisor's own (cross-terminal hot-attach). */
 #define WM_LEADER_CONSOLE_SLOT_OFFSET  696
 
+/* Phase 59 / WM γ.9: WM-mediated GRID surface.  Mirror of
+ * WM_LEADER_CONSOLE_SLOT for positioned text — the leader stashes
+ * the cap returned by wm_bind_surface(WSURF_GRID) here, and
+ * populate_child_term_slots wires it into ORX_SLOT_CHILD_O7 so
+ * children's grid SENDs flow through the WM's framebuffer
+ * rasteriser instead of /sys/term/<idx>/grid. */
+#define WM_LEADER_GRID_SLOT_OFFSET     704
+
 /* Sentinel target_pid values. PROCIDs occupy 0..0xFD; 0xFE / 0xFF
  * are reserved as routing markers.
  *
@@ -706,6 +714,21 @@ wm_leader_console_isn(void)
 	return isn;
 }
 
+/* OISN-style probe of WM_LEADER_GRID_SLOT.  Returns 1 if null. */
+static int
+wm_leader_grid_isn(void)
+{
+	int isn;
+	asm volatile(
+		"orefld o14, %1(o12)\n"
+		"oisn   %0, o14"
+		: "=r"(isn)
+		: "i"(WM_LEADER_GRID_SLOT_OFFSET)
+		: "r14"
+	);
+	return isn;
+}
+
 /* Phase 49: populate ORX_SLOT_CHILD_O5/O6/O7 from
  * /sys/term/<term_idx>/{console,keyboard,grid}. orx_task_create
  * inside the upcoming orx_spawn swaps these into the child's OPR
@@ -768,15 +791,33 @@ populate_child_term_slots(int term_idx)
 			  "i"(ORX_SLOT_CHILD_O6_OFFSET)
 		);
 	}
-	render_term_path(term_idx, "grid", path);
-	if (sup_walk_for_opr(path) == 0) {
+	int wired_grid = 0;
+	if (term_idx == task_my_terminal_idx()
+	    && wm_leader_grid_isn() == 0) {
+		/* WM-mediated GRID for the leader's own terminal —
+		 * positioned text rasterises into the framebuffer
+		 * through the WM, just like console output. */
 		asm volatile(
 			"orefld o14, %0(o12)\n"
 			"orefst o14, %1(o12)"
 			:
-			: "i"(DIR_RESULT_SLOT_OFFSET),
+			: "i"(WM_LEADER_GRID_SLOT_OFFSET),
 			  "i"(ORX_SLOT_CHILD_O7_OFFSET)
+			: "r14"
 		);
+		wired_grid = 1;
+	}
+	if (!wired_grid) {
+		render_term_path(term_idx, "grid", path);
+		if (sup_walk_for_opr(path) == 0) {
+			asm volatile(
+				"orefld o14, %0(o12)\n"
+				"orefst o14, %1(o12)"
+				:
+				: "i"(DIR_RESULT_SLOT_OFFSET),
+				  "i"(ORX_SLOT_CHILD_O7_OFFSET)
+			);
+		}
 	}
 }
 
@@ -1786,6 +1827,18 @@ main(void)
 				if (wm_bind_surface(wid, WSURF_KEYBOARD) == 0) {
 					asm volatile("orefld o6, %0(o12)"
 					             :: "i"(DIR_RESULT_SLOT_OFFSET));
+				}
+				/* GRID: same dance as CONSOLE — stash the
+				 * resolved cap so populate_child_term_slots
+				 * routes ORX_SLOT_CHILD_O7 through it. */
+				if (wm_bind_surface(wid, WSURF_GRID) == 0) {
+					asm volatile(
+						"orefld o7, %0(o12)\n"
+						"orefst o7, %1(o12)"
+						:
+						: "i"(DIR_RESULT_SLOT_OFFSET),
+						  "i"(WM_LEADER_GRID_SLOT_OFFSET)
+					);
 				}
 				SUP_PRINT("supervisor: WM-mediated leader "
 				          "session (wid=");

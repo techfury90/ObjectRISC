@@ -156,10 +156,24 @@
  *                                   in forward_console_write.
  *     456  WM_FORWARD_REPLY_SLOT    transient stash for the client's
  *                                   reply_cap on a console write.
+ *     712..840  WM_GRID_BASE         per-window GRID service refs
+ *                                   (16 windows × 8 bytes).  Same
+ *                                   shape as WM_CONSOLE_BASE — clients
+ *                                   that wm_bind_surface(WSURF_GRID)
+ *                                   get an R|S sub-cap of the
+ *                                   per-window object; the WM polls
+ *                                   the queues from the dispatch loop
+ *                                   and forward_grid_write rasterises
+ *                                   the bytes into the framebuffer at
+ *                                   the (col, row) the SEND specifies.
+ *                                   Phase 59 / WM γ.9.
  *
- * task.c reserves up to offset 672 (ORX_SLOT_O7_SAVE), and the orx-
- * manifest area runs 152..535 — we land safely inside it.  The WM
- * never invokes orx_spawn so the area's nominal use is moot.
+ * task.c reserves up to offset 712 (WM_LEADER_GRID_SLOT for the
+ * supervisor), and the orx-manifest area runs 152..535 — we land
+ * safely inside it for the slots up to 464.  WM_GRID_BASE sits past
+ * the supervisor's scratch slots; the libc bumps ORX_STATE_BYTES to
+ * 712 so the table covers it.  The WM never invokes orx_spawn so
+ * the orx-manifest area's nominal use is moot.
  */
 
 #define BOOT_PARENT_SLOT_OFFSET     544
@@ -174,6 +188,7 @@
 #define WM_SURF_FRAMEBUFFER_SLOT_OFFSET 440
 #define WM_FORWARD_SRC_SLOT_OFFSET      448
 #define WM_FORWARD_REPLY_SLOT_OFFSET    456
+#define WM_GRID_BASE_OFFSET             712
 
 /* === Glyph rendering ==================================================
  *
@@ -686,6 +701,59 @@ load_console_to_o1(int wid)
 	}
 }
 
+/* === Per-window GRID service slot helpers =============================
+ *
+ * Same shape as the CONSOLE helpers above, just at WM_GRID_BASE.
+ * Phase 59 / WM γ.9. */
+
+static void
+stash_grid_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefst o1, 712(o12)"); break;
+	case  2: asm volatile("orefst o1, 720(o12)"); break;
+	case  3: asm volatile("orefst o1, 728(o12)"); break;
+	case  4: asm volatile("orefst o1, 736(o12)"); break;
+	case  5: asm volatile("orefst o1, 744(o12)"); break;
+	case  6: asm volatile("orefst o1, 752(o12)"); break;
+	case  7: asm volatile("orefst o1, 760(o12)"); break;
+	case  8: asm volatile("orefst o1, 768(o12)"); break;
+	case  9: asm volatile("orefst o1, 776(o12)"); break;
+	case 10: asm volatile("orefst o1, 784(o12)"); break;
+	case 11: asm volatile("orefst o1, 792(o12)"); break;
+	case 12: asm volatile("orefst o1, 800(o12)"); break;
+	case 13: asm volatile("orefst o1, 808(o12)"); break;
+	case 14: asm volatile("orefst o1, 816(o12)"); break;
+	case 15: asm volatile("orefst o1, 824(o12)"); break;
+	case 16: asm volatile("orefst o1, 832(o12)"); break;
+	default: break;
+	}
+}
+
+static void
+load_grid_to_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefld o1, 712(o12)"); break;
+	case  2: asm volatile("orefld o1, 720(o12)"); break;
+	case  3: asm volatile("orefld o1, 728(o12)"); break;
+	case  4: asm volatile("orefld o1, 736(o12)"); break;
+	case  5: asm volatile("orefld o1, 744(o12)"); break;
+	case  6: asm volatile("orefld o1, 752(o12)"); break;
+	case  7: asm volatile("orefld o1, 760(o12)"); break;
+	case  8: asm volatile("orefld o1, 768(o12)"); break;
+	case  9: asm volatile("orefld o1, 776(o12)"); break;
+	case 10: asm volatile("orefld o1, 784(o12)"); break;
+	case 11: asm volatile("orefld o1, 792(o12)"); break;
+	case 12: asm volatile("orefld o1, 800(o12)"); break;
+	case 13: asm volatile("orefld o1, 808(o12)"); break;
+	case 14: asm volatile("orefld o1, 816(o12)"); break;
+	case 15: asm volatile("orefld o1, 824(o12)"); break;
+	case 16: asm volatile("orefld o1, 832(o12)"); break;
+	default: asm volatile("onull o1"); break;
+	}
+}
+
 /* === Surface-cap loader (for wm_reply_with_ref_o14) =================== */
 
 static void
@@ -759,6 +827,43 @@ alloc_window_console(int wid)
 	return status;
 }
 
+/* Mirror of alloc_window_console for the GRID surface.  Same
+ * lifetime: allocated alongside its CONSOLE peer in handle_new_window
+ * and freed by free_window_grid in handle_destroy_window. */
+static int
+alloc_window_grid(int wid)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, 16\n"
+		"addiu r5, r0, %1\n"           /* TAG_SERVICE */
+		"addiu r6, r0, %2\n"           /* R|W|S|V|C */
+		"call  #0x100\n"               /* ObjAlloc → O1 */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(TAG_SERVICE),
+		  "i"(CAP_R | CAP_W | CAP_S | CAP_V | CAP_C)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	if (status != 0) return status;
+
+	stash_grid_o1(wid);
+
+	/* Same depth-256 reasoning as the CONSOLE queue — grid SENDs
+	 * are also fire-and-forget (term_grid_print etc.). */
+	asm volatile(
+		"addiu r4, r0, 256\n"
+		"call  #0x203\n"               /* ReceiveQueueAttach */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	return status;
+}
+
 /* WM_OP_NEW_WINDOW — allocate the next free window slot.
  *   R5 = window type
  *   O2 = owner task ref (for task_query auto-destroy)
@@ -818,6 +923,19 @@ handle_new_window(int wtype)
 		return;
 	}
 
+	/* Same dance for GRID (Phase 59 / WM γ.9).  If GRID alloc fails
+	 * we tear the CONSOLE allocation down too — clients see E_IO and
+	 * retry, expecting a fresh window. */
+	status = alloc_window_grid(wid);
+	if (status != 0) {
+		WM_PRINT("oriscwm: alloc_window_grid failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT("\n");
+		free_window_console(wid);
+		wm_reply(E_IO, 0, 0, 0);
+		return;
+	}
+
 	window_type[wid - 1] = WIN_TYPE_CONSOLE;
 	window_subscribe_op[wid - 1] = 0;
 	window_cur_col[wid - 1] = 0;
@@ -848,15 +966,37 @@ free_window_console(int wid)
 	stash_console_o1(wid);
 }
 
+/* Mirror for the GRID service. */
+static void
+free_window_grid(int wid)
+{
+	load_grid_to_o1(wid);
+	int isn;
+	asm volatile("oisn %0, o1" : "=r"(isn));
+	if (isn) return;
+	asm volatile(
+		"addiu r4, r0, 0\n"
+		"call  #0x101\n"        /* ObjFree */
+		"nop"
+		: : : "r1", "r2", "r4"
+	);
+	asm volatile("onull o1");
+	stash_grid_o1(wid);
+}
+
 /* WM_OP_BIND_SURFACE — return a surface cap for a window.
  *   R4 = wid  (already-validated by dispatch)
  *   R5 = surface kind
  *
- * Phase 58:
+ * Phase 58 + 59 / WM γ.9:
  *   - WSURF_CONSOLE returns an R|S sub-cap of the per-window
  *     CONSOLE service (the WM is in the data path; client SENDs
  *     land in the per-window queue and the WM forwards them to the
- *     underlying terminal).
+ *     underlying terminal AND glyph-renders them into the framebuffer).
+ *   - WSURF_GRID returns an R|S sub-cap of the per-window GRID
+ *     service.  Same shape as CONSOLE: client SENDs land in the
+ *     per-window queue, the WM rasterises positioned text into the
+ *     framebuffer.
  *   - WSURF_KEYBOARD still returns the underlying terminal's
  *     keyboard cap directly (passthrough — keyboard mediation
  *     comes with multi-window in the next milestone). */
@@ -877,7 +1017,8 @@ handle_bind_surface(int wid, int kind)
 		wm_reply(E_NOTIMPL, 0, 0, 0);
 		return;
 	}
-	if (kind != WSURF_CONSOLE && kind != WSURF_KEYBOARD) {
+	if (kind != WSURF_CONSOLE && kind != WSURF_KEYBOARD
+	                          && kind != WSURF_GRID) {
 		wm_reply(E_INVAL, 0, 0, 0);
 		return;
 	}
@@ -890,6 +1031,27 @@ handle_bind_surface(int wid, int kind)
 		asm volatile(
 			"addiu r4, r0, %1\n"        /* R | S */
 			"call  #0x103\n"            /* ObjDerive → O1 */
+			"nop\n"
+			"omov  o14, o1\n"
+			"addu  %0, r2, r0"
+			: "=r"(derive_status)
+			: "i"(CAP_R | CAP_S)
+			: "r1", "r2", "r4"
+		);
+		if (derive_status != 0) {
+			wm_reply(E_IO, 0, 0, 0);
+			return;
+		}
+		wm_reply_with_ref_o14(0);
+		return;
+	}
+
+	if (kind == WSURF_GRID) {
+		load_grid_to_o1(wid);
+		int derive_status;
+		asm volatile(
+			"addiu r4, r0, %1\n"
+			"call  #0x103\n"
 			"nop\n"
 			"omov  o14, o1\n"
 			"addu  %0, r2, r0"
@@ -930,6 +1092,7 @@ handle_destroy_window(int wid)
 		return;
 	}
 	free_window_console(wid);
+	free_window_grid(wid);
 	window_type[wid - 1] = 0;
 	window_subscribe_op[wid - 1] = 0;
 	/* Owner-ref stash is left in place; future allocations will
@@ -1048,6 +1211,7 @@ scan_owner_exits(void)
 		int state = state_word & 0xFF;
 		if (state == TASK_STATE_EXITED) {
 			free_window_console(wid);
+			free_window_grid(wid);
 			window_type[wid - 1] = 0;
 			window_subscribe_op[wid - 1] = 0;
 			/* The owner-ref slot stays populated; it'll get
@@ -1358,6 +1522,77 @@ forward_console_write(int wid, int offset, int count)
 	}
 }
 
+/* WSURF_GRID counterpart of forward_console_write.  The SEND payload
+ * for a per-window GRID service is:
+ *   O2 = byte source ref      (passed via slot stash, like CONSOLE)
+ *   R4 = byte offset within source
+ *   R5 = byte count
+ *   R6 = grid column (cell x)
+ *   R7 = grid row    (cell y)
+ *
+ * Special: col == row == 0xFFFFFFFF (signed -1, -1) is the legacy
+ * "clear the entire grid surface" sentinel from oriscterm's pre-WM
+ * design.  In the framebuffer-shared world the right semantics
+ * aren't obvious (clearing every pixel would also wipe the WM's
+ * console glyphs), so for now we treat it as a no-op and TODO a
+ * proper per-window backing store before reviving it.
+ *
+ * Non-clear path: ObjFetchBytes the bytes locally, then flush_strip
+ * a single horizontal strip of (count) glyphs at (col, row).  No
+ * cursor advance — grid is explicit-positioning, unlike CONSOLE. */
+static void
+forward_grid_write(int offset, int count, int col, int row)
+{
+	/* Clear sentinel: no-op for now.  See note above. */
+	if ((unsigned int)col == 0xFFFFFFFF
+	 && (unsigned int)row == 0xFFFFFFFF) {
+		return;
+	}
+	/* Bounds: drop entirely if the start cell is off-screen.  Clamp
+	 * count if the strip would extend past N_COLS — flush_strip
+	 * itself drops cell rows >= N_ROWS, so the row check is
+	 * advisory. */
+	if (col < 0 || col >= N_COLS) return;
+	if (row < 0 || row >= N_ROWS) return;
+	if (count <= 0)               return;
+	int max_glyphs = N_COLS - col;
+	if (count > max_glyphs) count = max_glyphs;
+	if (count > 256)        count = 256;     /* fetch buffer cap */
+
+	/* Stash source ref so the asm below can OREFLD it back. */
+	asm volatile("orefst o2, %0(o12)"
+	             :: "i"(WM_FORWARD_SRC_SLOT_OFFSET));
+
+	unsigned char buf[256];
+	int buf_off = (int)((unsigned int)buf - STACK_BOTTOM);
+	asm volatile(
+		"orefld o1, %0(o12)\n"
+		"omov   o2, o11\n"
+		"addu   r4, %1, r0\n"
+		"addu   r5, %2, r0\n"
+		"addu   r6, %3, r0\n"
+		"call   #0x108\n"              /* ObjFetchBytes */
+		"nop"
+		:
+		: "i"(WM_FORWARD_SRC_SLOT_OFFSET),
+		  "r"(offset), "r"(buf_off), "r"(count)
+		: "r1", "r2", "r3", "r4", "r5", "r6"
+	);
+
+	/* flush_strip assumes printable ASCII (its callers in render_buffer
+	 * filter ahead of it).  Grid input may contain anything; substitute
+	 * non-printable bytes with space so we render a blank cell instead
+	 * of indexing off the end of font_8x16. */
+	int i;
+	for (i = 0; i < count; i++) {
+		if (buf[i] < 32 || buf[i] > 126) buf[i] = ' ';
+	}
+
+	/* Render one strip at (row, col).  No cursor advance — grid is
+	 * explicit positioning, unlike CONSOLE. */
+	flush_strip(buf, count, row, col);
+}
+
 /* Round-robin poll all per-window CONSOLE queues with timeout=0.
  * For each pending SEND, forward to the underlying terminal.
  *
@@ -1395,6 +1630,56 @@ poll_window_consoles(void)
 			 * pcc-orisc treats OPRs as scratch but our asm reloads
 			 * them from the stash slots inside forward_console_write. */
 			forward_console_write(wid, offset, count);
+		}
+	}
+}
+
+/* See poll_window_grids — we sw R2 (status) into this global from
+ * inside the poll asm because the asm body's output-operand limit
+ * caps us at 4 and we need 5 captures (status + offset + count +
+ * col + row). */
+static int _wm_grid_poll_status;
+
+/* Mirror of poll_window_consoles for the GRID surface.  Same shape:
+ * round-robin per-window, ReceiveQueuePoll with timeout=0, dispatch
+ * non-empty SENDs to forward_grid_write.  The queue-poll overlay
+ * sets R3..R6 from the sender's R4..R7 (offset, count, col, row). */
+static void
+poll_window_grids(void)
+{
+	int wid;
+	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
+		if (window_type[wid - 1] != WIN_TYPE_CONSOLE) continue;
+
+		load_grid_to_o1(wid);
+		/* Poll the per-window queue.  We need five values out
+		 * (status + offset + count + col + row); pcc-orisc's
+		 * codegen caps single-asm register outputs at 4.
+		 * Workaround: capture R3..R6 (offset, count, col, row)
+		 * via the asm's regular output operands, and stash R2
+		 * (status) to a file-scope global from inside the same
+		 * asm.  Using a global instead of a stack-local
+		 * sidesteps any pcc bug with stack-spill addressing
+		 * mid-asm; the global is fine since we only use it
+		 * synchronously across this one call. */
+		int g_offset, g_count, g_col, g_row;
+		asm volatile(
+			"addiu r4, r0, 0\n"
+			"call  #0x204\n"           /* ReceiveQueuePoll */
+			"nop\n"
+			"la    r1, _wm_grid_poll_status\n"
+			"sw    r2, 0(r1)\n"
+			"addu  %0, r3, r0\n"
+			"addu  %1, r4, r0\n"
+			"addu  %2, r5, r0\n"
+			"addu  %3, r6, r0"
+			: "=r"(g_offset), "=r"(g_count),
+			  "=r"(g_col),    "=r"(g_row)
+			:
+			: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+		);
+		if (_wm_grid_poll_status == 0) {
+			forward_grid_write(g_offset, g_count, g_col, g_row);
 		}
 	}
 }
@@ -1540,5 +1825,6 @@ main(void)
 
 		/* Drain any pending per-window CONSOLE writes. */
 		poll_window_consoles();
+		poll_window_grids();
 	}
 }
