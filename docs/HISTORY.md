@@ -4779,6 +4779,1049 @@ documents the indexing accounting for future archaeologists.
   `kill @N task` to externally terminate; round-robin for
   `run cmd &` if no @ specified.
 
+## Phase 45f — Directory service (Ouroboros, day 26)
+
+The first system service distinct from "the supervisor on this CPU":
+`oriscdir`, a hierarchical name → ref directory daemon. Replaces 45e's
+hardcoded `PEER=6@9` two-CPU peer-discovery wiring with self-registration
+under `/sys/cpu/<procid>/supervisor`, and lays the namespace each
+subsequent phase will populate (devices at `/sys/term/...`, mounts at
+`/programs`, the WM at `/sys/wm/0`).
+
+The directory holds an in-memory tree of `DIR` / `LEAF` / `MOUNT` nodes
+and serves four wire ops on its mailbox:
+
+- `REGISTER` — bind a caller-supplied OR ref to a path as a leaf.
+- `MOUNT` — bind a (service ref, path-prefix) at a path; walks
+  descending past the mount return early with the service ref plus
+  the unconsumed remainder (prefix joined with leftover).
+- `WALK` — resolve a path, return kind + ref + remainder bytes.
+- `LIST` — enumerate children of a `DIR`, NUL-separated names.
+
+Boot ABI shrinks: each CPU's boot O8 carries a sub-cap of oriscdir's
+primary mailbox (boot.sh wires `--service "18=1@9"`). `task_init`
+harvests it into a renamed `BOOT_PARENT_SLOT` (was 45a's `SUP_SLOT`,
+now generic — supervisors interpret it as the directory; child programs
+interpret it as their parent supervisor and lazily query the directory
+through it via a new `SUP_OP_GET_DIR` op).
+
+Libc gets `dir_walk` / `dir_register` / `dir_mount` / `dir_list` in
+`tools/cc/lib/dir.c`, with `DIR_KIND_*` constants in `liborisc.h`.
+`dir_walk` publishes the resolved ref to a dedicated `DIR_RESULT_SLOT`
+in O12 — pcc treats OPRs as caller-saved scratch, so passing OR refs
+back through O1 across function boundaries isn't reliable. `dir_register`
+and `dir_mount` stash the caller-supplied O1 to a `DIR_INPUT_REF_SLOT`
+at function entry before any internal `orefld` / `ObjAlloc` can clobber
+it, then `OREFLD` it back into O4 at SEND time. `ORX_STATE_BYTES` bumps
+496 → 504 for the new input slot.
+
+`oriscrun` gains `--directory pid=N` to spawn the daemon and waits for
+its `READY` banner before bringing up CPUs; `boot.sh` and the supervisor
+tests switch over. A new `test_directory.sh` exercises register / walk /
+mount / list / `ENOENT` against a live daemon.
+
+Open follow-ups: pinning peers statically still works for two-CPU
+configs but the discovery path is the way new system services come
+online without touching boot.sh.
+
+## Phase 45g — VFS layer + shell migration (Ouroboros, day 26)
+
+Programs should not call `hf_*` directly when paths are involved — the
+hostfsd ref is just one of the (eventually many) backends a path might
+resolve to. `tools/cc/lib/vfs.c` adds a path-aware front door that
+`dir_walk`s a user-visible path into a `(kind, remainder)` pair, then
+dispatches:
+
+- `MOUNT`-resolved → hand the remainder to `hf_*`. Multi-backend
+  dispatch via the *resolved* service ref is deferred — every mount
+  today routes back to the same hostfsd anyway.
+- `DIR`-resolved → `vfs_list` calls `dir_list`; `vfs_open` /
+  `vfs_opendir` fail (no underlying file backend).
+- `LEAF` / not-found → all vfs ops fail.
+- No directory wired (`dir_walk` returns `NO_DIRECTORY`) → fall back
+  to direct `hf_*` with the input path verbatim. Standalone shell
+  tests that don't spin up oriscdir keep working.
+
+Surface API: `vfs_walk_kind` / `vfs_open` / `vfs_opendir` / `vfs_close` /
+`vfs_read` / `vfs_write` / `vfs_list`. The list op covers both DIR
+(via `dir_list`) and MOUNT (via `hf_opendir` + accumulating `hf_read`)
+so callers don't branch on which regime served them.
+
+The leader supervisor runs `dir_mount("/programs", "/programs")` at
+boot, publishing its boot O10 hostfsd ref directly. ObjDerive can't
+narrow it (the boot ref lacks `C`), but storing O10 verbatim is fine:
+peers get a ref equivalent to their own boot O10, and `S` is sufficient
+for `OP_OPEN` / `OP_READ` / `OP_CLOSE`. Workers don't mount — the
+directory is shared and a duplicate would `EEXISTS`.
+
+Migrated callers: `cmd_cat` / `cmd_more` / `cmd_view` / `cmd_ls` /
+`cmd_cd` in the shell, `edit_load` / `edit_save` in the editor, and
+`orx_spawn`'s loader. `orx_spawn` is what makes
+`run /programs/hello.orx` translate the mount through the directory
+before opening on hostfsd. `cmd_cd` learns to accept either `DIR`
+(`/sys/cpu`) or `MOUNT` (`/programs`) but reject `LEAF`
+(`/sys/cpu/0/supervisor`).
+
+### 45g hotfix — vfs lazy bootstrap + sup.c O15 clobber
+
+Two bugs that ship-blocked 45g under `make boot`:
+
+- **`ls` produced `supervisor: unknown op` and hung.** dir.c's
+  lazy-bootstrap path SENDs `op=4` (`SUP_OP_GET_DIR`) to the
+  supervisor on the first `dir_*()` call from a non-supervisor
+  program, expecting back the directory mailbox in O2. 45f added
+  the SEND but never wired the matching handler — the dispatch
+  loop only knew `op=1` (spawn) and `op=2` (shutdown). Add an
+  `op=4` case that replies with our own `DIR_SLOT`.
+
+- **`run @1 /programs/hello.orx` echoed `[read failed: flags=0x02]`
+  on every keystroke after.** sup.c's `sup_spawn_at` parked its
+  derived reply sub-cap directly in O15 and never restored it. But
+  O15 is task.c's boot data ref save — `_term_restore_or` reads
+  from O15 to set O3 for every print, and `_term_console_write`'s
+  data-segment branch uses `omov o2, o15` as the SEND source. After
+  `sup_spawn` returned, O15 held a tiny TAG_SERVICE ref, so
+  oriscterm's `OBJ_READ_REQ` for the print source landed
+  out-of-bounds → `RESP_BOUNDS = 0x02`. Stash the derived sub-cap
+  in a slot in O12 (`SUP_REPLY_SCRATCH` at offset 608, sharing the
+  physical slot with dir.c's `DIR_REPLY_SCRATCH` since both are
+  synchronous and never have a reply outstanding simultaneously)
+  and `OREFLD` it into O3 at SEND time. The 45a-era O15-park
+  pattern was the pre-existing footgun.
+
+`test_supervisor_run_at.sh` extended to type `ls` first (exercises the
+lazy-bootstrap path — without the op=4 handler the shell hangs), assert
+`[exited 0]` appears in the rendered console (catches the sup.c
+clobber), and assert no `supervisor: unknown op` appears in cpu0
+stdout. Reverting each fix individually reproduces a distinct test
+failure.
+
+Two follow-up fixes the same day under continued `make boot` testing:
+
+- **`vfs_list` ate trailing entries on DIR listings.** oriscdir packs
+  entries as `name1\0name2\0...` (machine-friendly); hostfsd's
+  `opendir` produces `name1\nname2\n...`. `cmd_ls` dumps the buffer
+  raw via `term_print_n_sync`, which silently swallows embedded NULs,
+  so DIR listings rendered as `programs/sys/` glommed together. The
+  byte-length calculation also looked for a double-NUL terminator
+  oriscdir doesn't produce, so it walked past the actual end into
+  uninitialised buffer — and a subsequent `ls` of a smaller directory
+  bled prior content through. Fix: walk the buffer with the entry
+  count `dir_list` returned, replacing each NUL with a newline,
+  tracking the byte length as we go.
+
+- **`task_free` left local libc bookkeeping live for relayed tasks.**
+  After `run @1 /programs/edit.orx &` and quitting the editor, every
+  subsequent `ENTER` re-emitted `[task 0 done 0]`. simorisc's
+  `primitive_ObjFree` refuses remote-home refs (returns `EREMOTE` —
+  the descriptor lives on the peer), and `task_free`'s slot-clear
+  branch was gated on `status == 0`. Fix: also clear the slot on
+  `EREMOTE`. The libc task table is purely local bookkeeping; the
+  remote descriptor is a separate concern (today's behaviour: it
+  lingers in `EXITED` until the peer supervisor exits, a leak for
+  long-lived multi-CPU sessions but not a functional bug).
+
+## Phase 45h — Leader registers boot devices in directory (Ouroboros, day 26)
+
+The leader supervisor publishes the device refs it boots with as
+`LEAF`s in oriscdir, on top of the existing
+`/sys/cpu/<procid>/supervisor` self-registration and `/programs`
+mount:
+
+    /sys/term/0/console     ← O5
+    /sys/term/0/keyboard    ← O6
+    /sys/term/0/grid        ← O7
+    /sys/hostfsd/0          ← O10
+
+The Python device daemons speak the wire protocol but have no
+`ObjAlloc` of their own — they can't allocate the `TAG_DATA`
+path-bytes object `dir_register` needs as O2. The supervisor is a
+real CPU program with all the device refs in its boot OPRs, so
+publishing them on the daemons' behalf is `omov o1, oN; dir_register
+"/sys/..."`. The `/0` instance suffix is forward-looking for Phase 46.
+
+Boot wiring is unchanged — `term_init` / `hf_init` still consume the
+boot-O slots directly. Phase 46 starts using the new paths to vary
+which terminal a child binds to. Phase 47 retires this scheme entirely
+in favour of self-registration once a wire-side path-encoding op is in
+place.
+
+## Phase 46 — Multi-terminal shells (Ouroboros, day 26)
+
+`make boot` now opens two Tk windows, with one shell per window. Each
+shell is a fully independent session sharing the same `/programs`
+mount, the same hostfsd, and the same directory tree — but with its
+own terminal binding, its own keyboard subscription, and its own
+per-CPU supervisor.
+
+Architecture:
+
+`boot.sh` launches two oriscterm daemons (pids 16 and 19). CPU 0's
+boot OPRs wire to terminal 16; CPU 1's wire to terminal 19. Both
+share oriscdir (pid 18) and hostfsd (pid 17). Each supervisor probes
+O5 with `oisn` at boot — the `has_terminal` gate. CPUs with a non-null
+terminal:
+
+- register their own `/sys/term/<procid>/{console,keyboard,grid}` as
+  `LEAF`s (generalising 45h's hardcoded `/0`)
+- spawn a shell with normal OPR inheritance, so each shell talks to
+  its own terminal
+- accept `op=2` `SUP_SHUTDOWN` from their own shell
+
+CPUs without a terminal stay in the dispatch loop as before, ready
+to service relayed spawns. The previous `is_leader = (procid == 0)`
+gate for shell spawn is replaced by `has_terminal`. `/programs` MOUNT
+and `/sys/hostfsd/0` registration stay procid-0-only — singleton
+resources today.
+
+`test_multiterminal.sh` launches two fake terminals and asserts that
+both shells receive their welcome banner without keyboard
+cross-binding, and that `ls /sys/term` from both lists `0/` and `1/`,
+proving they share a consistent directory tree.
+
+## Phase 47 — Directory-driven boot: collapse to one ref (Ouroboros, day 26)
+
+The only object reference each CPU's firmware needs to wire at boot
+is now O8 — the oriscdir mailbox sub-cap. Terminal console / keyboard /
+grid and hostfsd all get discovered via directory walks at supervisor
+init. `boot.sh`'s `--cpu` lines collapse to a row of null pads with
+just `service=18=1@9` for O8.
+
+The blocker for self-registration from Python device daemons was
+that `DIR_OP_REGISTER` consumed the path bytes via `OBJ_READ_REQ` on
+a `TAG_DATA` ref — and the daemons can't ObjAlloc one. The new
+`DIR_OP_REG_INLINE` (op 5) packs the path inline into the spare
+bytes of `SEND_DELIVER`'s payload:
+
+    int_payload[0]    = op (5)
+    int_payload[1]    = path length (1..32)
+    int_payload[2..3] = path bytes 0..7
+    or_payload[0]     = ref to register
+    or_payload[1..3]  = path bytes 8..31
+
+32-byte path budget — enough for `/sys/cpu/255/supervisor` (23 bytes)
+and `/sys/term/255/keyboard` (23 bytes). Fire-and-forget; failures
+surface only in oriscdir's log.
+
+oriscterm and hostfsd grow `--directory-pid` and `--instance` flags.
+On startup, before printing READY, they self-register R+S sub-caps
+of their own services at `/sys/term/<instance>/{console,keyboard,grid}`
+and `/sys/hostfsd/<instance>`. fake_terminal mirrors so headless tests
+work unchanged.
+
+The supervisor walks `/sys/term/<procid>/*` and `/sys/hostfsd/0` right
+after `task_init`, OREFLDing each resolved ref into the target OPR
+before `hf_init` / `orx_spawn` need them. Walks retry on `NOT_FOUND`
+with `task_yield` between attempts — handles the race where device
+self-register packets are still in flight when CPUs come up. On
+`NO_DIRECTORY` (no oriscdir wired — single-CPU test fixtures), the
+walk fails and the boot OPR keeps whatever simorisc's `--service`
+flag wired, so legacy fully-wired boots still work.
+
+A second retry loop guards `orx_spawn(SHELL_PATH)`: worker CPUs race
+the leader's `/programs` mount, so we walk `/programs` first and
+yield until it shows up before attempting the shell load. 45h's
+supervisor-side device-registration block is gone — each device owns
+its own `/sys/*` registration now, and the supervisor only consumes
+them.
+
+## Phase 48 — `sysinit` + `login` + `logout` (Ouroboros, day 26)
+
+Three new pieces of system architecture, layered on 47:
+
+- **`/programs/sysinit.orx`** — one-shot leader-only init task.
+  Currently a placeholder (prints `online` and exits), but in place
+  for future system-wide setup work.
+- **`/programs/login.orx`** — per-terminal session manager. Replaces
+  the supervisor's direct shell spawn. Loop: clear both panes, print
+  welcome banner, wait for ENTER, spawn shell as a child, `task_wait`,
+  on shell exit loop back. The supervisor spawns one login per
+  terminal-equipped CPU.
+- **`logout`** — new shell command. Ends *this* shell session
+  (`return 0`); login's `task_wait` wakes and welcomes the next
+  user. Distinct from `exit` / `quit`, which still call `sup_shutdown`
+  to halt the system.
+
+Wire-protocol additions to support the login UX:
+
+- **`term_clear()` / `\f`** — oriscterm and fake_terminal interpret
+  a `0x0C` (form-feed) byte in the console stream as "wipe the
+  text pane", same shape as `\b` for backspace. Pairs with
+  `grid_clear()` for a fully-blanked terminal between sessions.
+- **`term_resubscribe()`** — re-attaches the keyboard subscription
+  using the existing O9 mailbox. login uses it after `task_wait`;
+  calling `term_init` again would re-save (now-clobbered) O2/O3/O4
+  into the boot-OR slots and break subsequent `term_print` of
+  data-segment strings (same shape as the 45g sup.c O15 bug).
+
+Supervisor changes: spawns `login.orx` per terminal-equipped CPU; the
+leader additionally fires off `sysinit.orx` as fire-and-forget (a
+blocking `task_wait` would deadlock against sysinit's own dir.c
+lazy-bootstrap op=4 SEND). `/programs` mount stays inline in the
+leader rather than moving into sysinit — the supervisor needs the
+mount in place *before* it can `orx_spawn` anything from `/programs/`,
+sysinit included. `op=2` now `task_kill`s any still-alive child tasks
+before returning, so login's welcome-loop doesn't outlive the
+supervisor on shutdown.
+
+The login → shell handoff threads two ends of the keyboard subscriber
+list carefully: login unsubscribes from kbd before `sup_spawn` so the
+shell is the only subscriber when the user types; the shell's
+`logout` calls `term_shutdown` so its dead sub-cap doesn't haunt the
+list when login resubscribes.
+
+### Phase 48 bug fixes
+
+Three bugs surfaced under `make boot`:
+
+1. **login spawned shells in a tight loop instead of waiting on them.**
+2. **`exit` from a worker terminal halted that CPU but left the
+   simulator running** — oriscrun's `--leader 0` watchdog only watches
+   CPU 0.
+3. **`logout` ended the shell session correctly but the welcome banner
+   never reappeared** — login's `task_wait` stayed stuck on the
+   already-dead shell.
+
+(1) and (3) are the same root cause. simorisc's `primitive_TaskWait`
+returned `EBUSY` whenever `pick_next_runnable` came back empty, with
+the rationale "nothing else can run — waiting would deadlock the CPU."
+That's wrong in any system with external events: a CPU can sit idle
+waiting on a wire packet or key event that wakes a blocked task.
+login.task_wait(shell) hit this when the shell had already blocked in
+`term_getkey` (perfectly normal) — login got `EBUSY` back, fell
+through `orx_unload`, re-entered the welcome-banner loop, and visibly
+spammed the screen.
+
+The fix mirrors `primitive_TaskExit`'s idle pattern: save the waiter's
+state to its Task struct (so the eventual `_wake_waiters` writes land
+in the right place), set `cpu.current_task = None`, arm
+`BlockedOnExitWait` so the CPU stays alive for in-flight wire requests.
+When `_wake_waiters` later promotes the waiter to RUNNABLE, the run
+loop's blocked-but-runnable branch sees no current task, takes the
+`load_task_to_cpu` path, and the waiter resumes past its CALL with
+the wake values in place.
+
+For (2), supervisor.c's `op=2` handler now calls
+`relay_shutdown_to_leader()` before halting — workers walk
+`/sys/cpu/0/supervisor` and SEND `op=2` to the leader, so its halt
+trips oriscrun's watchdog and SIGTERMs the rest. The leader skips
+the relay (its own halt is the trigger). Shell.c's `exit` /
+`quit` now yields-forever only when `sup_have_supervisor()` — the
+no-supervisor path (`test_shell.sh` launches `shell.orx` directly)
+needs a clean `return 0` because there's no one to `task_kill` it.
+
+## Phase 49 — Terminal pass-through for relayed spawns (Ouroboros, day 26)
+
+When a shell on terminal X did `run @N cmd`, the spawned `cmd` ran on
+CPU N but inherited CPU N's boot O5/O6/O7 — i.e. terminal N's services.
+Its `term_print`s went to the wrong oriscterm window. Phase 49 carries
+the requester's terminal index in the relay op so the receiving
+supervisor can `dir_walk`
+`/sys/term/<requester>/{console,keyboard,grid}` and inject those refs
+into the child's OPR file before `TaskCreate`. The child wakes up bound
+to the right terminal regardless of host CPU.
+
+Wire change: op=1's R7 now carries `terminal_idx + 1` (0 = "no
+override; child inherits this supervisor's boot OPRs," N+1 = "child
+runs with `/sys/term/<N>/*`"). The +1 bias keeps a Phase-48 caller
+that sends R7=0 from accidentally selecting terminal 0.
+`relay_spawn_request` sets it to `self_procid + 1` when forwarding —
+49 keeps the procid-equals-terminal-index assumption.
+
+Libc plumbing mirrors the existing `ORX_SLOT_CHILD_O8` dance for
+O5/O6/O7. `orx_task_create` probes each slot, save+swap if non-null,
+restore after `TaskCreate`. `ORX_STATE_BYTES` grows by 48 bytes (3
+child slots + 3 parent-save slots). On the supervisor side,
+`populate_child_term_slots(idx)` walks the directory and stashes the
+resolved refs into the CHILD slots; `clear_child_term_slots` zeros
+them post-spawn so a subsequent local spawn (no hint) doesn't
+accidentally inherit.
+
+`test_term_passthrough.sh` runs `run @1 /programs/term_hello.orx` from
+terminal 0 and asserts the guest's `term_print` lands on terminal 0
+(the requester) and not on terminal 1.
+
+Round-robin spawn placement was prototyped at the same time but is
+not in this PR. The shell.exit semantics — `sup_shutdown` halts the
+*spawning* supervisor, but with round-robin that's no longer the
+session-owning one — need a deeper rework before round-robin can be
+turned on by default. That's Phase 51.
+
+## Phase 50 — `mkdir` / `rm` / `touch` shell builtins (Ouroboros, day 26)
+
+The shell could read and list files but had no way to create or
+delete them. Three new builtins backed by two new hostfsd ops:
+
+    mkdir <path>   → vfs_mkdir → hf_mkdir → OP_MKDIR (op=6)
+    rm <path>      → vfs_unlink → hf_unlink → OP_UNLINK (op=7)
+    touch <path>   → vfs_open(O_WRONLY|O_CREAT) + close
+
+`touch` reuses `OP_OPEN`'s create flag that hostfsd already
+implements; no new wire op. Wire shape for `OP_MKDIR` / `OP_UNLINK` is
+the path-only subset of `OP_OPEN`: O2 = path buffer, R5 = offset,
+R6 = length. Reply: R3 = 0 or negative errno.
+
+Errors mostly mirror POSIX (`E_NOENT`, `E_ACCES`, `E_EXIST`); unlink
+on a directory returns `E_EXIST` rather than letting macOS raise its
+non-portable `PermissionError` for that case — an explicit
+`path_obj.is_dir()` probe gives a stable signal across Linux and
+macOS. The shell's `cmd_print_fs_error` maps the negative errnos to
+human-friendly strings; `cmd_rm` overrides `E_EXIST` to "is a
+directory" since the user is trying to delete, not create.
+
+No `-p` / `-r` / `-f` flags — those would want a real getopt parser
+and aren't worth it until there's demand. If you want recursive `rm`
+today, you walk the path yourself.
+
+## Phase 51 — Round-robin spawn placement + terminal_idx propagation (Ouroboros, day 26)
+
+Phase 49 introduced terminal pass-through for explicit `run @N`. Phase
+51 makes round-robin the *default* for shell-issued `run cmd` (no @N)
+by propagating each task's terminal_idx through the spawn graph — so
+the supervisor can route a relayed spawn back to the requester's
+terminal regardless of which CPU ends up hosting it.
+
+The propagation chain:
+
+    parent.orx_task_create
+      → set R5 = (terminal_idx + 1)             — pre-TaskCreate
+    primitive_TaskCreate
+      → child.R4 = caller.R5                    — simulator copies
+    crt0._start
+      → store R4 to _orisc_init_r4 in .data     — before jal main
+    child.task_init
+      → my_terminal_idx = _orisc_init_r4 - 1    — (or -1 if 0)
+    child.sup_spawn
+      → R7 = (my_terminal_idx + 1)              — back into the wire
+
+The 0 = "no terminal info" encoding lets a top-level boot (the
+supervisor itself, whose R4 from oriscrun isn't a Phase-51 sender)
+naturally land at -1 internally; supervisor.main() then sets its own
+`my_terminal_idx = procid` explicitly.
+
+Wire / sentinel changes:
+
+- **`SUP_TARGET_ANY (0xFE)`** — new — "any CPU is fine; round-robin
+  OK." Plain `sup_spawn()` uses this. Receiver picks via
+  `pick_next_cpu` (a counter biased to `procid+1` so leader spreads
+  to worker first and worker spreads to leader first, alternating).
+  Self IS a valid pick — single-CPU boots and boot-time-race
+  fallbacks naturally land local with no extra logic.
+- **`SUP_TARGET_LOCAL (0xFF)`** — kept — "stay local, no round-robin."
+  Used (a) by callers that want strict local placement (login pins
+  the shell here so the user's session stays on their terminal's
+  CPU), and (b) on the wire by `relay_spawn_request` as the
+  relay-pin marker — without that pin the receiver would
+  round-robin again and the request would ping-pong indefinitely.
+
+`orx_task_create` also takes `ORX_SLOT_CHILD_TERMINAL_IDX` as a
+per-spawn override (set by the supervisor when servicing a relayed
+pass-through request, cleared otherwise), distinct from
+`ORX_SLOT_CHILD_O5/O6/O7` (the actual OPR refs to inject). Both flow
+together: the OPRs carry "where to send my prints," the int carries
+"what to tell my own children when they `sup_spawn`."
+
+login.c gains an exit-code check on `orx_unload`: the shell can now
+run on a peer CPU, and when the user `exit`s, the spawning supervisor
+`task_kill`s it (code 137). Login on the terminal CPU wakes from its
+remote `task_wait` and would otherwise loop into `term_clear` +
+welcome, wiping the rendered shell session before the test fixture
+captures it. Code != 0 → exit cleanly, don't redraw.
+
+### 51 follow-up — yield-after-spawn
+
+`handle_spawn_request` resumed the new task, then looped straight back
+to `poll_one_request`. If a SEND already sat in the supervisor's
+mailbox at that moment — most commonly a worker's relayed `op=2`
+shutdown — the next poll picked it up without yielding, and the
+cascade-kill took the just-resumed task from NEW straight to EXITED
+before the scheduler ever ran it.
+
+The trigger correlated with linking `sup_spawn` into a leader-side
+boot binary, which suggested a BSS / loader bug — but that was a red
+herring. `sup_spawn`-linkage transitively pulls in the .orx loader
+subtree, ballooning the binary's text by ~24 KiB and extending the
+leader's `hf_read`-driven load window enough that a worker's session
+finished first and its relayed `op=2` landed in the leader's mailbox
+before the leader's spawn-then-resume returned. Single-CPU repros
+(no relay → no race) worked fine with the same wiring.
+
+Fix: `task_yield()` once after `task_resume(t)`. The just-resumed
+child runs through crt0, `task_init`, `term_init`'s keyboard
+subscribe, and the welcome banner SEND, until it blocks in
+`term_getkey`'s `RecvQueuePoll`. Only then does the supervisor's main
+loop continue and pick up any pending `op=2`.
+
+## Phase 52 — Cross-CPU `ps` and terminal hot-attach (Ouroboros, day 27)
+
+Two threads bundled under one phase number. The shell needed a way to
+see what was running across the fleet, and the system needed to react
+to terminals that come and go after boot.
+
+### `ps`: cross-CPU task listing
+
+A new `SUP_OP_LIST_TASKS` (op=5) per supervisor. Each supervisor
+stashes the basename of every spawned `.orx` and, on op=5, packs a
+human-readable text listing into a `TAG_DATA` bytes object and replies
+with the ref. The shell's new `ps` command walks
+`/sys/cpu/<N>/supervisor` for procids 0..7, SENDs op=5 to each live
+peer, and `ObjFetchBytes` the reply (cross-CPU-safe, unlike
+`MapObject`) into a stack buffer, printing with a `CPU N:` header.
+
+    /> ps
+    CPU 0:
+    [0] exited sysinit.orx (exit 0)
+    [1] blocked login.orx
+    [2] blocked shell.orx
+    CPU 1:
+    [0] blocked login.orx
+    [1] blocked shell.orx
+
+The op=5 handler needed splitting across several small helpers
+because pcc-orisc bails with `adrput: illegal op 57` on a single
+function with too many asm blocks + locals — same constraint that hit
+Phase 51's first 5-arg `sup_spawn_for_terminal` attempt. pcc also
+lowers `(char *)CONSTANT_LITERAL` as `la r,N`, which asmorisc rejects;
+routing the buffer VA through a function arg coaxes pcc into emitting
+`li` (lui+ori) instead.
+
+### Terminal hot-attach
+
+Wire the leader supervisor to detect `/sys/term/<N>` entries that
+appear after boot and spawn a fresh `login.orx` for each, with the
+right Phase-49 pass-through bindings so the hot-attached login binds
+to its terminal's services regardless of host CPU.
+
+The leader switches its main-loop `RecvQueuePoll` from infinite to
+finite-timeout (`HOT_ATTACH_POLL_TICKS = 5000` ticks, ≈ 5 s of idle
+wall clock); on timeout, it `dir_list`s `/sys/term`, walks the names,
+and for each integer index not yet in `hot_attach_seen` runs the same
+`populate_child_term_slots` + `orx_set_child_terminal_idx` +
+`orx_spawn(LOGIN_PATH)` dance `handle_spawn_request` does for relayed
+spawns, just self-initiated. Workers stay on infinite-timeout polling
+and skip the scan.
+
+The seen bitmap is seeded once at the end of supervisor.main's boot
+path, so terminals registered AT BOOT TIME — including peer CPUs'
+boot terminals — don't get redundantly spawned by the first scan.
+
+Why it's baked into the supervisor instead of a dedicated
+session_manager program: the obvious split-out adds ~30 KiB of
+`hf_read` load to cpu0's startup window for the new .orx, and the
+multi-terminal stress test demonstrated that's enough to push the
+leader off its boot timing edge — a fast peer worker shell can finish
+its session and relay `op=2` before cpu0's own login has even
+rendered the welcome banner, and the cascade-kill curtails the
+leader's shell. The supervisor's already loaded; embedding the
+hot-attach logic adds ~190 lines without any extra .orx I/O on the
+critical boot path.
+
+Adding a 5th C arg to `poll_one_request` (timeout) trips the same
+`adrput: illegal op 57` pcc bug from `ps`. Workaround: pass the
+timeout via a static `poll_timeout_ticks`, default -1 (infinite) for
+legacy callers and workers, set to `HOT_ATTACH_POLL_TICKS` by the
+leader before entering its dispatch loop.
+
+Hot-attach is validated against an interactive single-CPU + late-term
+setup: cpu0 prints `supervisor: hot-attached login for term=2` and
+the new login subscribes to `/sys/term/2/keyboard`. The end-to-end
+deterministic test for that scenario is left as a follow-up — fake
+terminal timing makes it fragile, and the unit-test surface is enough.
+
+Open follow-ups: kill-on-detach (Phase 54) and replacing the periodic
+poll with directory subscription (also 54).
+
+## Phase 53 — Dynamic CPU count (Ouroboros, day 27)
+
+Add a worker CPU to a *running* Object RISC system. The supervisor
+side already supports this — Phase 51's `pick_next_cpu` and
+`relay_spawn_request` both `dir_walk` `/sys/cpu/<N>/supervisor` per
+call rather than caching a peer set at boot, so a new CPU that
+registers mid-run shows up automatically. This phase ships the
+missing user-facing piece:
+
+`tools/oriscadd` — a thin wrapper that spawns simorisc with the right
+`--service` flags for the supervisor's expected boot-OPR layout (null
+pads at O5/O6/O7 for headless workers, oriscdir at O8). The complement
+to oriscrun: oriscrun boots the system once-and-for-all, oriscadd
+grows it.
+
+    # Boot the system normally
+    tools/oriscrun --terminal pid=16 --directory pid=18 \
+        --hostfsd pid=17,root=/some/jail \
+        --cpu pid=0:program=...,service=...
+
+    # Later, in a different shell, while oriscrun is still running:
+    tools/oriscadd --socket /tmp/oriscbar-XXXX.sock --pid 1 \
+        --supervisor /path/to/supervisor.orx --directory 18
+
+    # Now `run @1 cmd` from the leader's shell routes to cpu1.
+
+`--hostfsd` is optional (the supervisor's directory walk discovers it);
+`--directory` is required (it IS the discovery mechanism, so it can't
+be discovered through itself).
+
+Open: graceful peer disappearance. If a worker simorisc exits cleanly,
+`/sys/cpu/<N>/supervisor` stays in the directory until the host
+process is reaped — `pick_next_cpu` would pick it and get an `ESTALE`
+on relay. Both worker-side cleanup on `TaskExit` and leader-side
+skip-stale-peers in pick are fixable; out of scope here.
+
+## Phase 54 — Kill-on-detach + slot reaping + subscription wakeup (Ouroboros, day 27)
+
+Three related improvements to the Phase 52 hot-attach machinery, all
+landing the same day.
+
+### Slot reaping in the supervisor task table
+
+The libc task table has 16 slots; every spawn allocates one and
+nothing reaped them. After enough sessions / hot-attach cycles / shell
+`run` invocations, the table filled and `orx_spawn` returned
+`E_TASK_TABLE_FULL`. New `reap_exited_tasks()` pass walks
+`task_active_mask`, queries each slot, and `orx_unload`s any in
+`EXITED`. Called from the top of `handle_spawn_request` (before
+allocating the next slot) and the leader's hot-attach poll-timeout
+branch (periodic backstop). `task_names[t]` clears in the same pass so
+a subsequent `ps` doesn't show stale `shell.orx (exit 0)` lines for
+slots about to be reused. Mirrors shell.c's per-prompt reap pattern.
+
+### Kill-on-detach scaffolding
+
+When a terminal disappears, its bound login is left running and spins
+on `ESTALE` keyboard reads forever. New supervisor logic detects the
+disappearance via the existing `/sys/term` scan and `task_kill`s the
+login.
+
+`terminal_login_task[idx]` tracks the `task_t` bound to each terminal
+index (populated when login is spawned, either at boot or by
+hot-attach). `hot_attach_walk` is now a low-level walker; the new
+`hot_attach_scan` does a two-pass diff: first pass collects a
+present-mask of `/sys/term` entries; second pass acts on each
+transition (present + !seen → spawn; !present + seen → detach).
+`hot_attach_detach` kills the bound login and clears the seen bit so
+a subsequent re-attach gets a fresh login.
+
+The supervisor side is complete; the *full* flow (terminal exits →
+detach fires) needs oriscdir to remove entries when their registrant
+goes away, which requires oriscbar→oriscdir disconnect notifications.
+Separate scope. The scaffolding is in place and idempotent — when the
+disconnect-notification plumbing arrives, kill-on-detach fires
+automatically.
+
+### Subscription-based hot-attach wakeup
+
+Replace the periodic `/sys/term` polling with event-driven wakeups.
+oriscdir grows `OP_SUBSCRIBE` (op=6); the caller passes a
+notification-cap (a sub-cap of its own mailbox) and a `notify_op`
+code. On any tree mutation at or under the subscribed path, oriscdir
+SENDs to the notify-cap with R3 = notify_op. The receiver re-walks;
+oriscdir doesn't try to be diff-aware.
+
+libc gets `dir_subscribe` (mirror of `dir_register`'s OPR-stash
+pattern). The supervisor subscribes to `/sys/term` right after
+self-register, using its spawn mailbox sub-cap as the notification
+target and `SUP_OP_DIR_NOTIFY` (=6) as the dispatch op. The dispatch
+loop's op=6 handler runs reap + `hot_attach_scan`. The periodic-poll
+fallback stays in place — if oriscdir is unwired or subscription
+fails, the `HOT_ATTACH_POLL_TICKS`-cadence backstop still drives
+scans.
+
+Hot-attach latency drops from ~5 s (poll cadence) to ~1 ms (wire
+round-trip).
+
+### Reap-order fix
+
+The first version of `reap_exited_tasks()` at the top of
+`handle_spawn_request` ran *before* the dequeued O2 (bytes ref) /
+O3 (reply cap) were stashed. `orx_unload` (called by reap on EXITED
+slots) internally `task_wait`s via O1, which the firmware enforces
+with a capability check on the SEND used to deliver remote responses;
+the resulting O2/O3 clobber meant the subsequent stash saved garbage,
+and `reply_to_requester` later SEND'd to a non-`S` cap (`SEND lacks S
+on O1`). Move the OPR stash to function entry, before reap. Caught by
+`test_supervisor` (which has no oriscdir wired and so exercises the
+no-op-via-degraded-state path aggressively).
+
+## Phase 55 — Declarative directory config (Ouroboros, day 27)
+
+The `/programs` mount used to be installed inline by the supervisor's
+boot path: a `dir_mount("/programs", "/programs")` gated on
+`is_leader`, plus a workers-side `dir_walk` retry loop to wait for
+that mount to land. The supervisor was doing administrative work
+that's actually a property of the namespace daemon — every Ouroboros
+system grows the same `/programs` mount the same way.
+
+Move the assumption into oriscdir itself, via a config file:
+
+    # tools/devices/oriscdir.default.conf
+    mount /programs /sys/hostfsd/0 /programs
+
+oriscdir grows a `--config` flag that parses this at startup and
+stages each mount as a "deferred intent" — a `(target, source,
+prefix)` tuple in `self.pending_mounts`. Resolution is deferred
+because the source leaf (here `/sys/hostfsd/0`) is registered AFTER
+oriscdir parses config, when hostfsd connects and self-registers via
+`OP_REG_INLINE`.
+
+Every tree mutation (LEAF register, MOUNT install, REG_INLINE) now
+goes through a new `_after_tree_mutation()` helper that fires the
+existing subscriber notify AND walks `pending_mounts` looking for
+newly resolvable sources. When hostfsd's self-register lands,
+oriscdir spots that `/sys/hostfsd/0` is now a LEAF, applies the
+deferred `/programs` mount automatically, and notifies any
+subscribers watching `/programs`. Recursion via the secondary
+mutation (the MOUNT install) terminates because `pending_mounts`
+shrinks monotonically.
+
+`supervisor.c` drops the inline `dir_mount` block and the workers-side
+`dir_walk` wait. sysinit still runs as a one-shot setup hook for
+future CPU-local late-boot work; it's just no longer the thing that
+makes `/programs` reachable. The pre-Phase-55 fallback path (no
+oriscdir → vfs falls back to direct `hf_open`) still works unchanged
+for degraded test configs.
+
+oriscrun forwards `--config` to oriscdir by default — its
+`--directory` spec gains a `config=PATH` field defaulting to
+`tools/devices/oriscdir.default.conf` when that file exists. Operators
+who explicitly want a config-less directory pass `config=none`.
+Without this, `make boot` brings up an empty oriscdir with no
+`/programs` mount and the supervisor's
+`vfs_open("/programs/sysinit.orx")` fails — caught the morning after.
+
+## Phase 56 — `oriscwm`, the window manager (Ouroboros, day 27)
+
+A userspace daemon that arbitrates access to terminal surfaces, in
+the spirit of X's window manager but mediating capability refs rather
+than X resources. Programs request a window of a given type; the WM
+hands back a window-id, and `OP_BIND_SURFACE` returns the underlying
+surface caps the WM is set up to vend.
+
+Two window types pinned in the protocol:
+
+- **CONSOLE** = (console, keyboard).
+- **GRAPHICAL** = (keyboard, grid, vector, raster, pointer).
+
+Milestone 1 implements only CONSOLE; GRAPHICAL returns `E_NOTIMPL`.
+The wire shape is forward-compatible — extending to GRAPHICAL is
+adding handlers, not changing the protocol.
+
+Milestone 1 shipped as a Python prototype in
+`tools/devices/oriscwm`; milestone 2 translated it to a CPU-side
+`oriscwm.orx` that lives in Object RISC userspace the same way
+`supervisor.orx` does. The translation closed both "Python crutch"
+footnotes from milestone 1 — `OP_REGISTER_SURFACE` (Python daemons
+can't `dir_walk` because they can't ObjAlloc the path bytes) goes
+away because `oriscwm.orx` walks oriscdir itself; and `task_query`
+auto-destroy becomes possible because the .orx WM has access to the
+CPU-side primitive Python daemons can't reach.
+
+Wire-protocol revision in the translation: per-window-handle services
+from milestone 1 don't fit cleanly on a CPU. `ReceiveQueueAttach` is
+per-object and `ReceiveQueuePoll` dequeues one queue at a time.
+Distinguishing N concurrent windows would require either round-robin
+polling N queues or `ObjDerive` growing a primitive to vary something
+other than caps. Milestone 2 collapses to a single service at
+`/sys/wm/0` and moves window-id into the SEND payload:
+
+    WM_OP_NEW_WINDOW       R4 = 0     R5 = window_type
+                           Reply: status, geom_a, geom_b, window_id
+    WM_OP_BIND_SURFACE     R4 = wid   R5 = surface_kind
+                           Reply: status, surface cap in O2
+    WM_OP_DESTROY_WINDOW   R4 = wid
+    WM_OP_SUBSCRIBE_EVENTS R4 = wid   R5 = notify_op   O4 = notify_cap
+
+Window-handle-as-capability is dropped; clients track an integer
+window_id. Forgeable in principle (any client can claim wid=X) but
+acceptable under our single-tenant threat model.
+
+`tools/cc/lib/wm.c` adds libc wrappers (`wm_init` / `wm_new_window` /
+`wm_bind_surface` / `wm_destroy_window` / `wm_subscribe_events`)
+mirroring dir.c's lazy `WM_SLOT` populated on first call via
+`dir_walk("/sys/wm/0")`, plus per-op SEND-and-poll helpers reusing
+the per-program `REPLY_MB_SLOT` (shared with sup.c / dir.c — all
+three are synchronous and never have a reply outstanding
+simultaneously). `ORX_STATE_BYTES` 552 → 568.
+
+WM integration: the leader supervisor goes through oriscwm. After
+its existing `/sys/term/<procid>/*` walks (which stay as the no-WM
+fallback), the leader tries `wm_init` + `wm_new_window(CONSOLE)` +
+`wm_bind_surface(CONSOLE/KEYBOARD)`, then OREFLDs the resolved caps
+over its working O5/O6. Children — sysinit, login, the user's shell,
+anything `run`-ed — inherit the WM-mediated console + keyboard caps
+via the Phase-49 `ORX_SLOT_CHILD` swap. No client code changes;
+the shell sees the same boot ABI it always has, just with caps that
+route through the WM. Boot race: oriscrun launches CPUs roughly
+simultaneously, so the leader's `wm_init` retries up to 5× on
+`WIN_E_NOENT` with `task_yield` between, mirroring the
+terminal-discovery cadence. No-WM mode drops out cleanly.
+
+`scripts/boot.sh` adds a third `--cpu` spec for oriscwm at pid=2.
+
+## Phase 57 — Framebuffer service (Ouroboros, day 27 — WM α)
+
+First step toward the framebuffer end-state: oriscterm grows a 7th
+service exposing an 8-bit indexed pixel surface as a `TAG_DATA`-shaped
+bytes object that clients `OBJ_READ_REQ` / `OBJ_WRITE_REQ` pixel
+bytes against. Sized to match the existing canvas (so vector / grid /
+pointer coords and framebuffer pixel coords agree), one byte per
+pixel, row-major.
+
+This is α scope: the framebuffer is parallel infrastructure. Existing
+services (console / keyboard / grid / vector / raster / pointer)
+keep their existing Tk-widget rendering unchanged; the framebuffer
+is rendered behind them on the canvas at z-bottom and they layer on
+top. The next milestones (WM compositing, multi-window CONSOLE,
+eventual γ-stage migration of the terminal to a CPU) build on this
+foundation without revisiting the wire shape.
+
+Service idx 7 = `FRAMEBUFFER`. Published at
+`/sys/term/<n>/framebuffer` with R|W|V caps so clients can issue
+`OBJ_READ_REQ` / `OBJ_WRITE_REQ` against the byte storage. Pixel
+format: 1 byte per pixel, row-major; offset = `y * fb_w + x`. The
+byte indexes into oriscterm's existing `VEC_PALETTE` (the same
+9-color "early-1980s graphics terminal" palette the vector service
+uses), so framebuffer writes pick from the same colour space as
+vector primitives.
+
+oriscterm allocates a `bytearray(fb_w * fb_h)` at startup, sized
+from the canvas dimensions. A Tk PhotoImage is created on the canvas
+at (0,0) with `tag_lower` so it sits behind every other canvas
+item. Repainting is dirty-tracked: the poll loop only rebuilds the
+PhotoImage when an `OBJ_WRITE_REQ` has actually mutated pixels.
+Repaint converts via a precomputed 256→3-byte palette lookup into a
+PPM-P6 byte stream and `configure(data=…)` on the PhotoImage — Tk
+8.6's PPM support keeps this in stdlib-only territory.
+
+`_send_inline_register` grows a `caps=` parameter so the framebuffer
+can be published with R|W|V instead of the existing services' R|S.
+
+fake_terminal mirrors the wire-protocol extensions (no Tk surface —
+it's headless for testing): a 640×384 bytearray as the framebuffer
+storage, `OBJ_READ_REQ` / `OBJ_WRITE_REQ` handlers against it,
+self-registration of `/sys/term/<n>/framebuffer` alongside the
+existing services.
+
+`examples/cc/fb_smoke.c` walks `/sys/term/0/framebuffer`, OSBs four
+bytes (0x42..0x45) at offsets 0..3 via the OPR-relative encoding,
+OLBUs them back, verifies each round-trips. OSB / OLBU on a remote
+ref auto-trigger `OBJ_WRITE_REQ` / `OBJ_READ_REQ` wire round-trips,
+which is what we're testing.
+
+## Phase 58 — WM in the CONSOLE data path (Ouroboros, day 27 — WM β)
+
+The WM stops being a passthrough for the CONSOLE surface. When a
+client calls `OP_BIND_SURFACE(WSURF_CONSOLE)`, it gets back a sub-cap
+of a per-window `TAG_SERVICE` the WM `ObjAlloc`s at `NEW_WINDOW` time
+— not the underlying terminal's console cap. Client console writes
+land in the per-window queue; the WM round-robin-polls all per-window
+queues each dispatch-loop iteration and forwards the SEND to the
+underlying terminal's CONSOLE service.
+
+This is the inflection point where the WM transitions from "cap
+broker" to "active service mediator." Multi-window CONSOLE, glyph
+rendering into the framebuffer, and focus-based keyboard routing
+become layout/policy work on an already-working data path.
+
+When a client SENDs to its per-window CONSOLE cap, the WM receives:
+
+    R3 = sender's R4 = byte offset
+    R4 = sender's R5 = byte count
+    O2 = sender's O2 = source bytes ref
+    O3 = sender's O3 = reply_cap (passes through)
+
+`forward_console_write` re-emits a SEND to `WM_SURF_CONSOLE_SLOT`
+with the same payload, shifting R3/R4 down to the R4/R5 the
+underlying terminal expects. The reply_cap rides through unchanged,
+so any term-side reply (from `term_print_n_sync`) lands at the
+original client.
+
+`WM_SUBSCRIBE_BASE` (offsets 312..432, 16 slots × 8) is repurposed
+as `WM_CONSOLE_BASE` — per-window CONSOLE service refs. The
+subscribe-events handler is now a pure stub (accepts and discards
+the notify_cap) since no events fire yet. `alloc_window_console`
+ObjAllocs `TAG_SERVICE` → stashes full cap → `ReceiveQueueAttach`
+(depth 8); failure rolls back the slot allocation and replies
+`E_IO`. `free_window_console` ObjFrees the underlying object and
+nulls the slot, called from both `handle_destroy_window` and
+`scan_owner_exits`'s auto-destroy path.
+
+`WM_POLL_TICKS` drops from 5000 to 100 (~100 ms): per-window CONSOLE
+writes are drained on every main-poll iteration, so the latency
+floor for write-through is `WM_POLL_TICKS` × tick. 100 keeps
+interactive latency snappy without burning CPU on empty per-window
+queues (timeout=0 polls are ~free).
+
+## Phase 59 — Bitmap glyph rendering (Ouroboros, day 27–28 — WM γ)
+
+The big visible payoff. Console writes through the WM are now glyph-
+rendered into the framebuffer pane in addition to forwarding to the
+underlying terminal's text widget — first end-to-end "the WM is doing
+real work" demonstration, with a Lucida Sans Typewriter framebuffer
+pane sitting alongside oriscterm's Menlo console pane as visual
+proof. Shipped in six sub-stages, each merged separately.
+
+### γ.1 — `ObjStoreBytes` primitive (`#0x109`)
+
+A new firmware primitive symmetric to Phase-45e's `ObjFetchBytes`.
+Copies `R6` bytes from `O1+R4` (must be local) to `O2+R5` (may be
+local or remote); when the destination is remote, builds a single
+`OBJ_WRITE_REQ` carrying all the bytes and blocks on the matching
+`OBJ_WRITE_RESP`.
+
+The headline consumer is the WM's glyph renderer below: drawing one
+8×16 cell to oriscterm's remote framebuffer = 128 byte writes.
+Per-byte `OS{B,H,W}` on a remote ref blocks the CPU on 128 wire RTTs
+per glyph, which makes interactive text untenable. `ObjStoreBytes`
+collapses that to 1 RTT per pixel row × 16 rows = 16 RTTs per glyph,
+or fewer once we batch rows across glyphs.
+
+simorisc gets `BlockedOnObjStore`, `primitive_ObjStoreBytes`,
+`_try_unblock_obj_store`, and a `MODE_USER` dispatch table entry for
+`#0x109`. Same status-mapping convention as `ObjFetchBytes`: RESP_*
+fault flags map to ERR_*.
+
+### γ.2 — Glyph rendering into the framebuffer
+
+A one-time `tools/gen_wm_font.py` generator renders a font via
+ImageMagick, thresholds to 1-bit, and emits a C initialiser for an
+8×16 × 95-char bitmap font. `font_8x16[95][16]` (1520 bytes) is
+embedded in oriscwm.c (offsets 32..126; rows MSB-leftmost). Boot-time
+`walk_framebuffer_to_slot` `dir_walk`s `/sys/term/0/framebuffer` and
+stashes the resulting cap. Per-window cursor state
+(`window_cur_col` / `window_cur_row`) tracks where the next glyph
+goes.
+
+`render_glyph(wid, ch)` handles `\n` / `\r` / `\b`, drops other
+control chars, advances the cursor with wrap, no scroll yet.
+`forward_console_write` is rewritten — it `ObjFetchBytes` the
+client's source bytes into a stack buffer, `render_glyph`s each, then
+re-emits the SEND to the underlying terminal so the console pane
+keeps working. Per glyph: 16 `ObjStoreBytes` of 8 bytes each (1 wire
+RTT per pixel row).
+
+Performance: each character costs 16 wire RTTs. An 80-char line is
+~1280 RTTs. Boot output is visibly slower; γ.4 batches it.
+
+### γ.3 — Route leader-side children through the WM-mediated console
+
+When the leader successfully sets up WM mediation, it stashes the
+resulting WM-mediated CONSOLE sub-cap in a new
+`WM_LEADER_CONSOLE_SLOT`. `populate_child_term_slots` reads it back
+when spawning children targeting the leader's own terminal, parking
+it in `ORX_SLOT_CHILD_O5` so login / sysinit / shell — and anything
+those spawn in turn — inherit the WM-mediated console.
+
+Without this, only the supervisor's own banners actually traversed
+the WM data path and got glyph-rendered. login.c's welcome banner,
+shell.c's prompt, and every command's output went straight to
+`/sys/term/0/console` and skipped the WM entirely — the framebuffer
+pane on terminal 16 showed only the supervisor's startup chatter,
+never the user's session.
+
+Cross-terminal hot-attach still uses the direct walk (the leader's
+WM mediation is for its own terminal only); workers without WM keep
+their existing direct path because `WM_LEADER_CONSOLE_SLOT` is null
+on them. `ORX_STATE_BYTES` 568 → 576, single new slot at offset 696.
+
+### γ.4 — Batched per-cell-row rendering + queue depth 256
+
+`render_glyph` (one wire RTT per pixel row, 16 RTTs per glyph)
+becomes `flush_strip` + `render_buffer`. `render_buffer` walks the
+input buffer once, accumulating runs of printable chars on the same
+cell row into a `strip[N_COLS]`; `\n` / `\r` / `\b` / non-printable
+chars boundary the strip. `flush_strip` materialises one strip's
+`CELL_H` pixel rows into a 640-byte stack scratch and pushes each
+via a single `ObjStoreBytes`. Result: 16 wire RTTs per strip
+regardless of strip width. An 80-char line drops from 1280 RTTs to
+16. A 1-char echo stays at 16.
+
+A correctness fix lands at the same time. The earlier
+forward-first reorder (so the Menlo console pane updates immediately
+and the framebuffer pane fills in after) had a stack-reuse race: the
+WM forwarded the SEND, the terminal replied to the leader's
+reply_cap, the leader unblocked and started reusing its stack, and
+*then* the WM's `ObjFetchBytes` read garbage. Visible as
+dropped/swapped chars in the leader's typing echo. Fix:
+`ObjFetchBytes` a private copy *first* while the leader is still
+blocked on the SEND, then forward, then render against the private
+copy. The console pane still updates before the framebuffer pane
+(terminal sees `SEND_DELIVER` before any `OBJ_WRITE_REQ`).
+
+Per-window CONSOLE queue depth bumps from 8 to 256. shell.c's
+`term_print` uses fire-and-forget SENDs, and bursts of console writes
+(echoing typed chars, multi-line help text) overflow the 8-deep queue
+while the WM is busy rendering. simorisc silently drops on overflow,
+which manifested as missing chars in the rendered console pane (`/>
+run /prgrams/hello.orx`). 256 absorbs every burst we see in practice.
+
+### γ.5 — Lucida Sans Typewriter font
+
+Swap the WM's embedded font from Menlo to Lucida Sans Typewriter so
+the framebuffer pane on terminal 16 looks visibly different from
+oriscterm's Menlo console pane. Same text in two distinct fonts side
+by side is unambiguous proof that the WM's glyph renderer is doing
+real work, not mirroring the console pane.
+
+`gen_wm_font.py` grows `--font` / `--point-size` / `--threshold` /
+`--preset` CLI args. The hardcoded `FONT_PATH` constant goes away.
+Three presets ship: `menlo`, `courier`, and `lucida` (the new
+default; points at Word's bundled `LucidaSansTypewriterRegular.ttf`).
+Custom fonts via `--font /abs/path/to.ttf`.
+
+### γ.6 — Dedicated framebuffer Toplevel + pcc-orisc workarounds
+
+Move the framebuffer out from underneath the Tk text widget on the
+main canvas and into a dedicated Toplevel ("Window 2") sized 2× the
+native 640×384. The text pane in the main window is also showing the
+same console output via the wire-forward path; pixel-perfect alignment
++ same-size cell grid had made the two indistinguishable at a glance,
+so the framebuffer rendering was invisible despite being correct.
+
+Now: dedicated FB-only Toplevel at 1280×768 with each native pixel
+becoming a 2×2 block in the displayed PPM. The native 640×384
+resolution stays on the wire so the WM and any framebuffer-byte
+clients (fb_smoke) keep their existing offsets; oriscterm does the
+upscaling locally in `_repaint_framebuffer`. Each window gets its own
+PhotoImage rather than sharing one across two canvases — sharing
+works in theory but Tk's redraw propagation between canvases is finicky
+enough that the second view sometimes shows nothing. Closing the FB
+window withdraws it; the main window controls the process lifetime.
+
+Two pcc-orisc compiler bugs surfaced once the framebuffer was
+visible. The WM was rendering, but the on-screen result was either
+garbled or entirely missing.
+
+- **`font_8x16` switched from `unsigned char[95][16]` to
+  `unsigned int[95][4]`.** pcc-orisc serialises `char[]` initialisers
+  via `.ascii` with C-style octal escapes. When a byte happens to be
+  followed by an ASCII digit `8` or `9`, pcc emits something like
+  `\08` or `\208`. The GAS-compatible assembler stops octal parsing
+  at the non-octal digit, treating those as `\0` + literal `'8'` or
+  `\20` + literal `'8'`, and the assembled `.data` section silently
+  loses bytes — 18 total in our 1520-byte font, scrambling almost
+  every glyph. uint32 makes pcc emit `.word` directives instead, which
+  have no escape ambiguity. The font generator packs 4 pixel rows
+  into each big-endian word (MSB = earlier row); the WM's
+  glyph-render code casts the entry to `unsigned char *` and indexes
+  by row — BE storage maps byte layout 1:1 to row order on Object
+  RISC.
+
+- **`flush_strip`'s asm captures inputs to r7-r9 *first*.**
+  pcc-orisc doesn't always honour r4..r6 in the asm clobber list when
+  picking input register assignments. It placed `strip_pixels` (the
+  count) into r4, then the asm body's first instruction `addu r4,
+  %1, r0` overwrote r4 with the src_off before the later `addu r6,
+  %3, r0` could read strip_pixels — so r6 ended up holding src_off
+  (a stack-VA offset around 64K) and the simulator returned EINVAL
+  on every `ObjStoreBytes` (src_off + n > stack length). No bytes
+  ever landed in the framebuffer. Workaround: capture all three
+  inputs into r7..r9 *before* writing r4..r6. Inputs are stable in
+  safe registers; r4..r6 are then set from those temps just before
+  the call. The clobber list covers r1..r9.
+
+Both are real pcc-orisc issues — filed mentally for a future
+toolchain pass.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
@@ -4817,32 +5860,50 @@ documents the indexing accounting for future archaeologists.
 - A host-filesystem device server (`hostfsd`) — first
   OS-shaped piece, with optional `--root` jailing — that lets
   CPU-side C programs read and write actual host files via the
-  wire-format crossbar.
+  wire-format crossbar. `OP_MKDIR` / `OP_UNLINK` round out the
+  surface for shell-driven filesystem mutation.
 - A generic link-boot loader that lets you spin up extra CPUs whose
   code is decided at runtime — announce on the crossbar, receive a
   module by SEND, map and JR. The chunked variant
   (`examples/linkboot/chunkboot.s`) handles arbitrarily large
   programs in 256-byte windows and hands off via the
   `InstallProgram` firmware primitive (call #0x009).
-- A Python-side link-boot server (`tools/devices/linkbootd`) that
-  hosts a boot image and answers any number of loader CPUs over the
-  wire, with a control plane that lets the shell load programs by
-  path on demand.
-- A working `run <path>` command in the MVP shell, served by a
-  pre-spawned pool of spare CPUs whose `--reset-on-exit` makes them
-  reusable program slots: TaskExit clears state and re-runs the
-  loader, which re-announces to linkbootd as "ready for the next
-  job".
-- An MVP shell that's actually pleasant to use: `cd` / `pwd` /
-  `echo` / `cycles` / `time` alongside `cat` / `more` / `ls` /
-  `run` / `help` / `exit`, paths normalized against a shell-side
-  cwd, the prompt mirroring the cwd, command history with up/down
-  arrow recall (16-entry circular buffer), visual undo on
-  backspace, and a `more <path>` paginator with a `--More--` /
-  q-to-quit prompt. The Tk terminal's text pane is 24×80 so help
-  and casual cat output fit without scrolling off; `cmd_run`
-  surfaces the guest's actual exit code in the `[exited N]`
-  line.
+- An OS layer named **Ouroboros**, living under `ouroboros/`. A
+  per-CPU supervisor handles spawn, wait, kill, reap, hot-attach,
+  shutdown relay, and `ps`-style task listing; a per-terminal
+  `login.orx` cycles through welcome → shell → exit; a one-shot
+  `sysinit.orx` runs at boot for system-wide setup. `make boot`
+  brings up two terminals with one shell each, sharing a directory,
+  a hostfsd, and a window manager. `tools/oriscadd` grows the
+  system with a fresh worker CPU after boot.
+- A namespace daemon (`oriscdir`) holding a hierarchical
+  `DIR` / `LEAF` / `MOUNT` tree, populated by self-registering
+  device daemons (`/sys/term/<n>/{console,keyboard,grid,framebuffer}`,
+  `/sys/hostfsd/<n>`) and supervisors (`/sys/cpu/<n>/supervisor`,
+  `/sys/wm/0`). Config-driven mounts (`tools/devices/oriscdir.default.conf`
+  ships the canonical `/programs → /sys/hostfsd/0` mapping) install
+  lazily as their underlying leaves come online. A path-aware libc
+  layer (`vfs.c`) sits in front of `hf_*` so programs use
+  user-visible paths.
+- A window manager (`oriscwm.orx`) that arbitrates terminal surfaces
+  via `/sys/wm/0`. CONSOLE windows now flow through a per-window
+  `TAG_SERVICE` queue the WM allocates at `NEW_WINDOW` time;
+  forwarded SENDs reach the underlying terminal, while the same
+  bytes are bitmap-rendered through an embedded 8×16 font into
+  oriscterm's framebuffer pane via `ObjStoreBytes`. Children of
+  the leader supervisor inherit the WM-mediated CONSOLE cap so
+  the user's full session — login banner, shell prompt, command
+  output — appears as glyphs in the framebuffer.
+- A shell that's actually pleasant to use: `cd` / `pwd` / `echo` /
+  `cycles` / `time` / `ls` / `cat` / `more` / `view` / `mkdir` /
+  `rm` / `touch` / `edit` / `ps` / `kill` / `jobs` / `help`, plus
+  `exit` (halt the system) and `logout` (end this session — login
+  cycles to the next user). `run [@N] <path> [args]` spawns through
+  the supervisor with optional explicit-CPU placement; without
+  `@N`, requests round-robin across CPUs. Shell-side cwd, prompt
+  mirroring it, history with arrow-key recall, backspace undo,
+  pager. Each terminal's text pane is 24×80; `cmd_run` surfaces
+  the guest's exit code.
 - A `Dhrystone v2.1` port that runs end-to-end through pcc →
   asmorisc → orld → simorisc, reporting cycle counts the
   benchmark would have produced on actual silicon at the
@@ -4853,6 +5914,16 @@ documents the indexing accounting for future archaeologists.
   `ClockResolution` (#0x410) implemented in firmware with μs
   resolution; the spec's side-channel high bits are the only
   remaining gap.
+- Bulk-transfer primitives `ObjFetchBytes` (#0x108) and
+  `ObjStoreBytes` (#0x109) — symmetric pair that copies an
+  arbitrary range between objects in one wire round-trip when
+  exactly one side is remote. Indispensable for cross-CPU
+  request bytes (Ouroboros's spawn relay) and remote framebuffer
+  writes (the WM's glyph renderer).
+- Cross-CPU Task primitives: `TaskWait`, `TaskQuery`, and
+  `TaskKill` work on refs whose home isn't the calling CPU, via
+  `PKT_TASK_*_REQ`/`RESP` over the wire. The dispatch decision
+  is invisible to user code.
 
 The two open consequences from the initial commit are both closed:
 
