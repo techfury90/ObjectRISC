@@ -461,6 +461,83 @@ allocate_service_mailbox(void)
 	return status;
 }
 
+/* === Per-instance terminal-index parameterisation ====================
+ *
+ * Phase 59 / WM γ.15 — multi-WM, one instance per terminal.  Boot
+ * arg `--init-r4 N+1` (passed by oriscrun via `init-r4=N+1` in the
+ * --cpu spec) sets _orisc_init_r4 to N+1; libc task_init decodes
+ * that to my_terminal_idx = N.  We read it back here and compose
+ * /sys/term/<N>/* and /sys/wm/<N>/0 paths instead of the legacy
+ * hardcoded "/0" paths.  init_r4 == 0 (no boot arg) keeps
+ * my_terminal_idx == -1 → we default to N=0, preserving single-WM
+ * configurations and pre-multi-WM tests verbatim. */
+
+static int my_term_idx;
+static char path_console[40];        /* /sys/term/<N>/console */
+static char path_keyboard[40];
+static char path_framebuffer[40];
+static char path_pointer[40];
+static char path_self_register[40];  /* /sys/wm/<N>/0 */
+
+static int
+wm_append_decimal(int n, char *buf, int p)
+{
+	if (n >= 100) {
+		buf[p++] = '0' + (n / 100);
+		buf[p++] = '0' + ((n / 10) % 10);
+		buf[p++] = '0' + (n % 10);
+	} else if (n >= 10) {
+		buf[p++] = '0' + (n / 10);
+		buf[p++] = '0' + (n % 10);
+	} else {
+		buf[p++] = '0' + n;
+	}
+	return p;
+}
+
+static int
+wm_append_str(const char *s, char *buf, int p)
+{
+	int i;
+	for (i = 0; s[i]; i++) buf[p++] = s[i];
+	return p;
+}
+
+static void
+init_per_term_paths(void)
+{
+	int idx = task_my_terminal_idx();
+	if (idx < 0) idx = 0;
+	my_term_idx = idx;
+
+	int p;
+
+	p = wm_append_str("/sys/term/", path_console, 0);
+	p = wm_append_decimal(idx, path_console, p);
+	p = wm_append_str("/console", path_console, p);
+	path_console[p] = '\0';
+
+	p = wm_append_str("/sys/term/", path_keyboard, 0);
+	p = wm_append_decimal(idx, path_keyboard, p);
+	p = wm_append_str("/keyboard", path_keyboard, p);
+	path_keyboard[p] = '\0';
+
+	p = wm_append_str("/sys/term/", path_framebuffer, 0);
+	p = wm_append_decimal(idx, path_framebuffer, p);
+	p = wm_append_str("/framebuffer", path_framebuffer, p);
+	path_framebuffer[p] = '\0';
+
+	p = wm_append_str("/sys/term/", path_pointer, 0);
+	p = wm_append_decimal(idx, path_pointer, p);
+	p = wm_append_str("/pointer", path_pointer, p);
+	path_pointer[p] = '\0';
+
+	p = wm_append_str("/sys/wm/", path_self_register, 0);
+	p = wm_append_decimal(idx, path_self_register, p);
+	p = wm_append_str("/0", path_self_register, p);
+	path_self_register[p] = '\0';
+}
+
 /* === Surface-cap acquisition ========================================== */
 
 /* dir_walk wraps OBJ_WALK and parks the resolved ref in
@@ -472,7 +549,7 @@ walk_console_to_slot(void)
 {
 	int kind;
 	char rem[16];
-	int rc = dir_walk("/sys/term/0/console", &kind, rem, sizeof(rem));
+	int rc = dir_walk(path_console, &kind, rem, sizeof(rem));
 	if (rc != 0) return rc;
 	if (kind != DIR_KIND_LEAF) return -1;
 	asm volatile(
@@ -490,7 +567,7 @@ walk_keyboard_to_slot(void)
 {
 	int kind;
 	char rem[16];
-	int rc = dir_walk("/sys/term/0/keyboard", &kind, rem, sizeof(rem));
+	int rc = dir_walk(path_keyboard, &kind, rem, sizeof(rem));
 	if (rc != 0) return rc;
 	if (kind != DIR_KIND_LEAF) return -1;
 	asm volatile(
@@ -508,7 +585,7 @@ walk_framebuffer_to_slot(void)
 {
 	int kind;
 	char rem[16];
-	int rc = dir_walk("/sys/term/0/framebuffer", &kind, rem, sizeof(rem));
+	int rc = dir_walk(path_framebuffer, &kind, rem, sizeof(rem));
 	if (rc != 0) return rc;
 	if (kind != DIR_KIND_LEAF) return -1;
 	asm volatile(
@@ -529,7 +606,7 @@ walk_pointer_to_slot(void)
 {
 	int kind;
 	char rem[16];
-	int rc = dir_walk("/sys/term/0/pointer", &kind, rem, sizeof(rem));
+	int rc = dir_walk(path_pointer, &kind, rem, sizeof(rem));
 	if (rc != 0) return rc;
 	if (kind != DIR_KIND_LEAF) return -1;
 	asm volatile(
@@ -650,10 +727,13 @@ alloc_pointer_service(void)
 	return status;
 }
 
-/* === Self-register at /sys/wm/0 ======================================= */
+/* === Self-register at /sys/wm/<my_term>/0 ============================ */
 
 /* dir_register publishes whatever's in O1 at the given path.  We
- * derive a R+S sub-cap of our mailbox first, then call dir_register. */
+ * derive a R+S sub-cap of our mailbox first, then call dir_register.
+ * Path is composed from my_term_idx by init_per_term_paths so each
+ * WM instance lands at /sys/wm/<idx>/0; libc wm_init reads
+ * task_my_terminal_idx() and walks the matching path. */
 static int
 self_register(void)
 {
@@ -670,7 +750,7 @@ self_register(void)
 	);
 	if (derive_status != 0) return derive_status;
 
-	register_status = dir_register("/sys/wm/0");
+	register_status = dir_register(path_self_register);
 	return register_status;
 }
 
@@ -2770,14 +2850,30 @@ poll_pointer_events(void)
 }
 
 const char banner_boot[]            = "oriscwm: booting\n";
-const char banner_console_walk_ok[] = "oriscwm: /sys/term/0/console acquired\n";
-const char banner_keyboard_walk_ok[]= "oriscwm: /sys/term/0/keyboard acquired\n";
-const char banner_register_ok[]     = "oriscwm: registered at /sys/wm/0\n";
-const char banner_register_fail[]   = "oriscwm: dir_register /sys/wm/0 failed: ";
-const char banner_walk_console_fail[]  = "oriscwm: /sys/term/0/console walk failed: ";
-const char banner_walk_keyboard_fail[] = "oriscwm: /sys/term/0/keyboard walk failed: ";
 const char banner_alloc_fail[]      = "oriscwm: failed to allocate service mailbox: ";
 const char banner_ready[]           = "oriscwm: ready\n";
+
+/* Compose-and-print helpers — most banners now mention the composed
+ * /sys/term/<N>/* and /sys/wm/<N>/0 paths so multi-WM boots are
+ * self-identifying in the host log.  Each helper prints
+ * "oriscwm: <path> <suffix>" and restores boot ORs. */
+static void
+wm_print_walk_ok(const char *path)
+{
+	WM_PRINT("oriscwm: ");
+	WM_PRINT(path);
+	WM_PRINT(" acquired\n");
+}
+
+static void
+wm_print_walk_fail(const char *path, int status)
+{
+	WM_PRINT("oriscwm: ");
+	WM_PRINT(path);
+	WM_PRINT(" walk failed: ");
+	WM_PRINT_INT(status);
+	WM_PRINT("\n");
+}
 
 int
 main(void)
@@ -2795,8 +2891,12 @@ main(void)
 		return 1;
 	}
 	task_init();
+	init_per_term_paths();
 
 	WM_PRINT(banner_boot);
+	WM_PRINT("oriscwm: serving /sys/term/");
+	WM_PRINT_INT(my_term_idx);
+	WM_PRINT("\n");
 
 	/* Boot O8 carries the directory mailbox — the launcher wires it
 	 * via --service "DIR=1@9".  task_init parked O8 into
@@ -2813,39 +2913,21 @@ main(void)
 
 	/* Walk the directory for our underlying surface caps. */
 	status = walk_console_to_slot();
-	if (status == 0) {
-		WM_PRINT(banner_console_walk_ok);
-	} else {
-		WM_PRINT(banner_walk_console_fail);
-		WM_PRINT_INT(status);
-		WM_PRINT("\n");
-		/* Continue — OP_BIND_SURFACE will return E_NOENT for the
-		 * missing kind. */
-	}
+	if (status == 0) wm_print_walk_ok(path_console);
+	else             wm_print_walk_fail(path_console, status);
+	/* Continue on failure — OP_BIND_SURFACE returns E_NOENT for the
+	 * missing kind. */
 	status = walk_keyboard_to_slot();
-	if (status == 0) {
-		WM_PRINT(banner_keyboard_walk_ok);
-	} else {
-		WM_PRINT(banner_walk_keyboard_fail);
-		WM_PRINT_INT(status);
-		WM_PRINT("\n");
-	}
+	if (status == 0) wm_print_walk_ok(path_keyboard);
+	else             wm_print_walk_fail(path_keyboard, status);
 	status = walk_framebuffer_to_slot();
-	if (status == 0) {
-		WM_PRINT("oriscwm: /sys/term/0/framebuffer acquired\n");
-	} else {
-		WM_PRINT("oriscwm: /sys/term/0/framebuffer walk failed: ");
-		WM_PRINT_INT(status);
-		WM_PRINT(" — glyph rendering disabled\n");
-	}
+	if (status == 0) wm_print_walk_ok(path_framebuffer);
+	else             wm_print_walk_fail(path_framebuffer, status);
 
-	/* Phase 59 / WM γ.13 — pointer mediation.  Walk the underlying
-	 * /sys/term/0/pointer cap, allocate the WM-side pointer service
-	 * (clients SEND here to subscribe via wm_bind_surface), and
-	 * subscribe a private mailbox so events flow into us. */
+	/* Phase 59 / WM γ.13 — pointer mediation. */
 	status = walk_pointer_to_slot();
 	if (status == 0) {
-		WM_PRINT("oriscwm: /sys/term/0/pointer acquired\n");
+		wm_print_walk_ok(path_pointer);
 		status = alloc_pointer_service();
 		if (status != 0) {
 			WM_PRINT("oriscwm: alloc_pointer_service failed: ");
@@ -2862,20 +2944,22 @@ main(void)
 			}
 		}
 	} else {
-		WM_PRINT("oriscwm: /sys/term/0/pointer walk failed: ");
-		WM_PRINT_INT(status);
-		WM_PRINT(" — pointer mediation disabled\n");
+		wm_print_walk_fail(path_pointer, status);
 	}
 
-	/* Self-register at /sys/wm/0. */
+	/* Self-register at /sys/wm/<my_term>/0. */
 	status = self_register();
 	if (status != 0) {
-		WM_PRINT(banner_register_fail);
+		WM_PRINT("oriscwm: dir_register ");
+		WM_PRINT(path_self_register);
+		WM_PRINT(" failed: ");
 		WM_PRINT_INT(status);
 		WM_PRINT("\n");
 		return 1;
 	}
-	WM_PRINT(banner_register_ok);
+	WM_PRINT("oriscwm: registered at ");
+	WM_PRINT(path_self_register);
+	WM_PRINT("\n");
 
 	/* Initialise per-window state. */
 	{

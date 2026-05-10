@@ -6269,6 +6269,54 @@ only via direct `/sys/term/<idx>/{console,grid,vector,raster}`
 walks from clients with no WM in their world — the smoke-only
 fallback path.
 
+### γ.15 — Multi-WM, one instance per terminal
+
+γ.14 mediated terminal 0 only — `oriscwm` hard-coded
+`/sys/term/0/*` walks and registered at `/sys/wm/0`, so secondary
+terminals (PID 19, etc.) still rendered through oriscterm's Tk
+overlays.  γ.15 makes oriscwm parameterized: each terminal gets its
+own WM instance, walking its own surface tree and registering at its
+own `/sys/wm/<N>/0`.
+
+Mechanism:
+
+- **Boot-arg int.**  New `simorisc --init-r4 N` sets the loaded
+  program's R4 at first instruction; libc `task_init` decodes it
+  via the existing Phase-51 `_orisc_init_r4 = N+1 → my_terminal_idx
+  = N` rule.  `oriscrun` exposes it as `init-r4=N` in the `--cpu`
+  spec.  Defaults to 0 everywhere, so single-WM configs and tests
+  that don't pass it keep working as before.
+- **`oriscwm` reads its terminal idx** from `task_my_terminal_idx()`
+  (via `_orisc_init_r4`), composes `/sys/term/<N>/{console,
+  keyboard,framebuffer,pointer}` and `/sys/wm/<N>/0` into static
+  buffers at startup, and uses those everywhere a hard-coded
+  string used to be.  `init_r4 == 0` (no boot arg) keeps
+  `my_terminal_idx == -1` → defaults to N=0; pre-multi-WM tests
+  pass verbatim.
+- **`wm_init` (libc)** walks `/sys/wm/<my_term>/0` so any client
+  on terminal N reaches its own terminal's WM.
+- **Supervisor** drops the `is_leader` gate around the
+  `wm_init` + `wm_new_window` + `wm_bind_surface` block.  Every
+  supervisor binds for ITS terminal, then `dir_register`s its
+  CONSOLE / GRID sub-caps at `/sys/wm/<my_term>/leader-{console,
+  grid}`.
+- **`populate_child_term_slots`** now `dir_walk`s
+  `/sys/wm/<term_idx>/leader-{console,grid}` per spawn — composed
+  from the spawn's target term, not the supervisor's own.  γ.14's
+  cached `WM_LEADER_*_SLOT` short-circuit was single-slot and
+  couldn't represent multi-term targets, so it's gone; one
+  per-spawn dir_walk RTT is acceptable overhead.  Direct
+  `/sys/term/<N>/*` fallback unchanged for the no-WM case.
+- **`scripts/boot.sh`** now spawns `pid=2` (oriscwm,
+  `init-r4=1`, terminal 0) and `pid=3` (oriscwm, `init-r4=2`,
+  terminal 1), matching the two `--terminal` lines.
+
+End-state: every visible WM surface — console, grid, vector,
+raster, pointer — is WM-mediated on every terminal on every CPU.
+oriscterm's Tk overlay code is reachable only via direct
+`/sys/term/<idx>/*` walks from no-WM clients (smoke-only
+fallback).  Plug pulled.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to

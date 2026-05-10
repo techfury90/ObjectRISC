@@ -164,10 +164,39 @@ wm_reply_mailbox_init(void)
 	return status;
 }
 
+/* Compose /sys/wm/<my_term>/0 into buf.  Multi-WM (one instance per
+ * terminal, Phase 59 / WM γ.15) means each caller walks the WM that
+ * serves its own terminal.  task_my_terminal_idx() returns -1 when
+ * the caller has no terminal info (top-level oriscrun boots that
+ * skip Phase-51 R4 wiring); fall back to terminal 0 for back-compat
+ * with single-WM configurations and pre-multi-WM tests. */
+static void
+wm_render_path(char *buf)
+{
+	int idx = task_my_terminal_idx();
+	if (idx < 0) idx = 0;
+	const char prefix[] = "/sys/wm/";
+	const char suffix[] = "/0";
+	int p = 0, i;
+	for (i = 0; prefix[i]; i++) buf[p++] = prefix[i];
+	if (idx >= 100) {
+		buf[p++] = '0' + (idx / 100);
+		buf[p++] = '0' + ((idx / 10) % 10);
+		buf[p++] = '0' + (idx % 10);
+	} else if (idx >= 10) {
+		buf[p++] = '0' + (idx / 10);
+		buf[p++] = '0' + (idx % 10);
+	} else {
+		buf[p++] = '0' + idx;
+	}
+	for (i = 0; suffix[i]; i++) buf[p++] = suffix[i];
+	buf[p] = '\0';
+}
+
 /* Lazy: ensure WM_SLOT is populated.  Strategy:
  *   1. If WM_SLOT is non-null, fast-return.
- *   2. Otherwise dir_walk("/sys/wm/0").  On LEAF success, the
- *      resolved ref is in DIR_RESULT_SLOT; OREFLD it into O1 and
+ *   2. Otherwise dir_walk("/sys/wm/<my_term>/0").  On LEAF success,
+ *      the resolved ref is in DIR_RESULT_SLOT; OREFLD it into O1 and
  *      OREFST into WM_SLOT.
  *   3. On dir_walk failure: -6 (no directory) or -2 (path not
  *      found) propagate as WM_NO_DIRECTORY / WM_NO_WM. */
@@ -179,7 +208,9 @@ wm_init(void)
 
 	int kind;
 	char rem[16];
-	int rc = dir_walk("/sys/wm/0", &kind, rem, sizeof(rem));
+	char path[24];
+	wm_render_path(path);
+	int rc = dir_walk(path, &kind, rem, sizeof(rem));
 	if (rc == -6) return WM_NO_DIRECTORY;
 	if (rc < 0)   return WM_NO_WM;
 	if (kind != DIR_KIND_LEAF) return WM_NO_WM;

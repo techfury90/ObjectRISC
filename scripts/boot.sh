@@ -108,24 +108,24 @@ fi
 # (the per-procid path means each CPU's walk lands on its own
 # terminal without any per-CPU configuration on the supervisor.)
 #
-# CPU 2 = oriscwm (Phase 56).  The window manager runs on its own
-# CPU, dir-walks /sys/term/0/{console,keyboard} for the underlying
-# surface caps, and registers itself at /sys/wm/0.  The leader
-# supervisor (CPU 0) discovers it via wm_init and routes its
-# console session through it.  Workers (CPU 1) keep direct
-# /sys/term/<procid>/* terminals — milestone-3 WM only mediates
-# the leader.
+# CPUs 2 + 3 = oriscwm instances (Phase 59 / WM γ.15: one per
+# terminal).  Each WM dir-walks /sys/term/<N>/{console,keyboard,
+# framebuffer,pointer} for the surfaces of its terminal and
+# registers at /sys/wm/<N>/0; supervisors discover their own
+# terminal's WM via wm_init (walks /sys/wm/<my_term>/0).  init-r4=N+1
+# tells the WM its terminal index — task_init decodes init_r4 into
+# task_my_terminal_idx (Phase 51 convention).
 #
-# If the WM crashes / fails to register, supervisor.c's wm_init
-# returns negative and the leader falls back to direct
-# /sys/term/0/* — the shell still works.  So the WM is always-on
-# but never load-bearing.
+# If a WM crashes / fails to register, the matching supervisor's
+# wm_init returns negative and falls back to direct /sys/term/<N>/*
+# — the shell still works.  WMs are always-on but never load-bearing.
 exec python3 tools/oriscrun \
     --directory pid=18 \
     --terminal "pid=16,instance=0" \
     --terminal "pid=19,instance=1" \
     --hostfsd "pid=17,instance=0,root=$ROOT" \
-    --cpu "pid=2:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9" \
+    --cpu "pid=2:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=1" \
+    --cpu "pid=3:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=2" \
     --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
     --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
     --leader 0 --leader-timeout 600
