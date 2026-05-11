@@ -3557,18 +3557,22 @@ forward_console_write(int wid, int offset, int count)
 
 	/* ObjFetchBytes FIRST.  Pull a private copy of the source bytes
 	 * before any other work.  The leader's source ref points into
-	 * its stack — once the leader's task unblocks (when the
-	 * terminal's reply lands at the reply_cap), it will reuse that
-	 * stack region for the next print, and any later read of the
-	 * source ref returns garbage.  We have to capture our copy
-	 * while the leader is still blocked on this SEND, which is
-	 * before we forward.  Clamp to 256 bytes — the standard
-	 * term_print path batches per-string, so a typical write is
-	 * short.  Anything larger gets the leading 256 rendered (the
-	 * full count is forwarded below so the terminal still gets all
-	 * the bytes). */
-	unsigned char buf[256];
-	int fetch_count = (count > 256) ? 256 : count;
+	 * its stack — once the leader's task unblocks (when our reply
+	 * lands at the reply_cap), it will reuse that stack region for
+	 * the next print, and any later read of the source ref returns
+	 * garbage.  We have to capture our copy while the leader is
+	 * still blocked on this SEND, which is before we reply.
+	 *
+	 * Buffer sized at 1024 bytes — covers the typical large write
+	 * (a directory listing from `ls /programs` is ~375 bytes today
+	 * and growing).  The pre-step-3 forwarder used to relay the
+	 * full count downstream to oriscterm regardless, so the buf
+	 * was sized for visibility only; with the WM as the CONSOLE
+	 * endpoint, anything past the buf SILENTLY DROPS — keep this
+	 * generous.  Bigger writes get the leading 1024 rendered and
+	 * the tail discarded (no callers in tree exceed this). */
+	unsigned char buf[1024];
+	int fetch_count = (count > 1024) ? 1024 : count;
 	if (fetch_count > 0) {
 		int buf_off = (int)((unsigned int)buf - STACK_BOTTOM);
 		asm volatile(
