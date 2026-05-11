@@ -687,6 +687,15 @@ cmd_run(const char *cwd, const char *arg)
 			return;
 		}
 		int code = orx_unload(t);
+		/* Phase 60 step 17 — any foreground program that
+		 * wm_open_session + term_init's (mouse_paint, winhello,
+		 * future WM-aware tools) takes the WM's single-slot
+		 * keyboard subscriber.  term_shutdown clears it; without
+		 * this resubscribe the shell would block on the next
+		 * read_line forever.  Idempotent for programs that DON'T
+		 * touch the keyboard — re-derives a sub-cap from the
+		 * shell's still-live O9 mailbox and resends it. */
+		term_resubscribe();
 		term_print(run_done_pre);
 		term_print_int(code);
 		term_print(run_done_post);
