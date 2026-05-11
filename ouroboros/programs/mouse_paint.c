@@ -76,24 +76,36 @@ main(void)
 		return rc;
 	}
 
+	/* Full term_init (not term_print_only_init) so we get our own
+	 * keyboard mailbox in O9 and a real subscription to the WM
+	 * keyboard service.  Without it, O9 is whatever the parent
+	 * shell parked there at spawn time — term_pollkey would peek
+	 * that mailbox and either silently fail or, worse, dequeue
+	 * messages destined for the shell. */
+	term_init();
+
 	rc = wm_bind_surface(wid, WSURF_VECTOR);
-	if (rc != 0) { print_str("mouse_paint: bind VECTOR failed\n"); goto out_destroy; }
+	if (rc != 0) { print_str("mouse_paint: bind VECTOR failed\n"); goto out_shutdown; }
 	rc = vec_init_from_dir_result();
-	if (rc != 0) { print_str("mouse_paint: vec_init failed\n");    goto out_destroy; }
+	if (rc != 0) { print_str("mouse_paint: vec_init failed\n");    goto out_shutdown; }
 
 	rc = wm_bind_surface(wid, WSURF_POINTER);
-	if (rc != 0) { print_str("mouse_paint: bind POINTER failed\n"); goto out_destroy; }
+	if (rc != 0) { print_str("mouse_paint: bind POINTER failed\n"); goto out_shutdown; }
 	rc = pointer_init_from_dir_result();
-	if (rc != 0) { print_str("mouse_paint: pointer_init failed\n"); goto out_destroy; }
+	if (rc != 0) { print_str("mouse_paint: pointer_init failed\n"); goto out_shutdown; }
 	rc = pointer_subscribe();
-	if (rc != 0) { print_str("mouse_paint: pointer_subscribe failed\n"); goto out_unsub; }
+	if (rc != 0) { print_str("mouse_paint: pointer_subscribe failed\n"); goto out_shutdown; }
 
 	int color = 1;
 	vec_set_color(color);
-	vec_clear();
+	/* Deliberately no vec_clear() at startup — the WM drains its
+	 * per-window queues in a fixed order each tick (console THEN
+	 * vector), so a vec_clear right now would run AFTER the
+	 * welcome term_print and blank it.  The window FB is zero-
+	 * filled (= bg) at handle_new_window already; no clear needed. */
 
-	term_print("mouse_paint — left=draw  middle=color  right=clear  "
-	           "q/ESC=quit\n");
+	term_print("mouse_paint  left=draw  middle=color  "
+	           "right=clear  q/ESC=quit\n");
 
 	int last_x = -1, last_y = -1;
 	int quit = 0;
@@ -154,9 +166,8 @@ main(void)
 
 	term_print("mouse_paint: bye\n");
 	pointer_unsubscribe();
-out_unsub:
+out_shutdown:
 	term_shutdown();
-out_destroy:
 	wm_destroy_window(wid);
 	return rc < 0 ? -rc : rc;
 }
