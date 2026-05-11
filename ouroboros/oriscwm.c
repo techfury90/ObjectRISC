@@ -269,6 +269,20 @@
  * the right per-wid FB ref into here. */
 #define WM_ACTIVE_FB_SLOT_OFFSET        1304
 
+/* Phase 60 step 17 — keyboard-subscriber history (1-deep stack).
+ * When a new client SUBSCRIBES, the previous subscriber's reply
+ * ref moves here.  When the current subscriber UNSUBSCRIBES (sends
+ * O2 = null), poll_keyboard_subscribes restores this slot into
+ * the active sub slot so the originally-subscribed shell takes
+ * over again — without it, mouse_paint backgrounded with `&` would
+ * grab the keyboard via term_init and leave the shell comatose
+ * after its own term_shutdown.  Sized to one entry (8 bytes) —
+ * adequate for the common case of a single foreground tool stealing
+ * focus from the shell; nested take-overs degrade gracefully (the
+ * outermost subscriber gets stranded, but is no worse than the
+ * pre-fix all-null state). */
+#define WM_PREV_KBD_SUB_SLOT_OFFSET     1312
+
 /* === Glyph rendering ==================================================
  *
  * The framebuffer is row-major, one byte per pixel (palette index;
@@ -2748,8 +2762,14 @@ poll_one_request(int *out_op, int *out_wid, int *out_arg)
  * thrash the screen FB, and clients always paint a complete shape
  * before the next request anyway.
  *
- * Pixel buffer must live on our stack (STACK_BOTTOM-relative
- * offsets) — same as before. */
+ * Pixel buffer must live in the boot data segment (O15 / DATA_VA-
+ * relative offsets).  Callers stage pixels into vec_scratch_row
+ * (file-scope static = .data) and pass that.  Was STACK-relative
+ * in the original glyph-render path; latent bug because the only
+ * shipped caller back then went through ObjBlitGlyphs (different
+ * primitive).  mouse_paint is the first program to actually drive
+ * vec_rect_fill / vec_line / fb_blit_row through clients, exposing
+ * the wrong-ref / wrong-offset combo. */
 static void
 fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 {
@@ -2764,7 +2784,7 @@ fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 	if (x >= CELL_AREA_W_PX)           return;
 	if (x + n_pixels > CELL_AREA_W_PX) n_pixels = CELL_AREA_W_PX - x;
 
-	int src_off = (int)((unsigned int)pixels - STACK_BOTTOM);
+	int src_off = (int)((unsigned int)pixels - DATA_VA);
 	/* Window FB stride is USABLE_W_PX (the full FB width, including
 	 * border ring); cell-area pixel (x, y) lives at window-FB pixel
 	 * (CONTENT_X_OFF_PX + x, CONTENT_Y_OFF_PX + y). */
@@ -2774,7 +2794,7 @@ fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 		"addu  r7, %1, r0\n"
 		"addu  r8, %2, r0\n"
 		"addu  r9, %3, r0\n"
-		"omov  o1, o11\n"
+		"omov  o1, o15\n"            /* boot DATA ref */
 		"orefld o2, %0(o12)\n"
 		"addu  r4, r7, r0\n"
 		"addu  r5, r8, r0\n"
@@ -2792,17 +2812,18 @@ fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 /* Forward decl — vec_scratch_row + prep_scratch_row are defined
  * after the rasterisers because the oval helpers use the same
  * scratch buffer too. */
+static unsigned char  vec_scratch_row[];
 static unsigned char *prep_scratch_row(int n, unsigned char color);
 
 /* Single-pixel store.  Bresenham line and oval-outline plot pixel-
- * by-pixel; this is just a one-byte fb_blit_row.  Caller's `c`
- * lives on the stack across the call so the byte address is valid
- * for ObjStoreBytes. */
+ * by-pixel; this is just a one-byte fb_blit_row.  Stages the pixel
+ * into vec_scratch_row[0] (data-segment buffer) since fb_blit_row
+ * now addresses through O15/DATA_VA. */
 static void
 fb_set_pixel(int x, int y, unsigned char color)
 {
-	unsigned char one = color;
-	fb_blit_row(y, x, &one, 1);
+	vec_scratch_row[0] = color;
+	fb_blit_row(y, x, vec_scratch_row, 1);
 }
 
 /* pcc-orisc passes only 4 args in registers and trips ("adrput:
@@ -4063,6 +4084,26 @@ poll_pointer_events(void)
 	if (wm_handle_pointer(evt_type, packed_xy, button, btn_state))
 		return;
 
+	/* Translate screen-space coords to the topmost window's content-
+	 * area-local coords before forwarding.  Without this, subscribers
+	 * would see desktop-absolute coords and couldn't map them onto
+	 * their (window-local) vector / raster drawing space.  Events
+	 * outside any window's content area get dropped — for a v1
+	 * single-subscriber, that's "this click isn't for the subscriber's
+	 * window" and shouldn't be forwarded.  Multi-subscriber routing
+	 * with per-window pointer caps is post-MVP. */
+	{
+		int px = (packed_xy >> 16) & 0xFFFF;
+		int py = packed_xy & 0xFFFF;
+		int t = topmost_window_at(px, py);
+		if (t == 0) return;
+		int cx = px - window_pos_x[t - 1] - CONTENT_X_OFF_PX;
+		int cy = py - window_pos_y[t - 1] - CONTENT_Y_OFF_PX;
+		if (cx < 0 || cx >= CELL_AREA_W_PX
+		    || cy < 0 || cy >= CELL_AREA_H_PX) return;
+		packed_xy = ((cx & 0xFFFF) << 16) | (cy & 0xFFFF);
+	}
+
 	/* Not consumed by the WM — forward to the subscriber if any. */
 	int sub_isn;
 	asm volatile(
@@ -4130,12 +4171,37 @@ poll_keyboard_subscribes(void)
 		: "r1", "r2", "memory"
 	);
 	if (_wm_kbd_sub_poll_status != 0) return;
-	asm volatile(
-		"orefst o2, %0(o12)"
-		:
-		: "i"(WM_KBD_SUB_SLOT_OFFSET)
-		: "memory"
-	);
+
+	/* 1-deep subscriber stack.  Null O2 from the sender means
+	 * "unsubscribe"; restore the previous subscriber (typically
+	 * the shell) so it gets keyboard focus back.  Non-null O2
+	 * means "subscribe"; push the current subscriber into the
+	 * prev slot before overwriting. */
+	int new_isn;
+	asm volatile("oisn %0, o2" : "=r"(new_isn));
+
+	if (new_isn) {
+		asm volatile(
+			"orefld o1, %0(o12)\n"
+			"orefst o1, %1(o12)\n"
+			"onull  o1\n"
+			"orefst o1, %0(o12)"
+			:
+			: "i"(WM_PREV_KBD_SUB_SLOT_OFFSET),
+			  "i"(WM_KBD_SUB_SLOT_OFFSET)
+			: "r1", "memory"
+		);
+	} else {
+		asm volatile(
+			"orefld o1, %0(o12)\n"
+			"orefst o1, %1(o12)\n"
+			"orefst o2, %0(o12)"
+			:
+			: "i"(WM_KBD_SUB_SLOT_OFFSET),
+			  "i"(WM_PREV_KBD_SUB_SLOT_OFFSET)
+			: "r1", "memory"
+		);
+	}
 }
 
 static int _wm_kbd_evt_poll_status;
