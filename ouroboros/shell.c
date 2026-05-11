@@ -1165,6 +1165,20 @@ main(void)
 	 * orx_spawn uses the libc task table parked in O12 by task_init. */
 	task_init();
 
+	/* Phase 60 step 20 — every shell opens its own WM window.  Both
+	 * the boot shell (spawned by login) and menu-spawned shells go
+	 * through this; each gets its own wid and its own keyboard /
+	 * pointer subscriber slots under the focus model.  Soft-fail
+	 * when no WM is reachable (legacy test environments running
+	 * shell against bare oriscterm) — we fall back to the caps the
+	 * supervisor / parent already left in O5/O6/O7.  has_window
+	 * gates the matching wm_destroy_window on exit. */
+	int wm_wid = 0;
+	int wm_has_window = 0;
+	if (wm_open_session("shell", &wm_wid) == 0) {
+		wm_has_window = 1;
+	}
+
 	/* term_init parks boot O2/O3/O4 into O11/O14/O15; we don't need
 	 * to touch them ourselves here. (See term.c on why we avoid
 	 * `register __or __asm__("oN")` declarations for the saves.) */
@@ -1270,11 +1284,13 @@ main(void)
 			 * sup_shutdown is about to halt everything.) */
 			term_print("logged out\n");
 			term_shutdown();
+			if (wm_has_window) wm_destroy_window(wm_wid);
 			return 0;
 		} else if (strcmp(line, "exit") == 0
 		           || strcmp(line, "quit") == 0) {
 			term_print("bye!\n");
 			term_shutdown();
+			if (wm_has_window) wm_destroy_window(wm_wid);
 			/* Phase 48: SEND op=2 to halt the supervisor.
 			 * When a supervisor IS present, also yield
 			 * forever — returning would cause login.task_wait
