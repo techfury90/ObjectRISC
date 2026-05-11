@@ -724,14 +724,17 @@ cmd_edit(const char *cwd, const char *arg)
 		term_print("\n");
 		return;
 	}
-	/* Phase 60 step 13/18 — edit opens its own window and takes
-	 * keyboard focus via term_init.  Wait for it to exit; the
-	 * focus-model WM auto-reverts focus to our window when edit
-	 * destroys its own. */
-	int code = orx_unload(t);
-	term_print(run_done_pre);
-	term_print_int(code);
-	term_print(run_done_post);
+	/* Phase 60 step 18 — back to backgrounded by default.  Step 13
+	 * forced this foreground (orx_unload + term_resubscribe) because
+	 * single-subscriber keyboard meant the shell had to know when
+	 * edit released focus; with per-wid subscribers the WM auto-
+	 * reverts focus to whichever window the user clicks (or to the
+	 * new topmost when edit destroys its window), so edit can run
+	 * concurrently with the shell again. */
+	term_print(run_bg_pre);
+	term_print_int(t);
+	term_print(run_bg_post);
+	task_yield();
 }
 
 static void
