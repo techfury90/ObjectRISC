@@ -4381,11 +4381,16 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 		return 1;
 	}
 
-	/* Right-click on empty desktop summons the menu.  Empty =
-	 * topmost_window_at(px, py) returns 0.  Right-click on a
-	 * window falls through unconsumed for the subscriber to
-	 * handle (window-local context menus etc.). */
-	if (evt_type == PTR_EVT_DOWN && button == PTR_BTN_RIGHT
+	/* Right-click (or middle-click) on empty desktop summons the
+	 * menu.  Tk on macOS Aqua swaps button-2 and button-3 vs
+	 * X11 — the "secondary click" (ctrl-click / two-finger tap)
+	 * arrives as PTR_BTN_MIDDLE there, while real three-button
+	 * mice on X11 send PTR_BTN_RIGHT.  Accept either, since
+	 * neither has any other meaning when no window is under the
+	 * cursor (topmost_window_at returns 0).  Right-/middle-click
+	 * on a window still falls through unconsumed. */
+	if (evt_type == PTR_EVT_DOWN
+	    && (button == PTR_BTN_RIGHT || button == PTR_BTN_MIDDLE)
 	    && topmost_window_at(px, py) == 0) {
 		desktop_menu_show(px, py);
 		return 1;
