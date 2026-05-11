@@ -1922,12 +1922,72 @@ def lookup_label_in_text(asm: Assembler, name: str, file: str, line: int,
 # ---------------------------------------------------------------------------
 # Pass 2: encode all instructions and produce final byte stream.
 
+def _try_emit_word_abs32_reloc(asm: Assembler, blob: DataBlob, off: int,
+                                expr: Expr) -> bool:
+    """In relocatable mode, a `.word LABEL` (or `.word LABEL + N`)
+    fixup must become an R_ORISC_ABS32 relocation — otherwise
+    `_resolve_blob`'s `eval_expr` bakes in `section_base(sec) + off`
+    using the hardcoded DATA_BASE / TEXT_BASE, ignoring this .oro's
+    actual placement when other objects contribute to the same
+    section ahead of it.  The linker then has no record that the
+    bytes are a relocatable pointer; they keep the wrong VA.
+
+    Returns True if a reloc was emitted (caller leaves the
+    placeholder bytes zero; linker patches them).  False means the
+    expression shape isn't representable as a single ABS32 reloc
+    (multiple symbols, a negated symbol reference, or addend out of
+    16-bit signed range) — fall back to inline resolution, same as
+    non-relocatable mode.
+
+    Handles `.set` constants by folding them into the addend so a
+    pcc-emitted `.word LABEL + SOME_CONST` still goes the reloc
+    route as long as the addend stays in range. """
+    sym_terms: list = []     # list of (sign, name)
+    addend = 0
+    for sign, kind, value in expr.terms:
+        if kind == 'num':
+            addend += sign * value
+            continue
+        # 'sym': either a `.set` constant or a label reference.
+        if value in asm.constants:
+            addend += sign * eval_expr(asm, asm.constants[value])
+            continue
+        if value not in asm.labels:
+            # Undefined symbol: pcc may emit references to external
+            # globals.  Treat as a regular symbol reference; the
+            # linker will resolve it via the symbol table.
+            sym_terms.append((sign, value))
+            continue
+        sym_terms.append((sign, value))
+    if len(sym_terms) != 1:
+        return False
+    sign, label = sym_terms[0]
+    if sign != 1:
+        return False
+    if not (-(1 << 15) <= addend <= (1 << 15) - 1):
+        return False
+    asm.relocations.append(Reloc(
+        section=blob.section,
+        offset=blob.offset + off,
+        rtype=R_ORISC_ABS32,
+        symbol=label,
+        addend=addend))
+    return True
+
+
 def _resolve_blob(asm: Assembler, blob: DataBlob) -> bytes:
     """Apply any deferred fixups to a DataBlob and return the final bytes."""
     if not blob.fixups:
         return blob.data
     out = bytearray(blob.data)
     for off, w, expr, col in blob.fixups:
+        # Relocatable mode: defer 32-bit symbol references to the
+        # linker so cross-object placement (data_offsets per .oro) is
+        # accounted for.  Falls through to inline resolution if the
+        # expr shape isn't ABS32-representable.
+        if w == 4 and asm.relocatable \
+                and _try_emit_word_abs32_reloc(asm, blob, off, expr):
+            continue
         v = eval_expr(asm, expr)
         if w == 1:
             if not (-128 <= v <= 255):
