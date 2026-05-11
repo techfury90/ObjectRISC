@@ -4063,6 +4063,26 @@ poll_pointer_events(void)
 	if (wm_handle_pointer(evt_type, packed_xy, button, btn_state))
 		return;
 
+	/* Translate screen-space coords to the topmost window's content-
+	 * area-local coords before forwarding.  Without this, subscribers
+	 * would see desktop-absolute coords and couldn't map them onto
+	 * their (window-local) vector / raster drawing space.  Events
+	 * outside any window's content area get dropped — for a v1
+	 * single-subscriber, that's "this click isn't for the subscriber's
+	 * window" and shouldn't be forwarded.  Multi-subscriber routing
+	 * with per-window pointer caps is post-MVP. */
+	{
+		int px = (packed_xy >> 16) & 0xFFFF;
+		int py = packed_xy & 0xFFFF;
+		int t = topmost_window_at(px, py);
+		if (t == 0) return;
+		int cx = px - window_pos_x[t - 1] - CONTENT_X_OFF_PX;
+		int cy = py - window_pos_y[t - 1] - CONTENT_Y_OFF_PX;
+		if (cx < 0 || cx >= CELL_AREA_W_PX
+		    || cy < 0 || cy >= CELL_AREA_H_PX) return;
+		packed_xy = ((cx & 0xFFFF) << 16) | (cy & 0xFFFF);
+	}
+
 	/* Not consumed by the WM — forward to the subscriber if any. */
 	int sub_isn;
 	asm volatile(
