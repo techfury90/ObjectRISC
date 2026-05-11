@@ -608,21 +608,42 @@ static int           window_title_len;
  * gets a supervisor cap lazily on first menu use via a dir_walk of
  * /sys/cpu/0/supervisor (the leader); installed into SUP_SLOT_OFFSET
  * (544) so libc's sup_have_supervisor / sup_spawn pick it up. */
-/* Parallel arrays rather than a struct because pcc-orisc emits
- * `la sym+OFF` for struct-member loads, which asmorisc rejects. */
+/* Menu strings + spawn paths packed flat into one buffer each, with
+ * per-item offsets in a parallel int array.  The natural shape —
+ * an array of `const char *` pointing at string literals — generates
+ * `.word L_anon_literal` directives that asmorisc resolves
+ * internally at pass 2 using a hardcoded DATA_BASE = 0x40000.  In
+ * relocatable mode that breaks: this .oro's data isn't at the start
+ * of the linked image (crt0 / console_io contribute first), so the
+ * stored pointers are off by data_offsets[oriscwm.oro] bytes.  By
+ * keeping everything inside named char arrays and indexing by
+ * compile-time-constant offsets we sidestep the `.word LABEL` path
+ * — `la char_array + off` goes through the HI16/LO16 reloc path
+ * which the linker handles correctly.
+ *
+ * Strings are NUL-terminated for spawn_path consumers (sup_spawn
+ * expects C strings).  Label rendering uses the per-item length
+ * from desktop_menu_label_lens, so the NUL acts as separator. */
 #define DESKTOP_MENU_N 3
-static const char *const desktop_menu_labels[DESKTOP_MENU_N] = {
-	"Edit",
-	"Mouse Paint",
-	"Cancel",
+static const unsigned char desktop_menu_label_buf[] =
+	"Edit\0"
+	"Mouse Paint\0"
+	"Cancel\0";
+static const int desktop_menu_label_offs[DESKTOP_MENU_N] = {
+	0,            /* "Edit" */
+	5,            /* "Mouse Paint" — past "Edit\0" */
+	17,           /* "Cancel" — past "Mouse Paint\0" */
 };
 static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
 	4, 11, 6,
 };
-static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
-	"/programs/edit.orx",
-	"/programs/mouse_paint.orx",
-	(const char *)0,         /* Cancel — dismiss, no spawn */
+static const unsigned char desktop_menu_spawn_buf[] =
+	"/programs/edit.orx\0"
+	"/programs/mouse_paint.orx\0";
+static const int desktop_menu_spawn_offs[DESKTOP_MENU_N] = {
+	0,           /* edit.orx */
+	19,          /* mouse_paint.orx — past edit.orx\0 */
+	-1,          /* Cancel — no spawn */
 };
 
 /* Menu chrome: padding around each item in cells.  Width = max label
@@ -4221,16 +4242,19 @@ menu_paint_item(int item_idx)
 	wh |= CELL_H & 0xFFFF;
 	fill_rect_packed(xy, wh, bg);
 
-	/* Then the label glyphs, indented by MENU_PAD_CELLS_X. */
-	const char *label  = desktop_menu_labels[item_idx];
-	int label_len      = desktop_menu_label_lens[item_idx];
-	int glyph_cx       = menu_x_cell + MENU_PAD_CELLS_X;
-	int packed_xy_g    = ((glyph_cx & 0xFFFF) << 16) | (row_cell_y & 0xFFFF);
-	int packed_shape   = ((label_len & 0xFFFF) << 16)
-	                   | ((fg & 0xFF) << 8) | (bg & 0xFF);
-	screen_blit_glyph_row(packed_xy_g,
-	                      (const unsigned char *)label,
-	                      packed_shape);
+	/* Then the label glyphs, indented by MENU_PAD_CELLS_X.  Address
+	 * of the label is the buffer base + per-item offset — keeps
+	 * pcc-orisc's reloc path on the HI16/LO16 (named symbol)
+	 * track rather than the broken `.word LABEL` internal-fixup
+	 * track. */
+	const unsigned char *label = desktop_menu_label_buf
+	                           + desktop_menu_label_offs[item_idx];
+	int label_len    = desktop_menu_label_lens[item_idx];
+	int glyph_cx     = menu_x_cell + MENU_PAD_CELLS_X;
+	int packed_xy_g  = ((glyph_cx & 0xFFFF) << 16) | (row_cell_y & 0xFFFF);
+	int packed_shape = ((label_len & 0xFFFF) << 16)
+	                 | ((fg & 0xFF) << 8) | (bg & 0xFF);
+	screen_blit_glyph_row(packed_xy_g, label, packed_shape);
 }
 
 /* True if a cell coord falls inside the active menu rect. */
@@ -4311,9 +4335,10 @@ desktop_menu_select(int item_idx)
 		desktop_menu_dismiss();
 		return;
 	}
-	const char *path = desktop_menu_spawn_paths[item_idx];
+	int spawn_off = desktop_menu_spawn_offs[item_idx];
 	desktop_menu_dismiss();
-	if (path == (const char *)0) return;
+	if (spawn_off < 0) return;
+	const char *path = (const char *)(desktop_menu_spawn_buf + spawn_off);
 
 	int rc = sup_walk_to_slot();
 	if (rc != 0) {
