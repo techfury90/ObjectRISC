@@ -597,6 +597,75 @@ static int           drag_outline_x, drag_outline_y;
 static unsigned char window_title[MAX_TITLE_LEN];
 static int           window_title_len;
 
+/* Phase 60 step 19 — desktop root menu.  Old-school X11 style: right-
+ * click on empty desktop summons a vertical list of program entries,
+ * left-click an item to spawn it + dismiss, left-click off-menu or
+ * ESC to cancel.  Hardcoded items for v1; reads-from-config /
+ * client-registered items can come later.
+ *
+ * Spawn target uses sup_spawn (libc) which defaults to round-robin
+ * across live CPUs — same SUP_TARGET_ANY semantics `run` uses.  WM
+ * gets a supervisor cap lazily on first menu use via a dir_walk of
+ * /sys/cpu/0/supervisor (the leader); installed into SUP_SLOT_OFFSET
+ * (544) so libc's sup_have_supervisor / sup_spawn pick it up. */
+/* Menu strings + spawn paths packed flat into one buffer each, with
+ * per-item offsets in a parallel int array.  The natural shape —
+ * an array of `const char *` pointing at string literals — generates
+ * `.word L_anon_literal` directives that asmorisc resolves
+ * internally at pass 2 using a hardcoded DATA_BASE = 0x40000.  In
+ * relocatable mode that breaks: this .oro's data isn't at the start
+ * of the linked image (crt0 / console_io contribute first), so the
+ * stored pointers are off by data_offsets[oriscwm.oro] bytes.  By
+ * keeping everything inside named char arrays and indexing by
+ * compile-time-constant offsets we sidestep the `.word LABEL` path
+ * — `la char_array + off` goes through the HI16/LO16 reloc path
+ * which the linker handles correctly.
+ *
+ * Strings are NUL-terminated for spawn_path consumers (sup_spawn
+ * expects C strings).  Label rendering uses the per-item length
+ * from desktop_menu_label_lens, so the NUL acts as separator. */
+#define DESKTOP_MENU_N 3
+/* Int arrays declared FIRST so they end up at 4-aligned addresses
+ * in the linked binary.  pcc-orisc + asmorisc emit `.align 2`
+ * BEFORE a `.ascii` blob's bytes, not after — so the symbol
+ * following a non-multiple-of-4 .ascii lands at a misaligned
+ * address.  A subsequent `lw` on that symbol traps with
+ * address-misaligned-d.  Keep the .ascii blobs LAST. */
+static const int desktop_menu_label_offs[DESKTOP_MENU_N] = {
+	0,            /* "Edit" */
+	5,            /* "Mouse Paint" — past "Edit\0" */
+	17,           /* "Cancel" — past "Mouse Paint\0" */
+};
+static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
+	4, 11, 6,
+};
+static const int desktop_menu_spawn_offs[DESKTOP_MENU_N] = {
+	0,           /* edit.orx */
+	19,          /* mouse_paint.orx — past edit.orx\0 */
+	-1,          /* Cancel — no spawn */
+};
+static const unsigned char desktop_menu_label_buf[] =
+	"Edit\0"
+	"Mouse Paint\0"
+	"Cancel\0";
+static const unsigned char desktop_menu_spawn_buf[] =
+	"/programs/edit.orx\0"
+	"/programs/mouse_paint.orx\0";
+
+/* Menu chrome: padding around each item in cells.  Width = max label
+ * cells + 2 padding.  Height = N items × 1 row.  Cell-aligned so the
+ * ObjBlitGlyphs cell-coord math stays clean. */
+#define MENU_PAD_CELLS_X    1
+#define MENU_BG_COLOR       1     /* light gray (matches title bar bg) */
+#define MENU_FG_COLOR       0     /* dark navy (text over gray)        */
+#define MENU_HI_BG_COLOR    8     /* bright white when hovered         */
+#define MENU_HI_FG_COLOR    0     /* dark navy text over hilite        */
+
+static int  menu_active;           /* non-zero while desktop menu showing */
+static int  menu_x_cell, menu_y_cell;  /* top-left in CELL coords */
+static int  menu_w_cells, menu_h_cells;
+static int  menu_highlighted;     /* -1 = none, else 0..N-1 */
+
 /* The owner task ref and subscriber notify_cap live in OPR slots
  * (WM_OWNER_BASE_OFFSET + id*8 and WM_SUBSCRIBE_BASE_OFFSET + id*8)
  * so we can OREFST/OREFLD them.  We can't store cap refs in C
@@ -1279,6 +1348,48 @@ blit_title_text(int start_col, int n_chars)
 		: "r"(packed_xy), "r"(packed_shape),
 		  "r"(font_off),  "r"(text_off),
 		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
+		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+		  "r8", "r9", "r10", "r11"
+	);
+}
+
+/* Phase 60 step 19 — screen-FB variant of blit_title_text.  Same
+ * ObjBlitGlyphs wire as the window-FB version but targets the
+ * SCREEN framebuffer directly (no window backing store).  Used by
+ * the desktop menu — its glyphs live above all windows in the
+ * compositor order, so painting straight into the screen FB skips
+ * a composite step entirely.
+ *
+ * 3-arg signature (packed_xy, text, packed_shape) because pcc-orisc
+ * trips ("adrput: illegal op 57") on calls with 5+ args.  Caller
+ * packs (cell_x:high16, cell_y:low16) and (n_chars:high16, fg:bits
+ * 15..8, bg:bits 7..0).  Source text must live in our boot data
+ * segment — ObjBlitGlyphs reads it through O15 (boot data ref). */
+static void
+screen_blit_glyph_row(int packed_xy, const unsigned char *text,
+                      int packed_shape)
+{
+	if (((packed_shape >> 16) & 0xFFFF) == 0) return;
+	int text_off = (int)((unsigned int)text - DATA_VA);
+	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
+	asm volatile(
+		"addu   r8,  %0, r0\n"
+		"addu   r9,  %1, r0\n"
+		"addu   r10, %2, r0\n"
+		"addu   r11, %3, r0\n"
+		"orefld o1, %4(o12)\n"        /* O1 = screen FB */
+		"omov   o2, o15\n"            /* O2 = boot data (font) */
+		"omov   o3, o15\n"            /* O3 = boot data (text) */
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r10, r0\n"
+		"addu   r7, r11, r0\n"
+		"call   #0x10C\n"             /* ObjBlitGlyphs */
+		"nop"
+		:
+		: "r"(packed_xy), "r"(packed_shape),
+		  "r"(font_off),  "r"(text_off),
+		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET)
 		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
 		  "r8", "r9", "r10", "r11"
 	);
@@ -4065,6 +4176,192 @@ point_in_title_bar(int wid, int px, int py)
 	return (px >= tx_lo && px < tx_hi && py >= ty_lo && py < ty_hi);
 }
 
+/* Phase 60 step 19 — lazy supervisor cap acquisition.  WM boots with
+ * O8 = oriscdir cap (parked into BOOT_PARENT_SLOT_OFFSET / SUP_SLOT
+ * at task_init).  The desktop menu wants to use libc's sup_spawn,
+ * which reads its supervisor cap from SUP_SLOT_OFFSET — so we
+ * dir-walk /sys/cpu/0/supervisor on first use and overwrite the
+ * slot with the resolved cap.  Idempotent: subsequent calls early-
+ * return after the flag check.
+ *
+ * Note: at WM boot the slot holds the DIR cap (not a supervisor cap)
+ * — an OISN check alone can't distinguish, hence the file-scope
+ * flag.  Flag must live at file scope, not as a function-static —
+ * pcc-orisc emits the function into `.data` if a static-local
+ * variable is declared mid-function.  Same trick wm_z_count etc.
+ * already use.
+ *
+ * 0 on success (slot now holds the supervisor cap), negative on
+ * failure (slot left untouched). */
+static int sup_walked;
+
+static int
+sup_walk_to_slot(void)
+{
+	if (sup_walked) return 0;
+
+	const char path[] = "/sys/cpu/0/supervisor";
+	int kind;
+	char rem[16];
+	int rc = dir_walk(path, &kind, rem, sizeof(rem));
+	if (rc != 0) return rc;
+	if (kind != DIR_KIND_LEAF) return -1;
+	asm volatile(
+		"orefld o1, 616(o12)\n"             /* DIR_RESULT_SLOT */
+		"orefst o1, %0(o12)"                /* → BOOT_PARENT / SUP_SLOT */
+		:
+		: "i"(BOOT_PARENT_SLOT_OFFSET)
+		: "r1"
+	);
+	sup_walked = 1;
+	return 0;
+}
+
+/* Desktop menu helpers.  All coords below are in CELL units except
+ * where suffixed _px / when explicitly noted.  Menu position is
+ * cell-aligned so ObjBlitGlyphs's cell-coord math works directly. */
+static int
+menu_width_cells(void)
+{
+	int max = 0;
+	int i;
+	for (i = 0; i < DESKTOP_MENU_N; i++) {
+		int n = desktop_menu_label_lens[i];
+		if (n > max) max = n;
+	}
+	return max + 2 * MENU_PAD_CELLS_X;
+}
+
+static void
+menu_paint_item(int item_idx)
+{
+	if (item_idx < 0 || item_idx >= DESKTOP_MENU_N) return;
+	int row_cell_y = menu_y_cell + item_idx;
+	int is_hi = (item_idx == menu_highlighted);
+	int bg    = is_hi ? MENU_HI_BG_COLOR : MENU_BG_COLOR;
+	int fg    = is_hi ? MENU_HI_FG_COLOR : MENU_FG_COLOR;
+
+	/* Fill the row bg first (covers hilite change). */
+	int xy = ((menu_x_cell * CELL_W) & 0xFFFF) << 16;
+	xy |= (row_cell_y * CELL_H) & 0xFFFF;
+	int wh = ((menu_w_cells * CELL_W) & 0xFFFF) << 16;
+	wh |= CELL_H & 0xFFFF;
+	fill_rect_packed(xy, wh, bg);
+
+	/* Then the label glyphs, indented by MENU_PAD_CELLS_X.  Address
+	 * of the label is the buffer base + per-item offset — keeps
+	 * pcc-orisc's reloc path on the HI16/LO16 (named symbol)
+	 * track rather than the broken `.word LABEL` internal-fixup
+	 * track. */
+	const unsigned char *label = desktop_menu_label_buf
+	                           + desktop_menu_label_offs[item_idx];
+	int label_len    = desktop_menu_label_lens[item_idx];
+	int glyph_cx     = menu_x_cell + MENU_PAD_CELLS_X;
+	int packed_xy_g  = ((glyph_cx & 0xFFFF) << 16) | (row_cell_y & 0xFFFF);
+	int packed_shape = ((label_len & 0xFFFF) << 16)
+	                 | ((fg & 0xFF) << 8) | (bg & 0xFF);
+	screen_blit_glyph_row(packed_xy_g, label, packed_shape);
+}
+
+/* True if a cell coord falls inside the active menu rect. */
+static int
+menu_hit_cell(int cx, int cy)
+{
+	if (!menu_active) return -1;
+	if (cx < menu_x_cell || cx >= menu_x_cell + menu_w_cells)
+		return -1;
+	if (cy < menu_y_cell || cy >= menu_y_cell + menu_h_cells)
+		return -1;
+	return cy - menu_y_cell;
+}
+
+static void
+desktop_menu_show(int px, int py)
+{
+	if (menu_active) return;
+	menu_w_cells = menu_width_cells();
+	menu_h_cells = DESKTOP_MENU_N;
+	int cx = px / CELL_W;
+	int cy = py / CELL_H;
+	/* Clamp so the menu fits fully on screen. */
+	int max_cx = (FB_W / CELL_W) - menu_w_cells;
+	int max_cy = (FB_H / CELL_H) - menu_h_cells;
+	if (cx < 0) cx = 0;
+	if (cy < 0) cy = 0;
+	if (cx > max_cx) cx = max_cx;
+	if (cy > max_cy) cy = max_cy;
+	menu_x_cell = cx;
+	menu_y_cell = cy;
+	menu_highlighted = -1;
+	menu_active = 1;
+
+	int i;
+	for (i = 0; i < DESKTOP_MENU_N; i++) menu_paint_item(i);
+}
+
+/* Erase the menu by bg-filling + recomposing the rect from the
+ * window z-stack — same primitive recompose_after_destroy uses. */
+static void
+desktop_menu_dismiss(void)
+{
+	if (!menu_active) return;
+	int sx = menu_x_cell * CELL_W;
+	int sy = menu_y_cell * CELL_H;
+	int sw = menu_w_cells * CELL_W;
+	int sh = menu_h_cells * CELL_H;
+	menu_active = 0;
+	menu_highlighted = -1;
+	recompose_after_destroy(sx, sy, sw, sh);
+}
+
+/* Update hover highlight based on the new cursor position.  Two
+ * paints worst case: erase old, paint new (each is one row +
+ * glyphs). */
+static void
+desktop_menu_update_highlight(int px, int py)
+{
+	int cx = px / CELL_W;
+	int cy = py / CELL_H;
+	int new_hi = menu_hit_cell(cx, cy);
+	if (new_hi == menu_highlighted) return;
+	int old_hi = menu_highlighted;
+	menu_highlighted = new_hi;
+	if (old_hi >= 0) menu_paint_item(old_hi);
+	if (new_hi >= 0) menu_paint_item(new_hi);
+}
+
+/* User clicked an item — dismiss menu, then sup_spawn the program
+ * if the entry has a spawn_path (Cancel has spawn_path = NULL).
+ * sup_spawn uses round-robin (SUP_TARGET_ANY) the same way `run`
+ * does in cmd_run's no-`@N` path. */
+static void
+desktop_menu_select(int item_idx)
+{
+	if (item_idx < 0 || item_idx >= DESKTOP_MENU_N) {
+		desktop_menu_dismiss();
+		return;
+	}
+	int spawn_off = desktop_menu_spawn_offs[item_idx];
+	desktop_menu_dismiss();
+	if (spawn_off < 0) return;
+	const char *path = (const char *)(desktop_menu_spawn_buf + spawn_off);
+
+	int rc = sup_walk_to_slot();
+	if (rc != 0) {
+		WM_PRINT("oriscwm: menu spawn: supervisor walk failed: ");
+		WM_PRINT_INT(rc);
+		WM_PRINT("\n");
+		return;
+	}
+	task_t t = sup_spawn(path, "", "/");
+	wm_restore_boot_or();
+	if (t < 0) {
+		WM_PRINT("oriscwm: menu spawn failed: ");
+		WM_PRINT_INT((int)t);
+		WM_PRINT("\n");
+	}
+}
+
 /* WM-side pointer event dispatch.  Called from poll_pointer_events
  * before forwarding to any subscriber.  Returns 1 if the event was
  * consumed (don't forward), 0 to let it through.
@@ -4091,6 +4388,44 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 	(void)btn_state;
 	int px = (packed_xy >> 16) & 0xFFFF;
 	int py = packed_xy & 0xFFFF;
+
+	/* Modal desktop menu: while up, the WM owns the cursor.
+	 * MOTION updates hover; LEFT DOWN inside menu = select +
+	 * dismiss + spawn; LEFT DOWN outside = cancel + dismiss;
+	 * other buttons / RIGHT clicks are swallowed silently so a
+	 * second right-click doesn't open a second menu. */
+	if (menu_active) {
+		if (evt_type == PTR_EVT_MOTION) {
+			desktop_menu_update_highlight(px, py);
+			return 1;
+		}
+		if (evt_type == PTR_EVT_DOWN) {
+			if (button != PTR_BTN_LEFT) return 1;
+			int cx = px / CELL_W;
+			int cy = py / CELL_H;
+			int hit = menu_hit_cell(cx, cy);
+			if (hit >= 0) desktop_menu_select(hit);
+			else          desktop_menu_dismiss();
+			return 1;
+		}
+		/* PTR_EVT_UP and anything else: swallow while modal. */
+		return 1;
+	}
+
+	/* Right-click (or middle-click) on empty desktop summons the
+	 * menu.  Tk on macOS Aqua swaps button-2 and button-3 vs
+	 * X11 — the "secondary click" (ctrl-click / two-finger tap)
+	 * arrives as PTR_BTN_MIDDLE there, while real three-button
+	 * mice on X11 send PTR_BTN_RIGHT.  Accept either, since
+	 * neither has any other meaning when no window is under the
+	 * cursor (topmost_window_at returns 0).  Right-/middle-click
+	 * on a window still falls through unconsumed. */
+	if (evt_type == PTR_EVT_DOWN
+	    && (button == PTR_BTN_RIGHT || button == PTR_BTN_MIDDLE)
+	    && topmost_window_at(px, py) == 0) {
+		desktop_menu_show(px, py);
+		return 1;
+	}
 
 	if (evt_type == PTR_EVT_MOTION) {
 		if (!drag_active) return 0;
@@ -4322,14 +4657,9 @@ static int _wm_kbd_evt_poll_status;
 static void
 poll_keyboard_events(void)
 {
-	/* Load focused window's subscriber ref into O1.  If null,
-	 * still drain the event sink so events don't pile up. */
-	if (focused_wid < 1 || focused_wid > MAX_WINDOWS) return;
-	load_kbd_sub_to_o1(focused_wid);
-	int sub_isn;
-	asm volatile("oisn %0, o1" : "=r"(sub_isn));
-	if (sub_isn) return;
-
+	/* Always drain the sink first so WM-side consumers (e.g.,
+	 * the desktop menu's ESC handler) can see events even when
+	 * no focused-window subscriber is registered. */
 	asm volatile("orefld o1, %0(o12)"
 	             :: "i"(WM_KBD_EVENTS_SLOT_OFFSET));
 	int code, mods, r5_zero, r6_zero;
@@ -4350,9 +4680,19 @@ poll_keyboard_events(void)
 	);
 	if (_wm_kbd_evt_poll_status != 0) return;
 
-	/* Reload sub-cap into O1 (the poll just clobbered it) and
-	 * SEND.  Safe-temps dance for pcc-orisc input clobber. */
+	/* Modal menu: ESC dismisses; anything else gets swallowed. */
+	if (menu_active) {
+		if (code == TK_ESCAPE) desktop_menu_dismiss();
+		return;
+	}
+
+	/* Forward to focused window's subscriber, if any. */
+	if (focused_wid < 1 || focused_wid > MAX_WINDOWS) return;
 	load_kbd_sub_to_o1(focused_wid);
+	int sub_isn;
+	asm volatile("oisn %0, o1" : "=r"(sub_isn));
+	if (sub_isn) return;
+
 	asm volatile(
 		"addu   r8,  %0, r0\n"
 		"addu   r9,  %1, r0\n"
