@@ -543,6 +543,17 @@ static int           window_z_count;
  * fb_scroll_up_one_cell, blit_title_text) inherit it transparently. */
 static int           active_wid;
 
+/* Phase 60 step 16 — window dragging.  When drag_active is non-zero,
+ * pointer motion events relocate drag_wid by (px - drag_start_x,
+ * py - drag_start_y) and recompose the screen.  Cleared on button-up.
+ * drag_window_x / drag_window_y snapshot the window's position at
+ * the moment of grab so motion deltas are absolute from the grab
+ * point, immune to compounding rounding. */
+static int           drag_active;
+static int           drag_wid;
+static int           drag_start_x, drag_start_y;
+static int           drag_window_x, drag_window_y;
+
 /* Phase 60 step 8 — title bar text storage.  Single buffer for v1
  * (one title overwrites another at wm_set_title time, regardless of
  * which window receives it); per-wid title strings would need a
@@ -3737,6 +3748,161 @@ poll_window_rasters(void)
 	}
 }
 
+/* Phase 60 step 16 — window dragging helpers.
+ *
+ * raise_window(wid): rotate wid to the top of the z-stack and
+ * re-blit its screen footprint so anything that was previously
+ * above is overpainted.  No-op if wid isn't in the stack or is
+ * already topmost.
+ *
+ * recompose_full_screen(): fill the entire screen FB with bg
+ * and walk the z-stack to blit each window's full extent.  Used
+ * by the drag path after a window's position changes: the
+ * vacated pixels need bg + any windows beneath that show through,
+ * and the new position needs a fresh paint at the destination.
+ * Whole-screen recompose is simpler than tracking the union of
+ * old and new rects; at ~1MB ObjBlitCopy per window the cost is
+ * a few ms per motion event, well under Tk's event rate. */
+static void
+raise_window(int wid)
+{
+	int i, found = -1;
+	for (i = 0; i < window_z_count; i++) {
+		if (window_z[i] == wid) { found = i; break; }
+	}
+	if (found < 0) return;
+	if (found == window_z_count - 1) return;   /* already top */
+	for (i = found; i < window_z_count - 1; i++) {
+		window_z[i] = window_z[i + 1];
+	}
+	window_z[window_z_count - 1] = wid;
+	/* Repaint just this window's screen footprint — windows that
+	 * were previously above it in z get overpainted by the new
+	 * top of the stack. */
+	int sx = window_pos_x[wid - 1];
+	int sy = window_pos_y[wid - 1];
+	composite_screen_rect(sx, sy, USABLE_W_PX, USABLE_H_PX);
+}
+
+static void
+recompose_full_screen(void)
+{
+	int packed_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
+	int packed_wh = ((FB_W & 0xFFFF) << 16) | (FB_H & 0xFFFF);
+	fill_rect_packed(packed_xy, packed_wh, WM_BG_COLOR);
+	composite_screen_rect(0, 0, FB_W, FB_H);
+}
+
+/* Walk the z-stack top-to-bottom, return the topmost wid whose
+ * screen footprint contains (px, py).  Returns 0 if nothing's
+ * under the pointer. */
+static int
+topmost_window_at(int px, int py)
+{
+	int z;
+	for (z = window_z_count - 1; z >= 0; z--) {
+		int t = window_z[z];
+		if (t < 1 || t > MAX_WINDOWS) continue;
+		int wx = window_pos_x[t - 1];
+		int wy = window_pos_y[t - 1];
+		if (px >= wx && px < wx + USABLE_W_PX &&
+		    py >= wy && py < wy + USABLE_H_PX) {
+			return t;
+		}
+	}
+	return 0;
+}
+
+/* True if (px, py) is inside wid's title bar (the area between
+ * the border ring and the content cells — same rect ObjBlitGlyphs
+ * paints title text into). */
+static int
+point_in_title_bar(int wid, int px, int py)
+{
+	int wx = window_pos_x[wid - 1];
+	int wy = window_pos_y[wid - 1];
+	int tx_lo = wx + TITLE_X_OFF_PX;
+	int tx_hi = tx_lo + CELL_AREA_W_PX;
+	int ty_lo = wy + TITLE_Y_OFF_PX;
+	int ty_hi = ty_lo + TITLE_BAR_PX;
+	return (px >= tx_lo && px < tx_hi && py >= ty_lo && py < ty_hi);
+}
+
+/* WM-side pointer event dispatch.  Called from poll_pointer_events
+ * before forwarding to any subscriber.  Returns 1 if the event was
+ * consumed (don't forward), 0 to let it through.
+ *
+ * Behaviour:
+ *   LEFT button DOWN on a title bar  → raise + start drag (consumed)
+ *   LEFT button DOWN on a window     → raise; forward (not consumed)
+ *   MOTION while dragging            → update window pos + recompose
+ *                                       (consumed)
+ *   LEFT button UP while dragging    → end drag (consumed)
+ *   anything else                    → forward */
+static int
+wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
+{
+	(void)btn_state;
+	int px = (packed_xy >> 16) & 0xFFFF;
+	int py = packed_xy & 0xFFFF;
+
+	if (evt_type == PTR_EVT_MOTION) {
+		if (!drag_active) return 0;
+		int idx = drag_wid - 1;
+		if (idx < 0 || idx >= MAX_WINDOWS) {
+			drag_active = 0;
+			return 0;
+		}
+		int nx = drag_window_x + (px - drag_start_x);
+		int ny = drag_window_y + (py - drag_start_y);
+		/* Clamp so the window stays fully on screen.  No partial-
+		 * offscreen for v1 — keeps the math simple and avoids
+		 * source-rect clipping inside composite_screen_rect's
+		 * ObjBlitCopy. */
+		int max_x = FB_W - USABLE_W_PX;
+		int max_y = FB_H - USABLE_H_PX;
+		if (nx < 0) nx = 0;
+		if (ny < 0) ny = 0;
+		if (nx > max_x) nx = max_x;
+		if (ny > max_y) ny = max_y;
+		if (nx == window_pos_x[idx] && ny == window_pos_y[idx])
+			return 1;
+		window_pos_x[idx] = nx;
+		window_pos_y[idx] = ny;
+		recompose_full_screen();
+		return 1;
+	}
+
+	if (evt_type == PTR_EVT_DOWN) {
+		if (button != PTR_BTN_LEFT) return 0;
+		int t = topmost_window_at(px, py);
+		if (t == 0) return 0;
+		raise_window(t);
+		if (point_in_title_bar(t, px, py)) {
+			drag_active   = 1;
+			drag_wid      = t;
+			drag_start_x  = px;
+			drag_start_y  = py;
+			drag_window_x = window_pos_x[t - 1];
+			drag_window_y = window_pos_y[t - 1];
+			return 1;
+		}
+		/* Click in a non-title region: raise but let the
+		 * subscriber see the click. */
+		return 0;
+	}
+
+	if (evt_type == PTR_EVT_UP) {
+		if (drag_active && button == PTR_BTN_LEFT) {
+			drag_active = 0;
+			return 1;
+		}
+		return 0;
+	}
+
+	return 0;
+}
+
 /* Phase 59 / WM γ.13 — pointer mediation polls.
  *
  * poll_pointer_subscribes: drain any subscribe SENDs queued on the
@@ -3785,24 +3951,14 @@ static int _wm_ptr_evt_poll_status;
 static void
 poll_pointer_events(void)
 {
-	/* If no subscriber, leave events queued in the underlying
-	 * mailbox (depth 64) so they aren't lost during the window
-	 * between WM boot and the client's subscribe SEND landing —
-	 * which is large enough to swallow several events from a
-	 * --event sequence at default --delay.  When a subscriber
-	 * appears, we'll start draining naturally.  Queue overflow
-	 * past 64 deep is a silent drop, acceptable for this test
-	 * shape. */
-	int sub_isn;
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"oisn   %0, o1"
-		: "=r"(sub_isn)
-		: "i"(WM_PTR_SUB_SLOT_OFFSET)
-		: "r1"
-	);
-	if (sub_isn) return;
-
+	/* Always drain the events sink — the WM may consume an event
+	 * (window drag / raise) independently of whether a client
+	 * subscriber is registered.  Pre-step-16 the early-return on
+	 * no-subscriber was meant to buffer events in the underlying
+	 * ReceiveQueue (depth 64) across the boot/subscribe window;
+	 * now that the WM itself acts on events, we have to read
+	 * them out regardless and discard unconsumed ones if no
+	 * client is listening. */
 	asm volatile("orefld o1, %0(o12)"
 	             :: "i"(WM_PTR_EVENTS_SLOT_OFFSET));
 	int evt_type, packed_xy, button, btn_state;
@@ -3822,6 +3978,21 @@ poll_pointer_events(void)
 		: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
 	);
 	if (_wm_ptr_evt_poll_status != 0) return;
+
+	/* WM-side handling first: drag / raise.  If consumed, swallow. */
+	if (wm_handle_pointer(evt_type, packed_xy, button, btn_state))
+		return;
+
+	/* Not consumed by the WM — forward to the subscriber if any. */
+	int sub_isn;
+	asm volatile(
+		"orefld o1, %1(o12)\n"
+		"oisn   %0, o1"
+		: "=r"(sub_isn)
+		: "i"(WM_PTR_SUB_SLOT_OFFSET)
+		: "r1"
+	);
+	if (sub_isn) return;
 
 	/* Forward the event: SEND to subscriber's ref with the same
 	 * int_payload[0..3] = (evt_type, packed_xy, button, btn_state).
