@@ -625,10 +625,12 @@ static int           window_title_len;
  * expects C strings).  Label rendering uses the per-item length
  * from desktop_menu_label_lens, so the NUL acts as separator. */
 #define DESKTOP_MENU_N 3
-static const unsigned char desktop_menu_label_buf[] =
-	"Edit\0"
-	"Mouse Paint\0"
-	"Cancel\0";
+/* Int arrays declared FIRST so they end up at 4-aligned addresses
+ * in the linked binary.  pcc-orisc + asmorisc emit `.align 2`
+ * BEFORE a `.ascii` blob's bytes, not after — so the symbol
+ * following a non-multiple-of-4 .ascii lands at a misaligned
+ * address.  A subsequent `lw` on that symbol traps with
+ * address-misaligned-d.  Keep the .ascii blobs LAST. */
 static const int desktop_menu_label_offs[DESKTOP_MENU_N] = {
 	0,            /* "Edit" */
 	5,            /* "Mouse Paint" — past "Edit\0" */
@@ -637,14 +639,18 @@ static const int desktop_menu_label_offs[DESKTOP_MENU_N] = {
 static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
 	4, 11, 6,
 };
-static const unsigned char desktop_menu_spawn_buf[] =
-	"/programs/edit.orx\0"
-	"/programs/mouse_paint.orx\0";
 static const int desktop_menu_spawn_offs[DESKTOP_MENU_N] = {
 	0,           /* edit.orx */
 	19,          /* mouse_paint.orx — past edit.orx\0 */
 	-1,          /* Cancel — no spawn */
 };
+static const unsigned char desktop_menu_label_buf[] =
+	"Edit\0"
+	"Mouse Paint\0"
+	"Cancel\0";
+static const unsigned char desktop_menu_spawn_buf[] =
+	"/programs/edit.orx\0"
+	"/programs/mouse_paint.orx\0";
 
 /* Menu chrome: padding around each item in cells.  Width = max label
  * cells + 2 padding.  Height = N items × 1 row.  Cell-aligned so the
