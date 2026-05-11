@@ -269,6 +269,20 @@
  * the right per-wid FB ref into here. */
 #define WM_ACTIVE_FB_SLOT_OFFSET        1304
 
+/* Phase 60 step 17 — keyboard-subscriber history (1-deep stack).
+ * When a new client SUBSCRIBES, the previous subscriber's reply
+ * ref moves here.  When the current subscriber UNSUBSCRIBES (sends
+ * O2 = null), poll_keyboard_subscribes restores this slot into
+ * the active sub slot so the originally-subscribed shell takes
+ * over again — without it, mouse_paint backgrounded with `&` would
+ * grab the keyboard via term_init and leave the shell comatose
+ * after its own term_shutdown.  Sized to one entry (8 bytes) —
+ * adequate for the common case of a single foreground tool stealing
+ * focus from the shell; nested take-overs degrade gracefully (the
+ * outermost subscriber gets stranded, but is no worse than the
+ * pre-fix all-null state). */
+#define WM_PREV_KBD_SUB_SLOT_OFFSET     1312
+
 /* === Glyph rendering ==================================================
  *
  * The framebuffer is row-major, one byte per pixel (palette index;
@@ -4157,12 +4171,37 @@ poll_keyboard_subscribes(void)
 		: "r1", "r2", "memory"
 	);
 	if (_wm_kbd_sub_poll_status != 0) return;
-	asm volatile(
-		"orefst o2, %0(o12)"
-		:
-		: "i"(WM_KBD_SUB_SLOT_OFFSET)
-		: "memory"
-	);
+
+	/* 1-deep subscriber stack.  Null O2 from the sender means
+	 * "unsubscribe"; restore the previous subscriber (typically
+	 * the shell) so it gets keyboard focus back.  Non-null O2
+	 * means "subscribe"; push the current subscriber into the
+	 * prev slot before overwriting. */
+	int new_isn;
+	asm volatile("oisn %0, o2" : "=r"(new_isn));
+
+	if (new_isn) {
+		asm volatile(
+			"orefld o1, %0(o12)\n"
+			"orefst o1, %1(o12)\n"
+			"onull  o1\n"
+			"orefst o1, %0(o12)"
+			:
+			: "i"(WM_PREV_KBD_SUB_SLOT_OFFSET),
+			  "i"(WM_KBD_SUB_SLOT_OFFSET)
+			: "r1", "memory"
+		);
+	} else {
+		asm volatile(
+			"orefld o1, %0(o12)\n"
+			"orefst o1, %1(o12)\n"
+			"orefst o2, %0(o12)"
+			:
+			: "i"(WM_KBD_SUB_SLOT_OFFSET),
+			  "i"(WM_PREV_KBD_SUB_SLOT_OFFSET)
+			: "r1", "memory"
+		);
+	}
 }
 
 static int _wm_kbd_evt_poll_status;
