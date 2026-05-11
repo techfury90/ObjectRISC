@@ -131,20 +131,8 @@ main(void)
 		int y = packed_xy & 0xFFFF;
 
 		if (evt_type == PTR_EVT_DOWN) {
-			/* Diagnostic. */
-			term_print("DN b=");
-			term_print_int(button);
-			term_print(" x=");
-			term_print_int(x);
-			term_print(" y=");
-			term_print_int(y);
-			term_print("\n");
-
 			if (button == PTR_BTN_LEFT) {
-				int rfrc = vec_rect_fill(x - 5, y - 5, 10, 10);
-				term_print("rf rc=");
-				term_print_int(rfrc);
-				term_print("\n");
+				vec_rect_fill(x - 5, y - 5, 10, 10);
 				last_x = x; last_y = y;
 			} else if (button == PTR_BTN_MIDDLE) {
 				color = (color % MAX_COLOR) + 1;

@@ -2748,8 +2748,14 @@ poll_one_request(int *out_op, int *out_wid, int *out_arg)
  * thrash the screen FB, and clients always paint a complete shape
  * before the next request anyway.
  *
- * Pixel buffer must live on our stack (STACK_BOTTOM-relative
- * offsets) — same as before. */
+ * Pixel buffer must live in the boot data segment (O15 / DATA_VA-
+ * relative offsets).  Callers stage pixels into vec_scratch_row
+ * (file-scope static = .data) and pass that.  Was STACK-relative
+ * in the original glyph-render path; latent bug because the only
+ * shipped caller back then went through ObjBlitGlyphs (different
+ * primitive).  mouse_paint is the first program to actually drive
+ * vec_rect_fill / vec_line / fb_blit_row through clients, exposing
+ * the wrong-ref / wrong-offset combo. */
 static void
 fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 {
@@ -2764,7 +2770,7 @@ fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 	if (x >= CELL_AREA_W_PX)           return;
 	if (x + n_pixels > CELL_AREA_W_PX) n_pixels = CELL_AREA_W_PX - x;
 
-	int src_off = (int)((unsigned int)pixels - STACK_BOTTOM);
+	int src_off = (int)((unsigned int)pixels - DATA_VA);
 	/* Window FB stride is USABLE_W_PX (the full FB width, including
 	 * border ring); cell-area pixel (x, y) lives at window-FB pixel
 	 * (CONTENT_X_OFF_PX + x, CONTENT_Y_OFF_PX + y). */
@@ -2774,7 +2780,7 @@ fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 		"addu  r7, %1, r0\n"
 		"addu  r8, %2, r0\n"
 		"addu  r9, %3, r0\n"
-		"omov  o1, o11\n"
+		"omov  o1, o15\n"            /* boot DATA ref */
 		"orefld o2, %0(o12)\n"
 		"addu  r4, r7, r0\n"
 		"addu  r5, r8, r0\n"
@@ -2792,17 +2798,18 @@ fb_blit_row(int y, int x, const unsigned char *pixels, int n_pixels)
 /* Forward decl — vec_scratch_row + prep_scratch_row are defined
  * after the rasterisers because the oval helpers use the same
  * scratch buffer too. */
+static unsigned char  vec_scratch_row[];
 static unsigned char *prep_scratch_row(int n, unsigned char color);
 
 /* Single-pixel store.  Bresenham line and oval-outline plot pixel-
- * by-pixel; this is just a one-byte fb_blit_row.  Caller's `c`
- * lives on the stack across the call so the byte address is valid
- * for ObjStoreBytes. */
+ * by-pixel; this is just a one-byte fb_blit_row.  Stages the pixel
+ * into vec_scratch_row[0] (data-segment buffer) since fb_blit_row
+ * now addresses through O15/DATA_VA. */
 static void
 fb_set_pixel(int x, int y, unsigned char color)
 {
-	unsigned char one = color;
-	fb_blit_row(y, x, &one, 1);
+	vec_scratch_row[0] = color;
+	fb_blit_row(y, x, vec_scratch_row, 1);
 }
 
 /* pcc-orisc passes only 4 args in registers and trips ("adrput:
