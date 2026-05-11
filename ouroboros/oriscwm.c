@@ -543,16 +543,25 @@ static int           window_z_count;
  * fb_scroll_up_one_cell, blit_title_text) inherit it transparently. */
 static int           active_wid;
 
-/* Phase 60 step 16 — window dragging.  When drag_active is non-zero,
- * pointer motion events relocate drag_wid by (px - drag_start_x,
- * py - drag_start_y) and recompose the screen.  Cleared on button-up.
+/* Phase 60 step 16/17 — outline-style window dragging.  While
+ * drag_active is non-zero the WM tracks the pointer with a 2px
+ * outline rectangle drawn directly on the screen FB; the actual
+ * window stays put.  Button-up erases the outline and snaps the
+ * window to drag_outline_x / drag_outline_y.
+ *
  * drag_window_x / drag_window_y snapshot the window's position at
- * the moment of grab so motion deltas are absolute from the grab
- * point, immune to compounding rounding. */
+ * grab time so motion deltas are absolute from the grab point,
+ * immune to compounding rounding.  drag_outline_x / drag_outline_y
+ * track the outline's currently-painted position so the next
+ * motion can erase the strips it occupies before painting at the
+ * new spot. */
+#define OUTLINE_PX        2
+#define WM_OUTLINE_COLOR  8       /* palette idx 8 = bright white */
 static int           drag_active;
 static int           drag_wid;
 static int           drag_start_x, drag_start_y;
 static int           drag_window_x, drag_window_y;
+static int           drag_outline_x, drag_outline_y;
 
 /* Phase 60 step 8 — title bar text storage.  Single buffer for v1
  * (one title overwrites another at wm_set_title time, regardless of
@@ -3813,6 +3822,57 @@ topmost_window_at(int px, int py)
 	return 0;
 }
 
+/* Phase 60 step 17 — outline-drag primitives.  Paint / unpaint a
+ * rectangular outline (4 thin strips: top, bottom, left, right)
+ * directly on the screen FB.  Unpaint = bg-fill each strip then
+ * re-composite the affected screen rect so any windows beneath
+ * the outline come back unscathed. */
+static void
+draw_outline(int x, int y)
+{
+	int w = USABLE_W_PX;
+	int h = USABLE_H_PX;
+	int color = WM_OUTLINE_COLOR;
+	/* Top strip. */
+	fill_rect_packed(((x & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((w & 0xFFFF) << 16) | (OUTLINE_PX & 0xFFFF),
+	                 color);
+	/* Bottom strip. */
+	fill_rect_packed(((x & 0xFFFF) << 16)
+	                 | ((y + h - OUTLINE_PX) & 0xFFFF),
+	                 ((w & 0xFFFF) << 16) | (OUTLINE_PX & 0xFFFF),
+	                 color);
+	/* Left strip. */
+	fill_rect_packed(((x & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((OUTLINE_PX & 0xFFFF) << 16) | (h & 0xFFFF),
+	                 color);
+	/* Right strip. */
+	fill_rect_packed((((x + w - OUTLINE_PX) & 0xFFFF) << 16)
+	                 | (y & 0xFFFF),
+	                 ((OUTLINE_PX & 0xFFFF) << 16) | (h & 0xFFFF),
+	                 color);
+}
+
+static void
+erase_screen_rect(int sx, int sy, int w, int h)
+{
+	int packed_xy = ((sx & 0xFFFF) << 16) | (sy & 0xFFFF);
+	int packed_wh = ((w  & 0xFFFF) << 16) | (h  & 0xFFFF);
+	fill_rect_packed(packed_xy, packed_wh, WM_BG_COLOR);
+	composite_screen_rect(sx, sy, w, h);
+}
+
+static void
+erase_outline(int x, int y)
+{
+	int w = USABLE_W_PX;
+	int h = USABLE_H_PX;
+	erase_screen_rect(x, y, w, OUTLINE_PX);                   /* top */
+	erase_screen_rect(x, y + h - OUTLINE_PX, w, OUTLINE_PX);  /* bot */
+	erase_screen_rect(x, y, OUTLINE_PX, h);                   /* left */
+	erase_screen_rect(x + w - OUTLINE_PX, y, OUTLINE_PX, h);  /* right */
+}
+
 /* True if (px, py) is inside wid's title bar (the area between
  * the border ring and the content cells — same rect ObjBlitGlyphs
  * paints title text into). */
@@ -3832,12 +3892,21 @@ point_in_title_bar(int wid, int px, int py)
  * before forwarding to any subscriber.  Returns 1 if the event was
  * consumed (don't forward), 0 to let it through.
  *
- * Behaviour:
- *   LEFT button DOWN on a title bar  → raise + start drag (consumed)
+ * Behaviour (outline-style drag — same model as Mac / Windows /
+ * X11 c. 1986: the window stays put during the drag and only an
+ * outline rectangle tracks the pointer; on button-up the window
+ * snaps to the final outline position):
+ *
+ *   LEFT button DOWN on a title bar  → raise, snapshot drag state,
+ *                                       paint outline at current
+ *                                       window pos (consumed)
  *   LEFT button DOWN on a window     → raise; forward (not consumed)
- *   MOTION while dragging            → update window pos + recompose
+ *   MOTION while dragging            → erase old outline, paint
+ *                                       new outline at target pos
  *                                       (consumed)
- *   LEFT button UP while dragging    → end drag (consumed)
+ *   LEFT button UP while dragging    → erase outline, move window
+ *                                       to final pos, recompose
+ *                                       (consumed)
  *   anything else                    → forward */
 static int
 wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
@@ -3848,28 +3917,27 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 
 	if (evt_type == PTR_EVT_MOTION) {
 		if (!drag_active) return 0;
-		int idx = drag_wid - 1;
-		if (idx < 0 || idx >= MAX_WINDOWS) {
+		if (drag_wid < 1 || drag_wid > MAX_WINDOWS) {
 			drag_active = 0;
 			return 0;
 		}
 		int nx = drag_window_x + (px - drag_start_x);
 		int ny = drag_window_y + (py - drag_start_y);
-		/* Clamp so the window stays fully on screen.  No partial-
-		 * offscreen for v1 — keeps the math simple and avoids
-		 * source-rect clipping inside composite_screen_rect's
-		 * ObjBlitCopy. */
+		/* Clamp so the outline (= future window pos) stays fully
+		 * on screen — same constraint we'll enforce on the
+		 * window at button-up. */
 		int max_x = FB_W - USABLE_W_PX;
 		int max_y = FB_H - USABLE_H_PX;
 		if (nx < 0) nx = 0;
 		if (ny < 0) ny = 0;
 		if (nx > max_x) nx = max_x;
 		if (ny > max_y) ny = max_y;
-		if (nx == window_pos_x[idx] && ny == window_pos_y[idx])
+		if (nx == drag_outline_x && ny == drag_outline_y)
 			return 1;
-		window_pos_x[idx] = nx;
-		window_pos_y[idx] = ny;
-		recompose_full_screen();
+		erase_outline(drag_outline_x, drag_outline_y);
+		draw_outline(nx, ny);
+		drag_outline_x = nx;
+		drag_outline_y = ny;
 		return 1;
 	}
 
@@ -3879,12 +3947,15 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 		if (t == 0) return 0;
 		raise_window(t);
 		if (point_in_title_bar(t, px, py)) {
-			drag_active   = 1;
-			drag_wid      = t;
-			drag_start_x  = px;
-			drag_start_y  = py;
-			drag_window_x = window_pos_x[t - 1];
-			drag_window_y = window_pos_y[t - 1];
+			drag_active    = 1;
+			drag_wid       = t;
+			drag_start_x   = px;
+			drag_start_y   = py;
+			drag_window_x  = window_pos_x[t - 1];
+			drag_window_y  = window_pos_y[t - 1];
+			drag_outline_x = drag_window_x;
+			drag_outline_y = drag_window_y;
+			draw_outline(drag_outline_x, drag_outline_y);
 			return 1;
 		}
 		/* Click in a non-title region: raise but let the
@@ -3894,6 +3965,15 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 
 	if (evt_type == PTR_EVT_UP) {
 		if (drag_active && button == PTR_BTN_LEFT) {
+			erase_outline(drag_outline_x, drag_outline_y);
+			int idx = drag_wid - 1;
+			if (idx >= 0 && idx < MAX_WINDOWS
+			    && (drag_outline_x != window_pos_x[idx]
+			        || drag_outline_y != window_pos_y[idx])) {
+				window_pos_x[idx] = drag_outline_x;
+				window_pos_y[idx] = drag_outline_y;
+				recompose_full_screen();
+			}
 			drag_active = 0;
 			return 1;
 		}
