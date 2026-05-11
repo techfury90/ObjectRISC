@@ -131,8 +131,23 @@ main(void)
 		int y = packed_xy & 0xFFFF;
 
 		if (evt_type == PTR_EVT_DOWN) {
+			/* Diagnostic: log every DOWN with its button number
+			 * so we can see what macOS Tk is delivering for each
+			 * gesture (one-finger tap, two-finger tap, ctrl-click,
+			 * etc.).  Strip this once button mapping is sorted. */
+			{
+				char dbg[8];
+				dbg[0] = 'D'; dbg[1] = 'N'; dbg[2] = ' ';
+				dbg[3] = 'b'; dbg[4] = '=';
+				dbg[5] = '0' + (button & 7);
+				dbg[6] = '\n'; dbg[7] = '\0';
+				term_print(dbg);
+			}
 			if (button == PTR_BTN_LEFT) {
-				vec_rect_fill(x - 2, y - 2, 4, 4);
+				/* 10×10 — bigger than the original 4×4 so a
+				 * single click is unambiguously visible at
+				 * typical screen scales. */
+				vec_rect_fill(x - 5, y - 5, 10, 10);
 				last_x = x; last_y = y;
 			} else if (button == PTR_BTN_MIDDLE) {
 				color = (color % MAX_COLOR) + 1;
