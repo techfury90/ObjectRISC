@@ -234,11 +234,17 @@
 #define WM_VECTOR_BASE_OFFSET           848
 #define WM_RASTER_BASE_OFFSET           984
 
-/* Phase 59 / WM γ.13 — pointer mediation.  Single global subscriber
- * for v1; multi-window focus is post-multi-window WM work. */
+/* Phase 59 / WM γ.13 — pointer mediation.  Subscriber routing is
+ * per-wid as of step 18 (see WM_PTR_SUB_BASE below); these slots
+ * are the service-side plumbing. */
 #define WM_POINTER_CAP_SLOT_OFFSET      1112  /* libc-visible bound cap */
 #define WM_POINTER_SVC_SLOT_OFFSET      1120  /* TAG_SERVICE clients SEND to */
-#define WM_PTR_SUB_SLOT_OFFSET          1128  /* current subscriber's reply ref */
+/*                                      1128    formerly WM_PTR_SUB_SLOT
+ *                                              (single-subscriber slot) —
+ *                                              superseded by per-wid
+ *                                              WM_PTR_SUB_BASE.  Kept
+ *                                              reserved so neighbouring
+ *                                              offsets don't shift. */
 #define WM_PTR_EVENTS_SLOT_OFFSET       1136  /* TAG_INPUT_SINK kind=1 */
 #define WM_SURF_POINTER_SLOT_OFFSET     1144  /* unused post step 3 */
 
@@ -249,7 +255,8 @@
  * appends them to the sink queue.  oriscterm no longer mediates
  * input — the WM CPU IS the terminal. */
 #define WM_KEYBOARD_SVC_SLOT_OFFSET     1152  /* TAG_SERVICE clients SEND to */
-#define WM_KBD_SUB_SLOT_OFFSET          1160  /* current subscriber's reply ref */
+/*                                      1160    formerly WM_KBD_SUB_SLOT —
+ *                                              same story as 1128. */
 #define WM_KBD_EVENTS_SLOT_OFFSET       1168  /* TAG_INPUT_SINK kind=0 */
 
 /* Phase 60 step 11 — per-wid window backing stores.  Each CONSOLE
@@ -269,19 +276,22 @@
  * the right per-wid FB ref into here. */
 #define WM_ACTIVE_FB_SLOT_OFFSET        1304
 
-/* Phase 60 step 17 — keyboard-subscriber history (1-deep stack).
- * When a new client SUBSCRIBES, the previous subscriber's reply
- * ref moves here.  When the current subscriber UNSUBSCRIBES (sends
- * O2 = null), poll_keyboard_subscribes restores this slot into
- * the active sub slot so the originally-subscribed shell takes
- * over again — without it, mouse_paint backgrounded with `&` would
- * grab the keyboard via term_init and leave the shell comatose
- * after its own term_shutdown.  Sized to one entry (8 bytes) —
- * adequate for the common case of a single foreground tool stealing
- * focus from the shell; nested take-overs degrade gracefully (the
- * outermost subscriber gets stranded, but is no worse than the
- * pre-fix all-null state). */
-#define WM_PREV_KBD_SUB_SLOT_OFFSET     1312
+/* Phase 60 step 18 — focus model.  Replaces the global single-slot
+ * subscriber + 1-deep history from step 17 with per-window
+ * subscriber tables and a `focused_wid` global that selects which
+ * window's slot the WM SENDs to.  Click on a window (or open a
+ * new one) → focused_wid := that wid → its subscribers start
+ * receiving events.  Destroy the focused window → focused_wid
+ * reverts to the new topmost.  Multi-tool, multi-window UX with
+ * no race between concurrent term_init calls — each window's
+ * subscriber lives in its own slot.
+ *
+ * Two parallel arrays, 16 wids × 8 bytes each.  load_kbd_sub_to_o1
+ * / load_ptr_sub_to_o1 select the right slot per wid (pcc-orisc
+ * can't synthesise a computed OREFLD offset, so each per-wid case
+ * compiles to a literal byte offset). */
+#define WM_KBD_SUB_BASE_OFFSET          1312      /* 1312..1440 */
+#define WM_PTR_SUB_BASE_OFFSET          1440      /* 1440..1568 */
 
 /* === Glyph rendering ==================================================
  *
@@ -884,6 +894,126 @@ set_active_window(int wid)
 	load_window_fb_to_o1(wid);
 	asm volatile("orefst o1, %0(o12)"
 	             :: "i"(WM_ACTIVE_FB_SLOT_OFFSET));
+}
+
+/* Phase 60 step 18 — focus model.  focused_wid is the window that
+ * receives keyboard input and (by virtue of always being the topmost
+ * window after a click) the window pointer events route to.  Updated
+ * by handle_new_window, wm_handle_pointer (click-to-focus), and
+ * handle_destroy_window (auto-revert on destroy). */
+static int focused_wid;
+
+/* Per-wid keyboard subscriber ref load/stash.  Same pcc-orisc dance
+ * as load_window_fb_to_o1 — computed-offset OREFLD/OREFST isn't
+ * legal, so each wid gets a switch case with a literal byte offset
+ * (WM_KBD_SUB_BASE_OFFSET + (wid - 1) * 8). */
+static void
+load_kbd_sub_to_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefld o1, 1312(o12)"); break;
+	case  2: asm volatile("orefld o1, 1320(o12)"); break;
+	case  3: asm volatile("orefld o1, 1328(o12)"); break;
+	case  4: asm volatile("orefld o1, 1336(o12)"); break;
+	case  5: asm volatile("orefld o1, 1344(o12)"); break;
+	case  6: asm volatile("orefld o1, 1352(o12)"); break;
+	case  7: asm volatile("orefld o1, 1360(o12)"); break;
+	case  8: asm volatile("orefld o1, 1368(o12)"); break;
+	case  9: asm volatile("orefld o1, 1376(o12)"); break;
+	case 10: asm volatile("orefld o1, 1384(o12)"); break;
+	case 11: asm volatile("orefld o1, 1392(o12)"); break;
+	case 12: asm volatile("orefld o1, 1400(o12)"); break;
+	case 13: asm volatile("orefld o1, 1408(o12)"); break;
+	case 14: asm volatile("orefld o1, 1416(o12)"); break;
+	case 15: asm volatile("orefld o1, 1424(o12)"); break;
+	case 16: asm volatile("orefld o1, 1432(o12)"); break;
+	default: asm volatile("onull o1"); break;
+	}
+}
+
+static void
+stash_kbd_sub_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefst o1, 1312(o12)"); break;
+	case  2: asm volatile("orefst o1, 1320(o12)"); break;
+	case  3: asm volatile("orefst o1, 1328(o12)"); break;
+	case  4: asm volatile("orefst o1, 1336(o12)"); break;
+	case  5: asm volatile("orefst o1, 1344(o12)"); break;
+	case  6: asm volatile("orefst o1, 1352(o12)"); break;
+	case  7: asm volatile("orefst o1, 1360(o12)"); break;
+	case  8: asm volatile("orefst o1, 1368(o12)"); break;
+	case  9: asm volatile("orefst o1, 1376(o12)"); break;
+	case 10: asm volatile("orefst o1, 1384(o12)"); break;
+	case 11: asm volatile("orefst o1, 1392(o12)"); break;
+	case 12: asm volatile("orefst o1, 1400(o12)"); break;
+	case 13: asm volatile("orefst o1, 1408(o12)"); break;
+	case 14: asm volatile("orefst o1, 1416(o12)"); break;
+	case 15: asm volatile("orefst o1, 1424(o12)"); break;
+	case 16: asm volatile("orefst o1, 1432(o12)"); break;
+	default: break;
+	}
+}
+
+static void
+load_ptr_sub_to_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefld o1, 1440(o12)"); break;
+	case  2: asm volatile("orefld o1, 1448(o12)"); break;
+	case  3: asm volatile("orefld o1, 1456(o12)"); break;
+	case  4: asm volatile("orefld o1, 1464(o12)"); break;
+	case  5: asm volatile("orefld o1, 1472(o12)"); break;
+	case  6: asm volatile("orefld o1, 1480(o12)"); break;
+	case  7: asm volatile("orefld o1, 1488(o12)"); break;
+	case  8: asm volatile("orefld o1, 1496(o12)"); break;
+	case  9: asm volatile("orefld o1, 1504(o12)"); break;
+	case 10: asm volatile("orefld o1, 1512(o12)"); break;
+	case 11: asm volatile("orefld o1, 1520(o12)"); break;
+	case 12: asm volatile("orefld o1, 1528(o12)"); break;
+	case 13: asm volatile("orefld o1, 1536(o12)"); break;
+	case 14: asm volatile("orefld o1, 1544(o12)"); break;
+	case 15: asm volatile("orefld o1, 1552(o12)"); break;
+	case 16: asm volatile("orefld o1, 1560(o12)"); break;
+	default: asm volatile("onull o1"); break;
+	}
+}
+
+static void
+stash_ptr_sub_o1(int wid)
+{
+	switch (wid) {
+	case  1: asm volatile("orefst o1, 1440(o12)"); break;
+	case  2: asm volatile("orefst o1, 1448(o12)"); break;
+	case  3: asm volatile("orefst o1, 1456(o12)"); break;
+	case  4: asm volatile("orefst o1, 1464(o12)"); break;
+	case  5: asm volatile("orefst o1, 1472(o12)"); break;
+	case  6: asm volatile("orefst o1, 1480(o12)"); break;
+	case  7: asm volatile("orefst o1, 1488(o12)"); break;
+	case  8: asm volatile("orefst o1, 1496(o12)"); break;
+	case  9: asm volatile("orefst o1, 1504(o12)"); break;
+	case 10: asm volatile("orefst o1, 1512(o12)"); break;
+	case 11: asm volatile("orefst o1, 1520(o12)"); break;
+	case 12: asm volatile("orefst o1, 1528(o12)"); break;
+	case 13: asm volatile("orefst o1, 1536(o12)"); break;
+	case 14: asm volatile("orefst o1, 1544(o12)"); break;
+	case 15: asm volatile("orefst o1, 1552(o12)"); break;
+	case 16: asm volatile("orefst o1, 1560(o12)"); break;
+	default: break;
+	}
+}
+
+/* Recompute focused_wid after a window is destroyed.  Falls back to
+ * the topmost remaining window (top of window_z), or 0 if no windows
+ * are left. */
+static void
+refocus_to_topmost(void)
+{
+	if (window_z_count > 0) {
+		focused_wid = window_z[window_z_count - 1];
+	} else {
+		focused_wid = 0;
+	}
 }
 
 /* Phase 60 step 7 — allocate the offscreen backing store the WM
@@ -2036,10 +2166,14 @@ handle_new_window(int wtype)
 		window_pos_y[idx] = py;
 	}
 
-	/* Push to top of z-stack and mark active for the title-bar paint. */
+	/* Push to top of z-stack and mark active for the title-bar paint.
+	 * A new window takes focus immediately (Phase 60 step 18) — that
+	 * way the program calling wm_open_session + term_init will land
+	 * its keyboard subscribe in its own freshly-opened slot. */
 	window_z[window_z_count] = wid;
 	window_z_count += 1;
 	set_active_window(wid);
+	focused_wid = wid;
 
 	/* Phase 60 step 8 — paint the title bar so the window is visibly
 	 * framed from creation.  Title is initially empty; the client
@@ -2450,6 +2584,15 @@ handle_destroy_window(int wid)
 	window_z_remove(wid);
 	window_type[wid - 1] = 0;
 	window_subscribe_op[wid - 1] = 0;
+	/* Phase 60 step 18 — null per-wid kbd / ptr subscriber slots so
+	 * future events for a recycled wid don't land on a dead ref.  If
+	 * the destroyed window was focused, refocus to the next topmost
+	 * remaining window (= z-stack top after the remove above). */
+	asm volatile("onull o1");
+	stash_kbd_sub_o1(wid);
+	asm volatile("onull o1");
+	stash_ptr_sub_o1(wid);
+	if (focused_wid == wid) refocus_to_topmost();
 	/* Owner-ref stash is left in place; future allocations will
 	 * overwrite it.  No SEND fires for the close — the WM doesn't
 	 * push events to subscribers yet. */
@@ -2694,6 +2837,13 @@ scan_owner_exits(void)
 			window_z_remove(wid);
 			window_type[wid - 1] = 0;
 			window_subscribe_op[wid - 1] = 0;
+			/* Same focus + subscriber cleanup as the explicit
+			 * handle_destroy_window path. */
+			asm volatile("onull o1");
+			stash_kbd_sub_o1(wid);
+			asm volatile("onull o1");
+			stash_ptr_sub_o1(wid);
+			if (focused_wid == wid) refocus_to_topmost();
 			recompose_after_destroy(sx, sy,
 			                        USABLE_W_PX, USABLE_H_PX);
 			/* The owner-ref slot stays populated; it'll get
@@ -3801,6 +3951,12 @@ raise_window(int wid)
 		if (window_z[i] == wid) { found = i; break; }
 	}
 	if (found < 0) return;
+	/* Always set focus to the just-clicked window, even if it was
+	 * already topmost — focus may have drifted away (e.g., another
+	 * window was destroyed and focus reverted to z-top, which is
+	 * us, but only for one tick).  Idempotent re-assignment is
+	 * cheap. */
+	focused_wid = wid;
 	if (found == window_z_count - 1) return;   /* already top */
 	for (i = found; i < window_z_count - 1; i++) {
 		window_z[i] = window_z[i + 1];
@@ -4004,17 +4160,19 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 	return 0;
 }
 
-/* Phase 59 / WM γ.13 — pointer mediation polls.
+/* Phase 60 step 18 — pointer mediation polls (focus-model version).
  *
- * poll_pointer_subscribes: drain any subscribe SENDs queued on the
- * WM-side pointer service.  Wire: O2 = subscriber's reply ref (0 to
- * unsubscribe).  Single-subscriber v1 — replace whatever's in
- * WM_PTR_SUB_SLOT.
+ * poll_pointer_subscribes: drain subscribe SENDs queued on the
+ * WM-side pointer service.  Wire: O2 = subscriber's reply ref (0
+ * to unsubscribe).  Stashes into ptr_sub[focused_wid - 1] so the
+ * subscribe associates with whichever window the caller is acting
+ * on (typically the one they just wm_open_session'd, since
+ * handle_new_window sets focus to it).
  *
- * poll_pointer_events: drain events from the underlying terminal.
- * Wire from oriscterm: int_payload[0..3] = (evt_type, packed_xy,
- * button, btn_state).  Forward each to the current subscriber if
- * any. */
+ * poll_pointer_events: drain events from the local TAG_INPUT_SINK,
+ * run WM-side handling (drag / raise / focus update), translate
+ * surviving events into focused_wid's content-area-local coords,
+ * and forward to ptr_sub[focused_wid - 1]. */
 static int _wm_ptr_sub_poll_status;
 
 static void
@@ -4035,16 +4193,11 @@ poll_pointer_subscribes(void)
 	if (_wm_ptr_sub_poll_status != 0) return;
 
 	/* Subscribe SENDs land sender's O2 → our O2 (the receive-queue
-	 * overlay maps wire slot 1 → O2; same convention stash_owner_o2
-	 * uses on the main service queue).  Stash that ref into
-	 * WM_PTR_SUB_SLOT.  Null O2 from the sender means
-	 * unsubscribe-all → null the slot. */
-	asm volatile(
-		"orefst o2, %0(o12)"
-		:
-		: "i"(WM_PTR_SUB_SLOT_OFFSET)
-		: "memory"
-	);
+	 * overlay maps wire slot 1 → O2).  Stash into ptr_sub[focused_wid].
+	 * Null O2 = unsubscribe; same path nulls the slot. */
+	if (focused_wid < 1 || focused_wid > MAX_WINDOWS) return;
+	asm volatile("omov o1, o2");
+	stash_ptr_sub_o1(focused_wid);
 }
 
 static int _wm_ptr_evt_poll_status;
@@ -4080,57 +4233,42 @@ poll_pointer_events(void)
 	);
 	if (_wm_ptr_evt_poll_status != 0) return;
 
-	/* WM-side handling first: drag / raise.  If consumed, swallow. */
+	/* WM-side handling first: drag / raise / focus update.  If
+	 * consumed (drag in progress, title-bar grab) — swallow. */
 	if (wm_handle_pointer(evt_type, packed_xy, button, btn_state))
 		return;
 
-	/* Translate screen-space coords to the topmost window's content-
-	 * area-local coords before forwarding.  Without this, subscribers
-	 * would see desktop-absolute coords and couldn't map them onto
-	 * their (window-local) vector / raster drawing space.  Events
-	 * outside any window's content area get dropped — for a v1
-	 * single-subscriber, that's "this click isn't for the subscriber's
-	 * window" and shouldn't be forwarded.  Multi-subscriber routing
-	 * with per-window pointer caps is post-MVP. */
+	/* Translate to FOCUSED window's content-area-local coords.
+	 * wm_handle_pointer has already moved focus to whatever
+	 * window was just clicked (LEFT DOWN raises + focuses), so
+	 * `focused_wid` is the right target for the forward.  Events
+	 * outside the focused window's content area get dropped —
+	 * the subscriber only cares about its own canvas. */
+	if (focused_wid < 1 || focused_wid > MAX_WINDOWS) return;
 	{
 		int px = (packed_xy >> 16) & 0xFFFF;
 		int py = packed_xy & 0xFFFF;
-		int t = topmost_window_at(px, py);
-		if (t == 0) return;
-		int cx = px - window_pos_x[t - 1] - CONTENT_X_OFF_PX;
-		int cy = py - window_pos_y[t - 1] - CONTENT_Y_OFF_PX;
+		int cx = px - window_pos_x[focused_wid - 1] - CONTENT_X_OFF_PX;
+		int cy = py - window_pos_y[focused_wid - 1] - CONTENT_Y_OFF_PX;
 		if (cx < 0 || cx >= CELL_AREA_W_PX
 		    || cy < 0 || cy >= CELL_AREA_H_PX) return;
 		packed_xy = ((cx & 0xFFFF) << 16) | (cy & 0xFFFF);
 	}
 
-	/* Not consumed by the WM — forward to the subscriber if any. */
+	/* Load focused window's pointer subscriber and forward. */
+	load_ptr_sub_to_o1(focused_wid);
 	int sub_isn;
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"oisn   %0, o1"
-		: "=r"(sub_isn)
-		: "i"(WM_PTR_SUB_SLOT_OFFSET)
-		: "r1"
-	);
+	asm volatile("oisn %0, o1" : "=r"(sub_isn));
 	if (sub_isn) return;
 
-	/* Forward the event: SEND to subscriber's ref with the same
-	 * int_payload[0..3] = (evt_type, packed_xy, button, btn_state).
-	 * No source ref.
-	 *
-	 * pcc-orisc doesn't always honour r4..r7 in the clobber list
-	 * when picking input regs — it can place an input operand in
-	 * r4 (or r5), then the first `addu r4, %x, r0` stomps that
-	 * input before the later `addu r6, %y, r0` reads it.  Save
-	 * all four inputs into safe temps (r8..r11) FIRST, then move
-	 * them into the ABI registers for the SEND. */
+	/* Same safe-temps dance as before to dodge pcc-orisc's r4..r7
+	 * input clobber.  O1 already holds the sub-ref from
+	 * load_ptr_sub_to_o1 above. */
 	asm volatile(
-		"addu   r8,  %1, r0\n"        /* save evt_type */
-		"addu   r9,  %2, r0\n"        /* save packed_xy */
-		"addu   r10, %3, r0\n"        /* save button */
-		"addu   r11, %4, r0\n"        /* save btn_state */
-		"orefld o1, %0(o12)\n"
+		"addu   r8,  %0, r0\n"        /* save evt_type */
+		"addu   r9,  %1, r0\n"        /* save packed_xy */
+		"addu   r10, %2, r0\n"        /* save button */
+		"addu   r11, %3, r0\n"        /* save btn_state */
 		"onull  o2\n"
 		"onull  o3\n"
 		"addu   r4, r8,  r0\n"
@@ -4139,20 +4277,19 @@ poll_pointer_events(void)
 		"addu   r7, r11, r0\n"
 		"send   o1"
 		:
-		: "i"(WM_PTR_SUB_SLOT_OFFSET),
-		  "r"(evt_type), "r"(packed_xy),
+		: "r"(evt_type), "r"(packed_xy),
 		  "r"(button),   "r"(btn_state)
 		: "r1", "r4", "r5", "r6", "r7",
 		  "r8", "r9", "r10", "r11"
 	);
 }
 
-/* Phase 60 step 3 — keyboard subscribe/event polls.  Direct mirror
- * of the pointer pair above: subscribers register reply refs at
- * WM_KEYBOARD_SVC_SLOT (single subscriber for v1, stashed in
- * WM_KBD_SUB_SLOT); Tk events arrive in WM_KBD_EVENTS_SLOT (a
- * TAG_INPUT_SINK fed by simorisc's display worker); each event gets
- * forwarded to the current subscriber via SEND. */
+/* Phase 60 step 18 — focus-model keyboard subscribe / forward.
+ * Each subscribe SEND lands its sender's O2 (reply ref, or null
+ * to unsubscribe) into kbd_sub[focused_wid - 1] — the slot for
+ * whatever window is currently focused.  poll_keyboard_events
+ * loads kbd_sub[focused_wid - 1] for every forward, so as focus
+ * moves between windows the keyboard automatically follows. */
 static int _wm_kbd_sub_poll_status;
 
 static void
@@ -4172,36 +4309,12 @@ poll_keyboard_subscribes(void)
 	);
 	if (_wm_kbd_sub_poll_status != 0) return;
 
-	/* 1-deep subscriber stack.  Null O2 from the sender means
-	 * "unsubscribe"; restore the previous subscriber (typically
-	 * the shell) so it gets keyboard focus back.  Non-null O2
-	 * means "subscribe"; push the current subscriber into the
-	 * prev slot before overwriting. */
-	int new_isn;
-	asm volatile("oisn %0, o2" : "=r"(new_isn));
-
-	if (new_isn) {
-		asm volatile(
-			"orefld o1, %0(o12)\n"
-			"orefst o1, %1(o12)\n"
-			"onull  o1\n"
-			"orefst o1, %0(o12)"
-			:
-			: "i"(WM_PREV_KBD_SUB_SLOT_OFFSET),
-			  "i"(WM_KBD_SUB_SLOT_OFFSET)
-			: "r1", "memory"
-		);
-	} else {
-		asm volatile(
-			"orefld o1, %0(o12)\n"
-			"orefst o1, %1(o12)\n"
-			"orefst o2, %0(o12)"
-			:
-			: "i"(WM_KBD_SUB_SLOT_OFFSET),
-			  "i"(WM_PREV_KBD_SUB_SLOT_OFFSET)
-			: "r1", "memory"
-		);
-	}
+	/* The subscribe SEND landed sender's O2 → our O2.  Move it
+	 * into kbd_sub[focused_wid - 1].  Null O2 (unsubscribe)
+	 * clears the slot for the same wid. */
+	if (focused_wid < 1 || focused_wid > MAX_WINDOWS) return;
+	asm volatile("omov o1, o2");
+	stash_kbd_sub_o1(focused_wid);
 }
 
 static int _wm_kbd_evt_poll_status;
@@ -4209,14 +4322,12 @@ static int _wm_kbd_evt_poll_status;
 static void
 poll_keyboard_events(void)
 {
+	/* Load focused window's subscriber ref into O1.  If null,
+	 * still drain the event sink so events don't pile up. */
+	if (focused_wid < 1 || focused_wid > MAX_WINDOWS) return;
+	load_kbd_sub_to_o1(focused_wid);
 	int sub_isn;
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"oisn   %0, o1"
-		: "=r"(sub_isn)
-		: "i"(WM_KBD_SUB_SLOT_OFFSET)
-		: "r1"
-	);
+	asm volatile("oisn %0, o1" : "=r"(sub_isn));
 	if (sub_isn) return;
 
 	asm volatile("orefld o1, %0(o12)"
@@ -4239,13 +4350,12 @@ poll_keyboard_events(void)
 	);
 	if (_wm_kbd_evt_poll_status != 0) return;
 
-	/* Forward: SEND to subscriber's ref with int_payload[0..3] =
-	 * (code, mods, 0, 0).  Same safe-temps dance as the pointer
-	 * forwarder. */
+	/* Reload sub-cap into O1 (the poll just clobbered it) and
+	 * SEND.  Safe-temps dance for pcc-orisc input clobber. */
+	load_kbd_sub_to_o1(focused_wid);
 	asm volatile(
-		"addu   r8,  %1, r0\n"
-		"addu   r9,  %2, r0\n"
-		"orefld o1, %0(o12)\n"
+		"addu   r8,  %0, r0\n"
+		"addu   r9,  %1, r0\n"
 		"onull  o2\n"
 		"onull  o3\n"
 		"addu   r4, r8, r0\n"
@@ -4254,8 +4364,7 @@ poll_keyboard_events(void)
 		"addiu  r7, r0, 0\n"
 		"send   o1"
 		:
-		: "i"(WM_KBD_SUB_SLOT_OFFSET),
-		  "r"(code), "r"(mods)
+		: "r"(code), "r"(mods)
 		: "r1", "r4", "r5", "r6", "r7", "r8", "r9"
 	);
 }
