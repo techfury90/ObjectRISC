@@ -624,7 +624,7 @@ static int           window_title_len;
  * Strings are NUL-terminated for spawn_path consumers (sup_spawn
  * expects C strings).  Label rendering uses the per-item length
  * from desktop_menu_label_lens, so the NUL acts as separator. */
-#define DESKTOP_MENU_N 3
+#define DESKTOP_MENU_N 4
 /* Int arrays declared FIRST so they end up at 4-aligned addresses
  * in the linked binary.  pcc-orisc + asmorisc emit `.align 2`
  * BEFORE a `.ascii` blob's bytes, not after — so the symbol
@@ -632,23 +632,27 @@ static int           window_title_len;
  * address.  A subsequent `lw` on that symbol traps with
  * address-misaligned-d.  Keep the .ascii blobs LAST. */
 static const int desktop_menu_label_offs[DESKTOP_MENU_N] = {
-	0,            /* "Edit" */
-	5,            /* "Mouse Paint" — past "Edit\0" */
-	17,           /* "Cancel" — past "Mouse Paint\0" */
+	0,            /* "Shell" */
+	6,            /* "Edit"        — past "Shell\0"     */
+	11,           /* "Mouse Paint" — past "Edit\0"      */
+	23,           /* "Cancel"      — past "Mouse Paint\0" */
 };
 static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
-	4, 11, 6,
+	5, 4, 11, 6,
 };
 static const int desktop_menu_spawn_offs[DESKTOP_MENU_N] = {
-	0,           /* edit.orx */
-	19,          /* mouse_paint.orx — past edit.orx\0 */
+	0,           /* /programs/shell.orx */
+	20,          /* edit.orx       — past shell.orx\0 */
+	39,          /* mouse_paint.orx — past edit.orx\0 */
 	-1,          /* Cancel — no spawn */
 };
 static const unsigned char desktop_menu_label_buf[] =
+	"Shell\0"
 	"Edit\0"
 	"Mouse Paint\0"
 	"Cancel\0";
 static const unsigned char desktop_menu_spawn_buf[] =
+	"/programs/shell.orx\0"
 	"/programs/edit.orx\0"
 	"/programs/mouse_paint.orx\0";
 
