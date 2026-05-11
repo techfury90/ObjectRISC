@@ -687,15 +687,11 @@ cmd_run(const char *cwd, const char *arg)
 			return;
 		}
 		int code = orx_unload(t);
-		/* Phase 60 step 17 — any foreground program that
-		 * wm_open_session + term_init's (mouse_paint, winhello,
-		 * future WM-aware tools) takes the WM's single-slot
-		 * keyboard subscriber.  term_shutdown clears it; without
-		 * this resubscribe the shell would block on the next
-		 * read_line forever.  Idempotent for programs that DON'T
-		 * touch the keyboard — re-derives a sub-cap from the
-		 * shell's still-live O9 mailbox and resends it. */
-		term_resubscribe();
+		/* Phase 60 step 18 — no resubscribe needed.  The
+		 * focus-model WM auto-reverts focus to the topmost
+		 * remaining window when the foreground program destroys
+		 * its own; our shell-side keyboard subscription is still
+		 * parked in our window's per-wid slot. */
 		term_print(run_done_pre);
 		term_print_int(code);
 		term_print(run_done_post);
@@ -728,15 +724,11 @@ cmd_edit(const char *cwd, const char *arg)
 		term_print("\n");
 		return;
 	}
-	/* Phase 60 step 13 — edit now opens its own window and takes
-	 * keyboard focus.  Wait for it to exit, then re-subscribe to
-	 * reclaim the keyboard for the next shell prompt.  Pre-multi-
-	 * window this was a fire-and-forget bg spawn; that no longer
-	 * works because edit's subscription would supersede ours and
-	 * never get cleaned up, so we'd block on the next read_line
-	 * forever. */
+	/* Phase 60 step 13/18 — edit opens its own window and takes
+	 * keyboard focus via term_init.  Wait for it to exit; the
+	 * focus-model WM auto-reverts focus to our window when edit
+	 * destroys its own. */
 	int code = orx_unload(t);
-	term_resubscribe();
 	term_print(run_done_pre);
 	term_print_int(code);
 	term_print(run_done_post);

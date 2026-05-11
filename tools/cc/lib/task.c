@@ -236,10 +236,13 @@
  * Total: 720 standard + 128 WM_GRID_BASE + 128 WM_VECTOR_BASE +
  * 8 WM_RASTER_CAP_SLOT + 128 WM_RASTER_BASE + 8 WM_POINTER_CAP_SLOT
  * + 32 WM_POINTER_INTERNAL + 24 WM_KEYBOARD_INTERNAL + 128
- * WM_WINDOW_FB_BASE + 8 WM_ACTIVE_FB_SLOT = 1312.  The libc
- * oversizes ORX_STATE_BYTES so the WM's task-table objstore covers
- * all of its slot map; non-WM programs leave the tail dead. */
-#define ORX_STATE_BYTES   1312
+ * WM_WINDOW_FB_BASE + 8 WM_ACTIVE_FB_SLOT + 128 WM_KBD_SUB_BASE +
+ * 128 WM_PTR_SUB_BASE = 1568.  Adds room for per-wid keyboard /
+ * pointer subscriber refs introduced by the focus model (Phase 60
+ * step 18) — the WM stores one sub per window so it can route
+ * events to the currently-focused window without a single-slot
+ * race.  Non-WM programs leave the tail dead, same as before. */
+#define ORX_STATE_BYTES   1568
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Byte offset within O12 of the boot-parent ref parked from O8
