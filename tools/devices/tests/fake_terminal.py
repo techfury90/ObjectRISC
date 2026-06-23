@@ -37,6 +37,12 @@ PKT_OBJ_READ_RESP  = 0x11
 PKT_OBJ_WRITE_REQ  = 0x12
 PKT_OBJ_WRITE_RESP = 0x13
 PKT_SEND_DELIVER   = 0x20
+# Phase 60 follow-up — headless host-input injection.  Sent to a WM's
+# CPU pid to drop a keyboard/pointer event into that CPU's local
+# TAG_INPUT_SINK (the WM no longer subscribes to a terminal keyboard;
+# simorisc routes this straight into the sink the way its Tk display
+# worker feeds live input).  payload = [kind, w0, w1, w2, w3].
+PKT_HOST_INPUT     = 0x50
 
 # OBJ-RESP fault codes (Vol IV §4.1).
 RESP_OK     = 0x00
@@ -92,6 +98,17 @@ def build_send_deliver(src_pid, dst_pid, trans, recipient_ref,
         pl.append(ref & 0xFFFFFFFF)
         pl.append((ref >> 32) & 0xFFFFFFFF)
     return pack_packet(src_pid, dst_pid, PKT_SEND_DELIVER, 0, trans, pl)
+
+
+def build_host_input(src_pid, dst_pid, kind, payload4):
+    """Host-input injection packet: deliver a keyboard/pointer event into
+    dst_pid's local TAG_INPUT_SINK.  `kind` 0=keyboard, 1=pointer;
+    `payload4` is the 4-word sink payload (kbd: [code, mods, 0, 0];
+    pointer: [evt_type, packed_xy, button, btn_state])."""
+    words = [kind & 0xFFFFFFFF] + [w & 0xFFFFFFFF for w in payload4[:4]]
+    while len(words) < 5:
+        words.append(0)
+    return pack_packet(src_pid, dst_pid, PKT_HOST_INPUT, 0, 0, words)
 
 
 def build_obj_read_req(src_pid, dst_pid, trans, ref, offset, width):
@@ -169,9 +186,15 @@ def send_inline_register(sock, my_pid, dir_pid, my_index, path,
 
 
 class FakeTerminal:
-    def __init__(self, sock, pid):
+    def __init__(self, sock, pid, inject_cpu=None):
         self.sock = sock
         self.pid = pid
+        # Phase 60 follow-up: when set, keyboard/pointer events are
+        # injected straight into this CPU's WM input sink via
+        # PKT_HOST_INPUT instead of SENT to a terminal subscriber.  Used
+        # by the WM-mediated tests, where the WM owns the input surfaces
+        # locally and nobody subscribes to a terminal keyboard.
+        self.inject_cpu = inject_cpu
         self.buf = bytearray()
         # Multiple kbd subscribers can register (e.g. shell + a
         # backgrounded editor program). The focused index decides
@@ -467,6 +490,14 @@ class FakeTerminal:
             self.send_key(0x10E, 0)   # KEY_FOCUS_IN — see oriscterm
 
     def send_key(self, code, mods=0):
+        if self.inject_cpu is not None:
+            # WM-mediated: drop the key into the WM CPU's keyboard sink.
+            pkt = build_host_input(self.pid, self.inject_cpu, 0,
+                                   [code, mods, 0, 0])
+            self.sock.sendall(struct.pack(">I", len(pkt)) + pkt)
+            print(f"fake_terminal: inject key code=0x{code:x} mods=0x{mods:x} "
+                  f"→ cpu{self.inject_cpu} sink", flush=True)
+            return
         # Phase 48: when one program (e.g. login.orx) unsubscribes
         # and the next (e.g. the shell it just spawned) hasn't
         # subscribed yet, the kbd subscriber list goes briefly
@@ -494,13 +525,24 @@ class FakeTerminal:
               flush=True)
 
     def _send_pointer(self, evt_type, x, y, button):
-        if self.ptr_sub is None:
-            sys.exit("fake_terminal: no ptr subscriber for pointer event")
         if evt_type == PTR_DOWN:
             self.ptr_state |= 1 << button
         elif evt_type == PTR_UP:
             self.ptr_state &= ~(1 << button)
         packed_xy = ((x & 0xFFFF) << 16) | (y & 0xFFFF)
+        kind = {PTR_MOTION: "motion", PTR_DOWN: "down", PTR_UP: "up"}[evt_type]
+        if self.inject_cpu is not None:
+            # WM-mediated: drop the pointer event into the WM CPU's
+            # pointer sink (kind=1).
+            pkt = build_host_input(self.pid, self.inject_cpu, 1,
+                                   [evt_type, packed_xy, button, self.ptr_state])
+            self.sock.sendall(struct.pack(">I", len(pkt)) + pkt)
+            print(f"fake_terminal: inject ptr {kind} x={x} y={y} btn={button} "
+                  f"state=0x{self.ptr_state:x} → cpu{self.inject_cpu} sink",
+                  flush=True)
+            return
+        if self.ptr_sub is None:
+            sys.exit("fake_terminal: no ptr subscriber for pointer event")
         pkt = build_send_deliver(
             src_pid=self.pid, dst_pid=ref_home(self.ptr_sub),
             trans=self._next_trans(), recipient_ref=self.ptr_sub,
@@ -508,7 +550,6 @@ class FakeTerminal:
             or_payload=[self.ptr_sub, 0, 0, 0],
         )
         self.sock.sendall(struct.pack(">I", len(pkt)) + pkt)
-        kind = {PTR_MOTION: "motion", PTR_DOWN: "down", PTR_UP: "up"}[evt_type]
         print(f"fake_terminal: sent ptr {kind} x={x} y={y} btn={button} "
               f"state=0x{self.ptr_state:x}", flush=True)
 
@@ -549,6 +590,8 @@ def parse_event(spec):
         return ("up", int(parts[0]), int(parts[1]), int(parts[2]))
     if kind == "wait-kbd":
         return ("wait-kbd", int(parts[0]))
+    if kind == "sleep":
+        return ("sleep", float(parts[0]))
     sys.exit(f"fake_terminal: unknown event kind {kind!r}")
 
 
@@ -571,6 +614,13 @@ def main():
     ap.add_argument("--instance", type=int, default=0,
                     help="terminal instance number for the directory "
                          "path; defaults to 0")
+    ap.add_argument("--inject-cpu", type=int, default=None,
+                    help="WM-mediated mode (Phase 60): inject keyboard/"
+                         "pointer events straight into this CPU pid's "
+                         "input sink via PKT_HOST_INPUT, instead of "
+                         "SENDing to a terminal subscriber. The WM owns "
+                         "the input surfaces, so there is no terminal "
+                         "keyboard to subscribe to.")
     args = ap.parse_args()
 
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -603,16 +653,21 @@ def main():
     print(f"fake_terminal READY pid={args.pid}", flush=True)
     s.setblocking(False)
 
-    term = FakeTerminal(s, args.pid)
+    term = FakeTerminal(s, args.pid, inject_cpu=args.inject_cpu)
     events = [parse_event(e) for e in args.event]
 
-    # Figure out which subscriptions we'll need.
-    need_kbd = any(e[0] == "key" for e in events)
-    need_ptr = any(e[0] in ("motion", "down", "up") for e in events)
-    if not term.wait_for(need_kbd, need_ptr, args.subscribe_timeout):
-        sys.exit(f"fake_terminal: required subscriptions did not arrive "
-                 f"(kbd={'ok' if term.kbd_subs else 'pending'}, "
-                 f"ptr={'ok' if term.ptr_sub else 'pending'})")
+    if args.inject_cpu is None:
+        # Direct-terminal mode: wait for the program(s) to subscribe to
+        # our keyboard/pointer before we start emitting events.
+        need_kbd = any(e[0] == "key" for e in events)
+        need_ptr = any(e[0] in ("motion", "down", "up") for e in events)
+        if not term.wait_for(need_kbd, need_ptr, args.subscribe_timeout):
+            sys.exit(f"fake_terminal: required subscriptions did not arrive "
+                     f"(kbd={'ok' if term.kbd_subs else 'pending'}, "
+                     f"ptr={'ok' if term.ptr_sub else 'pending'})")
+    # WM-mediated (inject) mode: there is no subscriber to wait for — the
+    # caller sequences us after the WM + session are up (see the test's
+    # wait-for-"oriscwm: ready" + login-prompt gating).
 
     for ev in events:
         # Keep the socket drained between events so console writes
@@ -640,6 +695,12 @@ def main():
             if not term.wait_for_n_kbd(n, timeout=20.0):
                 sys.exit(f"fake_terminal: only {len(term.kbd_subs)}/{n} "
                          f"kbd subscribers arrived")
+        elif ev[0] == "sleep":
+            # Pause (still draining the socket) — used to pace injection
+            # across a focus/subscriber handoff the injector can't
+            # observe directly (e.g. WM-mediated login → shell, where
+            # the shell must re-subscribe before it can receive keys).
+            term.drain_pending_subs(ev[1])
 
     # Final drain — give the CPU a chance to flush its last outputs.
     term.drain_pending_subs(args.linger)

@@ -461,6 +461,12 @@ PKT_TASK_QUERY_REQ  = 0x42
 PKT_TASK_QUERY_RESP = 0x43
 PKT_TASK_KILL_REQ   = 0x44
 PKT_TASK_KILL_RESP  = 0x45
+# Phase 60 follow-up — headless host-input injection.  A test harness
+# (fake_terminal) sends this to a WM's CPU to deliver a keyboard/pointer
+# event into that CPU's local TAG_INPUT_SINK, exactly as the Tk display
+# worker does for live input.  payload = [kind, w0, w1, w2, w3] where
+# kind 0=keyboard ([code, mods, 0, 0]), 1=pointer ([evt, xy, btn, state]).
+PKT_HOST_INPUT      = 0x50
 PKT_LINK_FLOW_CREDIT= 0xF0
 PKT_LINK_ERROR      = 0xF1
 PKT_LINK_HEARTBEAT  = 0xFE
@@ -900,6 +906,7 @@ class InProcessCrossbar(Crossbar):
             PKT_TASK_QUERY_RESP: "TASK_QUERY_RESP",
             PKT_TASK_KILL_REQ:   "TASK_KILL_REQ",
             PKT_TASK_KILL_RESP:  "TASK_KILL_RESP",
+            PKT_HOST_INPUT:      "HOST_INPUT",
         }.get(pkt["type"], f"type=0x{pkt['type']:02x}")
         print(f"  ; CROSSBAR CPU{pkt['src_pid']} -> CPU{pkt['dst_pid']} "
               f"{type_name} trans={pkt['trans_id']} len={len(pkt['payload'])}w "
@@ -1072,8 +1079,50 @@ class CPU(Port):
             # get matched against cpu.blocked_on (or task.blocked_on for
             # parked tasks) by trans_id.
             self.responses.append(packet)
+        elif t == PKT_HOST_INPUT:
+            # Headless host-input injection (Phase 60 follow-up): a test
+            # harness delivers a keyboard/pointer event into this CPU's
+            # local TAG_INPUT_SINK, the same path the Tk display worker
+            # uses for live input.  payload = [kind, w0, w1, w2, w3].
+            p = pkt["payload"]
+            if len(p) >= 5:
+                self.enqueue_input_sink(p[0] & 0xFF, [p[1], p[2], p[3], p[4]])
         # Other packet types currently dropped silently (e.g., DESC_*,
         # LINK_*); future revisions may dispatch them here too.
+
+    def enqueue_input_sink(self, kind: int, int_payload: List[int]) -> None:
+        """Append a host-input SEND_DELIVER to this CPU's registered
+        TAG_INPUT_SINK queue for `kind` (0=keyboard, 1=pointer), if any.
+
+        Shared by the Tk display worker (live keystrokes/mouse, via
+        TkDisplayWorker._enqueue_sink) and the PKT_HOST_INPUT crossbar
+        path (headless test injection).  Both deliver a byte-identical
+        event into the sink — the WM can't tell a real keypress from an
+        injected one.  No-op if no sink is registered or its queue is
+        full (matches the Tk worker's silent-drop behaviour)."""
+        sinks = getattr(self, "input_sinks", None)
+        if sinks is None:
+            return
+        idx = sinks.get(kind)
+        if idx is None:
+            return
+        if idx >= len(self.descriptors) or self.descriptors[idx] is None:
+            return
+        desc = self.descriptors[idx]
+        if not desc.live or desc.queue is None:
+            return
+        if len(desc.queue) >= desc.queue_max_depth:
+            return  # silent drop; queue full
+        recipient_ref = make_ref(generation=desc.generation,
+                                 home=self.pid, index=idx,
+                                 caps=desc.max_caps)
+        pkt = build_send_deliver(
+            src_pid=self.pid, dst_pid=self.pid, trans_id=0,
+            recipient_ref=recipient_ref,
+            int_payload=int_payload,
+            or_payload=[recipient_ref, 0, 0, 0],
+        )
+        desc.queue.append(pkt)
 
     # ---- GPR/OR helpers -----------------------------------------------------
 
@@ -2327,32 +2376,11 @@ class TkDisplayWorker:
         return b
 
     def _enqueue_sink(self, cpu, kind, int_payload):
-        """Construct a SEND_DELIVER packet and append it to the
-        registered TAG_INPUT_SINK queue for this kind, if any.
-        No-op if no sink is registered or its queue is full."""
-        sinks = getattr(cpu, "input_sinks", None)
-        if sinks is None:
-            return
-        idx = sinks.get(kind)
-        if idx is None:
-            return
-        if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
-            return
-        desc = cpu.descriptors[idx]
-        if not desc.live or desc.queue is None:
-            return
-        if len(desc.queue) >= desc.queue_max_depth:
-            return  # silent drop; queue full
-        recipient_ref = make_ref(generation=desc.generation,
-                                 home=cpu.pid, index=idx,
-                                 caps=desc.max_caps)
-        pkt = build_send_deliver(
-            src_pid=cpu.pid, dst_pid=cpu.pid, trans_id=0,
-            recipient_ref=recipient_ref,
-            int_payload=int_payload,
-            or_payload=[recipient_ref, 0, 0, 0],
-        )
-        desc.queue.append(pkt)
+        """Deliver a live Tk input event into the CPU's TAG_INPUT_SINK.
+        Thin wrapper over CPU.enqueue_input_sink (shared with the
+        headless PKT_HOST_INPUT path) so the _on_key/_on_pointer
+        handlers read naturally."""
+        cpu.enqueue_input_sink(kind, int_payload)
 
     def _on_key(self, cpu, event):
         code = self._key_codepoint(event)
