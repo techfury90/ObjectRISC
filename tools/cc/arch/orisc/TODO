@@ -3,6 +3,63 @@ Object RISC backend for pcc — work list
 Done
 ====
 
+- `__or` as the OREFTY base type — the durable, composable object-
+  reference representation (replaces the parse-only OREF qualifier as
+  the internal carrier). `void *__or` is a typed object CAPABILITY,
+  not a byte pointer: it can be passed, returned, stored, compared,
+  null-tested, and lives in the OR file (CLASSC); it is NOT C-pointer-
+  arithmetic-capable (p+n / p[i] / p++ are intentionally rejected —
+  indexed/strided access is the job of the Phase-2 OL/OS accessors).
+
+  Why a base type, not a high flag bit in n_type (the rejected
+  "Candidate 3"): a spike proved a flag bit is shifted off the word
+  the moment an OR sits under a modifier —
+      void *__or         = 0x40000033
+      INCREF(void *__or) = 0x000000b3   (flag lost)
+  so "function returning void *__or" dropped OR-ness and the return
+  temp mis-classed CLASSA. A base type lives in the BTMASK bits, which
+  INCREF/DECREF never shift, so OR-ness composes with FTN/PTR/ARY and
+  survives tempnode/spill by construction — the real "invariant by
+  construction."
+
+  Pieces:
+    - mip/manifest.h: OREFTY=18 (freed MOETY slot, < MAXTYPES);
+      ISOREFT(t) = BTYPE(t)==OREFTY. The `__or` qualifier (OREF) moved
+      to a HIGH bit (0x40000000) — at 0x80 it collided with CON
+      (0x20) shifted up one pointer level by INCQAL, so a
+      `const char *const *` was misparsed as a capability. INCQAL/
+      DECQAL mask OREF so it never shifts (per-level qualifier,
+      consumed at tyreduce).
+    - pftn.c tyreduce: `void *__or` → OREFTY base type, OREF consumed.
+      tsize/talign(OREFTY) = 64/8. oalloc: OR autos are always
+      register temps (never byte memory).
+    - mip/match.c + pass2.h: TOREF shape bit; ttype(OREFTY)→TOREF.
+    - mip/reader.c deltemp: OR temps stay register-resident regardless
+      of xtemps (can't spill a capability to byte memory).
+    - trees.c chkpun: capability=capability and capability=null(0) are
+      compatible; the generic ptr/int punning checks no longer misfire.
+    - arch/orisc: gclass(OREFTY)→CLASSC; RETREG(OREFTY)→O1; CALL/UCALL
+      INCREG patterns (call result in O1); bfcode/moveargs/FORCE detect
+      OR via ISOREFT(type) not the (creator-zeroed) qualifier. Deleted
+      the PCLASS OREF/n_qual hack and the cgram.y cftnod->n_qual patch
+      — classing is now purely from the type word.
+
+  Verified: examples/cc/oref_calls.c (params O1..O4, return O1, null,
+  OR-returning call, named OR local — all OR-file, no byte spill) via
+  test_oref_calls.sh; the previously-broken plain `const char *const *`
+  subscript now compiles AND runs (the original menu.c workaround's
+  root cause); all existing OR examples (hello_or, print_clean,
+  or_callee_inspect, …) and the full device smoke suite still pass.
+
+  Still pending (breadth, follow-ups):
+    - native deref `*p` → OL/OS, needs a referent-type ATTR for the
+      load/store width (today typed access is via intrinsics, Phase 2).
+    - OBJSTORE-backed OR spill (OREFLD/OREFST) when OR register
+      pressure exceeds the file; today OR temps/autos are register-only.
+    - capability type-checks: reject __or<->int* casts, pointer
+      arithmetic, and address-of of an __or lvalue (uerror).
+    - indirect (function-pointer) calls returning an OR.
+
 - 5+-argument calls (the "4-arg ceiling"). Two bugs fixed together:
     1. adrput (local2.c) had no FUNARG case, so the spill template
        "sw AL, AR(sp)" — where AR resolves (via getlr on the UTYPE

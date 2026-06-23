@@ -201,7 +201,9 @@ typedef long long OFFSZ;
 #define	MAXREGS		64
 #define	NUMCLASS	3
 
-#define	RETREG(x)	(DEUNSIGN(x) == LONGLONG ? R2R3 : R2)
+#define	RETREG(x)	(ISOREFT(x) ? O1 : \
+			 DEUNSIGN(x) == LONGLONG ? R2R3 : R2)
+				/* Object RISC: capabilities return in O1 */
 #define	FPREG		FP	/* frame pointer */
 
 /*
@@ -340,20 +342,18 @@ typedef long long OFFSZ;
 
 #define GCLASS(x)	((x) < 32 ? CLASSA : (x) < 48 ? CLASSB : CLASSC)
 /*
- * PCLASS: the register class a node should be allocated to. For
- * Object RISC, an `__or`-qualified value (n_qual carries the OREF
- * bit per mip/manifest.h) must live in the OR file (CLASSC) — that
- * is the architectural commitment Volume III enforces. Everything
- * else falls through to gclass on the basic type.
+ * PCLASS: the register class a node should be allocated to. Object-
+ * reference pointers (OBIT set in the type word, per mip/manifest.h)
+ * live in the OR file (CLASSC) — Volume III's architectural
+ * commitment. Because OBIT rides n_type, gclass() already routes them
+ * to CLASSC, so the gclass fallback below covers the normal case
+ * without consulting the (creator-zeroed) qualifier word.
  *
- * We also check for REG nodes whose physical reg number is in the
- * CLASSC range — that catches the case where pftn binds the
- * variable to an OR via `register __or T *p __asm__("oN")` and the
- * qualifier gets lost in transit.
+ * The REG-range arm is kept as a belt-and-suspenders for nodes bound
+ * to an OR slot via `register __or T *p __asm__("oN")`, whose physical
+ * reg number lands in CLASSC's range.
  */
-#define PCLASS(p)	(ISOREF((p)->n_qual) \
-			    ? (1 << CLASSC) \
-			    : ((p)->n_op == REG && (p)->n_rval >= 48 \
+#define PCLASS(p)	(((p)->n_op == REG && (p)->n_rval >= 48 \
 			       && (p)->n_rval < 64) \
 			    ? (1 << CLASSC) \
 			    : (1 << gclass((p)->n_type)))

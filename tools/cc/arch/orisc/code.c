@@ -179,23 +179,23 @@ bfcode(struct symtab **sp, int cnt)
 				break;
 
 			default:
-				if (ISOREF(sym->squal) && opr <= O4) {
-					/* `__or` parameter — arg arrived in
-					 * O[opr]. Bind the symtab entry
-					 * directly to that physical OR slot,
-					 * the same way `register __or T *p
-					 * __asm__("oN")` does for explicit
-					 * declarations. No tempnode, no
-					 * ASSIGN — body NAME references
-					 * resolve via clocal's REGISTER case
-					 * straight to the OR slot. (SINREG is
-					 * defined in ccom/pass1.h and aliased
-					 * to SLOCAL1 in cxxcom/pass1.h so
-					 * this file builds for both.) */
+				if (ISOREFT(sym->stype) && opr <= O4) {
+					/* `__or` parameter (OBIT in the type
+					 * word) — arg arrived in O[opr]. Bind
+					 * the symtab entry directly to that
+					 * physical OR slot, the same way
+					 * `register __or T *p __asm__("oN")`
+					 * does for explicit declarations. No
+					 * tempnode, no ASSIGN — body NAME
+					 * references resolve via clocal's
+					 * REGISTER case straight to the OR slot.
+					 * (SINREG is defined in ccom/pass1.h and
+					 * aliased to SLOCAL1 in cxxcom/pass1.h
+					 * so this file builds for both.) */
 					sym->sclass = REGISTER;
 					sym->sflags |= SINREG;
 					sym->soffset = opr++;
-				} else if (!ISOREF(sym->squal) && gpr <= R7) {
+				} else if (!ISOREFT(sym->stype) && gpr <= R7) {
 					q = block(REG, NIL, NIL, sym->stype,
 					    sym->sdf, sym->sap);
 					q->n_rval = gpr++;
@@ -259,17 +259,17 @@ moveargs(NODE *p, int *gpr, int *opr, int *stacksize)
 	}
 
 	/*
-	 * `__or`-qualified arguments route to the OR file (O1..O4)
-	 * per Vol VII §2.1; everything else uses the integer arg
-	 * regs (R4..R7) and spills to the outgoing-arg area beyond
-	 * that.
+	 * Object-reference arguments (OBIT in the type word) route to
+	 * the OR file (O1..O4) per Vol VII §2.1; everything else uses
+	 * the integer arg regs (R4..R7) and spills to the outgoing-arg
+	 * area beyond that. The dest REG node inherits r->n_type, which
+	 * already carries OBIT, so it classes CLASSC by construction.
 	 */
-	if (ISOREF(r->n_qual) && *opr <= O4) {
+	if (ISOREFT(r->n_type) && *opr <= O4) {
 		q = block(REG, NIL, NIL, r->n_type, r->n_df, r->n_ap);
-		q->n_qual = OREF;
 		q->n_rval = (*opr)++;
 		r = buildtree(ASSIGN, q, r);
-	} else if (!ISOREF(r->n_qual) && *gpr <= R7) {
+	} else if (!ISOREFT(r->n_type) && *gpr <= R7) {
 		q = block(REG, NIL, NIL, r->n_type, r->n_df, r->n_ap);
 		q->n_rval = (*gpr)++;
 		r = buildtree(ASSIGN, q, r);
@@ -281,7 +281,7 @@ moveargs(NODE *p, int *gpr, int *opr, int *stacksize)
 		 * byte memory violates the capability invariant; cerror
 		 * if we hit that case. */
 		int sz;
-		if (ISOREF(r->n_qual))
+		if (ISOREFT(r->n_type))
 			cerror("more than four __or arguments — needs OBJSTORE spill");
 		sz = tsize(r->n_type, r->n_df, r->n_ap) / SZCHAR;
 		r = block(FUNARG, r, NIL, r->n_type, r->n_df, r->n_ap);

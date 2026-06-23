@@ -246,6 +246,8 @@ ttype(TWORD t, int tword)
 		return( tword & TDOUBLE );
 	case LDOUBLE:
 		return( tword & TLDOUBLE );
+	case OREFTY:
+		return( tword & TOREF );	/* Object RISC capability */
 	}
 
 	return(0);

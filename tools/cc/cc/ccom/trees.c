@@ -1088,6 +1088,24 @@ chkpun(P1ND *p)
 	t1 = p->n_left->n_type;
 	t2 = p->n_right->n_type;
 
+	/*
+	 * Object RISC: an object-reference capability (OREFTY) is its own
+	 * kind — not a byte pointer, not an integer — so the generic
+	 * pointer/integer punning checks below would mis-warn on
+	 * capability-to-capability assignment. A capability is compatible
+	 * with another capability, and with a null constant (0). Mixing a
+	 * capability with a real pointer or a nonzero integer is a
+	 * capability violation; that enforcement lives in the cast/assign
+	 * checks, not here.
+	 */
+	if (ISOREFT(t1) || ISOREFT(t2)) {
+		if (ISOREFT(t1) && ISOREFT(t2))
+			return;
+		q = ISOREFT(t1) ? p->n_right : p->n_left;
+		if (q->n_op == ICON && glval(q) == 0)
+			return;
+	}
+
 	switch (p->n_op) {
 	case RETURN:
 		/* return of void allowed but nothing else */

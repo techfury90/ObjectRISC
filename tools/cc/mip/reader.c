@@ -1404,6 +1404,17 @@ deltemp(NODE *p, void *arg)
 	NODE *l;
 
 	if (p->n_op == TEMP) {
+		/*
+		 * Object RISC: an object-reference temp (OREFTY) lives in
+		 * the OR file (CLASSC) and cannot be spilled to byte memory
+		 * — the capability invariant forbids it. Keep it as a
+		 * register temp for the allocator to color into an OR slot,
+		 * exactly as xtemps does, regardless of the xtemps flag.
+		 * (Real OR spills, when register pressure demands them, go
+		 * through OREFLD/OREFST to an OBJSTORE — a later phase.)
+		 */
+		if (ISOREFT(p->n_type))
+			return;
 		if (aor[regno(p)][0] == 0) {
 			if (xtemps)
 				return;

@@ -78,7 +78,16 @@
 #define	STRTY		15
 #define	UNIONTY		16
 #define	XTYPE		17	/* Extended target-specific type */
-/* #define	MOETY		18 */	/* member of enum */
+#define	OREFTY		18	/* Object RISC: object-reference capability
+				 * (held in the OR register file). Reuses the
+				 * freed MOETY slot; < MAXTYPES so it passes the
+				 * pass2 BTYPE sanity gate. A leaf base type, NOT
+				 * a PTR modifier — it composes with FTN/PTR/ARY
+				 * under INCREF/DECREF by construction (BTYPE bits
+				 * are never shifted), unlike a high flag bit. The
+				 * referent type (for OL/OS width + sizeof) rides
+				 * an ATTR; __or T * is a typed capability, not a
+				 * C byte pointer (no pointer arithmetic). */
 #define	VOID		19
 
 #define	MAXTYPES	19	/* highest type+1 to be used by lang code */
@@ -95,7 +104,21 @@
 #define	ARY		0x60
 #define	CON		0x20
 #define	VOL		0x40
-#define	OREF		0x80	/* Object RISC: held in OR file (capability-bearing reference) */
+#define	OREF	0x40000000	/* Object RISC: __or QUALIFIER bit (n_qual). Parse-time
+				 * marker only; tyreduce translates it into the
+				 * OREFTY base type, then consumes it. MUST be a high
+				 * bit, NOT in the shiftable modifier region: CON
+				 * (0x20) shifted up one pointer level by INCQAL
+				 * (0x20<<TSHIFT = 0x80) would otherwise read as OREF,
+				 * so a `const char *const *` would be misparsed as a
+				 * capability. INCQAL/DECQAL mask OREF so it never
+				 * shifts (per-level qualifier, consumed where set). */
+/*
+ * ISOREFT(t): is type word t an object-reference capability? Tests the
+ * base type (OREFTY), which is preserved by every node creator/copier
+ * and survives INCREF/DECREF — so OR-ness is invariant by construction.
+ */
+#define	ISOREFT(x)	(BTYPE(x) == OREFTY)
 
 /*
  * Type packing constants
@@ -125,9 +148,13 @@
 #define	ISVOL(x)	(((x)&VOL)==VOL)	/* is x volatile? */
 #define	ISOREF(x)	(((x)&OREF)==OREF)	/* is x held in an OR? */
 #define INCREF(x)	((((x)&~BTMASK)<<TSHIFT)|PTR|((x)&BTMASK))
-#define INCQAL(x)	((((x)&~BTMASK)<<TSHIFT)|((x)&BTMASK))
+/* INCQAL/DECQAL mask OREF (Object RISC) out of the shift: it is a
+ * per-level capability qualifier consumed where written (tyreduce), so
+ * it must neither propagate to inner levels nor shift into/out of the
+ * CON/VOL slots. No-op for targets that never set OREF. */
+#define INCQAL(x)	((((x)&~BTMASK&~OREF)<<TSHIFT)|((x)&BTMASK))
 #define DECREF(x)	((((x)>>TSHIFT)&~BTMASK)|((x)&BTMASK))
-#define DECQAL(x)	((((x)>>TSHIFT)&~BTMASK)|((x)&BTMASK))
+#define DECQAL(x)	((((((x)&~OREF))>>TSHIFT)&~BTMASK)|((x)&BTMASK))
 #define SETOFF(x,y)	{ if ((x)%(y) != 0) (x) = (((x)/(y) + 1) * (y)); }
 		/* advance x to a multiple of y */
 #define NOFIT(x,y,z)	(((x)%(z) + (y)) > (z))
