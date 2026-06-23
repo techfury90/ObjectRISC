@@ -25,6 +25,16 @@
 extern void flush_charbuf(void);	/* in local.c */
 
 /*
+ * Max outgoing-arg-spill bytes across all calls in the current
+ * function. moveargs() spills call args #5+ to OFFSET(sp) at the
+ * bottom of OUR frame; offcalc() (local2.c) reserves this many bytes
+ * there so the spill area never overlaps locals or saved registers.
+ * Reset per function in bfcode (pass1), accumulated in funcode
+ * (pass1), consumed in offcalc (pass2). Defined in local2.c.
+ */
+extern int orisc_argszmax;
+
+/*
  * Print the assembler segment directive corresponding to a pcc
  * section enum. Asmorisc supports `.text`, `.data`, and the related
  * directives in CONTRACT.md §4.2 — no .rodata / PIC / TLS / CTORS
@@ -133,6 +143,11 @@ bfcode(struct symtab **sp, int cnt)
 	struct symtab *sym;
 	NODE *p, *q;
 	int i, gpr;
+
+	/* Reset the per-function outgoing-arg-area high-water mark;
+	 * funcode() accumulates it as calls are lowered, offcalc()
+	 * reserves it in the frame. */
+	orisc_argszmax = 0;
 
 	/* Hidden struct-return arg occupies R4 if present. */
 	if (cftnsp->stype == STRTY+FTN || cftnsp->stype == UNIONTY+FTN) {
@@ -289,11 +304,14 @@ funcode(NODE *p)
 
 	p->n_right = moveargs(p->n_right, &gpr, &opr, &stacksize);
 	/*
-	 * Caller's outgoing-arg-spill area is allocated in the
-	 * prologue — pcc tracks the maximum across all calls in the
-	 * function and reserves it once. (See local2.c::prologue.)
+	 * Remember the largest outgoing-arg area any call in this
+	 * function needs; the prologue reserves it once (see
+	 * local2.c::offcalc).  Previously this was discarded, so the
+	 * spill stores at OFFSET(sp) clobbered locals whenever a
+	 * function both had locals and made a 5+-arg call.
 	 */
-	(void)stacksize;
+	if (stacksize > orisc_argszmax)
+		orisc_argszmax = stacksize;
 	return p;
 }
 
