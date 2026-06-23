@@ -24,6 +24,10 @@ typedef char obj__off_check[(OBJ_TABLE_OFFSET == 1704) ? 1 : -1];
 /* bit h set => handle h is allocated. */
 static unsigned int obj_inuse;
 
+/* Set once obj_init has run, so a second caller (another migrated
+ * subsystem ensuring the table is up) doesn't zero out live handles. */
+static int obj_inited;
+
 /* --- slot <-> O-register moves (immediate-offset switch) ------------- */
 
 static void
@@ -93,7 +97,10 @@ obj_init(void)
 	asm volatile("oisn %0, o12" : "=r"(o12_null));
 	if (o12_null)
 		return -1;
-	obj_inuse = 0;
+	if (!obj_inited) {             /* idempotent — don't clobber live handles */
+		obj_inuse = 0;
+		obj_inited = 1;
+	}
 	return 0;
 }
 
@@ -211,6 +218,33 @@ obj_drop(obj_t h)
 	obj_inuse &= ~(1u << h);
 }
 
+/* DIR_RESULT slot in the O12 task table — where dir_walk publishes its
+ * resolved ref (task.c's slot map). Hard offset because OREFLD takes an
+ * immediate; drift shows up as a wrong/null cap, caught by tests. */
+#define OBJ_DIR_RESULT_OFFSET 616
+
+obj_t
+obj_adopt_dir_result(void)
+{
+	int h, isn;
+
+	h = obj__alloc_handle();
+	if (h < 0)
+		return OBJ_NULL;
+	asm volatile(
+		"orefld o1, %1(o12)\n"    /* O1 = dir_walk's resolved ref */
+		"oisn   %0, o1"
+		: "=r"(isn)
+		: "i"(OBJ_DIR_RESULT_OFFSET)
+		: "r1"
+	);
+	if (isn)
+		return OBJ_NULL;          /* dir result was null — nothing to adopt */
+	obj__store_o1(h);             /* O1 still holds the ref (orx.c idiom) */
+	obj_inuse |= (1u << h);
+	return h;
+}
+
 /* --- inspection ----------------------------------------------------- */
 
 int
@@ -296,6 +330,26 @@ obj_storew(obj_t h, int val)
 /* --- messaging ------------------------------------------------------ */
 
 int
+obj_queue_attach(obj_t h, unsigned int depth)
+{
+	int status;
+
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return -1;
+	obj__load_o1(h);               /* queue object -> O1 */
+	asm volatile(
+		"addu r4, %1, r0\n"
+		"call #0x203\n"           /* ReceiveQueueAttach: O1, R4=depth -> R2 */
+		"nop\n"
+		"addu %0, r2, r0"
+		: "=r"(status)
+		: "r"(depth)
+		: "r2", "r3", "r4"
+	);
+	return status;
+}
+
+int
 obj_send(obj_t h, int a0, int a1, int a2, int a3)
 {
 	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
@@ -313,6 +367,30 @@ obj_send(obj_t h, int a0, int a1, int a2, int a3)
 		: "r4", "r5", "r6", "r7", "o2", "o3", "o4"
 	);
 	return 0;                       /* SEND traps on error rather than status */
+}
+
+int
+obj_send_or(obj_t h, obj_t or_h, int a0, int a1, int a2, int a3)
+{
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return -1;
+	obj__load_o1(h);               /* recipient -> O1 */
+	if (or_h >= 0 && or_h < OBJ_NHANDLE && (obj_inuse & (1u << or_h)))
+		obj__load_o2(or_h);    /* payload capability -> O2 (leaves O1) */
+	else
+		asm volatile("onull o2");   /* OBJ_NULL -> null O2 (unsubscribe) */
+	asm volatile(
+		"onull o3\n onull o4\n"
+		"addu r7, %3, r0\n"
+		"addu r6, %2, r0\n"
+		"addu r5, %1, r0\n"
+		"addu r4, %0, r0\n"
+		"send o1"
+		:
+		: "r"(a0), "r"(a1), "r"(a2), "r"(a3)
+		: "r4", "r5", "r6", "r7", "o3", "o4"
+	);
+	return 0;
 }
 
 int
@@ -336,4 +414,41 @@ obj_recv(obj_t h)
 	if (status != 0)
 		return -1;
 	return word;
+}
+
+/* Status-via-global: ReceiveQueuePoll yields 5 results (status + 4
+ * payload words) but pcc allows only 4 asm outputs, so R2 (status) is
+ * sw'd to this global from inside the asm body — the pointer_getevent /
+ * poll_window_grids idiom. */
+static int obj__poll_status;
+
+int
+obj_poll(obj_t h, int out[4])
+{
+	int w0, w1, w2, w3;
+
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return -1;
+	obj__load_o1(h);               /* queue object -> O1 */
+	asm volatile(
+		"addiu r4, r0, 0\n"       /* timeout 0 = non-blocking poll */
+		"call  #0x204\n"          /* ReceiveQueuePoll -> R2 status, R3..R6 */
+		"nop\n"
+		"la    r1, obj__poll_status\n"
+		"sw    r2, 0(r1)\n"
+		"addu  %0, r3, r0\n"
+		"addu  %1, r4, r0\n"
+		"addu  %2, r5, r0\n"
+		"addu  %3, r6, r0"
+		: "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
+		:
+		: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+	);
+	if (obj__poll_status != 0)
+		return -1;
+	out[0] = w0;
+	out[1] = w1;
+	out[2] = w2;
+	out[3] = w3;
+	return 0;
 }

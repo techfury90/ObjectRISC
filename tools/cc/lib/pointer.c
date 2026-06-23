@@ -1,36 +1,34 @@
 /*
  * pointer.c — WM-mediated pointer client (Phase 59 / WM γ.13).
  *
- * Allocates its own pointer-event mailbox (TAG_SERVICE) into O10,
- * attaches a receive queue, derives an R|S sub-cap, and SENDs it
- * as O2 to the WM-mediated pointer cap.  The WM stashes that ref
- * as its single subscriber and forwards every pointer event from
- * the underlying terminal (motion / down / up) to it.
+ * Phase 4: migrated onto the handle-based object API (obj.h). The
+ * pointer-event mailbox is now an `obj_t` handle in the O12 handle table
+ * (it used to be a hand-managed capability parked in O10, the last free
+ * boot OPR — now reclaimed), the WM-mediated pointer service is adopted
+ * straight from the dir-walk result into a handle, and subscribe /
+ * unsubscribe / poll go through obj_send_or / obj_poll. All the raw
+ * ObjAlloc / ReceiveQueueAttach / ObjDerive / send / ReceiveQueuePoll
+ * inline asm is gone.
  *
- * Boot OPR conventions used here:
- *   O10 = our pointer-event mailbox (allocated by pointer_subscribe)
- *   O11 = boot stack ref
- *   O15 = boot data ref
- *
- * O10 is the only previously-free OPR in liborisc's boot map (O9 is
- * reserved by term_init for the keyboard mailbox; O5/O6/O7/O14/O15
- * are reserved for surfaces and boot refs).
+ * Boot OPR convention still honoured here:
+ *   O11 = boot stack ref, O15 = boot data ref. The object API uses
+ *   O2/O3 as scratch (obj_send_or puts the subscriber sub-cap in O2),
+ *   so we restore O2/O3 from O11/O15 after any SEND/poll — otherwise a
+ *   following print_str would read string data through a clobbered O2.
  */
 
 #include "liborisc.h"
+#include "obj.h"
 
-#define DIR_RESULT_SLOT_OFFSET     616
-#define WM_POINTER_CAP_SLOT_OFFSET 1112
+/* The WM-mediated pointer service (adopted from the dir-walk result)
+ * and our own pointer-event mailbox, both as object handles. */
+static obj_t wm_ptr_h   = OBJ_NULL;
+static obj_t ptr_mbox_h = OBJ_NULL;
 
-/* Tag + cap constants, mirrored from dir.c (each libc .c file
- * copies these locally — there's no shared firmware-constants
- * header yet). */
-#define TAG_SERVICE  0x4103
-#define CAP_R        0x01
-#define CAP_W        0x02
-#define CAP_S        0x08
-#define CAP_V        0x04
-#define CAP_C        0x10
+/* Mailbox caps mirror term.c's keyboard mailbox: R|W|S|V|C (== 0x5b).
+ * The C bit is the derive-rights bit ObjDerive needs on the source. */
+#define PTR_MBOX_CAPS \
+	(OBJ_CAP_R | OBJ_CAP_W | OBJ_CAP_S | OBJ_CAP_V | OBJ_CAP_C)
 
 static void
 _ptr_restore_or(void)
@@ -39,169 +37,79 @@ _ptr_restore_or(void)
 	asm volatile("omov o3, o15");
 }
 
-static int
-_ptr_cap_isn(void)
-{
-	int isn;
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"oisn   %0, o1"
-		: "=r"(isn)
-		: "i"(WM_POINTER_CAP_SLOT_OFFSET)
-		: "r1"
-	);
-	return isn;
-}
-
 int
 pointer_init_from_dir_result(void)
 {
-	int isn;
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"oisn   %0, o1\n"
-		"orefst o1, %2(o12)"
-		: "=r"(isn)
-		: "i"(DIR_RESULT_SLOT_OFFSET),
-		  "i"(WM_POINTER_CAP_SLOT_OFFSET)
-		: "r1"
-	);
-	return isn ? -1 : 0;
+	if (obj_init() != 0)
+		return -1;
+	/* Adopt dir_walk's resolved WM-pointer ref into a handle (replaces
+	 * the old "copy DIR_RESULT slot -> WM_POINTER_CAP slot" dance). */
+	wm_ptr_h = obj_adopt_dir_result();
+	return (wm_ptr_h < 0) ? -1 : 0;
 }
 
 int
 pointer_subscribe(void)
 {
-	if (_ptr_cap_isn()) return -1;
+	obj_t sub;
 
-	/* ObjAlloc(TAG_SERVICE, 0x5b) → O1; park into O10.
-	 *
-	 * Caps mirror term.c's keyboard-mailbox alloc — 0x5b includes
-	 * a derive-rights bit at 0x40 that ObjDerive otherwise rejects
-	 * the source for (status 3 = E_PERM-ish).  The exact bit name
-	 * isn't in the firmware doc but the value is load-bearing. */
-	int status;
-	asm volatile(
-		"addiu r4, r0, 16\n"
-		"addiu r5, r0, %1\n"           /* TAG_SERVICE */
-		"addiu r6, r0, 0x5b\n"
-		"call  #0x100\n"               /* ObjAlloc */
-		"nop\n"
-		"omov  o10, o1\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "i"(TAG_SERVICE)
-		: "r1", "r2", "r4", "r5", "r6"
-	);
-	if (status != 0) return status;
+	if (wm_ptr_h < 0)
+		return -1;
 
-	/* ReceiveQueueAttach(depth=16). */
-	asm volatile(
-		"omov  o1, o10\n"
-		"addiu r4, r0, 16\n"
-		"call  #0x203\n"               /* ReceiveQueueAttach */
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		:
-		: "r1", "r2", "r3", "r4"
-	);
-	if (status != 0) return status;
+	/* Allocate our event mailbox and give it a receive queue. */
+	ptr_mbox_h = obj_alloc(16, OBJ_TAG_SERVICE, PTR_MBOX_CAPS);
+	if (ptr_mbox_h < 0)
+		return -1;
+	if (obj_queue_attach(ptr_mbox_h, 16) != 0)
+		return -1;
 
-	/* Derive R|S sub-cap of O10 → O2; SEND to WM_POINTER_CAP_SLOT
-	 * with O2 = sub-cap, R4..R7 = zero (subscribe-all v1). */
-	asm volatile(
-		"omov   o1, o10\n"
-		"addiu  r4, r0, %1\n"          /* R|S */
-		"call   #0x103\n"              /* ObjDerive → O1 */
-		"nop\n"
-		"omov   o2, o1\n"
-		"orefld o1, %0(o12)\n"
-		"onull  o3\n"
-		"addiu  r4, r0, 0\n"
-		"addiu  r5, r0, 0\n"
-		"addiu  r6, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1"
-		:
-		: "i"(WM_POINTER_CAP_SLOT_OFFSET),
-		  "i"(CAP_R | CAP_S)
-		: "r1", "r2", "r4", "r5", "r6", "r7"
-	);
+	/* Derive an R|S sub-cap of the mailbox and SEND it to the WM as our
+	 * subscriber ref (O2). R4..R7 = 0 (subscribe-all v1). The WM stashes
+	 * its own copy, so we drop ours. */
+	sub = obj_derive(ptr_mbox_h, OBJ_CAP_R | OBJ_CAP_S);
+	if (sub < 0)
+		return -1;
+	obj_send_or(wm_ptr_h, sub, 0, 0, 0, 0);
+	obj_drop(sub);
 	_ptr_restore_or();
 	return 0;
 }
 
-/* True (1) if pointer_subscribe has run and our event mailbox (O10)
- * is live, 0 otherwise.  menu_run uses this to decide whether it can
- * poll the mouse — a program that never subscribed gets a keyboard-
- * only menu instead of a poll on a null mailbox. */
+/* True (1) if pointer_subscribe has run and our event mailbox is live,
+ * 0 otherwise. menu_run uses this to decide whether it can poll the
+ * mouse — a program that never subscribed gets a keyboard-only menu. */
 int
 pointer_subscribed(void)
 {
-	int isn;
-	asm volatile("oisn %0, o10" : "=r"(isn));
-	return !isn;
+	return !obj_isnull(ptr_mbox_h);
 }
 
 int
 pointer_unsubscribe(void)
 {
-	if (_ptr_cap_isn()) return -1;
-	/* SEND with O2 = null clears the WM's subscriber slot.  Same
-	 * coarse v1 contract oriscterm uses for keyboard / pointer
-	 * unsubscribe-all. */
-	asm volatile(
-		"orefld o1, %0(o12)\n"
-		"onull  o2\n"
-		"onull  o3\n"
-		"addiu  r4, r0, 0\n"
-		"addiu  r5, r0, 0\n"
-		"addiu  r6, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1"
-		:
-		: "i"(WM_POINTER_CAP_SLOT_OFFSET)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
+	if (wm_ptr_h < 0)
+		return -1;
+	/* SEND with O2 = null clears the WM's subscriber slot — the same
+	 * coarse v1 unsubscribe-all contract oriscterm uses. */
+	obj_send_or(wm_ptr_h, OBJ_NULL, 0, 0, 0, 0);
 	_ptr_restore_or();
 	return 0;
 }
-
-/* See poll_window_grids in oriscwm — same status-via-global trick to
- * fit a 5-output capture (status + int_payload[0..3]) into pcc's
- * 4-output operand limit.  R2 (status) is sw'd to this global from
- * inside the asm body; R3..R6 use the regular outputs. */
-static int _ptr_getevent_status;
 
 int
 pointer_getevent(int *evt_type, int *packed_xy,
                  int *button, int *btn_state)
 {
-	int et, pxy, btn, mask;
-	asm volatile(
-		"omov  o1, o10\n"
-		"addiu r4, r0, 0\n"            /* timeout = 0 */
-		"call  #0x204\n"               /* ReceiveQueuePoll */
-		"nop\n"
-		"la    r1, _ptr_getevent_status\n"
-		"sw    r2, 0(r1)\n"
-		"addu  %0, r3, r0\n"
-		"addu  %1, r4, r0\n"
-		"addu  %2, r5, r0\n"
-		"addu  %3, r6, r0"
-		: "=r"(et), "=r"(pxy), "=r"(btn), "=r"(mask)
-		:
-		: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
-	);
-	if (_ptr_getevent_status != 0) {
+	int out[4];
+
+	if (obj_poll(ptr_mbox_h, out) != 0) {
 		_ptr_restore_or();
 		return -1;
 	}
-	*evt_type  = et;
-	*packed_xy = pxy;
-	*button    = btn;
-	*btn_state = mask;
+	*evt_type  = out[0];
+	*packed_xy = out[1];
+	*button    = out[2];
+	*btn_state = out[3];
 	_ptr_restore_or();
 	return 0;
 }

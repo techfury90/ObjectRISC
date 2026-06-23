@@ -73,6 +73,13 @@ int   obj_free(obj_t h);
  * descriptor, fewer caps), so it must be dropped, not freed. */
 void  obj_drop(obj_t h);
 
+/* Adopt the capability that dir_walk resolved into the per-task
+ * DIR_RESULT slot (its LEAF target / MOUNT service ref) as a handle —
+ * the clean way to bring a directory-resolved service cap into the
+ * handle world without the asm holding it in an O-register across a
+ * call. Returns OBJ_NULL if that slot is null or the table is full. */
+obj_t obj_adopt_dir_result(void);
+
 /* --- inspection (no memory access) ---------------------------------- */
 
 int   obj_isnull(obj_t h);            /* 1 if the slot holds a null ref */
@@ -88,13 +95,29 @@ void  obj_storew(obj_t h, int val);    /* OSW word at offset 0 */
 
 /* --- messaging ------------------------------------------------------ */
 
+/* Attach a receive queue (`depth` slots) to the handle's object so it
+ * can receive SENDs — required for a service mailbox before subscribers
+ * or senders target it. Returns firmware status (0 = attached). */
+int   obj_queue_attach(obj_t h, unsigned int depth);
+
 /* SEND to the service named by `h` (needs S cap), payload in R4..R7;
  * no OR-register payload. Returns firmware status (0 = sent). */
 int   obj_send(obj_t h, int a0, int a1, int a2, int a3);
+
+/* Like obj_send, but carries an OR-register payload: O2 = `or_h`'s
+ * capability, or null O2 when `or_h` is OBJ_NULL (the coarse v1
+ * unsubscribe convention). Used to hand a service a sub-cap of your
+ * mailbox (subscribe). Returns 0 (SEND traps on error). */
+int   obj_send_or(obj_t h, obj_t or_h, int a0, int a1, int a2, int a3);
 
 /* Block on the receive queue attached to `h` until a message arrives;
  * returns its R3 word (or <0 on poll error). Caller reads the rest of
  * the payload via a follow-up obj_recv variant in a later revision. */
 int   obj_recv(obj_t h);
+
+/* Non-blocking poll of the receive queue attached to `h`: on a message,
+ * writes the R3..R6 payload words to out[0..3] and returns 0; returns
+ * -1 when the queue is empty or on error. */
+int   obj_poll(obj_t h, int out[4]);
 
 #endif /* OBJ_H */
