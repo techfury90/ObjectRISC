@@ -530,3 +530,33 @@ term_getkey(int *out_mods)
 	if (out_mods) *out_mods = mods;
 	return code;
 }
+
+/* --- term_pollkey: non-blocking peek of the keyboard queue ----------- */
+
+/* Like term_getkey but with timeout 0: returns 0 and fills *out_code /
+ * *out_mods if a keystroke is waiting, -1 if the queue is empty.  For
+ * event-loop programs that interleave keyboard with pointer / timer
+ * work and can't afford term_getkey's infinite block (mouse_paint,
+ * menu_run, future TUIs). */
+int
+term_pollkey(int *out_code, int *out_mods)
+{
+	int status, code, mods;
+	asm volatile(
+		"omov  o1, o9\n"                /* O9 = term mailbox (term_init) */
+		"addiu r4, r0, 0\n"            /* timeout 0 = non-blocking */
+		"call  #0x204\n"                /* ReceiveQueuePoll */
+		"nop\n"
+		"addu  %0, r2, r0\n"
+		"addu  %1, r3, r0\n"
+		"addu  %2, r4, r0"
+		: "=r"(status), "=r"(code), "=r"(mods)
+		:
+		: "r1", "r2", "r3", "r4"
+	);
+	_term_restore_or();
+	if (status != 0) return -1;
+	if (out_code) *out_code = code;
+	if (out_mods) *out_mods = mods;
+	return 0;
+}

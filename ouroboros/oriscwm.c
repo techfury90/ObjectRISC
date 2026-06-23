@@ -632,20 +632,22 @@ static int           window_title_lens[MAX_WINDOWS];
  * buffers with parallel offset arrays because the .word LABEL
  * path resolved to `DATA_BASE + offset_in_obj` at assemble time,
  * ignoring this .oro's actual placement in the linked image. */
-#define DESKTOP_MENU_N 4
+#define DESKTOP_MENU_N 5
 static const char *const desktop_menu_labels[DESKTOP_MENU_N] = {
 	"Shell",
 	"Edit",
 	"Mouse Paint",
+	"Menu Demo",
 	"Cancel",
 };
 static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
-	5, 4, 11, 6,
+	5, 4, 11, 9, 6,
 };
 static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
 	"/programs/shell.orx",
 	"/programs/edit.orx",
 	"/programs/mouse_paint.orx",
+	"/programs/menudemo.orx",
 	(const char *)0,         /* Cancel — dismiss, no spawn */
 };
 
