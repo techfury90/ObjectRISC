@@ -402,6 +402,21 @@
 #define WM_TITLE_BAR_BG WM_FG_COLOR
 #define WM_TITLE_BAR_FG WM_BG_COLOR
 
+/* Phase 60 step 22 — focus indicator.  The focused window's title
+ * bar gets a brighter bar (palette 8 = bright white); unfocused
+ * windows keep the dimmer gray (palette 1).  Text stays navy on
+ * both so it reads at either brightness. */
+#define WM_TITLE_FOCUSED_BG    8   /* bright white — has keyboard focus */
+#define WM_TITLE_UNFOCUSED_BG  WM_FG_COLOR  /* gray — not focused */
+#define WM_TITLE_TEXT_FG       WM_BG_COLOR  /* navy text on either bar */
+
+/* Phase 60 step 22 — close box.  A "[X]" affordance occupies the
+ * rightmost CLOSE_BOX_CELLS cells of every window's title bar; a
+ * left-click there destroys the window.  The centred title text is
+ * laid out within (N_COLS - CLOSE_BOX_CELLS) cells so it never
+ * collides with the box. */
+#define CLOSE_BOX_CELLS  3         /* "[X]" */
+
 /* Title string storage — single window for v1, becomes per-wid when
  * multi-window lands.  Sized to the max title that fits the bar with
  * no horizontal padding (158 cells × 1 byte).  ASCII only — same
@@ -952,6 +967,25 @@ set_active_window(int wid)
  * handle_destroy_window (auto-revert on destroy). */
 static int focused_wid;
 
+/* Phase 60 step 22 — repaint wid's title bar with focus-appropriate
+ * colors + composite it onto screen.  Defined after paint_title_bar;
+ * forward-declared here because set_focus / refocus_to_topmost (both
+ * above paint_title_bar in source order) call it. */
+static void repaint_title_bar(int wid);
+
+/* Move keyboard/pointer focus to new_wid, repainting the title bars
+ * of both the previously-focused and newly-focused windows so the
+ * brightness indicator tracks focus.  No-op if focus doesn't move. */
+static void
+set_focus(int new_wid)
+{
+	if (new_wid == focused_wid) return;
+	int old = focused_wid;
+	focused_wid = new_wid;
+	repaint_title_bar(old);
+	repaint_title_bar(new_wid);
+}
+
 /* Per-wid keyboard subscriber ref load/stash.  Same pcc-orisc dance
  * as load_window_fb_to_o1 — computed-offset OREFLD/OREFST isn't
  * legal, so each wid gets a switch case with a literal byte offset
@@ -1054,12 +1088,15 @@ stash_ptr_sub_o1(int wid)
 
 /* Recompute focused_wid after a window is destroyed.  Falls back to
  * the topmost remaining window (top of window_z), or 0 if no windows
- * are left. */
+ * are left.  Repaints the newly-focused window's title bar so it
+ * lights up — the just-destroyed window is already gone from the
+ * z-stack, so there's no old bar to dim. */
 static void
 refocus_to_topmost(void)
 {
 	if (window_z_count > 0) {
 		focused_wid = window_z[window_z_count - 1];
+		repaint_title_bar(focused_wid);
 	} else {
 		focused_wid = 0;
 	}
@@ -1290,26 +1327,22 @@ fill_rect_window(int packed_xy, int packed_wh, int color)
 	);
 }
 
-/* Render `n` chars of `window_title` into the window FB's title-bar
- * region.  The title is centred horizontally; if n exceeds N_COLS,
- * extra chars truncate.  Source ref is the WM's boot data O15 since
- * window_title[] lives in our data segment.
+/* Render a glyph row into the ACTIVE window FB.  Generic counterpart
+ * of screen_blit_glyph_row (which targets the screen FB).  3-arg
+ * packed signature for the pcc-orisc 5+-arg-call bug.  Caller packs
+ * (cell_x:high16, cell_y:low16) and (n_chars:high16, fg:bits 15..8,
+ * bg:bits 7..0).  Source text must live in boot data (O15) — the
+ * title buffer and the close-box literal both do.
  *
- * pcc-orisc input-clobber dance same as flush_strip. */
+ * Phase 60 step 22 generalised the old hardcoded blit_title_text into
+ * this so the title text and the close box can render with different
+ * (start_col, fg/bg) without duplicating the asm. */
 static void
-blit_title_text(int start_col, int n_chars)
+win_blit_glyph_row(int packed_xy, const unsigned char *text, int packed_shape)
 {
-	if (n_chars <= 0) return;
-	int text_off = (int)((unsigned int)window_title - DATA_VA);
+	if (((packed_shape >> 16) & 0xFFFF) == 0) return;
+	int text_off = (int)((unsigned int)text - DATA_VA);
 	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
-	/* Title text sits inside the border ring at cell-row
-	 * TITLE_CELL_Y_OFF; centre start_col offset by
-	 * TITLE_CELL_X_OFF for the left border. */
-	int fb_col = start_col + TITLE_CELL_X_OFF;
-	int packed_xy = ((fb_col & 0xFFFF) << 16) | (TITLE_CELL_Y_OFF & 0xFFFF);
-	int packed_shape = ((n_chars & 0xFFFF) << 16)
-	                 | ((WM_TITLE_BAR_FG & 0xFF) << 8)
-	                 | (WM_TITLE_BAR_BG & 0xFF);
 	asm volatile(
 		"addu   r8,  %0, r0\n"
 		"addu   r9,  %1, r0\n"
@@ -1317,7 +1350,7 @@ blit_title_text(int start_col, int n_chars)
 		"addu   r11, %3, r0\n"
 		"orefld o1, %4(o12)\n"      /* O1 = window FB */
 		"omov   o2, o15\n"          /* O2 = boot data (font) */
-		"omov   o3, o15\n"          /* O3 = boot data (title) */
+		"omov   o3, o15\n"          /* O3 = boot data (text) */
 		"addu   r4, r8,  r0\n"
 		"addu   r5, r9,  r0\n"
 		"addu   r6, r10, r0\n"
@@ -1332,6 +1365,10 @@ blit_title_text(int start_col, int n_chars)
 		  "r8", "r9", "r10", "r11"
 	);
 }
+
+/* Close-box label, in boot data so win_blit_glyph_row can reach it
+ * via O15. */
+static const unsigned char close_box_label[] = "[X]";
 
 /* Phase 60 step 19 — screen-FB variant of blit_title_text.  Same
  * ObjBlitGlyphs wire as the window-FB version but targets the
@@ -1375,35 +1412,71 @@ screen_blit_glyph_row(int packed_xy, const unsigned char *text,
 	);
 }
 
-/* Phase 60 step 8 — paint the title bar at the top of the window FB.
- * Bar bg = WM_TITLE_BAR_BG (inverse video — light gray); title text
- * (centred) renders in WM_TITLE_BAR_FG (dark navy).  After painting
- * the window-local title bar region we composite it onto the screen.
+/* Phase 60 step 8 / step 22 — paint the title bar at the top of the
+ * window FB.  Bar bg is brightness-coded by focus (bright white when
+ * active_wid == focused_wid, gray otherwise); title text (centred)
+ * and the "[X]" close box render navy on whichever bar color.  After
+ * painting the window-local title bar region we composite it onto the
+ * screen.
  *
- * Called once at handle_new_window time (empty title — visible
- * bar) and after every wm_set_title to refresh the displayed
- * text. */
+ * Called from handle_new_window, wm_set_title, and repaint_title_bar
+ * (focus changes).  active_wid must be set to the target window
+ * first (set_active_window) — fill_rect_window / win_blit_glyph_row /
+ * composite_window_region all key off it. */
 static void
 paint_title_bar(void)
 {
 	/* Title bar lives inside the border ring at
 	 * (TITLE_X_OFF_PX, TITLE_Y_OFF_PX), extent
 	 * (CELL_AREA_W_PX, TITLE_BAR_PX). */
+	int bar_bg = (active_wid == focused_wid)
+	           ? WM_TITLE_FOCUSED_BG : WM_TITLE_UNFOCUSED_BG;
 	int bar_xy = ((TITLE_X_OFF_PX & 0xFFFF) << 16)
 	           | (TITLE_Y_OFF_PX & 0xFFFF);
 	int bar_wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
 	           | (TITLE_BAR_PX & 0xFFFF);
-	fill_rect_window(bar_xy, bar_wh, WM_TITLE_BAR_BG);
+	fill_rect_window(bar_xy, bar_wh, bar_bg);
 
+	/* Centre the title within the cells left of the close box so the
+	 * two never overlap. */
+	int title_cells = N_COLS - CLOSE_BOX_CELLS;
 	int n = window_title_len;
-	if (n > N_COLS) n = N_COLS;
+	if (n > title_cells) n = title_cells;
 	if (n > 0) {
-		int start_col = (N_COLS - n) / 2;
-		blit_title_text(start_col, n);
+		int start_col = (title_cells - n) / 2 + TITLE_CELL_X_OFF;
+		int packed_xy = ((start_col & 0xFFFF) << 16)
+		              | (TITLE_CELL_Y_OFF & 0xFFFF);
+		int packed_shape = ((n & 0xFFFF) << 16)
+		                 | ((WM_TITLE_TEXT_FG & 0xFF) << 8)
+		                 | (bar_bg & 0xFF);
+		win_blit_glyph_row(packed_xy, window_title, packed_shape);
+	}
+
+	/* Close box "[X]" in the rightmost CLOSE_BOX_CELLS cells. */
+	{
+		int box_col = TITLE_CELL_X_OFF + (N_COLS - CLOSE_BOX_CELLS);
+		int packed_xy = ((box_col & 0xFFFF) << 16)
+		              | (TITLE_CELL_Y_OFF & 0xFFFF);
+		int packed_shape = ((CLOSE_BOX_CELLS & 0xFFFF) << 16)
+		                 | ((WM_TITLE_TEXT_FG & 0xFF) << 8)
+		                 | (bar_bg & 0xFF);
+		win_blit_glyph_row(packed_xy, close_box_label, packed_shape);
 	}
 
 	composite_window_region(TITLE_X_OFF_PX, TITLE_Y_OFF_PX,
 	                        CELL_AREA_W_PX, TITLE_BAR_PX);
+}
+
+/* Phase 60 step 22 — repaint wid's title bar (focus-color refresh).
+ * Saves/restores active_wid via set_active_window so callers that
+ * weren't mid-paint don't get their active window clobbered. */
+static void
+repaint_title_bar(int wid)
+{
+	if (wid < 1 || wid > MAX_WINDOWS) return;
+	if (window_type[wid - 1] == 0) return;
+	set_active_window(wid);
+	paint_title_bar();
 }
 
 /* Phase 60 step 5 — fill a rectangle in the framebuffer with a single
@@ -2263,8 +2336,18 @@ handle_new_window(int wtype)
 	 * its keyboard subscribe in its own freshly-opened slot. */
 	window_z[window_z_count] = wid;
 	window_z_count += 1;
+
+	/* Phase 60 step 22 — dim the previously-focused window's title
+	 * bar before this one steals focus, so only one bar reads as
+	 * focused at a time.  Done before set_active_window(wid) below
+	 * since repaint_title_bar reassigns active_wid. */
+	{
+		int prev_focus = focused_wid;
+		focused_wid = wid;
+		if (prev_focus && prev_focus != wid)
+			repaint_title_bar(prev_focus);
+	}
 	set_active_window(wid);
-	focused_wid = wid;
 
 	/* Phase 60 step 8 — paint the title bar so the window is visibly
 	 * framed from creation.  Title is initially empty; the client
@@ -2653,18 +2736,15 @@ handle_bind_surface(int wid, int kind)
 	wm_reply(E_INVAL, 0, 0, 0);
 }
 
-/* WM_OP_DESTROY_WINDOW — release a window. */
+/* Core window teardown shared by the WM_OP_DESTROY_WINDOW handler
+ * and the title-bar close-box click path (Phase 60 step 22).  Frees
+ * the per-wid surfaces, removes the window from the z-stack, nulls
+ * its subscriber slots, refocuses, and recomposites the vacated
+ * screen rect.  Does NOT wm_reply — the close-box path has no
+ * client reply_cap to answer.  Assumes wid is valid + live. */
 static void
-handle_destroy_window(int wid)
+window_teardown(int wid)
 {
-	if (wid < 1 || wid > MAX_WINDOWS) {
-		wm_reply(E_INVAL, 0, 0, 0);
-		return;
-	}
-	if (window_type[wid - 1] == 0) {
-		wm_reply(E_NOENT, 0, 0, 0);
-		return;
-	}
 	int sx = window_pos_x[wid - 1];
 	int sy = window_pos_y[wid - 1];
 	free_window_console(wid);
@@ -2688,6 +2768,21 @@ handle_destroy_window(int wid)
 	 * overwrite it.  No SEND fires for the close — the WM doesn't
 	 * push events to subscribers yet. */
 	recompose_after_destroy(sx, sy, USABLE_W_PX, USABLE_H_PX);
+}
+
+/* WM_OP_DESTROY_WINDOW — release a window. */
+static void
+handle_destroy_window(int wid)
+{
+	if (wid < 1 || wid > MAX_WINDOWS) {
+		wm_reply(E_INVAL, 0, 0, 0);
+		return;
+	}
+	if (window_type[wid - 1] == 0) {
+		wm_reply(E_NOENT, 0, 0, 0);
+		return;
+	}
+	window_teardown(wid);
 	wm_reply(0, 0, 0, 0);
 }
 
@@ -4049,9 +4144,10 @@ raise_window(int wid)
 	/* Always set focus to the just-clicked window, even if it was
 	 * already topmost — focus may have drifted away (e.g., another
 	 * window was destroyed and focus reverted to z-top, which is
-	 * us, but only for one tick).  Idempotent re-assignment is
-	 * cheap. */
-	focused_wid = wid;
+	 * us, but only for one tick).  set_focus repaints both the
+	 * old and new windows' title bars for the brightness indicator;
+	 * it's a no-op (no repaint) when focus didn't actually move. */
+	set_focus(wid);
 	if (found == window_z_count - 1) return;   /* already top */
 	for (i = found; i < window_z_count - 1; i++) {
 		window_z[i] = window_z[i + 1];
@@ -4158,6 +4254,22 @@ point_in_title_bar(int wid, int px, int py)
 	int ty_lo = wy + TITLE_Y_OFF_PX;
 	int ty_hi = ty_lo + TITLE_BAR_PX;
 	return (px >= tx_lo && px < tx_hi && py >= ty_lo && py < ty_hi);
+}
+
+/* Phase 60 step 22 — true if (px, py) is inside wid's close box (the
+ * rightmost CLOSE_BOX_CELLS cells of the title bar).  Checked before
+ * the general title-bar drag test so a close-box click destroys
+ * rather than starts a drag. */
+static int
+point_in_close_box(int wid, int px, int py)
+{
+	int wx = window_pos_x[wid - 1];
+	int wy = window_pos_y[wid - 1];
+	int bx_lo = wx + TITLE_X_OFF_PX + (N_COLS - CLOSE_BOX_CELLS) * CELL_W;
+	int bx_hi = wx + TITLE_X_OFF_PX + CELL_AREA_W_PX;
+	int by_lo = wy + TITLE_Y_OFF_PX;
+	int by_hi = by_lo + TITLE_BAR_PX;
+	return (px >= bx_lo && px < bx_hi && py >= by_lo && py < by_hi);
 }
 
 /* Phase 60 step 19 — lazy supervisor cap acquisition.  WM boots with
@@ -4436,6 +4548,14 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 		if (button != PTR_BTN_LEFT) return 0;
 		int t = topmost_window_at(px, py);
 		if (t == 0) return 0;
+		/* Close box takes priority over raise/drag — clicking it
+		 * destroys the window outright.  Check before raise_window
+		 * so we don't bother re-stacking a window we're about to
+		 * tear down. */
+		if (point_in_close_box(t, px, py)) {
+			window_teardown(t);
+			return 1;
+		}
 		raise_window(t);
 		if (point_in_title_bar(t, px, py)) {
 			drag_active    = 1;
