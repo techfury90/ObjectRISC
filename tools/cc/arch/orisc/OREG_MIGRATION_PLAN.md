@@ -1,4 +1,10 @@
-# REFINED PLAN (execute this): free O15 → callee-saved CLASSC (K=5)
+> ⚠️ **STATUS (2026-06-23, session 3): the "REFINED PLAN" below is NOT
+> directly executable as scoped — its site map is incomplete and K=5 is
+> insufficient. Both unblock paths are Phase-4-scale; the object API stays
+> blocked by deliberate decision. Read "SESSION-3 FINDINGS" (after the
+> REFINED PLAN) BEFORE attempting either path again.**
+
+# REFINED PLAN (superseded — see SESSION-3 FINDINGS): free O15 → callee-saved CLASSC (K=5)
 
 Supersedes the full 10-register migration below for the immediate goal:
 make the `__or`-value object API viable. You do NOT need all 10 registers
@@ -62,6 +68,96 @@ Context: memory `project_or_spill_phase2`. Abandoned dead-end: a
 hard-coded-O2 call-result store (clocal offset-bias mark + SORCALL /
 zzzcode 'J') fixes only the isolated store, not g2 — don't revive it; the
 register free is the real fix.
+
+---
+
+# SESSION-3 FINDINGS (2026-06-23): both paths are Phase-4-scale
+
+A focused session executed the REFINED PLAN and, in parallel, probed a
+compiler-only alternative. Both hit walls. Decision: **accept the
+call-result-store / `__or`-value-object-API limitation for now** (same
+as the 2026-06-23 decision in `project_or_spill_phase2`). Everything
+below was reverted; `main`/baseline is untouched and green.
+
+## Empirical register thresholds (standalone compile, not runtime)
+Mark O15 (and O14/O11) `SCREG|PERMREG`, COLORMAP CLASSC `num<K`, disable
+the local.c call-result-store uerror, then compile:
+- **K=4** (today): `g2`/`E` fail. `E` is `void *__or x=p; other(); return x`.
+- **K=5** (free O15 only — the REFINED PLAN's bet): `g2` AND `E` STILL
+  FAIL. Only `g3` (`x=echo(p); use(x); use(x); return x`) newly compiles.
+  ⇒ **K=5 is insufficient; the REFINED PLAN's headline does not reach the
+  goal.** (The plan's own step-4 fallback "free a 2nd register for K=6"
+  is what's actually needed.)
+- **K=6** (free O15 + a 2nd reg): `g2`, `E`, and a two-`__or`-value
+  case all compile. But this is COMPILE-ONLY with INCOMPLETE callee-save
+  (no objstore save/restore) — NOT runtime-validated.
+
+## Why the register migration is Phase-4-scale (REFINED PLAN site map is wrong)
+The plan's "~32 sites, 13 files" covered libc + 3 OS programs only. That
+migration was done and is mechanically correct (codegen verified: ALLOC
+1576→1584 ⇒ 1712 bytes, boot-data slot at byte 1704 just past the 1696
+anchor, `orefst o3, 1704(o12)` in task_init parks boot O3 — which DOES
+survive ObjAllocStore #0x106; the sim only writes GPR2+OPR1). **But it
+broke the OS** (`test_hostfs`, `test_wm_smoke`, `test_vec_smoke`,
+`test_raster_smoke`), because:
+- The **boot-OR contract is a PUBLIC API** (liborisc.h §"host_io"):
+  *"O11=boot stack, O14=boot self, O15=boot data — program parks o2/o4/o3
+  here at startup."* EVERY program that uses term/host_io/grid/raster/
+  vector follows it and reads O15 directly.
+- The plan's grep scoped `tools/cc/lib` + `ouroboros` and **missed
+  `examples/` and the inline test programs**: ~9 example C programs
+  (vec_smoke, raster_smoke, wm_smoke, fb_smoke, fb_local_smoke, ptr_smoke,
+  kbd_echo, paint, host_cat) each have their OWN `restore_or_state()`
+  doing `omov o3, o15` (23 O15 refs; O11 ~20 more), plus raw-asm demos
+  (hello_terminal.s, parallel_primes.s, chunkboot.s) and `test_hostfs.sh`'s
+  inline program.
+- Several of those (host_cat, kbd_echo, paint, the asm demos, test_hostfs)
+  **never call task_init**, so they have NO O12 table and CANNOT read an
+  O12 slot without being reworked to set one up.
+- Programs that DO call task_init (vec_smoke etc.) still broke until THEIR
+  `restore_or_state` is migrated too — and term_init's masking re-park is
+  why `test_shell`/`test_supervisor` happened to still pass.
+⇒ Freeing O15 is a **public-API contract change touching every program**
+(~230 sites incl. O11), exactly the Phase-4 effort the memory shelved.
+To do it: change the contract so task_init parks boot refs into O12 slots
+and ALL programs call task_init + drop manual O-register parking; convert
+or carve out the raw-asm demos; update liborisc.h's documented contract.
+
+## Why the compiler-only alternative is also deep (and the REAL root cause)
+Alternative probed: route OREFTY (capability) spills to the per-frame
+OBJSTORE instead of the (impossible) byte stack. Hooks landed cleanly —
+`MYSTOREMOD`+a `storemod` override rewrite an OREFTY spill node into the
+OREG-of-TOREF "home" leaf, and a `spilloff()` helper at regs.c's three
+spill sites (longtemp/shstore/shorttemp) gives it an objstore slot
+(`orisc_orspill_slot()` bumping `orisc_orhome`). The OFFSET routing works.
+BUT pcc's spill machinery has THREE paths and OREFTY breaks two:
+- `longtemp` (named cross-block temps) → clean storemod rewrite: OK.
+- `shorttemp`/`shstore`/`dospill` (within-block NODE-RESULT spills) → tree
+  surgery (`*r=*p`, in-place rewrite) that mis-classes the OREFTY reload
+  to a CLASSB GPR pair (`r16!r17!`) ⇒ "Cannot generate code op OREG".
+- Routing CLASSC node-results to `longtemp` instead **infinite-loops**
+  (longtemp only rewrites TEMP nodes, not node-results).
+
+**Deeper finding — the spills are SPURIOUS (false pressure):** `E`
+(`x=p; other(); return x`) generates the SAME 2-CREG code as `E2`
+(`x=p; return x`) plus a harmless `jal other` — NOTHING is live across
+the call (x lives in its objstore home). Yet pcc spills the FOR-EFFECT
+result of the `x=p` OREFST across the call (confirmed: storemod is invoked
+on the ASSIGN node, op 49). The OREFST pattern's `NCREG RDEST` leaves a
+phantom live CREG the allocator thinks must survive the call. So the real
+fix is to KILL the spurious spill (table.c OREFST result semantics /
+liveness), NOT to make capability spilling work — and that's a careful
+pcc-internals change with miscompilation risk to an OS-critical libc.
+
+## Bottom line for the next attempt
+Pick ONE and budget for Phase-4:
+1. **Compiler (preferred — no OS/API risk):** fix the spurious cross-call
+   OREFTY spill (false pressure from OREFST `NCREG RDEST` / the
+   store-for-effect leaving a live CREG). If that alone makes g2/E compile
+   at K=4, the whole register migration becomes unnecessary.
+2. **Register migration (K=6):** the full public-API contract change
+   above — convert every program + the contract doc + the asm demos.
+Re-run the K=4/5/6 experiment first to re-confirm thresholds (code drifts).
 
 ---
 
