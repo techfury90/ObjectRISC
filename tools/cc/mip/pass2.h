@@ -134,6 +134,7 @@ typedef unsigned int bittype; /* XXX - for basicblock */
 #define	TULONGLONG	0100000	/* unsigned long long */
 #define	TLDOUBLE	0200000	/* long double; exceeds 16 bit */
 #define	TFTN		0400000	/* function pointer; exceeds 16 bit */
+#define	TOREF		01000000 /* Object RISC: object-reference capability (OREFTY) */
 
 /* reclamation cookies */
 #define RNULL		0	/* clobber result */

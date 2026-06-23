@@ -675,6 +675,27 @@ struct optab table[] = {
 		"	jal CL\n"
 		"	nop\n", },
 
+/*
+ * Object RISC: calls returning an object-reference capability — the
+ * result comes back in O1 (CLASSC, RETREG(OREFTY)); allocate a CLASSC
+ * result (NCREG) that the allocator coalesces with O1.
+ */
+{ CALL,		INCREG,
+	SCON,	TANY,
+	SCREG,	TANY,
+		NCREG,	RESC1,
+		"	addiu sp, sp, -16\n"
+		"	jal CL\n"
+		"	nop\n"
+		"ZC", },
+
+{ UCALL,	INCREG,
+	SCON,	TANY,
+	SCREG,	TANY,
+		NCREG,	RESC1,
+		"	jal CL\n"
+		"	nop\n", },
+
 /* Indirect calls — target in a GPR, jalr it. */
 { CALL,		FOREFF,
 	SAREG,	TANY,

@@ -980,11 +980,13 @@ statement:	   e ';' { ecomp(eve($1)); symclear(blevel); }
 					    p->n_df, p->n_ap);
 					cftnod = tmpalloc(sizeof(P1ND));
 					*cftnod = *r;
-					/* Preserve return-type qualifiers
-					 * (Object RISC: __or/OREF needs to
-					 * route the temp through the OR
-					 * register file). */
-					cftnod->n_qual = p->n_qual;
+					/*
+					 * Object RISC: no qualifier patch needed.
+					 * An __or return type carries OBIT in
+					 * n_type, which tempnode copies — so the
+					 * return temp classes CLASSC by
+					 * construction (see mip/manifest.h OBIT).
+					 */
 					p1tfree(r);
 				}
 				ecomp(buildtree(ASSIGN,

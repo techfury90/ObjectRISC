@@ -1148,6 +1148,7 @@ talign(unsigned int ty, struct attr *apl)
 #ifdef GCC_COMPAT
 	case VOID: a = ALCHAR; break; /* GCC */
 #endif
+	case OREFTY: a = ALLONGLONG; break;	/* Object RISC: 64-bit capability */
 	case BOOL: a = ALBOOL; break;
 	case CHAR: a = ALCHAR; break;
 	case SHORT: a = ALSHORT; break;
@@ -1206,7 +1207,9 @@ tsize(TWORD ty, union dimfun *d, struct attr *apl)
 
 	if (ty == VOID)
 		ty = CHAR;
-	if (ty <= LDOUBLE)
+	if (ty == OREFTY)
+		sz = SZLONGLONG;	/* Object RISC: 64-bit capability */
+	else if (ty <= LDOUBLE)
 		sz = sztable[ty];
 	else if (ISSOU(ty)) {
 		if ((ap = strattr(apl)) == NULL ||
@@ -1315,6 +1318,22 @@ oalloc(struct symtab *p, int *poff )
 {
 	int al, off, tsz;
 	int noff;
+
+	/*
+	 * Object RISC: an object-reference capability (OREFTY) auto MUST
+	 * live in the OR register file — it cannot be given a byte-memory
+	 * stack home (the capability invariant). Promote it to a register
+	 * temp unconditionally (independent of xtemps); deltemp keeps OR
+	 * temps register-resident and the allocator colors them CLASSC.
+	 */
+	if (ISOREFT(p->stype) &&
+	    ((p->sclass == AUTO) || (p->sclass == REGISTER))) {
+		NODE *tn = tempnode(0, p->stype, p->sdf, p->sap);
+		p->soffset = regno(tn);
+		p->sflags |= STNODE;
+		nfree(tn);
+		return 0;
+	}
 
 	/*
 	 * Only generate tempnodes if we are optimizing,
@@ -2063,6 +2082,22 @@ tyreduce(NODE *p, union dimfun *df)
 		}
 		break;
 	case UMUL:
+		/*
+		 * Object RISC: `void *__or` (the __or qualifier on this
+		 * pointer level) is an object-reference capability, not a
+		 * byte pointer. Represent it as the OREFTY base type — which
+		 * rides n_type and survives INCREF/DECREF by construction
+		 * (BTYPE bits are never shifted), so OR-ness composes with
+		 * FTN/PTR/ARY and is invariant through node creation. Discard
+		 * the INCREF'd pointer form computed above and consume the
+		 * OREF qualifier so there is exactly one representation
+		 * downstream. (Referent type for OL/OS width + sizeof will
+		 * ride an ATTR; added with the deref support.)
+		 */
+		if (ISOREF(q)) {
+			t = OREFTY;
+			q &= ~OREF;
+		}
 		break;
 	default:
 		cerror("bad node %d\n", o);

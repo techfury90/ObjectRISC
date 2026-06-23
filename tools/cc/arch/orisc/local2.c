@@ -529,13 +529,17 @@ rmove(int s, int d, TWORD t)
 int
 gclass(TWORD t)
 {
+	/*
+	 * Object-reference pointers (OBIT set in the type word) live in
+	 * the OR file (CLASSC). Because OBIT rides n_type — preserved by
+	 * every node creator/copier — this classes return temps, param
+	 * temps and spill nodes CLASSC by construction, with no reliance
+	 * on the (creator-zeroed) qualifier word.
+	 */
+	if (ISOREFT(t))
+		return CLASSC;
 	if (t == LONGLONG || t == ULONGLONG)
 		return CLASSB;
-	/*
-	 * TODO: when `__or` qualifier lands, return CLASSC for
-	 * reference-typed pointers. For now everything else lives
-	 * in the GPR file.
-	 */
 	return CLASSA;
 }
 
