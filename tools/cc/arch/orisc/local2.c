@@ -36,10 +36,25 @@ static int regoff[32];
 static TWORD ftype;
 
 /*
- * Calculate stack frame size — sum of automatic-storage area plus
- * one slot per callee-preserved GPR that this function actually
- * uses. Returns the total in bytes, rounded up to 8-byte alignment
- * per Vol VII §2.2.
+ * Max outgoing-arg-spill bytes across all calls in the current
+ * function (set by funcode() in code.c during pass1, read here in
+ * pass2). moveargs() spills call args #5+ to OFFSET(sp), i.e. the
+ * bottom of our frame; we must reserve this many bytes there or the
+ * stores clobber locals / saved registers.
+ */
+int orisc_argszmax;
+
+/*
+ * Calculate stack frame size — automatic-storage area, one slot per
+ * callee-preserved GPR this function uses, plus the outgoing-arg
+ * spill area for the largest call. Returns the total in bytes,
+ * rounded up to 8-byte alignment per Vol VII §2.2.
+ *
+ * Layout below FP (high → low address): autos [0..p2maxautooff),
+ * then callee-preserved reg saves, then the outgoing-arg area at the
+ * very bottom (sp+0..). Autos and reg saves are addressed FP-relative
+ * so they're unaffected by the outgoing-arg reservation; growing the
+ * frame at the bottom simply moves sp down, keeping sp+OFFSET clear.
  */
 static int
 offcalc(struct interpass_prolog *ipp)
@@ -56,6 +71,13 @@ offcalc(struct interpass_prolog *ipp)
 	}
 
 	addto = (addto + 7) & ~7;
+
+	/* Reserve the outgoing-arg spill area at the bottom of the frame
+	 * (where moveargs' "sw AL, OFFSET(sp)" stores land). Without this
+	 * a function that both has locals and makes a 5+-arg call writes
+	 * its spilled args over its own locals. */
+	addto += (orisc_argszmax + 7) & ~7;
+
 	return addto;
 }
 
@@ -432,6 +454,18 @@ adrput(FILE *io, NODE *p)
 
 	case REG:
 		fputs(rnames[p->n_rval], io);
+		return;
+
+	case FUNARG:
+		/*
+		 * Outgoing stack argument (call arg #5+). moveargs() in
+		 * code.c stashed this arg's byte offset within the outgoing-
+		 * arg area in n_rval; the FUNARG template ("sw AL, AR(sp)")
+		 * references it via AR, which getlr() resolves to the FUNARG
+		 * node itself (it is UTYPE, so 'R' returns p). Emit the raw
+		 * offset so the store lands at OFFSET(sp).
+		 */
+		fprintf(io, "%d", p->n_rval);
 		return;
 
 	default:

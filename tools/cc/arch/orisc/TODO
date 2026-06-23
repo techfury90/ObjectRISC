@@ -3,6 +3,25 @@ Object RISC backend for pcc — work list
 Done
 ====
 
+- 5+-argument calls (the "4-arg ceiling"). Two bugs fixed together:
+    1. adrput (local2.c) had no FUNARG case, so the spill template
+       "sw AL, AR(sp)" — where AR resolves (via getlr on the UTYPE
+       FUNARG node) to the node itself — tripped "adrput: illegal
+       op 57". adrput now prints the FUNARG's n_rval (the byte
+       offset moveargs stashed there).
+    2. funcode (code.c) discarded the per-call outgoing-arg size
+       (`(void)stacksize`), so offcalc never reserved the outgoing-
+       arg area at the bottom of the frame. A function that both had
+       locals and made a 5+-arg call wrote its spilled args over its
+       own locals. funcode now tracks the max (orisc_argszmax, reset
+       per function in bfcode) and offcalc reserves it.
+  Verified by examples/cc/manyargs.c + tools/devices/tests/
+  test_manyargs.sh (5/6/7-arg calls, multiple spill-calls + locals
+  in one frame, nested spill-calls from a callee with locals), and
+  the full device smoke suite still passes (the frame change touches
+  every function's prologue).
+
+
 - Build wiring. configure.ac knows the orisc target (`orisc-*-*`
   with `targmach=orisc, targos=none, endian=big, abi=orx`).
   os/none/ccconfig.h emits `-D__orisc__ -D__OBJECT_RISC__` for
