@@ -31,6 +31,30 @@
 #define tfree p1tfree
 #endif
 
+/*
+ * Build the lvalue for an `__or` auto/param homed at byte offset `off`
+ * in the per-frame OBJSTORE (see macdefs.h). The home is reached two
+ * levels deep -- load the per-frame spill objstore's ref from the O12
+ * task-table anchor slot, then OREFLD/OREFST the capability at `off`
+ * within it -- emitted as a single OREG leaf whose table.c OREFLD/OREFST
+ * patterns expand the two-level sequence via zzzcode ('H' load / 'I'
+ * store). The OREG carries the home byte offset in its lval; its base
+ * register field is R0 (cosmetic: the zzzcode hard-codes the O12 anchor
+ * deref and never consults it, and R0 avoids the allocator seeing a
+ * live precolored CLASSC value at every home access). The OREFTY type
+ * keeps it clear of the byte lw/sw patterns.
+ */
+static NODE *
+oref_home(int off)
+{
+	NODE *p = block(OREG, NIL, NIL, OREFTY, 0, 0);
+
+	p->n_rval = R0;
+	slval(p, off);
+	p->n_name = "";
+	return p;
+}
+
 NODE *
 clocal(NODE *p)
 {
@@ -68,6 +92,19 @@ clocal(NODE *p)
 		switch (q->sclass) {
 		case PARAM:
 		case AUTO:
+			/*
+			 * An `__or` auto/param lives in the per-frame OBJSTORE
+			 * (its soffset is a byte offset there), not on the byte
+			 * stack — replace the NAME with the two-level OBJSTORE
+			 * access. bfcode/oalloc assign the home; the prologue
+			 * allocates the spill objstore and homes incoming params.
+			 */
+			if (ISOREFT(q->stype)) {
+				int off = q->soffset;
+				nfree(p);
+				p = oref_home(off);
+				break;
+			}
 			r = block(REG, NIL, NIL, PTR+STRTY, 0, 0);
 			slval(r, 0);
 			r->n_rval = FP;
@@ -85,6 +122,28 @@ clocal(NODE *p)
 			p->n_rval = q->soffset;
 			break;
 		}
+		break;
+
+	case ASSIGN:
+		/*
+		 * Storing a capability *call result* straight into an `__or`
+		 * home is the one OBJSTORE-memory case the v1 lowering can't yet
+		 * handle: the OREFST needs a base scratch O-reg (the O12 anchor
+		 * deref), but the call clobbers every caller-saved O-reg, and the
+		 * 4-register OR file leaves the result interfering with all its
+		 * sibling clobbers -- so the allocator spills the (capability)
+		 * result, which is impossible for an OR. The real fix is callee-
+		 * saved CLASSC registers (saved via this same per-frame OBJSTORE);
+		 * until then, fail loudly with a workaround rather than emit
+		 * broken code. (Every other form -- param/local load, null, a
+		 * non-call value -- stores fine.)
+		 */
+		if (p->n_left->n_op == OREG && ISOREFT(p->n_left->n_type) &&
+		    (p->n_right->n_op == CALL || p->n_right->n_op == UCALL))
+			uerror("storing an __or call result into a local/param is "
+			    "not yet supported; capture the call result in a "
+			    "separate __or variable passed by the caller, or use "
+			    "inline asm (v1 OBJSTORE-spill limit)");
 		break;
 
 	case FORCE:

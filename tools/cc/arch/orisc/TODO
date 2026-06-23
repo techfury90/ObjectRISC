@@ -54,11 +54,70 @@ Done
   Still pending (breadth, follow-ups):
     - native deref `*p` → OL/OS, needs a referent-type ATTR for the
       load/store width (today typed access is via intrinsics, Phase 2).
-    - OBJSTORE-backed OR spill (OREFLD/OREFST) when OR register
-      pressure exceeds the file; today OR temps/autos are register-only.
     - capability type-checks: reject __or<->int* casts, pointer
       arithmetic, and address-of of an __or lvalue (uerror).
     - indirect (function-pointer) calls returning an OR.
+
+- `__or` autos/params as per-frame OBJSTORE-memory variables (Phase 2,
+  the OR-spill mechanism). A capability used after a call cannot stay in
+  the OR file — every O-register is caller-saved and a call clobbers
+  them all — so each `__or` auto/param is HOMED in a per-frame OR-typed
+  OBJSTORE and reloaded into an O-register transiently per use.
+
+  Pieces:
+    - macdefs.h: O5..O15 marked non-allocatable in RSTATUS (latent-bug
+      fix: under CLASSC pressure the allocator could otherwise colour a
+      libc-global O-reg — allocating O12 would destroy the task table).
+      Only O1..O4 are compiler CLASSC scratch; COLORMAP CLASSC → num<4.
+      Constants ORSPILL_ANCHOR / _TAG / _CAPS / _BASE.
+    - pftn.c oalloc + code.c bfcode: `__or` autos and params get an
+      OBJSTORE byte-offset home (slot 0 = recursion chain link, homes
+      from ORSPILL_BASE), tracked in the pass1→pass2 globals
+      orisc_orhome / orisc_orparam_cnt. v1 caps `__or` params at 3.
+    - local.c clocal: an `__or` auto/param NAME lowers to a single OREG
+      leaf (oref_home); table.c OPLTYPE/ASSIGN OREFTY patterns expand
+      the two-level access via zzzcode 'H' (load) / 'I' (store):
+        orefld t, ORSPILL_ANCHOR(o12) ; t = this frame's spill objstore
+        orefld/orefst v, off(t)        ; the home
+    - local2.c prologue/eoftn: if the function homes any `__or`, the
+      prologue ObjAllocStore's the per-frame spill objstore, stores the
+      incoming `__or` params (preserving param1 across the alloc, which
+      lands its result in O1), and chains onto the enclosing frame via
+      the O12 anchor slot; the epilogue unchains and ObjFree's it,
+      protecting the return value (O1 for an OR return, R2/R3 saved to a
+      reserved frame slot otherwise) across the firmware call.
+    - tools/cc/lib/task.c: reserves the 8-byte OR_SPILL_ANCHOR slot at
+      O12 byte offset 1696 (== macdefs.h ORSPILL_ANCHOR); ORX_STATE_BYTES
+      bumped 1568→1576. NO simulator changes (ObjAllocStore / OREFLD /
+      OREFST / ObjFree already exist; the 0x121/0x122 firmware spill
+      primitives stay deprecated/unbuilt).
+
+  Verified: examples/cc/oref_spill.c runs (a capability param survives a
+  call that nulls O1..O4; exit 42) via test_oref_spill.sh; oref_calls.c
+  still passes (now exercising param + non-call-store homing); full
+  device smoke suite unaffected (the OS uses no `__or` autos yet, so
+  orisc_orhome stays at ORSPILL_BASE and no objstore is allocated).
+
+  KNOWN v1 LIMITATION — storing a capability CALL RESULT into an `__or`
+  home (`void *__or o = obj_alloc(...);`) is rejected with a clear
+  uerror ("storing an __or call result ... not yet supported"). Root
+  cause: the OREFST needs a base scratch O-reg (the O12 anchor deref),
+  but the call clobbers every caller-saved O-reg and, with only 4 ORs in
+  the file, the call result interferes with all its sibling clobbers
+  (regs.c addalledges over livecall) → the allocator tries to spill the
+  capability result to byte memory, which is impossible. Both attempted
+  lowerings hit this: a zzzcode-hidden base scratch gets coalesced with
+  the value; an explicit-temp base (COMOP) regresses because comops()
+  doesn't cleanly split RHS COMOPs (loads/returns). The proper fix is
+  CALLEE-SAVED CLASSC registers (e.g. O9..O12 reclaimed), saved/restored
+  in the prologue/epilogue through this same per-frame OBJSTORE: that
+  enlarges the colourable OR set so the result + a post-call scratch fit
+  without spilling, and lets a value genuinely live across a call. Until
+  then, callers capture allocations via inline asm or receive the ref as
+  a parameter. (A targeted regs.c change — not LIVEADD-ing the call
+  clobbers into each other so the result doesn't interfere with its
+  siblings — was tried and reverted: it didn't resolve it alone and is
+  shared-mip risk.)
 
 - 5+-argument calls (the "4-arg ceiling"). Two bugs fixed together:
     1. adrput (local2.c) had no FUNARG case, so the spill template

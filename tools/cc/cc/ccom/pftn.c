@@ -1320,18 +1320,23 @@ oalloc(struct symtab *p, int *poff )
 	int noff;
 
 	/*
-	 * Object RISC: an object-reference capability (OREFTY) auto MUST
-	 * live in the OR register file — it cannot be given a byte-memory
-	 * stack home (the capability invariant). Promote it to a register
-	 * temp unconditionally (independent of xtemps); deltemp keeps OR
-	 * temps register-resident and the allocator colors them CLASSC.
+	 * Object RISC: an object-reference capability (OREFTY) auto cannot
+	 * be given a byte-memory stack home (the capability invariant), and
+	 * keeping it in a CLASSC register across a call is impossible (ORs
+	 * are all caller-saved with no byte spill). So it lives in the
+	 * per-frame OBJSTORE: assign it a byte-offset home there (slot 0 is
+	 * the recursion chain link, homes start at ORSPILL_BASE) and route
+	 * body references through clocal's OBJSTORE access, loading it into
+	 * an O-register transiently per use. orisc_orhome is the backend's
+	 * per-function high-water mark (arch/orisc/local2.c); the prologue
+	 * allocs the objstore and the epilogue frees it.
 	 */
 	if (ISOREFT(p->stype) &&
 	    ((p->sclass == AUTO) || (p->sclass == REGISTER))) {
-		NODE *tn = tempnode(0, p->stype, p->sdf, p->sap);
-		p->soffset = regno(tn);
-		p->sflags |= STNODE;
-		nfree(tn);
+		extern int orisc_orhome;	/* arch/orisc/local2.c */
+		p->sclass = AUTO;		/* memory-resident, not a temp */
+		p->soffset = orisc_orhome;	/* per-frame OBJSTORE byte offset */
+		orisc_orhome += SZLONGLONG / SZCHAR;
 		return 0;
 	}
 
