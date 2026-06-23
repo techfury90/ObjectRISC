@@ -159,6 +159,28 @@ void grid_print(int col, int row, const char *s);
 void grid_print_n(int col, int row, const char *buf, int count);
 void grid_clear(void);
 
+/* ---- menu.c — reusable modal pop-up menu ------------------------
+ *
+ * menu_run draws a vertical list of `n` items at grid cell (col,
+ * row), then blocks until the user picks one or cancels.  Mirrors
+ * the WM desktop root menu's model: mouse motion highlights, left-
+ * click selects, click-outside or Esc cancels; arrow keys + Enter
+ * also work.  The selected row is marked "> " (grid text carries no
+ * color, so no inverse-video bar).
+ *
+ * `items` is a flat buffer of n NUL-terminated strings end to end,
+ * e.g.  static const char items[] = "Red\0Green\0Blue\0Quit";
+ * (the array-of-pointers shape trips a pcc-orisc codegen bug — see
+ * menu.c).
+ *
+ * Returns the chosen index [0, n), or -1 on cancel.  Does not
+ * restore the cells it drew over — repaint after it returns.
+ *
+ * Needs term_init (keyboard + grid).  For mouse control also do
+ * pointer_init_from_dir_result + pointer_subscribe; without a
+ * subscription the menu is keyboard-only. */
+int  menu_run(int col, int row, const char *items, int n);
+
 /* ---- vec.c — WM-mediated vector graphics client (Phase 59 / WM γ.11) ----
  *
  * Pixel-space line / rect / oval rasterisation through the window
@@ -288,12 +310,22 @@ int  pointer_subscribe(void);
 int  pointer_unsubscribe(void);
 int  pointer_getevent(int *evt_type, int *packed_xy,
                        int *button, int *btn_state);
+/* pointer_subscribed: 1 if pointer_subscribe has run and the event
+ * mailbox is live, 0 otherwise. Lets helpers (menu_run) decide
+ * whether the mouse is available before polling it. */
+int  pointer_subscribed(void);
 
 /* term_getkey: blocks until the next keystroke arrives. Returns
  * the codepoint (ASCII for printable, ≥0x100 for special — see
  * KEY_* in tools/devices/oriscterm). Modifier mask written to
  * *out_mods (NULL OK to ignore). */
 int  term_getkey(int *out_mods);
+
+/* term_pollkey: non-blocking peek. Returns 0 and fills *out_code /
+ * *out_mods (either may be NULL) if a keystroke is waiting, -1 if
+ * none. For event loops that interleave keyboard with pointer/timer
+ * work (mouse_paint, menu_run). term_init must have run. */
+int  term_pollkey(int *out_code, int *out_mods);
 
 /* Special-key codepoints (mirrored from oriscterm). */
 #define TK_BACKSPACE 0x108

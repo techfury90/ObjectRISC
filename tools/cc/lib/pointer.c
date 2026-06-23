@@ -132,6 +132,18 @@ pointer_subscribe(void)
 	return 0;
 }
 
+/* True (1) if pointer_subscribe has run and our event mailbox (O10)
+ * is live, 0 otherwise.  menu_run uses this to decide whether it can
+ * poll the mouse — a program that never subscribed gets a keyboard-
+ * only menu instead of a poll on a null mailbox. */
+int
+pointer_subscribed(void)
+{
+	int isn;
+	asm volatile("oisn %0, o10" : "=r"(isn));
+	return !isn;
+}
+
 int
 pointer_unsubscribe(void)
 {
