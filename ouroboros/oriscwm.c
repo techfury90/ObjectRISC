@@ -602,15 +602,17 @@ static int           drag_start_x, drag_start_y;
 static int           drag_window_x, drag_window_y;
 static int           drag_outline_x, drag_outline_y;
 
-/* Phase 60 step 8 — title bar text storage.  Single buffer for v1
- * (one title overwrites another at wm_set_title time, regardless of
- * which window receives it); per-wid title strings would need a
- * (16 × MAX_TITLE_LEN) array — punt until programs actually want
- * distinct titles per window.  Lives in the data segment so the WM
- * can pass O3 = boot data (O15) to ObjBlitGlyphs without copying to
- * the stack.  Initialised empty; wm_set_title overwrites + repaints. */
-static unsigned char window_title[MAX_TITLE_LEN];
-static int           window_title_len;
+/* Phase 60 step 8 / step 22 — per-window title bar text storage.
+ * Was a single shared buffer through step 21; step 22 added title-bar
+ * repaints on focus change (set_focus / refocus_to_topmost), which
+ * re-blit the stored title — so a shared buffer painted the LAST
+ * wm_set_title's text onto whichever window got focus next (visible
+ * bug: closing a window stamped its title onto the new top window).
+ * Per-wid storage fixes it: each window keeps its own title and
+ * repaints reproduce it faithfully.  Lives in the data segment so
+ * win_blit_glyph_row can reach it via O15 (boot data ref). */
+static unsigned char window_titles[MAX_WINDOWS][MAX_TITLE_LEN];
+static int           window_title_lens[MAX_WINDOWS];
 
 /* Phase 60 step 19 — desktop root menu.  Old-school X11 style: right-
  * click on empty desktop summons a vertical list of program entries,
@@ -1438,9 +1440,11 @@ paint_title_bar(void)
 	fill_rect_window(bar_xy, bar_wh, bar_bg);
 
 	/* Centre the title within the cells left of the close box so the
-	 * two never overlap. */
+	 * two never overlap.  Title comes from the ACTIVE window's own
+	 * slot (per-wid since step 22). */
 	int title_cells = N_COLS - CLOSE_BOX_CELLS;
-	int n = window_title_len;
+	int n = (active_wid >= 1 && active_wid <= MAX_WINDOWS)
+	      ? window_title_lens[active_wid - 1] : 0;
 	if (n > title_cells) n = title_cells;
 	if (n > 0) {
 		int start_col = (title_cells - n) / 2 + TITLE_CELL_X_OFF;
@@ -1449,7 +1453,8 @@ paint_title_bar(void)
 		int packed_shape = ((n & 0xFFFF) << 16)
 		                 | ((WM_TITLE_TEXT_FG & 0xFF) << 8)
 		                 | (bar_bg & 0xFF);
-		win_blit_glyph_row(packed_xy, window_title, packed_shape);
+		win_blit_glyph_row(packed_xy, window_titles[active_wid - 1],
+		                   packed_shape);
 	}
 
 	/* Close box "[X]" in the rightmost CLOSE_BOX_CELLS cells. */
@@ -2352,8 +2357,9 @@ handle_new_window(int wtype)
 	/* Phase 60 step 8 — paint the title bar so the window is visibly
 	 * framed from creation.  Title is initially empty; the client
 	 * (typically the shell or the spawning supervisor) wm_set_title's
-	 * to fill it in. */
-	window_title_len = 0;
+	 * to fill it in.  Reset this wid's title slot in case the id was
+	 * recycled from a destroyed window. */
+	window_title_lens[wid - 1] = 0;
 	paint_title_bar();
 
 	/* Phase 60 step 13 — composite the full window onto the screen
@@ -2791,11 +2797,11 @@ handle_destroy_window(int wid)
  *   R6 = packed (len:high16, src_off:low16)
  *   O2 = source ref containing the title bytes
  *
- * ObjFetchBytes the bytes into window_title[], repaint the title bar,
- * reply with status.  Same source-ref stash dance as
- * forward_console_write — pcc-orisc may spill R4..R6 to stack across
- * a function-call boundary but OPRs survive, so O2 is still the
- * caller's source ref at handler entry. */
+ * ObjFetchBytes the bytes into the target wid's window_titles[] slot,
+ * repaint the title bar, reply with status.  Same source-ref stash
+ * dance as forward_console_write — pcc-orisc may spill R4..R6 to
+ * stack across a function-call boundary but OPRs survive, so O2 is
+ * still the caller's source ref at handler entry. */
 static void
 handle_set_title(int wid, int packed_len_off)
 {
@@ -2831,8 +2837,8 @@ handle_set_title(int wid, int packed_len_off)
 		 * ObjFetchBytes checks ref caps, not mapping perms).  So we
 		 * fetch into a stack-local buffer first (boot stack O11 has
 		 * CAP_W at the ref level), then memcpy through the data
-		 * mapping's W bit into the persistent window_title.  Same
-		 * trick forward_console_write uses. */
+		 * mapping's W bit into the persistent window_titles slot.
+		 * Same trick forward_console_write uses. */
 		unsigned char fetch_buf[MAX_TITLE_LEN];
 		int dst_off = (int)((unsigned int)fetch_buf - STACK_BOTTOM);
 		int fetch_status;
@@ -2860,9 +2866,9 @@ handle_set_title(int wid, int packed_len_off)
 		}
 		int i;
 		for (i = 0; i < len; i++)
-			window_title[i] = fetch_buf[i];
+			window_titles[wid - 1][i] = fetch_buf[i];
 	}
-	window_title_len = len;
+	window_title_lens[wid - 1] = len;
 	set_active_window(wid);
 	paint_title_bar();
 	wm_reply(0, 0, 0, 0);
