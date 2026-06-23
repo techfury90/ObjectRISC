@@ -253,7 +253,11 @@
  *   sits at the old end of the allocation (TABLE_BYTES + 1568 = 1696),
  *   guaranteed clear of every libc slot above.  Starts null from
  *   task_init's zero-init objstore = "no enclosing spill frame".) */
-#define ORX_STATE_BYTES   1576	/* 1568 libc + 8 compiler OR-spill anchor */
+/* 1568 libc + 8 compiler OR-spill anchor + 64 obj.c handle table (8
+ * 8-byte capability slots at byte offset 1704 = OBJ_TABLE_OFFSET in
+ * obj.h, just past the anchor at 1696; obj.c stores capabilities there
+ * so handle-based code needn't hold an `__or` value across a call). */
+#define ORX_STATE_BYTES   1640
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
 
 /* Compiler-owned OR-spill anchor slot (see macdefs.h ORSPILL_ANCHOR). */
