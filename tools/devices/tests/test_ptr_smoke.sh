@@ -64,35 +64,17 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# --- launch fake terminal at pid 16 with pointer event sequence ----
-# 5 events: motion, down (LMB), motion, up (LMB), motion.
-# --delay 1.0 gives smoke ~1s after the WM subscribes before the
-# first event fires; combined with the WM's defer-until-subscriber
-# poll behaviour, smoke catches all 5.
-python3 tools/devices/tests/fake_terminal.py \
-    --socket "$SOCK" --pid 16 \
-    --directory-pid 18 --instance 0 \
-    --delay 1.0 --linger 5.0 \
-    --event motion:100,150 \
-    --event down:100,150,1 \
-    --event motion:120,170 \
-    --event up:120,170,1 \
-    --event motion:200,200 \
-    > "$TMP/term.out" 2>&1 &
-TERM_PID=$!
-for _ in $(seq 50); do
-    grep -q "fake_terminal READY" "$TMP/term.out" 2>/dev/null && break
-    sleep 0.05
-done
-
-# --- launch the WM CPU at pid 0 ------------------------------------
+# --- launch the WM CPU at pid 0 (owns the pointer sink locally) ----
+# Post-Phase-60 the WM owns its pointer sink (TAG_INPUT_SINK via
+# #0x10B); nothing is published under /sys/term/0.  init-r4=1 →
+# terminal index 0 (matches scripts/boot.sh).
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
     --service "0=0@0" --service "0=0@0" --service "0=0@0" \
-    --service "18=1@9" \
+    --service "18=1@9" --init-r4 1 \
     "$TMP/oriscwm.orx" >"$TMP/wm.out" 2>"$TMP/wm.err" &
 WM_CPU=$!
 
-for _ in $(seq 100); do
+for _ in $(seq 200); do
     grep -q "oriscwm: ready" "$TMP/wm.out" 2>/dev/null && break
     sleep 0.05
 done
@@ -103,6 +85,27 @@ python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
     --service "18=1@9" \
     "$TMP/ptr_smoke.orx" >"$TMP/cpu.out" 2>"$TMP/cpu.err" &
 CPU=$!
+
+# Wait until ptr_smoke has subscribed to the WM pointer surface, then
+# inject the pointer event sequence into the WM CPU's pointer sink
+# (--inject-cpu 0) via PKT_HOST_INPUT — byte-identical to live mouse
+# input from simorisc's Tk display worker.  Inject only after the
+# subscribe so the WM has a subscriber to forward the events to.
+for _ in $(seq 300); do
+    grep -q "ptr_smoke: subscribed" "$TMP/cpu.out" 2>/dev/null && break
+    kill -0 $CPU 2>/dev/null || break
+    sleep 0.1
+done
+python3 tools/devices/tests/fake_terminal.py \
+    --socket "$SOCK" --pid 16 --inject-cpu 0 \
+    --delay 0.3 --linger 2.0 \
+    --event motion:100,150 \
+    --event down:100,150,1 \
+    --event motion:120,170 \
+    --event up:120,170,1 \
+    --event motion:200,200 \
+    > "$TMP/term.out" 2>&1 &
+TERM_PID=$!
 
 wait $CPU 2>/dev/null || true
 CPU_RC=$?

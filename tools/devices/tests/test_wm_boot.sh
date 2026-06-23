@@ -102,13 +102,52 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# --- launch fake_terminal at pid 16 (drives the shell session) -----
+# --- launch oriscwm at CPU 2 (the terminal: owns FB + input sinks) --
+# Boot ABI: O8 = oriscdir cap.  Post-Phase-60 step 3 the WM owns its
+# framebuffer + keyboard/pointer sinks locally (TAG_INPUT_SINK via
+# #0x10B) and registers itself at /sys/wm/0 — there is NO separate
+# terminal device, and nothing is published under /sys/term/0.
+# init-r4=1 → terminal index 0 (matches scripts/boot.sh).
+python3 tools/sim/simorisc --connect "$SOCK" --pid 2 \
+    --service "0=0@0" --service "0=0@0" --service "0=0@0" \
+    --service "18=1@9" --init-r4 1 \
+    "$ROOT/build/oriscwm.orx" >"$TMP/wm.out" 2>"$TMP/wm.err" &
+WM_CPU=$!
+for _ in $(seq 200); do
+    grep -q "oriscwm: ready" "$TMP/wm.out" 2>/dev/null && break
+    sleep 0.05
+done
+
+# --- launch supervisor on CPU 0 (leader) ---------------------------
+# Standard boot OPRs: O8 = oriscdir, O9/O10 = pads.  Its /sys/term/0
+# walk fails (no terminal device) and it falls back to wm_init at
+# /sys/wm/0 — exactly as a real `make boot` leader does.
+python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
+    --service "0=0@0" --service "0=0@0" --service "0=0@0" \
+    --service "18=1@9" --service "0=0@0" --service "0=0@0" \
+    "$ROOT/build/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
+CPU0=$!
+
+# Wait for the leader session to reach the login prompt.  By then
+# login's term_init has subscribed to the WM keyboard surface, so an
+# injected keystroke gets forwarded to it.
+for _ in $(seq 300); do
+    grep -q "login: top of loop" "$TMP/cpu0.out" 2>/dev/null && break
+    kill -0 $CPU0 2>/dev/null || break
+    sleep 0.1
+done
+
+# --- drive the session via host-input injection --------------------
+# The WM owns the keyboard sink locally; nobody subscribes to a
+# terminal keyboard, so fake_terminal --inject-cpu 2 drops each key
+# straight into CPU 2's sink via PKT_HOST_INPUT — byte-identical to a
+# live keystroke from simorisc's Tk display worker.
 # Sequence: <RET> (dismiss login welcome) → run /programs/hello.orx
-# <RET> → exit <RET>
+# <RET> → exit <RET>.
 python3 tools/devices/tests/fake_terminal.py \
-    --socket "$SOCK" --pid 16 \
-    --directory-pid 18 --instance 0 \
+    --socket "$SOCK" --pid 16 --inject-cpu 2 \
     --event key:0x10D \
+    --event sleep:10 \
     --event key:r --event key:u --event key:n --event key:0x20 \
     --event key:0x2f \
     --event key:p --event key:r --event key:o --event key:g \
@@ -117,49 +156,26 @@ python3 tools/devices/tests/fake_terminal.py \
     --event key:h --event key:e --event key:l --event key:l --event key:o \
     --event key:0x2e --event key:o --event key:r --event key:x \
     --event key:0x10D \
+    --event sleep:6 \
     --event key:e --event key:x --event key:i --event key:t \
     --event key:0x10D \
-    --linger 12.0 --delay 0.20 \
+    --linger 4.0 --delay 0.20 \
     > "$TMP/term.out" 2>&1 &
 TERM_PID=$!
-for _ in $(seq 50); do
-    grep -q "fake_terminal READY" "$TMP/term.out" 2>/dev/null && break
-    sleep 0.05
-done
 
-# --- launch oriscwm at CPU 2 ---------------------------------------
-# Boot ABI: O8 = oriscdir cap (the WM walks /sys/term/0/{console,
-# keyboard} via dir_walk and registers itself at /sys/wm/0).
-python3 tools/sim/simorisc --connect "$SOCK" --pid 2 \
-    --service "0=0@0" --service "0=0@0" --service "0=0@0" \
-    --service "18=1@9" \
-    "$ROOT/build/oriscwm.orx" >"$TMP/wm.out" 2>"$TMP/wm.err" &
-WM_CPU=$!
-for _ in $(seq 100); do
-    grep -q "oriscwm: ready" "$TMP/wm.out" 2>/dev/null && break
-    sleep 0.05
-done
-
-# --- launch supervisor on CPU 0 (leader) ---------------------------
-# Standard boot OPRs: O5/O6/O7 unused (filled by dir-walks), O8 =
-# oriscdir, O9/O10 = pads.
-python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "0=0@0" --service "0=0@0" --service "0=0@0" \
-    --service "18=1@9" --service "0=0@0" --service "0=0@0" \
-    "$ROOT/build/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
-CPU0=$!
-
-# Test sequence: fake_terminal types `run /programs/hello.orx<RET>`
-# then `exit<RET>`.  We wait for fake_terminal to finish typing,
-# then for the supervisor to halt (op=2 SEND from the shell's
-# `exit`).
+# Wait for injection to finish, then for the supervisor to halt via the
+# shell's `exit` (op=2 SEND).  Bounded — in --connect mode simorisc runs
+# unbounded (no --max-cycles), so a missed halt must become a fast
+# assertion failure below, not an infinite hang.
 wait $TERM_PID 2>/dev/null || true
-sleep 0.5
-wait $CPU0 2>/dev/null || true
+for _ in $(seq 150); do
+    kill -0 $CPU0 2>/dev/null || break
+    sleep 0.1
+done
 
 # Cleanup.
-kill -KILL $WM_CPU $HF $DIR $BAR 2>/dev/null || true
-wait $WM_CPU $HF $DIR $BAR 2>/dev/null || true
+kill -KILL $CPU0 $WM_CPU $HF $DIR $BAR 2>/dev/null || true
+wait $CPU0 $WM_CPU $HF $DIR $BAR 2>/dev/null || true
 
 echo "--- cpu0 (supervisor) stdout ---"
 cat "$TMP/cpu0.out"
