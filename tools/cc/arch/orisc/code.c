@@ -35,6 +35,15 @@ extern void flush_charbuf(void);	/* in local.c */
 extern int orisc_argszmax;
 
 /*
+ * Per-frame OBJSTORE OR-spill state (defined in local2.c). orisc_orhome
+ * is the spill objstore high-water mark in bytes (ORSPILL_BASE = just
+ * the chain slot, i.e. no `__or` homes); orisc_orparam_cnt counts the
+ * `__or` parameters the prologue must store to their homes.
+ */
+extern int orisc_orhome;
+extern int orisc_orparam_cnt;
+
+/*
  * Print the assembler segment directive corresponding to a pcc
  * section enum. Asmorisc supports `.text`, `.data`, and the related
  * directives in CONTRACT.md §4.2 — no .rodata / PIC / TLS / CTORS
@@ -149,6 +158,13 @@ bfcode(struct symtab **sp, int cnt)
 	 * reserves it in the frame. */
 	orisc_argszmax = 0;
 
+	/* Reset the per-frame OR-spill high-water mark. Slot 0 of the spill
+	 * objstore is the recursion chain link, so `__or` homes start at
+	 * ORSPILL_BASE; the per-function counter advances from there as
+	 * `__or` params (below) and autos (oalloc) are homed. */
+	orisc_orhome = ORSPILL_BASE;
+	orisc_orparam_cnt = 0;
+
 	/* Hidden struct-return arg occupies R4 if present. */
 	if (cftnsp->stype == STRTY+FTN || cftnsp->stype == UNIONTY+FTN) {
 		cerror("struct return not yet implemented for orisc");
@@ -179,22 +195,29 @@ bfcode(struct symtab **sp, int cnt)
 				break;
 
 			default:
-				if (ISOREFT(sym->stype) && opr <= O4) {
-					/* `__or` parameter (OBIT in the type
-					 * word) — arg arrived in O[opr]. Bind
-					 * the symtab entry directly to that
-					 * physical OR slot, the same way
-					 * `register __or T *p __asm__("oN")`
-					 * does for explicit declarations. No
-					 * tempnode, no ASSIGN — body NAME
-					 * references resolve via clocal's
-					 * REGISTER case straight to the OR slot.
-					 * (SINREG is defined in ccom/pass1.h and
-					 * aliased to SLOCAL1 in cxxcom/pass1.h
-					 * so this file builds for both.) */
-					sym->sclass = REGISTER;
-					sym->sflags |= SINREG;
-					sym->soffset = opr++;
+				if (ISOREFT(sym->stype)) {
+					/*
+					 * `__or` parameter. Homed in the per-frame
+					 * OBJSTORE (memory-resident model) rather
+					 * than register-bound, so it survives a
+					 * call: assign an objstore byte-offset home
+					 * and let clocal route body NAME references
+					 * through the OBJSTORE access; the prologue
+					 * stores the incoming O[opr] arg reg into
+					 * this home. v1 caps __or params at 3
+					 * (O1..O3): the prologue preserves param1
+					 * across the spill ObjAllocStore in O<cnt+1>,
+					 * so O4 is reserved as scratch.
+					 */
+					if (opr > O3)
+						cerror("more than three __or parameters"
+						    " not yet supported (v1 OBJSTORE"
+						    " spill limit)");
+					sym->sclass = AUTO;
+					sym->soffset = orisc_orhome;
+					orisc_orhome += SZLONGLONG / SZCHAR;
+					orisc_orparam_cnt++;
+					opr++;
 				} else if (!ISOREFT(sym->stype) && gpr <= R7) {
 					q = block(REG, NIL, NIL, sym->stype,
 					    sym->sdf, sym->sap);

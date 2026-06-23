@@ -45,6 +45,32 @@ static TWORD ftype;
 int orisc_argszmax;
 
 /*
+ * Per-frame OBJSTORE OR-spill state, communicated pass1 -> pass2 the
+ * same way as orisc_argszmax (file-scope globals; ccom runs a function
+ * fully through pass1 then pass2 before the next, so a value set in
+ * bfcode/oalloc/funcode survives into prologue/eoftn).
+ *
+ *   orisc_orhome      — high-water mark, in bytes, of the per-frame
+ *                       spill objstore. Slot 0 (offset 0) is the
+ *                       recursion chain link; `__or` homes occupy
+ *                       ORSPILL_BASE.. . Reset to ORSPILL_BASE in
+ *                       bfcode, bumped as `__or` autos (oalloc) and
+ *                       params (bfcode) are homed. If it ends >
+ *                       ORSPILL_BASE the function needs a spill object
+ *                       (prologue allocs / epilogue frees).
+ *   orisc_orparam_cnt — number of `__or` parameters, homed in arg regs
+ *                       O1..O<cnt> at entry; the prologue stores them to
+ *                       their byte-offset homes (ORSPILL_BASE + i*8).
+ */
+int orisc_orhome;
+int orisc_orparam_cnt;
+
+/* FP-relative byte offset of the 8-byte scalar-return save slot the
+ * epilogue uses to protect R2/R3 across the teardown ObjFree (set by
+ * offcalc when a spill objstore is present). */
+static int orisc_rvsaveoff;
+
+/*
  * Calculate stack frame size — automatic-storage area, one slot per
  * callee-preserved GPR this function uses, plus the outgoing-arg
  * spill area for the largest call. Returns the total in bytes,
@@ -62,6 +88,16 @@ offcalc(struct interpass_prolog *ipp)
 	int i, j, addto;
 
 	addto = p2maxautooff;
+
+	/* When the function has a per-frame OR-spill objstore, reserve an
+	 * 8-byte slot for the epilogue to stash R2/R3 across the teardown
+	 * ObjFree (which clobbers R2). Placed just below the autos so its
+	 * FP-relative offset is stable across the two offcalc calls. */
+	if (orisc_orhome > ORSPILL_BASE) {
+		addto = (addto + 7) & ~7;
+		addto += 8;
+		orisc_rvsaveoff = addto;	/* save at -orisc_rvsaveoff(fp) */
+	}
 
 	for (i = p2env.p_regs[0], j = 0; i; i >>= 1, j++) {
 		if (i & 1) {
@@ -130,6 +166,43 @@ prologue(struct interpass_prolog *ipp)
 		if (i & 1)
 			printf("\tsw r%d, -%d(fp) ; save callee-preserved\n",
 			    j, regoff[j]);
+
+	/*
+	 * Per-frame OBJSTORE for `__or` autos/params that must survive a
+	 * call (see macdefs.h). Allocate an OR-typed object sized to the
+	 * spill high-water mark, store the incoming `__or` params into
+	 * their homes, and chain this frame onto the enclosing one via the
+	 * O12 anchor slot (slot 0 = parent ref) for recursion safety.
+	 *
+	 * The ObjAllocStore result lands in O1, clobbering `__or` param 1;
+	 * we move it to the first free arg reg O<cnt+1> first (cnt<=3, so
+	 * O<cnt+1> is a real, unreserved arg reg). cnt==4 is rejected in
+	 * bfcode.
+	 */
+	if (orisc_orhome > ORSPILL_BASE) {
+		int k = orisc_orparam_cnt;
+
+		if (k >= 1)
+			printf("\tomov o%d, o1\t; preserve __or param1 across alloc\n",
+			    k + 1);
+		printf("\taddiu r4, r0, %d\t; per-frame OR-spill size\n",
+		    orisc_orhome);
+		printf("\taddiu r5, r0, %d\n", ORSPILL_TAG);
+		printf("\taddiu r6, r0, %d\n", ORSPILL_CAPS);
+		printf("\tcall #0x106\t; ObjAllocStore -> o1 (firmware trap)\n");
+		printf("\tnop\n");
+		if (k >= 1)
+			printf("\torefst o%d, %d(o1)\t; home __or param1\n",
+			    k + 1, ORSPILL_BASE);
+		for (j = 2; j <= k; j++)
+			printf("\torefst o%d, %d(o1)\t; home __or param%d\n",
+			    j, ORSPILL_BASE + (j - 1) * 8, j);
+		printf("\torefld o2, %d(o12)\t; enclosing spill frame\n",
+		    ORSPILL_ANCHOR);
+		printf("\torefst o2, 0(o1)\t; chain link\n");
+		printf("\torefst o1, %d(o12)\t; publish this spill frame\n",
+		    ORSPILL_ANCHOR);
+	}
 }
 
 /*
@@ -156,6 +229,39 @@ eoftn(struct interpass_prolog *ipp)
 
 	if (ipp->ipp_ip.ip_lbl == 0)
 		return;	/* no code generated */
+
+	/*
+	 * Tear down the per-frame OR-spill objstore: unchain (restore the
+	 * enclosing frame into the O12 anchor) and ObjFree it. ObjFree
+	 * takes its arg in O1 and writes status to R2, so the return value
+	 * must be protected across it: an `__or` return (in O1) is parked
+	 * in O4; a scalar return (R2, or R2:R3 for longlong) is saved to
+	 * the byte frame. Runs while FP/SP are still set up, before the
+	 * frame is unwound below.
+	 */
+	if (orisc_orhome > ORSPILL_BASE) {
+		TWORD rt = DECREF(ipp->ipp_type);	/* function ret type */
+
+		if (ISOREFT(rt))
+			printf("\tomov o4, o1\t; protect __or return across ObjFree\n");
+		else {
+			printf("\tsw r2, -%d(fp)\t; protect scalar return\n",
+			    orisc_rvsaveoff);
+			printf("\tsw r3, -%d(fp)\n", orisc_rvsaveoff - 4);
+		}
+		printf("\torefld o1, %d(o12)\t; this spill frame\n",
+		    ORSPILL_ANCHOR);
+		printf("\torefld o2, 0(o1)\t; enclosing spill frame\n");
+		printf("\torefst o2, %d(o12)\t; unchain\n", ORSPILL_ANCHOR);
+		printf("\tcall #0x101\t; ObjFree this spill frame (firmware trap)\n");
+		printf("\tnop\n");
+		if (ISOREFT(rt))
+			printf("\tomov o1, o4\t; restore __or return\n");
+		else {
+			printf("\tlw r2, -%d(fp)\n", orisc_rvsaveoff);
+			printf("\tlw r3, -%d(fp)\n", orisc_rvsaveoff - 4);
+		}
+	}
 
 	for (i = p2env.p_regs[0], j = 0; i; i >>= 1, j++)
 		if (i & 1)
@@ -339,6 +445,30 @@ zzzcode(NODE *p, int c)
 		sz = p->n_qual > 16 ? p->n_qual : 16;
 		printf("\taddiu sp, sp, %d\n", sz);
 		break;
+	case 'H': {
+		/* OR home LOAD: A1 (result, CLASSC) <- per-frame OBJSTORE home
+		 * at byte offset getlval(p). Load the spill objstore ref from
+		 * the O12 anchor into A1, then OREFLD the home through it —
+		 * reusing A1 is safe because OREFLD reads its objstore operand
+		 * before writing the destination. p is the OREG leaf. */
+		int rr = getlr(p, '1')->n_rval;
+		printf("\torefld %s, %d(o12)\n", rnames[rr], ORSPILL_ANCHOR);
+		printf("\torefld %s, " CONFMT "(%s)\n",
+		    rnames[rr], getlval(p), rnames[rr]);
+		break;
+	}
+	case 'I': {
+		/* OR home STORE: per-frame OBJSTORE home (p->n_left, an OREG
+		 * leaf) <- source capability (p->n_right). Load the spill
+		 * objstore ref from the O12 anchor into the NCREG scratch (A1),
+		 * then OREFST the source through it. */
+		int sc = getlr(p, '1')->n_rval;
+		int vr = p->n_right->n_rval;
+		printf("\torefld %s, %d(o12)\n", rnames[sc], ORSPILL_ANCHOR);
+		printf("\torefst %s, " CONFMT "(%s)\n",
+		    rnames[vr], getlval(p->n_left), rnames[sc]);
+		break;
+	}
 	case 'Q':
 		/* Struct assignment — emit a memcpy call. The matched
 		 * STASG node has the source pointer in R5 (forced by the
@@ -592,7 +722,8 @@ COLORMAP(int c, int *r)
 		return num < 13;	/* 13 allocatable pairs */
 	case CLASSC:
 		num = r[CLASSC];
-		return num < 14;	/* 16 ORs minus O0 (null) */
+		return num < 4;		/* only O1..O4 allocatable (O0 null,
+					 * O5..O15 reserved for libc globals) */
 	}
 	return 0;
 }

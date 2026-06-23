@@ -241,9 +241,23 @@
  * pointer subscriber refs introduced by the focus model (Phase 60
  * step 18) — the WM stores one sub per window so it can route
  * events to the currently-focused window without a single-slot
- * race.  Non-WM programs leave the tail dead, same as before. */
-#define ORX_STATE_BYTES   1568
+ * race.  Non-WM programs leave the tail dead, same as before.
+ *
+ * + 8 (OR_SPILL_ANCHOR: reserved for the C compiler, NOT touched by
+ *   libc.  The pcc backend homes `__or` autos/params that must survive
+ *   a call in a per-frame OR-typed OBJSTORE and anchors that object's
+ *   ref here (chained through the object's slot 0 for recursion).  The
+ *   prologue/epilogue it emits OREFLD/OREFST this slot directly; the
+ *   offset is hard-coded in tools/cc/arch/orisc/macdefs.h as
+ *   ORSPILL_ANCHOR and MUST equal OR_SPILL_ANCHOR_OFFSET below.  It
+ *   sits at the old end of the allocation (TABLE_BYTES + 1568 = 1696),
+ *   guaranteed clear of every libc slot above.  Starts null from
+ *   task_init's zero-init objstore = "no enclosing spill frame".) */
+#define ORX_STATE_BYTES   1576	/* 1568 libc + 8 compiler OR-spill anchor */
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
+
+/* Compiler-owned OR-spill anchor slot (see macdefs.h ORSPILL_ANCHOR). */
+#define OR_SPILL_ANCHOR_OFFSET   1696
 
 /* Byte offset within O12 of the boot-parent ref parked from O8
  * by task_init. See the multi-line comment above for the per-

@@ -254,27 +254,35 @@ typedef long long OFFSZ;
 	SBREG|TEMPREG, SBREG|TEMPREG,	/* R24R25, R26R27 */		\
 	0, 0,				/* R28R29, R30R31 — reserved */	\
 									\
-	/* CLASSC: O0 hardwired null, O1..O4 arg/return, O5..O15 callee
-	 * uses freely. Volume VII §2.4 specifies O9..O12 as
-	 * callee-preserved by convention, with the spill backed by an
-	 * ObjAllocStore'd OR-typed object plus OREFLD/OREFST. The pcc
-	 * backend doesn't yet emit that spill sequence — and a naive
-	 * PERMREG marking made pcc try to spill an OR's old value into
-	 * an *adjacent* OR (because that's the only place a CLASSC
-	 * temporary is allowed to live), clobbering O10 / O14 / etc.
-	 * For now we mark all ORs caller-saved (TEMPREG) so the spill
-	 * never gets emitted; programs that want a value to survive a
-	 * call do the save/restore explicitly via inline asm. The
-	 * convention should be revisited once the OBJSTORE spill path
-	 * is wired in. */ \
+	/* CLASSC: O0 hardwired null. ONLY O1..O4 are allocatable by the
+	 * compiler (the OR arg/return scratch set). O5..O15 are reserved
+	 * (marked 0 / non-allocatable) because the libc runtime parks
+	 * long-lived global capabilities there and reaches them via inline
+	 * asm that the compiler sees only as opaque clobbers:
+	 *   O5..O7 surfaces (console/keyboard/grid), O8 dir/parent,
+	 *   O9 term mailbox, O10 pointer mailbox, O11 boot stack,
+	 *   O12 the TASK TABLE (objstore), O13..O15 boot code/self/data.
+	 * If the allocator were allowed to colour any of these (it can
+	 * under CLASSC register pressure — e.g. the OBJSTORE-memory-
+	 * variable access sequence loads capabilities into CLASSC scratch)
+	 * it would silently corrupt libc state; allocating O12 would
+	 * destroy the entire task table. Reserving them confines the
+	 * compiler to O1..O4 and makes O12 safe to use as the fixed
+	 * OBJSTORE anchor base. The ≤3-`__or`-arg/param v1 limit keeps
+	 * peak CLASSC pressure at 4, so four scratch ORs suffice.
+	 *
+	 * Volume VII §2.4's "O9..O12 callee-preserved" convention is
+	 * superseded here: per-frame OBJSTORE homing (anchored in an O12
+	 * slot, chained for recursion) is how `__or` values survive calls,
+	 * so no O-register needs to be callee-preserved. */ \
 	0,				/* O0 — hardwired null */	\
-	SCREG|TEMPREG, SCREG|TEMPREG,	/* O1..O2 — args/returns */	\
-	SCREG|TEMPREG, SCREG|TEMPREG,	/* O3..O4 */			\
-	SCREG|TEMPREG, SCREG|TEMPREG,	/* O5..O6 — caller-saved */	\
-	SCREG|TEMPREG, SCREG|TEMPREG,	/* O7..O8 */			\
-	SCREG|TEMPREG, SCREG|TEMPREG,	/* O9..O10 — caller-saved (was */\
-	SCREG|TEMPREG, SCREG|TEMPREG,	/* O11..O12  PERMREG; bug above) */\
-	SCREG|TEMPREG, SCREG|TEMPREG, SCREG|TEMPREG,	/* O13..O15 */
+	SCREG|TEMPREG, SCREG|TEMPREG,	/* O1..O2 — args/returns/scratch */ \
+	SCREG|TEMPREG, SCREG|TEMPREG,	/* O3..O4 — args/returns/scratch */ \
+	0, 0,				/* O5..O6 — reserved (libc global) */ \
+	0, 0,				/* O7..O8 — reserved (libc global) */ \
+	0, 0,				/* O9..O10 — reserved (libc global) */ \
+	0, 0,				/* O11..O12 — reserved (O12=task tbl)*/ \
+	0, 0, 0,			/* O13..O15 — reserved (libc global) */
 
 /*
  * ROVERLAP — for each physical register, the list of other physical
@@ -339,6 +347,27 @@ typedef long long OFFSZ;
 	/* Object registers — disjoint from each other and from GPRs. */	\
 	{ -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 },	\
 	{ -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 },
+
+/*
+ * Per-frame OBJSTORE spill for `__or` autos/params that must survive a
+ * call. ORs are caller-saved and cannot be stored to byte memory (the
+ * capability invariant), so an `__or` local/param lives in a slot of a
+ * per-frame OR-typed OBJSTORE (allocated in the prologue, freed in the
+ * epilogue) and is loaded into an O-register transiently per use.
+ *
+ * The spill objstore's own ref must itself survive the calls it
+ * protects against, and there is no free callee-preserved O-register to
+ * hold it — so it is anchored in a dedicated slot of the always-live
+ * O12 task table, and frames are chained through the spill object's
+ * slot 0 (parent ref) for recursion safety. ORSPILL_ANCHOR is the byte
+ * offset of that anchor slot within the O12 task table; it MUST match
+ * the reserved slot in tools/cc/lib/task.c. Slot 0 of each per-frame
+ * objstore is the chain link; `__or` homes start at byte offset 8.
+ */
+#define ORSPILL_ANCHOR	1696	/* O12 byte offset; matches task.c */
+#define ORSPILL_TAG	0x4102	/* TAG_DATA */
+#define ORSPILL_CAPS	0x03	/* CAP_R | CAP_W */
+#define ORSPILL_BASE	8	/* first __or home (slot 0 = chain link) */
 
 #define GCLASS(x)	((x) < 32 ? CLASSA : (x) < 48 ? CLASSB : CLASSC)
 /*

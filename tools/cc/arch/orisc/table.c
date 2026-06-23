@@ -437,6 +437,22 @@ struct optab table[] = {
 		"	omov AL, AR\n", },
 
 /*
+ * Object RISC: store a capability into its per-frame OBJSTORE home.
+ * The destination (AL) is the single OREG leaf clocal's oref_home()
+ * builds (lval = home byte offset, type OREFTY); the source (AR) is a
+ * capability in an O-register. zzzcode 'I' loads the spill objstore ref
+ * from the O12 anchor into the NCREG scratch (A1), then
+ * `orefst <src>, off(scratch)`. (Storing a call result here is rejected
+ * earlier in clocal — see the ASSIGN case — so the source never
+ * coalesces with the scratch across a call.)
+ */
+{ ASSIGN,	FOREFF|INCREG,
+	SOREG,	TOREF,
+	SCREG,	TOREF,
+		NCREG,	RDEST,
+		"ZI", },
+
+/*
  * Compares. EQ/NE generate beq/bne on the operand pair directly,
  * with a delay-slot nop. Other relations fall back to the OPLOG
  * generic, which subtracts and tests against zero.
@@ -603,6 +619,21 @@ struct optab table[] = {
 		"	omov A1, AL\n", },
 
 /*
+ * Object RISC: load a capability from its per-frame OBJSTORE home.
+ * Fires for the single OREG leaf clocal's oref_home() builds (lval =
+ * home byte offset, type OREFTY). zzzcode 'H' loads the spill objstore
+ * ref from the O12 anchor into the result reg (A1), then
+ * `orefld A1, off(A1)` — the second orefld reads its objstore operand
+ * before writing the result, so one register serves as both scratch
+ * and result.
+ */
+{ OPLTYPE,	INCREG,
+	SANY,	TANY,
+	SOREG,	TOREF,
+		NCREG,	RESC1,
+		"ZH", },
+
+/*
  * Goto. Object RISC `j` has a delay slot.
  */
 
@@ -682,7 +713,7 @@ struct optab table[] = {
  */
 { CALL,		INCREG,
 	SCON,	TANY,
-	SCREG,	TANY,
+	SANY,	TANY,
 		NCREG,	RESC1,
 		"	addiu sp, sp, -16\n"
 		"	jal CL\n"
@@ -691,7 +722,7 @@ struct optab table[] = {
 
 { UCALL,	INCREG,
 	SCON,	TANY,
-	SCREG,	TANY,
+	SANY,	TANY,
 		NCREG,	RESC1,
 		"	jal CL\n"
 		"	nop\n", },
