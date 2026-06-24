@@ -140,8 +140,17 @@ cat "$TMP/rendered.txt"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-grep -q "\[bg task 0\]"               "$TMP/rendered.txt" \
-    || fail "[bg task 0] not found in rendered output"
+# Spawn announcement: cmd_run's `&` path printed "[bg task N]". We match
+# only the "[bg task " PREFIX, not the contiguous "[bg task 0]" — the bg
+# guest runs concurrently, and its output can interleave between the
+# prefix and the "N]" when the preempt timer fires mid-announcement (a
+# scheduling artifact, not a failure; it shifts on any libc cycle-count
+# change). The task NUMBER and clean exit are pinned by the reap invariant
+# below. Still fails if no bg task was announced at all (a real spawn
+# failure). [bg task NN comes through as one term_print, so the prefix
+# itself is never split.]
+grep -q "\[bg task "                   "$TMP/rendered.txt" \
+    || fail "no '[bg task' announcement — cmd_run's & path didn't spawn a bg task"
 grep -q "hello from inside the Tk"     "$TMP/rendered.txt" \
     || fail "guest term_print didn't reach the Tk window"
 
