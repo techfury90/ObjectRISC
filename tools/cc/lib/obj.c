@@ -816,3 +816,67 @@ obj_recv_cap(obj_t h, int *out_word)
 	obj_inuse |= (1u << hh);
 	return hh;
 }
+
+obj_t
+obj_recv_cap_full(obj_t h, int out[4])
+{
+	int hh, w0, w1, w2, w3;
+
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return OBJ_NULL;
+	hh = obj__alloc_handle();
+	if (hh < 0)
+		return OBJ_NULL;
+	obj__load_o1(h);               /* queue object -> O1 */
+	/* Four asm outputs is the ceiling, so the poll STATUS (R2) is sw'd to
+	 * obj__poll_status (the obj_recv_full idiom), leaving R3..R6 for
+	 * out[]; the O2 cap is OREFST'd into the handle slot right after. */
+	asm volatile(
+		"addiu r4, r0, -1\n"      /* block until a message */
+		"call  #0x204\n"          /* ReceiveQueuePoll -> R2 st, R3..R6, O2 = cap */
+		"nop\n"
+		"la    r1, obj__poll_status\n"
+		"sw    r2, 0(r1)\n"
+		"addu  %0, r3, r0\n"
+		"addu  %1, r4, r0\n"
+		"addu  %2, r5, r0\n"
+		"addu  %3, r6, r0"
+		: "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
+		:
+		: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+	);
+	/* Land the cap (still in O2) into the slot before any C touches O2.
+	 * Unlike obj_recv_cap, a NULL reply cap is NOT a failure here — a
+	 * dir_walk on a plain directory resolves no ref, yet R3..R6 are still
+	 * valid. So we keep the handle on any successful poll (the caller
+	 * checks obj_isnull / parks it); only a poll error returns OBJ_NULL. */
+	obj__store_o2(hh);
+	out[0] = w0; out[1] = w1; out[2] = w2; out[3] = w3;
+	if (obj__poll_status != 0)
+		return OBJ_NULL;          /* poll itself failed */
+	obj_inuse |= (1u << hh);
+	return hh;
+}
+
+int
+obj_fetch_to_stack(obj_t src, int dst_off, int count)
+{
+	int status;
+
+	if (src < 0 || src >= OBJ_NHANDLE || (obj_inuse & (1u << src)) == 0)
+		return -1;
+	obj__load_o1(src);             /* O1 = source object */
+	asm volatile(
+		"omov  o2, o11\n"         /* O2 = boot stack (destination) */
+		"addiu r4, r0, 0\n"       /* src offset 0 */
+		"addu  r5, %1, r0\n"      /* dst offset within the stack */
+		"addu  r6, %2, r0\n"      /* byte count */
+		"call  #0x108\n"          /* ObjFetchBytes -> R2 = status */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "r"(dst_off), "r"(count)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	return status;
+}

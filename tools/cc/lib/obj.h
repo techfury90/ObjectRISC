@@ -207,4 +207,19 @@ int   obj_recv_full(obj_t h, int out[4]);
  * full table. The int-only sibling is obj_recv_full. */
 obj_t obj_recv_cap(obj_t h, int *out_word);
 
+/* Like obj_recv_cap, but also writes the full R3..R6 payload to out[0..3]
+ * (the cap still rides O2). dir_walk's reply carries R3=status, R4=kind,
+ * R5=remainder length AND the resolved ref in O2 — which is NULL for a
+ * plain directory, a valid outcome. So this keeps the handle on ANY
+ * successful poll (a null cap lands a null ref in the slot — the caller
+ * checks obj_isnull or parks it); OBJ_NULL is returned only on a poll
+ * error or a full table. out[] is filled whenever the poll succeeds. */
+obj_t obj_recv_cap_full(obj_t h, int out[4]);
+
+/* ObjFetchBytes `count` bytes from handle `src` (at offset 0) into the
+ * boot stack (O11) at byte offset `dst_off` — for pulling a daemon-
+ * written remainder / listing into a caller's stack buffer (dir_walk,
+ * dir_list). Returns firmware status (0 = ok). */
+int   obj_fetch_to_stack(obj_t src, int dst_off, int count);
+
 #endif /* OBJ_H */

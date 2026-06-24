@@ -163,99 +163,10 @@ dir_reply_mailbox_init(void)
 	return status;
 }
 
-/* Pack `len` bytes from `src` (a stack/data string) into the
- * TAG_DATA bytes object whose ref is in O1. Reuses the
- * MapObject-into-temporary-VA dance sup.c::sup_pack_request uses;
- * factored locally rather than shared because the two functions
- * have slightly different VA conventions and we don't yet have a
- * shared-libc-helper layer. The mapping VA is 0x600000 (above
- * the long-lived argv mapping at 0x500000) so dir.c and sup.c
- * can coexist within one task without VA conflicts. */
-#define DIR_PACK_VA  0x00600000
-
-static int
-dir_pack_bytes_o1(const char *src, int len, int buf_size)
-{
-	int status;
-	/* Save the bytes ref in O14 (sup.c's convention) so MapObject
-	 * doesn't lose it. */
-	asm volatile("omov o14, o1");
-
-	asm volatile(
-		"omov  o1, o14\n"
-		"lui   r4, 0x60\n"
-		"addu  r5, r0, r0\n"
-		"addiu r6, r0, %1\n"          /* R+W */
-		"addu  r7, %2, r0\n"
-		"call  #0x110\n"              /* MapObject */
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "i"(CAP_R | CAP_W), "r"(buf_size)
-		: "r1", "r2", "r4", "r5", "r6", "r7"
-	);
-	if (status != 0) return status;
-
-	/* Copy bytes into the mapping. pcc rejects (char *)0x600000 as
-	 * a literal cast (emits an `la r, N` pseudo asmorisc doesn't
-	 * accept); synthesize the VA via lui+ori the way sup.c does. */
-	char *dst;
-	asm volatile(
-		"lui  %0, 0x60\n"
-		"ori  %0, %0, 0"
-		: "=r"(dst)
-	);
-	int i;
-	for (i = 0; i < len && i + 1 < buf_size; i++)
-		dst[i] = src[i];
-
-	asm volatile(
-		"lui   r4, 0x60\n"
-		"addu  r5, %1, r0\n"
-		"call  #0x111\n"              /* Unmap */
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "r"(buf_size)
-		: "r2", "r3", "r4", "r5"
-	);
-	return status;
-}
-
-/* Allocate a fresh TAG_DATA bytes object, parks the ref in O14
- * (the convention sup.c established). Returns 0 OK. */
-static int
-dir_alloc_bytes_o14(int size, int caps)
-{
-	int status;
-	asm volatile(
-		"addu  r4, %1, r0\n"
-		"addiu r5, r0, %2\n"          /* TAG_DATA */
-		"addu  r6, %3, r0\n"
-		"call  #0x100\n"
-		"nop\n"
-		"omov  o14, o1\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "r"(size), "i"(TAG_DATA), "r"(caps)
-		: "r1", "r2", "r4", "r5", "r6"
-	);
-	return status;
-}
-
-/* Free O14 with a generous drain so any remaining OBJ_READ_REQs
- * from the daemon land before reclamation. */
-static void
-dir_free_o14_deferred(void)
-{
-	asm volatile(
-		"omov  o1, o14\n"
-		"addiu r4, r0, 1500\n"
-		"call  #0x107\n"              /* ObjFreeDeferred */
-		"nop"
-		: : : "r2", "r3", "r4"
-	);
-}
+/* (Phase 4: the old MapObject/Unmap pack helper (dir_pack_bytes_o1),
+ * dir_alloc_bytes_o14, and dir_free_o14_deferred are gone — every wire op
+ * now builds its request object with obj_make_bytes and frees it with
+ * obj_free.) */
 
 /* String length, local. */
 static int
@@ -436,103 +347,42 @@ dir_mount(const char *path, const char *prefix)
 	if (plen <= 0 || plen + 1 + xlen + 1 > DIR_PATH_BUF_SIZE)
 		return -1;
 
-	rc = dir_alloc_bytes_o14(DIR_PATH_BUF_SIZE,
-	                          CAP_R | CAP_W | CAP_V | CAP_C);
-	if (rc != 0) return rc;
+	if (obj_init() != 0) return -6;
 
-	/* Pack path\0prefix\0. We do it in two ops: first the path,
-	 * then ANOTHER mapping cycle for the prefix. (We could just
-	 * pack everything in one map; this is slightly clearer.) */
-	int status;
-	asm volatile(
-		"omov  o1, o14\n"
-		"lui   r4, 0x60\n"
-		"addu  r5, r0, r0\n"
-		"addiu r6, r0, %1\n"
-		"addiu r7, r0, %2\n"
-		"call  #0x110\n"
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "i"(CAP_R | CAP_W), "i"(DIR_PATH_BUF_SIZE)
-		: "r1", "r2", "r4", "r5", "r6", "r7"
-	);
-	if (status != 0) { dir_free_o14_deferred(); return status; }
-
-	char *buf;
-	asm volatile(
-		"lui  %0, 0x60\n"
-		"ori  %0, %0, 0"
-		: "=r"(buf)
-	);
+	/* The daemon wants path\0prefix\0 in one bytes object. Build it on the
+	 * stack, then obj_make_bytes copies the whole thing (embedded NULs
+	 * included) into a fresh TAG_DATA object at offset 0. */
+	char buf[DIR_PATH_BUF_SIZE];
 	int i, n = 0;
-	for (i = 0; i < plen && n + 1 < DIR_PATH_BUF_SIZE; i++)
-		buf[n++] = path[i];
-	if (n + 1 < DIR_PATH_BUF_SIZE) buf[n++] = '\0';
-	for (i = 0; i < xlen && n + 1 < DIR_PATH_BUF_SIZE; i++)
-		buf[n++] = prefix[i];
-	if (n + 1 < DIR_PATH_BUF_SIZE) buf[n++] = '\0';
+	for (i = 0; i < plen; i++) buf[n++] = path[i];
+	buf[n++] = '\0';
+	for (i = 0; i < xlen; i++) buf[n++] = prefix[i];
+	buf[n++] = '\0';
 
-	asm volatile(
-		"lui   r4, 0x60\n"
-		"addiu r5, r0, %1\n"
-		"call  #0x111\n"
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "i"(DIR_PATH_BUF_SIZE)
-		: "r2", "r3", "r4", "r5"
-	);
-	if (status != 0) { dir_free_o14_deferred(); return status; }
+	obj_t dir_h   = obj_adopt_slot(DIR_SLOT_OFFSET);
+	obj_t reply_h = obj_adopt_slot(REPLY_MB_SLOT_OFFSET);
+	obj_t ref_h   = obj_adopt_slot(DIR_INPUT_REF_SLOT_OFFSET);
+	obj_t path_h  = obj_make_bytes(buf, n, CAP_R | CAP_W | CAP_V | CAP_C);
+	if (dir_h < 0 || reply_h < 0 || ref_h < 0 || path_h < 0) {
+		if (path_h >= 0) obj_free(path_h);
+		obj_drop(dir_h); obj_drop(reply_h); obj_drop(ref_h);
+		return -6;
+	}
 
-	/* Derive reply sub-cap. */
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, 9\n"
-		"call  #0x103\n"
-		"nop\n"
-		"orefst o1, 608(o12)\n"
-		"addu  %0, r2, r0"
-		: "=r"(status) : : "r1", "r2", "r4"
-	);
-	if (status != 0) { dir_free_o14_deferred(); return status; }
+	/* O2 = path\0prefix\0 bytes, O3 = reply mailbox, O4 = service ref;
+	 * R5 = path length, R6 = prefix length. */
+	obj_send_3or(dir_h, path_h, reply_h, ref_h,
+	             DIR_OP_MOUNT, plen, xlen, 0);
 
-	/* SEND.
-	 *   O1 = dir mailbox       (DIR_SLOT)
-	 *   O2 = path+prefix bytes (O14)
-	 *   O3 = reply_cap         (DIR_REPLY_SCRATCH)
-	 *   O4 = service ref       (DIR_INPUT_REF_SLOT, saved at entry)
-	 *   R5 = path length, R6 = prefix length */
-	asm volatile(
-		"orefld o1, 584(o12)\n"
-		"omov   o2, o14\n"
-		"orefld o3, 608(o12)\n"
-		"orefld o4, %3(o12)\n"
-		"addiu  r4, r0, %0\n"
-		"addu   r5, %1, r0\n"
-		"addu   r6, %2, r0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		: : "i"(DIR_OP_MOUNT), "r"(plen), "r"(xlen),
-		    "i"(DIR_INPUT_REF_SLOT_OFFSET)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
+	int out[4];
+	int prc = obj_recv_full(reply_h, out);
+	_dir_restore_or();
 
-	dir_free_o14_deferred();
+	obj_free(path_h);
+	obj_drop(dir_h); obj_drop(reply_h); obj_drop(ref_h);
 
-	int reply_status;
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"addu  %0, r3, r0\n"
-		"addu  %1, r2, r0"
-		: "=r"(reply_status), "=r"(status)
-		: : "r1", "r2", "r3", "r4"
-	);
-	if (status != 0) return -6;
-	return reply_status;
+	if (prc != 0) return -6;
+	return out[0];
 }
 
 /* dir_walk — resolve `path`. On success returns the remainder
@@ -553,213 +403,75 @@ dir_walk(const char *path, int *kind_out,
 
 	int len = dir_strlen(path);
 	if (len <= 0 || len >= DIR_PATH_BUF_SIZE) return -1;
+	if (obj_init() != 0) return -6;
 
-	/* Allocate path bytes. */
-	rc = dir_alloc_bytes_o14(DIR_PATH_BUF_SIZE,
-	                          CAP_R | CAP_W | CAP_V | CAP_C);
-	if (rc != 0) return rc;
-	rc = dir_pack_bytes_o1(path, len, DIR_PATH_BUF_SIZE);
-	if (rc != 0) { dir_free_o14_deferred(); return rc; }
-
-	/* Compute remainder dest as the offset of remainder_buf within
-	 * the boot stack object — daemon writes via OBJ_WRITE_REQ
-	 * through O11 (boot stack ref). Same pattern as supervisor's
-	 * read_spawn_request. */
+	/* The daemon writes the MOUNT remainder into the O4 object; we
+	 * ObjFetchBytes it into remainder_buf (on the boot stack) afterward,
+	 * at this offset. */
 	int dst_offset = (int)((unsigned int)remainder_buf - STACK_BOTTOM);
 
-	/* Stash the boot stack ref into O13 so the SEND can pass it
-	 * as the dest buffer in O4. */
-	asm volatile("omov o13, o11");
-
-	/* Derive reply sub-cap. */
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, 9\n"
-		"call  #0x103\n"
-		"nop\n"
-		"orefst o1, 608(o12)\n"
-		"addu  %0, r2, r0"
-		: "=r"(rc) : : "r1", "r2", "r4"
-	);
-	if (rc != 0) { dir_free_o14_deferred(); return rc; }
-
-	/* SEND op=walk.
-	 *   O1 = dir mailbox
-	 *   O2 = path bytes (O14)
-	 *   O3 = reply_cap (O15)
-	 *   O4 = boot stack ref (O13) — the daemon writes the
-	 *        remainder into our stack at dst_offset
-	 *   R5 = path length
-	 *   R6 = (carries dst_offset to the daemon? No: R6 is
-	 *        capacity. We ignore the daemon's dst_offset; the
-	 *        wire protocol writes at offset 0 inside the dest
-	 *        ref. To make it land at our remainder_buf's
-	 *        VA we'd need to pass dst_offset too — extending
-	 *        the protocol. For MVP we use a per-task scratch
-	 *        bytes object instead of the stack.) */
-
-	/* Reset: actually use a fresh TAG_DATA scratch for the
-	 * remainder. ObjFetchBytes-copy it into the caller's buffer
-	 * after the reply lands. Simpler than passing stack offsets
-	 * across the wire. */
-
-	/* Allocate a remainder scratch object, park its ref in O13. */
-	int rem_alloc_status;
-	asm volatile(
-		"addiu r4, r0, %1\n"
-		"addiu r5, r0, %2\n"          /* TAG_DATA */
-		"addiu r6, r0, %3\n"
-		"call  #0x100\n"              /* ObjAlloc → O1 */
-		"nop\n"
-		"omov  o13, o1\n"
-		"addu  %0, r2, r0"
-		: "=r"(rem_alloc_status)
-		: "i"(DIR_REM_BUF_SIZE), "i"(TAG_DATA),
-		  "i"(CAP_R | CAP_W | CAP_V | CAP_C)
-		: "r1", "r2", "r4", "r5", "r6"
-	);
-	if (rem_alloc_status != 0) {
-		dir_free_o14_deferred();
-		return rem_alloc_status;
-	}
-
-	asm volatile(
-		"orefld o1, 584(o12)\n"
-		"omov   o2, o14\n"
-		"orefld o3, 608(o12)\n"
-		"omov   o4, o13\n"
-		"addiu  r4, r0, %0\n"
-		"addu   r5, %1, r0\n"
-		"addiu  r6, r0, %2\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		: : "i"(DIR_OP_WALK), "r"(len), "i"(DIR_REM_BUF_SIZE)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
-
-	dir_free_o14_deferred();   /* path bytes — done with it */
-
-	/* Block on reply. Reply payload:
-	 *   R3 = status, R4 = kind, R5 = remainder length
-	 *   O2 = resolved ref (LEAF target / MOUNT service / null) */
-	int status, kind, rem_len, poll_status;
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"              /* ReceiveQueuePoll */
-		"nop\n"
-		"omov  o1, o2\n"              /* park resolved ref in O1 */
-		"addu  %0, r3, r0\n"
-		"addu  %1, r4, r0\n"
-		"addu  %2, r5, r0\n"
-		"addu  %3, r2, r0"
-		: "=r"(status), "=r"(kind), "=r"(rem_len), "=r"(poll_status)
-		: : "r1", "r2", "r3", "r4", "r5"
-	);
-
-	/* Save resolved ref so subsequent operations don't clobber. */
-	asm volatile("omov o14, o1");
-
-	if (poll_status != 0) {
-		/* poll failed; but free the remainder scratch first */
-		asm volatile(
-			"omov  o1, o13\n"
-			"addiu r4, r0, 0\n"
-			"call  #0x101\n"          /* ObjFree (immediate) */
-			"nop"
-			: : : "r1", "r2", "r4"
-		);
+	obj_t dir_h   = obj_adopt_slot(DIR_SLOT_OFFSET);
+	obj_t reply_h = obj_adopt_slot(REPLY_MB_SLOT_OFFSET);
+	obj_t path_h  = obj_make_bytes(path, len, CAP_R | CAP_W | CAP_V | CAP_C);
+	obj_t rem_h   = obj_alloc(DIR_REM_BUF_SIZE, OBJ_TAG_DATA,
+	                          CAP_R | CAP_W | CAP_V | CAP_C);
+	if (dir_h < 0 || reply_h < 0 || path_h < 0 || rem_h < 0) {
+		if (path_h >= 0) obj_free(path_h);
+		if (rem_h >= 0)  obj_free(rem_h);
+		obj_drop(dir_h); obj_drop(reply_h);
 		return -6;
 	}
 
+	/* O2 = path bytes, O3 = reply mailbox, O4 = remainder scratch;
+	 * R5 = path length, R6 = remainder capacity. */
+	obj_send_3or(dir_h, path_h, reply_h, rem_h,
+	             DIR_OP_WALK, len, DIR_REM_BUF_SIZE, 0);
+	/* The service cap is dead the moment the SEND returns; drop it now so
+	 * its handle slot is free for obj_recv_cap_full's resolved-ref handle.
+	 * Otherwise dir_walk's peak is 5 simultaneous handles (dir+reply+path+
+	 * rem+resolved), which overflows the 8-slot table once the caller holds
+	 * a few persistent handles of its own (the shell: term+host_io = 4). */
+	obj_drop(dir_h);
+
+	/* Reply: R3=status, R4=kind, R5=rem_len, O2=resolved ref (null for a
+	 * plain directory). Receive the cap into a handle, mirror it into
+	 * DIR_RESULT_SLOT for callers (obj_adopt_dir_result reads it), drop. */
+	int rep[4];
+	obj_t resolved_h = obj_recv_cap_full(reply_h, rep);
+	_dir_restore_or();
+
+	obj_free(path_h);
+	obj_drop(reply_h);
+
+	if (resolved_h < 0) {              /* poll itself failed */
+		obj_free(rem_h);
+		return -6;
+	}
+	obj_park_dir_result(resolved_h);   /* resolved ref (or null) -> 616 */
+	obj_drop(resolved_h);
+
+	int status  = rep[0];
+	int kind    = rep[1];
+	int rem_len = rep[2];
+	if (kind_out) *kind_out = kind;
+
 	if (status != 0 || kind != DIR_KIND_MOUNT || rem_len <= 0) {
-		/* No remainder to fetch. Free scratch. Restore ref to O1
-		 * for caller's convenience (LEAF case). */
-		asm volatile(
-			"omov  o1, o13\n"
-			"addiu r4, r0, 0\n"
-			"call  #0x101\n"
-			"nop"
-			: : : "r1", "r2", "r4"
-		);
-		/* Publish the resolved ref into DIR_RESULT_SLOT so the
-		 * caller can OREFLD it without depending on O1 being
-		 * preserved across the function-call boundary. */
-		asm volatile(
-			"orefst o14, %0(o12)"
-			:
-			: "i"(DIR_RESULT_SLOT_OFFSET)
-		);
-		asm volatile("omov o1, o14");   /* also leave in O1 */
-		if (kind_out) *kind_out = kind;
+		obj_free(rem_h);               /* no remainder to fetch */
 		return status;
 	}
-
-	/* MOUNT case: ObjFetchBytes the remainder from O13 (scratch)
-	 * into the caller's remainder_buf (on stack). Source = O13,
-	 * dest = O11 (boot stack), src_off=0, dst_off=stack offset of
-	 * remainder_buf, count=rem_len. */
 	if (rem_len + 1 > remainder_cap) {
-		asm volatile(
-			"omov  o1, o13\n"
-			"addiu r4, r0, 0\n"
-			"call  #0x101\n"
-			"nop"
-			: : : "r1", "r2", "r4"
-		);
-		asm volatile(
-			"orefst o14, %0(o12)"
-			:
-			: "i"(DIR_RESULT_SLOT_OFFSET)
-		);
-		asm volatile("omov o1, o14");
-		if (kind_out) *kind_out = kind;
-		return -5;       /* ETOOBIG */
+		obj_free(rem_h);
+		return -5;                     /* ETOOBIG */
 	}
 
-	int fetch_status;
-	asm volatile(
-		"omov  o1, o13\n"             /* source = remainder scratch */
-		"omov  o2, o11\n"             /* destination = boot stack */
-		"addiu r4, r0, 0\n"
-		"addu  r5, %1, r0\n"
-		"addu  r6, %2, r0\n"
-		"call  #0x108\n"              /* ObjFetchBytes */
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(fetch_status)
-		: "r"(dst_offset), "r"(rem_len)
-		: "r1", "r2", "r4", "r5", "r6"
-	);
-
-	/* NUL-terminate the remainder. */
-	if (fetch_status == 0 && rem_len < remainder_cap) {
+	/* MOUNT: copy the daemon-written remainder out of the scratch object
+	 * into the caller's stack buffer. */
+	int fetch_status = obj_fetch_to_stack(rem_h, dst_offset, rem_len);
+	obj_free(rem_h);
+	_dir_restore_or();
+	if (fetch_status == 0 && rem_len < remainder_cap)
 		remainder_buf[rem_len] = '\0';
-	}
-
-	/* Free remainder scratch. */
-	asm volatile(
-		"omov  o1, o13\n"
-		"addiu r4, r0, 0\n"
-		"call  #0x101\n"
-		"nop"
-		: : : "r1", "r2", "r4"
-	);
-
-	/* Publish the resolved ref into DIR_RESULT_SLOT and also
-	 * leave a copy in O1 (best-effort — pcc may clobber it
-	 * across the function return). Callers should OREFLD from
-	 * DIR_RESULT_SLOT for reliability. */
-	asm volatile(
-		"orefst o14, %0(o12)"
-		:
-		: "i"(DIR_RESULT_SLOT_OFFSET)
-	);
-	asm volatile("omov o1, o14");
-
-	if (kind_out) *kind_out = kind;
 	if (fetch_status != 0) return -6;
-	if (status != 0) return status;
 	return rem_len;
 }
 
@@ -777,124 +489,47 @@ dir_list(const char *path, char *buf, int cap)
 	int len = dir_strlen(path);
 	if (len <= 0 || len >= DIR_PATH_BUF_SIZE) return -1;
 	if (cap <= 0) return -1;
-
-	rc = dir_alloc_bytes_o14(DIR_PATH_BUF_SIZE,
-	                          CAP_R | CAP_W | CAP_V | CAP_C);
-	if (rc != 0) return rc;
-	rc = dir_pack_bytes_o1(path, len, DIR_PATH_BUF_SIZE);
-	if (rc != 0) { dir_free_o14_deferred(); return rc; }
+	if (obj_init() != 0) return -6;
 
 	int dst_offset = (int)((unsigned int)buf - STACK_BOTTOM);
 
-	/* Allocate entries scratch in O13. */
-	int alloc_status;
-	asm volatile(
-		"addu  r4, %1, r0\n"
-		"addiu r5, r0, %2\n"
-		"addiu r6, r0, %3\n"
-		"call  #0x100\n"
-		"nop\n"
-		"omov  o13, o1\n"
-		"addu  %0, r2, r0"
-		: "=r"(alloc_status)
-		: "r"(cap), "i"(TAG_DATA),
-		  "i"(CAP_R | CAP_W | CAP_V | CAP_C)
-		: "r1", "r2", "r4", "r5", "r6"
-	);
-	if (alloc_status != 0) {
-		dir_free_o14_deferred();
-		return alloc_status;
-	}
-
-	/* Reply sub-cap. */
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, 9\n"
-		"call  #0x103\n"
-		"nop\n"
-		"orefst o1, 608(o12)\n"
-		"addu  %0, r2, r0"
-		: "=r"(rc) : : "r1", "r2", "r4"
-	);
-	if (rc != 0) {
-		dir_free_o14_deferred();
-		asm volatile(
-			"omov o1, o13\n"
-			"addiu r4, r0, 0\n"
-			"call #0x101\n"
-			"nop"
-			: : : "r1", "r2", "r4"
-		);
-		return rc;
-	}
-
-	asm volatile(
-		"orefld o1, 584(o12)\n"
-		"omov   o2, o14\n"
-		"orefld o3, 608(o12)\n"
-		"omov   o4, o13\n"
-		"addiu  r4, r0, %0\n"
-		"addu   r5, %1, r0\n"
-		"addu   r6, %2, r0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		: : "i"(DIR_OP_LIST), "r"(len), "r"(cap)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
-
-	dir_free_o14_deferred();
-
-	int status, count, bytes_written, poll_status;
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"addu  %0, r3, r0\n"
-		"addu  %1, r4, r0\n"
-		"addu  %2, r5, r0\n"
-		"addu  %3, r2, r0"
-		: "=r"(status), "=r"(count), "=r"(bytes_written),
-		  "=r"(poll_status)
-		: : "r1", "r2", "r3", "r4", "r5"
-	);
-	if (poll_status != 0) {
-		asm volatile(
-			"omov o1, o13\n"
-			"addiu r4, r0, 0\n"
-			"call #0x101\n"
-			"nop"
-			: : : "r1", "r2", "r4"
-		);
+	obj_t dir_h   = obj_adopt_slot(DIR_SLOT_OFFSET);
+	obj_t reply_h = obj_adopt_slot(REPLY_MB_SLOT_OFFSET);
+	obj_t path_h  = obj_make_bytes(path, len, CAP_R | CAP_W | CAP_V | CAP_C);
+	obj_t ent_h   = obj_alloc(cap, OBJ_TAG_DATA,
+	                          CAP_R | CAP_W | CAP_V | CAP_C);
+	if (dir_h < 0 || reply_h < 0 || path_h < 0 || ent_h < 0) {
+		if (path_h >= 0) obj_free(path_h);
+		if (ent_h >= 0)  obj_free(ent_h);
+		obj_drop(dir_h); obj_drop(reply_h);
 		return -6;
 	}
 
-	if (status == 0 && bytes_written > 0) {
-		int fetch_status;
-		asm volatile(
-			"omov  o1, o13\n"
-			"omov  o2, o11\n"
-			"addiu r4, r0, 0\n"
-			"addu  r5, %1, r0\n"
-			"addu  r6, %2, r0\n"
-			"call  #0x108\n"
-			"nop\n"
-			"addu  %0, r2, r0"
-			: "=r"(fetch_status)
-			: "r"(dst_offset), "r"(bytes_written)
-			: "r1", "r2", "r4", "r5", "r6"
-		);
-		if (fetch_status != 0) status = -6;
-	}
+	/* O2 = path bytes, O3 = reply mailbox, O4 = entries scratch (the
+	 * daemon writes the NUL-separated names into it); R5 = path length,
+	 * R6 = buffer capacity. */
+	obj_send_3or(dir_h, path_h, reply_h, ent_h,
+	             DIR_OP_LIST, len, cap, 0);
+	obj_drop(dir_h);                  /* service cap dead after the SEND */
 
-	/* Free scratch. */
-	asm volatile(
-		"omov o1, o13\n"
-		"addiu r4, r0, 0\n"
-		"call #0x101\n"
-		"nop"
-		: : : "r1", "r2", "r4"
-	);
+	/* Reply: R3=status, R4=count, R5=bytes_written. */
+	int rep[4];
+	int prc = obj_recv_full(reply_h, rep);
+	_dir_restore_or();
+
+	obj_free(path_h);
+	obj_drop(reply_h);
+
+	if (prc != 0) { obj_free(ent_h); return -6; }
+	int status = rep[0];
+	int count  = rep[1];
+	int bytes_written = rep[2];
+	if (status == 0 && bytes_written > 0) {
+		int fs = obj_fetch_to_stack(ent_h, dst_offset, bytes_written);
+		_dir_restore_or();
+		if (fs != 0) status = -6;
+	}
+	obj_free(ent_h);
 
 	if (status != 0) return status;
 	return count;
@@ -925,6 +560,8 @@ dir_list(const char *path, char *buf, int cap)
 int
 dir_subscribe(const char *path, int notify_op)
 {
+	/* Save the caller's O1 (the notify cap to register) into
+	 * DIR_INPUT_REF_SLOT immediately — dir_init clobbers O1. */
 	asm volatile(
 		"orefst o1, %0(o12)"
 		:
@@ -938,54 +575,31 @@ dir_subscribe(const char *path, int notify_op)
 
 	int len = dir_strlen(path);
 	if (len <= 0 || len >= DIR_PATH_BUF_SIZE) return -1;
+	if (obj_init() != 0) return -6;
 
-	rc = dir_alloc_bytes_o14(DIR_PATH_BUF_SIZE,
-	                          CAP_R | CAP_W | CAP_V | CAP_C);
-	if (rc != 0) return rc;
-	rc = dir_pack_bytes_o1(path, len, DIR_PATH_BUF_SIZE);
-	if (rc != 0) { dir_free_o14_deferred(); return rc; }
+	obj_t dir_h    = obj_adopt_slot(DIR_SLOT_OFFSET);
+	obj_t reply_h  = obj_adopt_slot(REPLY_MB_SLOT_OFFSET);
+	obj_t notify_h = obj_adopt_slot(DIR_INPUT_REF_SLOT_OFFSET);
+	obj_t path_h   = obj_make_bytes(path, len, CAP_R | CAP_W | CAP_V | CAP_C);
+	if (dir_h < 0 || reply_h < 0 || notify_h < 0 || path_h < 0) {
+		if (path_h >= 0) obj_free(path_h);
+		obj_drop(dir_h); obj_drop(reply_h); obj_drop(notify_h);
+		return -6;
+	}
 
-	/* Derive R+S reply sub-cap (one-shot for the subscribe ack). */
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, 9\n"
-		"call  #0x103\n"
-		"nop\n"
-		"orefst o1, 608(o12)\n"
-		"addu  %0, r2, r0"
-		: "=r"(rc) : : "r1", "r2", "r4"
-	);
-	if (rc != 0) { dir_free_o14_deferred(); return rc; }
+	/* O2 = path bytes, O3 = reply mailbox, O4 = the persistent notify
+	 * cap oriscdir will SEND mutations to; R5 = path length,
+	 * R6 = notify_op. */
+	obj_send_3or(dir_h, path_h, reply_h, notify_h,
+	             DIR_OP_SUBSCRIBE, len, notify_op, 0);
 
-	asm volatile(
-		"orefld o1, 584(o12)\n"        /* DIR_SLOT */
-		"omov   o2, o14\n"
-		"orefld o3, 608(o12)\n"        /* DIR_REPLY_SCRATCH */
-		"orefld o4, %2(o12)\n"         /* DIR_INPUT_REF_SLOT (notify_cap) */
-		"addiu  r4, r0, %0\n"
-		"addu   r5, %1, r0\n"
-		"addu   r6, %3, r0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		: : "i"(DIR_OP_SUBSCRIBE), "r"(len),
-		    "i"(DIR_INPUT_REF_SLOT_OFFSET),
-		    "r"(notify_op)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
+	int out[4];
+	int prc = obj_recv_full(reply_h, out);
+	_dir_restore_or();
 
-	dir_free_o14_deferred();
+	obj_free(path_h);
+	obj_drop(dir_h); obj_drop(reply_h); obj_drop(notify_h);
 
-	int status, reply_status;
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"addu  %0, r3, r0\n"
-		"addu  %1, r2, r0"
-		: "=r"(reply_status), "=r"(status)
-		: : "r1", "r2", "r3", "r4"
-	);
-	if (status != 0) return -6;
-	return reply_status;
+	if (prc != 0) return -6;
+	return out[0];
 }
