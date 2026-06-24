@@ -194,12 +194,12 @@ int  menu_run(int col, int row, const char *items, int n);
  *   3. wm_new_window(WIN_TYPE_CONSOLE) succeeded.
  *   4. wm_bind_surface(wid, WSURF_VECTOR) succeeded — the resolved
  *      cap lands in DIR_RESULT_SLOT (offset 616) and the caller
- *      MUST stash it into WM_VECTOR_CAP_SLOT before the first
- *      vec_*() call.  vec_init_from_dir_result() is the convenience
- *      helper that does the copy.
+ *      MUST adopt it before the first vec_*() call.
+ *      vec_init_from_dir_result() is the convenience helper that
+ *      adopts it into the libc VECTOR handle (obj.h).
  *
- * All vec_*() return 0 on success, -1 if WM_VECTOR_CAP_SLOT is null
- * (no surface bound).  Coordinates are signed 16-bit (clamped /
+ * All vec_*() return 0 on success, -1 if no surface is bound
+ * (the VECTOR handle is still null).  Coordinates are signed 16-bit (clamped /
  * clipped by the WM); colors are palette indices 0..8 (matching
  * oriscterm's VEC_PALETTE).
  *
@@ -217,7 +217,7 @@ int  menu_run(int col, int row, const char *items, int n);
 #define VEC_OP_CLEAR        0x05
 #define VEC_OP_SET_COLOR    0x06
 
-int  vec_init_from_dir_result(void);                 /* DIR_RESULT_SLOT → WM_VECTOR_CAP_SLOT */
+int  vec_init_from_dir_result(void);                 /* adopt DIR_RESULT_SLOT cap into the VECTOR handle */
 int  vec_line(int x1, int y1, int x2, int y2);
 int  vec_rect_fill(int x, int y, int w, int h);
 int  vec_rect_outline(int x, int y, int w, int h);

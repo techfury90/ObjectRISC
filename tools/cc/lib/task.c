@@ -170,16 +170,14 @@
  *          spawned children write positioned text through the WM's
  *          GRID rasteriser instead of /sys/term/<idx>/grid.
  *          Phase 59 / WM γ.9.)
- *     + 8 (WM_VECTOR_CAP_SLOT: persistent — holds the WM-mediated
- *          VECTOR sub-cap that vec.c OREFLDs into O1 on each
- *          vec_*() SEND.  Unlike WM_LEADER_CONSOLE/GRID this isn't
- *          leader-only: any task that has run wm_bind_surface
- *          (WSURF_VECTOR) and stashed the result here can use the
- *          libc vec_*() helpers.  Null on tasks without WM
- *          mediation; vec_*() returns -1 in that case.  Phase 59 /
- *          WM γ.11.  Supervisor-level leader→child propagation is
- *          a follow-up; for now the smoke test seeds this slot
- *          itself from DIR_RESULT_SLOT.)
+ *     + 8 (WM_VECTOR_CAP_SLOT: reserved/legacy.  vector.c used to OREFLD
+ *          the WM-mediated VECTOR sub-cap from here into O1 on each
+ *          vec_*() SEND; Phase 4 migrated it onto the obj.h handle
+ *          table, so vector.c now adopts the dir-result cap into a
+ *          handle and this slot is dead.  Kept (not renumbered) so the
+ *          dozens of hardcoded O12 offsets after it — and oriscwm's
+ *          WM_VECTOR_BASE switch tables — stay put.  Phase 59 /
+ *          WM γ.11; migrated Phase 4.)
  *     + 128 (WM_GRID_BASE: WM-only — per-window GRID service refs
  *          (16 windows × 8 bytes).  Mirrors WM_CONSOLE_BASE but for
  *          positioned-text SENDs.  Other programs leave this dead;
