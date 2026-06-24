@@ -293,6 +293,27 @@
 #define WM_KBD_SUB_BASE_OFFSET          1312      /* 1312..1440 */
 #define WM_PTR_SUB_BASE_OFFSET          1440      /* 1440..1568 */
 
+/* Phase 61 — event-driven main loop.  WM_WAITSET_SLOT holds the ref to
+ * a dedicated OBJSTORE object (allocated at boot by alloc_wait_set)
+ * whose slots we refill each loop iteration with every queue the WM
+ * owns, then hand to the WaitAnyQueue (#0x206) readiness primitive so
+ * the WM idle-blocks instead of busy-polling on a timeout.
+ *
+ * The slot lives in the 128-byte gap between the WM's last libc slot
+ * (WM_PTR_SUB_BASE end = 1568) and the compiler's OR-spill anchor
+ * (ORSPILL_ANCHOR = 1696 in macdefs.h / task.c); see task.c's O12 map.
+ *
+ * Fixed wait-set layout (69 × 8-byte ref slots = 552 bytes), built by
+ * build_wait_set: slot 0 = main service queue (O9); 1..16 console;
+ * 17..32 grid; 33..48 vector; 49..64 raster; 65 pointer-svc; 66 pointer
+ * events sink; 67 keyboard-svc; 68 keyboard events sink.  Empty / freed
+ * per-window slots read back null or stale and WaitAnyQueue skips them,
+ * so we can pass the full fixed count every iteration. */
+#define WM_WAITSET_SLOT_OFFSET          1568
+#define WM_WAITSET_BYTES                552       /* 69 slots × 8 bytes */
+#define WM_WAITSET_COUNT                69
+#define TAG_DATA                        0x4102
+
 /* === Glyph rendering ==================================================
  *
  * The framebuffer is row-major, one byte per pixel (palette index;
@@ -3051,19 +3072,178 @@ scan_owner_exits(void)
 
 /* === Main loop ======================================================== */
 
-#define WM_POLL_TICKS 100   /* ~100ms.  Short enough that per-window
-                             * CONSOLE writes (which we round-robin
-                             * after each main-service iteration) get
-                             * drained promptly even when main is
-                             * idle. */
+/* Phase 61 — the WM is event-driven.  Instead of blocking on the main
+ * service queue with a WM_POLL_TICKS timeout and draining the other
+ * queues only between polls (a ~100ms interactive-latency floor), the
+ * loop blocks on WaitAnyQueue (#0x206) over EVERY queue the WM owns,
+ * then drains them all with non-blocking polls.  Any keystroke, pointer
+ * event, console/grid/vector/raster write, or service request wakes the
+ * WM the instant it lands — no timeout floor, and a truly idle WM burns
+ * no instructions (the firmware parks the CPU). */
 
+/* Allocate the wait-set OBJSTORE once at boot and park its ref in the
+ * WM_WAITSET_SLOT.  Sized for the full fixed wait-set layout (69 ×
+ * 8-byte ref slots). */
+static int
+alloc_wait_set(void)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, %1\n"           /* size = WM_WAITSET_BYTES */
+		"addiu r5, r0, %2\n"           /* TAG_DATA (objstore flag set by op) */
+		"addiu r6, r0, %3\n"           /* CAP_R | CAP_W */
+		"call  #0x106\n"               /* ObjAllocStore -> O1 */
+		"nop\n"
+		"orefst o1, %4(o12)\n"         /* stash ref in the wait-set slot */
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(WM_WAITSET_BYTES), "i"(TAG_DATA),
+		  "i"(CAP_R | CAP_W), "i"(WM_WAITSET_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	return status;
+}
+
+/* Refill the wait-set OBJSTORE (loaded into O2, which doubles as the
+ * OREFST base and the WaitAnyQueue argument) from the WM's current
+ * queue caps, then block until any of them is non-empty.  Returns the
+ * WaitAnyQueue status (ERR_OK once something is ready).
+ *
+ * Every source is a fixed O12 offset and every destination a fixed
+ * wait-set offset, so this is straight-line OREFLD/OREFST — no
+ * computed offsets (which pcc-orisc rejects) and no switch tables.
+ * Empty/freed per-window slots copy through as null/stale refs that
+ * WaitAnyQueue skips, so we always pass the full fixed count. */
+static int
+wm_block_until_ready(void)
+{
+	int status;
+
+	/* O2 = wait-set objstore: the OREFST base below and the call arg. */
+	asm volatile("orefld o2, %0(o12)" :: "i"(WM_WAITSET_SLOT_OFFSET));
+
+	/* slot 0 = main service queue (O9). */
+	asm volatile("orefst o9, 0(o2)");
+
+	/* console queues: O12 312.. -> wait_set 8.. */
+	asm volatile(
+		"orefld o14, 312(o12)\n orefst o14, 8(o2)\n"
+		"orefld o14, 320(o12)\n orefst o14, 16(o2)\n"
+		"orefld o14, 328(o12)\n orefst o14, 24(o2)\n"
+		"orefld o14, 336(o12)\n orefst o14, 32(o2)\n"
+		"orefld o14, 344(o12)\n orefst o14, 40(o2)\n"
+		"orefld o14, 352(o12)\n orefst o14, 48(o2)\n"
+		"orefld o14, 360(o12)\n orefst o14, 56(o2)\n"
+		"orefld o14, 368(o12)\n orefst o14, 64(o2)\n"
+		"orefld o14, 376(o12)\n orefst o14, 72(o2)\n"
+		"orefld o14, 384(o12)\n orefst o14, 80(o2)\n"
+		"orefld o14, 392(o12)\n orefst o14, 88(o2)\n"
+		"orefld o14, 400(o12)\n orefst o14, 96(o2)\n"
+		"orefld o14, 408(o12)\n orefst o14, 104(o2)\n"
+		"orefld o14, 416(o12)\n orefst o14, 112(o2)\n"
+		"orefld o14, 424(o12)\n orefst o14, 120(o2)\n"
+		"orefld o14, 432(o12)\n orefst o14, 128(o2)"
+		::: "memory");
+
+	/* grid queues: O12 720.. -> wait_set 136.. */
+	asm volatile(
+		"orefld o14, 720(o12)\n orefst o14, 136(o2)\n"
+		"orefld o14, 728(o12)\n orefst o14, 144(o2)\n"
+		"orefld o14, 736(o12)\n orefst o14, 152(o2)\n"
+		"orefld o14, 744(o12)\n orefst o14, 160(o2)\n"
+		"orefld o14, 752(o12)\n orefst o14, 168(o2)\n"
+		"orefld o14, 760(o12)\n orefst o14, 176(o2)\n"
+		"orefld o14, 768(o12)\n orefst o14, 184(o2)\n"
+		"orefld o14, 776(o12)\n orefst o14, 192(o2)\n"
+		"orefld o14, 784(o12)\n orefst o14, 200(o2)\n"
+		"orefld o14, 792(o12)\n orefst o14, 208(o2)\n"
+		"orefld o14, 800(o12)\n orefst o14, 216(o2)\n"
+		"orefld o14, 808(o12)\n orefst o14, 224(o2)\n"
+		"orefld o14, 816(o12)\n orefst o14, 232(o2)\n"
+		"orefld o14, 824(o12)\n orefst o14, 240(o2)\n"
+		"orefld o14, 832(o12)\n orefst o14, 248(o2)\n"
+		"orefld o14, 840(o12)\n orefst o14, 256(o2)"
+		::: "memory");
+
+	/* vector queues: O12 848.. -> wait_set 264.. */
+	asm volatile(
+		"orefld o14, 848(o12)\n orefst o14, 264(o2)\n"
+		"orefld o14, 856(o12)\n orefst o14, 272(o2)\n"
+		"orefld o14, 864(o12)\n orefst o14, 280(o2)\n"
+		"orefld o14, 872(o12)\n orefst o14, 288(o2)\n"
+		"orefld o14, 880(o12)\n orefst o14, 296(o2)\n"
+		"orefld o14, 888(o12)\n orefst o14, 304(o2)\n"
+		"orefld o14, 896(o12)\n orefst o14, 312(o2)\n"
+		"orefld o14, 904(o12)\n orefst o14, 320(o2)\n"
+		"orefld o14, 912(o12)\n orefst o14, 328(o2)\n"
+		"orefld o14, 920(o12)\n orefst o14, 336(o2)\n"
+		"orefld o14, 928(o12)\n orefst o14, 344(o2)\n"
+		"orefld o14, 936(o12)\n orefst o14, 352(o2)\n"
+		"orefld o14, 944(o12)\n orefst o14, 360(o2)\n"
+		"orefld o14, 952(o12)\n orefst o14, 368(o2)\n"
+		"orefld o14, 960(o12)\n orefst o14, 376(o2)\n"
+		"orefld o14, 968(o12)\n orefst o14, 384(o2)"
+		::: "memory");
+
+	/* raster queues: O12 984.. -> wait_set 392.. */
+	asm volatile(
+		"orefld o14, 984(o12)\n orefst o14, 392(o2)\n"
+		"orefld o14, 992(o12)\n orefst o14, 400(o2)\n"
+		"orefld o14, 1000(o12)\n orefst o14, 408(o2)\n"
+		"orefld o14, 1008(o12)\n orefst o14, 416(o2)\n"
+		"orefld o14, 1016(o12)\n orefst o14, 424(o2)\n"
+		"orefld o14, 1024(o12)\n orefst o14, 432(o2)\n"
+		"orefld o14, 1032(o12)\n orefst o14, 440(o2)\n"
+		"orefld o14, 1040(o12)\n orefst o14, 448(o2)\n"
+		"orefld o14, 1048(o12)\n orefst o14, 456(o2)\n"
+		"orefld o14, 1056(o12)\n orefst o14, 464(o2)\n"
+		"orefld o14, 1064(o12)\n orefst o14, 472(o2)\n"
+		"orefld o14, 1072(o12)\n orefst o14, 480(o2)\n"
+		"orefld o14, 1080(o12)\n orefst o14, 488(o2)\n"
+		"orefld o14, 1088(o12)\n orefst o14, 496(o2)\n"
+		"orefld o14, 1096(o12)\n orefst o14, 504(o2)\n"
+		"orefld o14, 1104(o12)\n orefst o14, 512(o2)"
+		::: "memory");
+
+	/* fixed input slots: pointer-svc, pointer-events, keyboard-svc,
+	 * keyboard-events sinks (always live after boot). */
+	asm volatile(
+		"orefld o14, 1120(o12)\n orefst o14, 520(o2)\n"   /* pointer svc  */
+		"orefld o14, 1136(o12)\n orefst o14, 528(o2)\n"   /* pointer evts */
+		"orefld o14, 1152(o12)\n orefst o14, 536(o2)\n"   /* keyboard svc */
+		"orefld o14, 1168(o12)\n orefst o14, 544(o2)"     /* keyboard evts*/
+		::: "memory");
+
+	/* Block until any listed queue is non-empty.  O2 already holds the
+	 * wait-set list; R5 = the fixed count. */
+	asm volatile(
+		"addiu r5, r0, %1\n"           /* count */
+		"call  #0x206\n"               /* WaitAnyQueue */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(WM_WAITSET_COUNT)
+		: "r1", "r2", "r5"
+	);
+
+	/* We clobbered O2 (the wait-set list) to make the call; restore the
+	 * boot stack/data ORs print_str and the console helpers expect —
+	 * same dance ReceiveQueuePoll needed. */
+	wm_restore_boot_or();
+	return status;
+}
+
+/* Non-blocking poll of the main service queue (timeout = 0): the
+ * WaitAnyQueue above already parked us until something was ready, so
+ * here we just drain whatever the service queue holds and return
+ * immediately if it's empty. */
 static int
 poll_one_request(int *out_op, int *out_wid, int *out_arg)
 {
 	int status, op, wid, arg;
 	asm volatile(
 		"omov  o1, o9\n"
-		"addiu r4, r0, %4\n"           /* timeout */
+		"addiu r4, r0, 0\n"            /* timeout = 0 (non-blocking) */
 		"call  #0x204\n"               /* ReceiveQueuePoll */
 		"nop\n"
 		"addu  %0, r2, r0\n"
@@ -3071,7 +3251,7 @@ poll_one_request(int *out_op, int *out_wid, int *out_arg)
 		"addu  %2, r4, r0\n"
 		"addu  %3, r5, r0"
 		: "=r"(status), "=r"(op), "=r"(wid), "=r"(arg)
-		: "i"(WM_POLL_TICKS)
+		:
 		: "r1", "r2", "r3", "r4", "r5"
 	);
 	*out_op  = op;
@@ -3784,10 +3964,10 @@ forward_grid_write(int offset, int count, int col, int row)
  * For each pending SEND, forward to the underlying terminal.
  *
  * Empty queues return ETIMEOUT immediately, so this is cheap.  We
- * call it after every main-service iteration (whether a request
- * dispatched or the poll timed out) so per-window writes have at
- * most ~WM_POLL_TICKS of latency on top of the natural turn-around
- * of the producing program. */
+ * call it after every wake (Phase 61: WaitAnyQueue wakes us the
+ * instant any console queue receives a SEND), so per-window writes
+ * now have no timeout floor — just the natural turn-around of the
+ * producing program. */
 static void
 poll_window_consoles(void)
 {
@@ -4995,6 +5175,18 @@ main(void)
 		}
 	}
 
+	/* Phase 61 — allocate the wait-set objstore the event-driven main
+	 * loop refills + hands to WaitAnyQueue each iteration.  Must come
+	 * after the service mailbox (O9) and the input sinks exist; the
+	 * per-window slots fill in as windows are created. */
+	status = alloc_wait_set();
+	if (status != 0) {
+		WM_PRINT("oriscwm: alloc_wait_set failed: ");
+		WM_PRINT_INT(status);
+		WM_PRINT("\n");
+		return 1;
+	}
+
 	WM_PRINT("oriscwm: registered at ");
 	WM_PRINT(path_self_register);
 	WM_PRINT("\n");
@@ -5012,30 +5204,33 @@ main(void)
 
 	WM_PRINT(banner_ready);
 
-	/* Dispatch loop.
+	/* Dispatch loop (Phase 61 — event-driven).
 	 *
 	 * Each iteration:
-	 *   1. Poll our main service queue with WM_POLL_TICKS timeout —
-	 *      handles NEW_WINDOW / BIND_SURFACE / DESTROY_WINDOW /
-	 *      SUBSCRIBE_EVENTS.
-	 *   2. After the main poll (whether it dispatched or timed out),
-	 *      drain all per-window CONSOLE queues round-robin and
-	 *      forward writes to the underlying terminal.  Per-window
-	 *      polling is non-blocking (timeout=0) so empty queues
-	 *      cost essentially nothing.
-	 *   3. On main-poll timeout: run the auto-destroy scan
-	 *      (task_query each window's owner; free EXITed slots).
-	 *
-	 * Per-window CONSOLE writes get drained on every iteration, so
-	 * their latency is bounded by the main-poll's turn-around.
-	 * Typical interactive flow (user types → keyboard event wakes
-	 * focused program → program writes to its console → SEND lands
-	 * in per-window queue → next iteration drains it) keeps the
-	 * latency to roughly the wall-clock time of the program's own
-	 * processing.  Pure-idle latency caps at WM_POLL_TICKS. */
+	 *   1. Block in WaitAnyQueue (#0x206) over EVERY queue we own —
+	 *      the main service queue, all per-window CONSOLE / GRID /
+	 *      VECTOR / RASTER queues, and the keyboard / pointer service
+	 *      + input-sink queues.  The firmware parks the CPU until ANY
+	 *      of them is non-empty, so an idle WM burns no instructions
+	 *      and a keystroke / console write / service request wakes us
+	 *      with no timeout floor.
+	 *   2. Drain everything with non-blocking polls (timeout=0): one
+	 *      service request, then every per-window queue round-robin,
+	 *      then the input sinks.  Empty queues return immediately.  If
+	 *      a backlog remains, WaitAnyQueue returns immediately next
+	 *      iteration (a queue is still non-empty) so we keep draining
+	 *      without ever idling — no busy-wait, just work-driven loops.
+	 *   3. When the service queue was empty this wake, run the
+	 *      auto-destroy scan (task_query each window's owner; free
+	 *      EXITed slots) — same trigger as the old timeout branch,
+	 *      now fired on any wake with no pending service request. */
 	for (;;) {
 		int op, wid_or_zero, arg;
-		int status = poll_one_request(&op, &wid_or_zero, &arg);
+		int status;
+
+		wm_block_until_ready();
+
+		status = poll_one_request(&op, &wid_or_zero, &arg);
 		if (status == 0) {
 			/* Stash sender's reply_cap (their O3, our O3 post-
 			 * dispatch) into WM_SCRATCH_SLOT before any subsequent
@@ -5058,7 +5253,8 @@ main(void)
 				wm_reply(E_INVAL, 0, 0, 0);
 			}
 		} else {
-			/* Timeout or transient — run the auto-destroy scan. */
+			/* No service request this wake — run the auto-destroy
+			 * scan (replaces the old WM_POLL_TICKS-timeout trigger). */
 			scan_owner_exits();
 		}
 

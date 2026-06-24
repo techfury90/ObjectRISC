@@ -272,6 +272,7 @@ subsection here notes a simulator-specific deviation.
 | `0x200` | `InstallHandler`      | S | Vol VI §6; §3.6 | |
 | `0x203` | `ReceiveQueueAttach`  | U | Vol VI §6; §3.7 | |
 | `0x204` | `ReceiveQueuePoll`    | U | Vol VI §6; §3.8 | |
+| `0x206` | `WaitAnyQueue`        | U | Vol VI §6; §3.8.1 | Readiness wait over a queue set |
 | `0x301` | `ReadCycles`          | U | Vol VI §7; §3.9 | |
 | `0x320` | `ConsoleWrite`        | U | Vol VI §7; §3.10 | |
 | `0x400` | `TimeNow`             | U | Vol VI §8 | |
@@ -462,6 +463,53 @@ Returns:
   - `R3`–`R6` = the SEND's four wire integer payload words. Note
     that `R3` carries the first integer payload word, *not* a return
     value — the status occupies `R2` alone.
+
+### 3.8.1 `0x206 WaitAnyQueue`
+
+The multi-queue companion to `ReceiveQueuePoll`: a **pure readiness
+wait** over a *set* of receive queues. It blocks the calling CPU until
+**any** listed queue is non-empty, then returns `OK` **without
+dequeuing** — the caller drains the actual messages with its own
+per-queue `ReceiveQueuePoll`s. This is the missing "wait on many queues
+at once" primitive: a multiplexing server (the window manager) can
+idle-block instead of busy-polling each of its queues on a short timeout
+(the old ~100 ms `WM_POLL_TICKS` interactive-latency floor).
+
+The queue set is dynamic and outgrows the object registers (a window
+manager has a per-window queue that comes and goes), so it is passed by
+memory, not in registers.
+
+Inputs:
+- `O2` = an `OBJSTORE` object whose first `R5` 8-byte slots hold packed
+  64-bit queue references (the `OREFST` layout). Must carry `R`.
+- `R5` = the number of references to read (count).
+
+Each listed reference is validated exactly like `ReceiveQueuePoll`'s
+`O1` target — `V` cap, home == the calling CPU, live descriptor,
+matching generation, a receive queue attached — but an entry that
+**fails** validation (a null slot, or the stale ref of a freed
+per-window queue, or a non-queue object) is **skipped, not fatal**: the
+set legitimately holds slots that come and go between iterations, and
+the caller rebuilds it each loop. A malformed *list object* (`O2`
+itself) is still an error.
+
+Returns:
+- `R2` = `OK` once at least one listed queue is non-empty (immediately
+  if one already is); `EFAULT` / `EPERM` / `EREMOTE` / `ESTALE` /
+  `EINVAL` if the list object itself is unusable.
+- `R3` = `0`. No payload is delivered — this is a readiness signal, not
+  a dequeue; registers and object registers are otherwise untouched.
+
+The block is **infinite** (no timeout): the CPU parks at the `CALL`
+until a queue fills, then advances. The wake works cross-CPU — when a
+remote `SEND` lands on a listed home queue via the crossbar, the
+scheduler resumes the parked caller the same tick.
+
+**Numbering.** `0x206` is the first free hole in the Communication group
+(§6) after `ReceiveQueuePoll`; `0x205` is reserved by Volume VI for
+`MessagePayloadOR4` and was skipped (an unnamed hole was claimed, per
+the §3.0.1 discipline). Volume VI §6 has been extended to define
+`0x206` so the spec and this implementation stay in lockstep.
 
 ### 3.9 `0x301 ReadCycles`
 

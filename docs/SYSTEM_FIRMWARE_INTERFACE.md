@@ -902,6 +902,34 @@ object types and the in-framebuffer rendering operations on them.
 > fourth payload slot was null). `R2`: status. Errors: `EINVAL` (not
 > in a handler dispatch context).
 
+**`0x206  WaitAnyQueue`** — *Non-restartable.*
+
+> Block until any one of a *set* of attached receive queues is
+> non-empty, then return without dequeuing — a pure readiness wait, the
+> multi-queue companion to `ReceiveQueuePoll`. The caller drains the
+> ready queue(s) with its own `ReceiveQueuePoll`s; this primitive only
+> reports that work is waiting. It lets a server that multiplexes many
+> queues block on all of them at once instead of polling each on a
+> timeout.
+>
+> The set is passed by memory because it is dynamic and larger than the
+> object-register file.
+>
+> Args:
+> - `O2`: an OR-typed storage object (`ObjAllocStore`) whose first `R5`
+>   slots hold packed queue references (one per 8-byte slot). Must carry
+>   `R`.
+> - `R5`: number of references in the set.
+>
+> Each reference is validated as in `ReceiveQueuePoll` (`V` cap, home ==
+> the calling processor, attached receive queue). An entry that fails
+> validation is skipped rather than faulting the call, so the caller may
+> rebuild the set freely as queues come and go.
+>
+> Returns: `R2`: status (`OK` once any listed queue is non-empty;
+> errors only for a malformed list object). `R3`: `0`. No message is
+> delivered. The wait is unbounded (no timeout).
+
 **`0x210  ProcessorList`** — *Restartable.*
 
 > Populate a buffer with the identifiers of every processor in the
