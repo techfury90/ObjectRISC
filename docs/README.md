@@ -52,17 +52,33 @@ dedicated boot guide is a possible follow-up.
 ## Combined PDFs
 
 [`build_pdf.py`](build_pdf.py) merges all seven volumes into a
-single markdown (`OBJECT_RISC.md`) ready for pandoc:
+single markdown (`OBJECT_RISC.md`); pandoc + xelatex then typeset it
+into a book with a title page, a hyperlinked TOC, and one chapter per
+volume:
 
 ```sh
 cd docs
 python3 build_pdf.py             # produces docs/OBJECT_RISC.md
 pandoc OBJECT_RISC.md -o ObjectRISC.pdf \
-    --include-in-header=preamble.tex \
-    --pdf-engine=xelatex
+    --include-in-header=preamble.tex --pdf-engine=xelatex \
+    --top-level-division=chapter -V documentclass=report \
+    --toc --toc-depth=2 -V geometry:margin=1in \
+    -V title="The Object RISC Architecture" \
+    -V subtitle="Architecture Reference, Revision 0.1" \
+    -V author="The Object RISC Architecture Group" \
+    -V date="1986"
 ```
+
+The `--top-level-division=chapter`, `documentclass=report`, title
+metadata, and `geometry` flags are all required: `preamble.tex`
+redefines the chapter heading (which only exists in a chapter-bearing
+class), and the title/TOC/margins are what reproduce the shipped layout.
 
 Two pre-built PDFs ship for convenience:
 
-- [`ObjectRISC.pdf`](ObjectRISC.pdf) — Computer Modern, 72 pp
-- [`ObjectRISC-Palatino.pdf`](ObjectRISC-Palatino.pdf) — TeX Gyre Pagella, 79 pp
+- [`ObjectRISC.pdf`](ObjectRISC.pdf) — Computer Modern, 72 pp (the
+  command above).
+- [`ObjectRISC-Palatino.pdf`](ObjectRISC-Palatino.pdf) — the academic
+  variant: the same command plus `-V mainfont="TeX Gyre Pagella"
+  -V mainfontoptions="Numbers=OldStyle"`. Regenerated less often, so it
+  may trail the Computer Modern build.
