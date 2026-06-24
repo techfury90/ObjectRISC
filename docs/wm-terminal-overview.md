@@ -892,10 +892,17 @@ terminal" comments — is all Phase 60.
 
 ## Open questions / things to verify
 
-- **`docs/SYSTEM_FIRMWARE_INTERFACE.md` / `CONTRACT.md` coverage of the Phase-60
-  primitives.** The `#0x102/#0x10B/#0x10C..#0x10F` graphics+input primitives are
-  fully implemented in `simorisc` but I did not confirm they are yet written into
-  the formal firmware spec volumes; if not, that is a spec/implementation gap.
+- **`CONTRACT.md` §3 implemented-primitive list is stale.** The Phase-60
+  graphics+input primitives (`#0x102/#0x10B/#0x10C..#0x10F`) are now specified in
+  [`docs/SYSTEM_FIRMWARE_INTERFACE.md` §5.4](SYSTEM_FIRMWARE_INTERFACE.md). But
+  `CONTRACT.md` §3 ("The Firmware Primitives the Simulator Must Implement") still
+  omits them — and several others the dispatch table implements (`ObjFetchBytes` /
+  `ObjStoreBytes` `#0x108/#0x109`, `ObjFreeDeferred` `#0x107`, `Unmap` `#0x111`,
+  `TaskKill` `#0x00A`, `TimeNow` `#0x400`, …). Two number conflicts also want
+  resolving: `#0x102` is `ObjAllocFramebuffer` in the implementation but `ObjRevoke`
+  in the spec (§5.1), and `#0x301` is `ReadCycles` in the implementation
+  ([`CONTRACT.md` §3.9](CONTRACT.md)) but `DeviceQuery` in the spec (§7).
+  Reconciling `CONTRACT.md` §3 with the `simorisc` dispatch is an open follow-up.
 - **Keyboard binding asymmetry** in the supervisor's per-spawn path
   ([`supervisor.c:927`](../ouroboros/supervisor.c#L927)): relayed/hot-attach
   children resolve keyboard only from `/sys/term/<idx>/keyboard`, which won't

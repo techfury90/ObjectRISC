@@ -619,6 +619,206 @@ The spill buffer is sized at sixteen slots in this revision. Code
 that requires deeper spilling must marshal references through a
 heap-allocated array object as Volume VII Section 2.4 describes.
 
+### 5.4 Display and Input Object Primitives
+
+The primitives of this subsection allocate and mutate two object types
+whose storage is bound to a host display surface and a host input
+device respectively. They exist to let a window manager / terminal run
+as ordinary user-mode code on a conforming processor — owning its
+framebuffer and its keyboard and pointer input locally — rather than as
+a separate device on the interconnect. The full subsystem walkthrough,
+with worked input and output traces, is the subsystem guide
+`docs/wm-terminal-overview.md`.
+
+Two object type tags are involved (values following the reference
+implementation's `0x410x` type-tag block, Volume V and `CONTRACT.md`
+Section 2):
+
+- **`TAG_FRAMEBUFFER`** (`0x4106`) — a host-display-backed pixel object
+  holding `w × h` bytes, one byte per pixel interpreted as a palette
+  index. The palette interpretation lives entirely in the host display;
+  firmware sees only raw bytes. A non-offscreen framebuffer is mirrored
+  to a host display surface and repainted whenever a write marks it
+  dirty.
+- **`TAG_INPUT_SINK`** (`0x4105`) — a zero-length object carrying an
+  auto-attached receive queue (Section 6) into which firmware appends
+  host input events as ordinary `SEND` messages.
+
+The four blitter primitives (`ObjBlitGlyphs`, `ObjFillRect`,
+`ObjFbScroll`, `ObjBlitCopy`) operate only on `TAG_FRAMEBUFFER` objects
+and require every referenced object to be **local** to the calling
+processor: a cross-processor blit would need a wire round-trip per
+source byte, defeating their purpose. A remote reference returns
+`EREMOTE`. Each names its destination framebuffer in `O1`, validates
+`W` on it (and `R` on any source), and marks it dirty on success; all
+take their geometry in packed register words, two signed 16-bit halves
+per word.
+
+> **Numbering note.** This subsection is a reference-implementation
+> extension. It occupies primitive numbers inside the memory-management
+> group (Section 3): `0x102` and `0x10B`–`0x10F`. Number `0x102`
+> nominally names `ObjRevoke` (Section 5.1); the reference firmware does
+> **not** provide `ObjRevoke` and assigns `0x102` to
+> `ObjAllocFramebuffer` instead — so a caller may not assume both are
+> present on the same firmware. Numbers `0x10B`–`0x10F` are otherwise
+> reserved within the group (Sections 3 and 12). A future revision
+> should reserve a dedicated range for the display/input primitives or
+> formally reassign these numbers; until then they are non-portable in
+> the sense of Section 12 and a conforming firmware that omits them
+> returns `ENOSYS`.
+
+**`0x102  ObjAllocFramebuffer`** — *Restartable.*
+
+> Allocate a host-display-backed pixel object of `R4 × R5` bytes (one
+> byte per pixel, a palette index). Unless allocated offscreen, the
+> object is registered with the host display so its bytes are mirrored
+> to a display surface, repainted by the host whenever a subsequent
+> write marks the object dirty.
+>
+> Args:
+> - `R4`: width in pixels (1–4096).
+> - `R5`: height in pixels (1–4096).
+> - `R6`: initial maximum capabilities (low 8 bits).
+> - `R7`: flags. Bit 0 (`OFFSCREEN`) suppresses host-display
+>   registration — used for backing stores composited onto a separate
+>   on-screen framebuffer rather than shown directly.
+>
+> Returns:
+> - `O1`: reference to the new `TAG_FRAMEBUFFER` object on success, null
+>   on failure.
+> - `R2`: status.
+>
+> Errors: `EINVAL` (width or height zero or greater than 4096), `ENOMEM`.
+
+**`0x10B  ObjAllocInputSink`** — *Restartable.*
+
+> Allocate a host-input event sink: a zero-length `TAG_INPUT_SINK`
+> object with a receive queue auto-attached at depth 64 (the caller
+> need not call `ReceiveQueueAttach`). The sink is registered as the
+> calling processor's sink for the given kind; host input events of
+> that kind are delivered into its queue as ordinary `SEND` messages,
+> drained with `ReceiveQueuePoll`. Allocating a second sink of the same
+> kind replaces the registration — the previous object stays valid and
+> pollable, but new events route to the new one.
+>
+> Args:
+> - `R4`: kind (0 = keyboard, 1 = pointer).
+> - `R5`: initial maximum capabilities (low 8 bits). The reference
+>   window manager requests `R|W|S|V|C`; `V` is required because
+>   `ReceiveQueuePoll` needs it.
+>
+> Returns:
+> - `O1`: reference to the new `TAG_INPUT_SINK` object on success, null
+>   on failure.
+> - `R2`: status.
+>
+> Errors: `EINVAL` (kind other than 0 or 1), `ENOMEM`.
+
+**`0x10C  ObjBlitGlyphs`** — *Restartable.*
+
+> Render a horizontal run of fixed-cell monochrome glyphs into a
+> framebuffer. The glyph source is a 1-bit-per-pixel font: sixteen
+> bytes per glyph (one byte per scan row, most-significant bit
+> leftmost), ninety-five glyphs beginning at codepoint 32 (space). Each
+> source bit selects the foreground or background palette index for one
+> pixel of an 8×16 destination cell. Bytes outside the printable range
+> (below 32 or above 126) render as a space. Cells that fall outside the
+> framebuffer are dropped.
+>
+> Args:
+> - `O1`: destination framebuffer (`TAG_FRAMEBUFFER`; must carry `W`;
+>   must be local).
+> - `O2`: font object (must carry `R`; must be local).
+> - `O3`: text object holding the bytes to render (must carry `R`; must
+>   be local).
+> - `R4`: packed destination cell position, `(cell_x << 16) | cell_y`
+>   (cells are 8×16 pixels).
+> - `R5`: packed render shape, `(n_chars << 16) | (fg << 8) | bg`.
+> - `R6`: byte offset of the font table within `O2`.
+> - `R7`: byte offset of the glyph bytes within `O3`.
+>
+> Returns:
+> - `R2`: status.
+> - `R3`: number of glyphs rendered (`≤ n_chars` after clipping).
+>
+> Errors: `EFAULT` (a null reference), `EPERM` (`O1` lacks `W`, or a
+> source lacks `R`), `EREMOTE` (any referenced object is not local),
+> `ESTALE`, `EINVAL` (`O1` is not a framebuffer, or the text range
+> exceeds `O3`'s length).
+
+**`0x10D  ObjFillRect`** — *Restartable.*
+
+> Fill an axis-aligned rectangle of a framebuffer with a single palette
+> index. The rectangle is clipped to the framebuffer; an empty
+> rectangle is a successful no-op.
+>
+> Args:
+> - `O1`: framebuffer (`TAG_FRAMEBUFFER`; must carry `W`; must be local).
+> - `R4`: packed top-left, `(x << 16) | y` (each a signed 16-bit value).
+> - `R5`: packed size, `(w << 16) | h`.
+> - `R6`: palette index (low 8 bits).
+>
+> Returns: `R2`: status.
+>
+> Errors: `EFAULT`, `EPERM` (no `W`), `EREMOTE`, `ESTALE`, `EINVAL`
+> (`O1` is not a framebuffer).
+
+**`0x10E  ObjFbScroll`** — *Non-restartable.*
+
+> Shift a rectangular region of a framebuffer vertically and clear the
+> strip the shift exposes. A positive `dy` moves content toward `y = 0`
+> (scrolls up); the `|dy|` rows freshly exposed at the far edge are
+> filled with `fill`. A `|dy|` at least the region height clears the
+> whole region; `dy = 0` is a no-op. The region is clipped to the
+> framebuffer. Non-restartable: a re-issue applies the shift a second
+> time.
+>
+> Args:
+> - `O1`: framebuffer (`TAG_FRAMEBUFFER`; must carry `W`; must be local).
+> - `R4`: packed region top-left, `(x << 16) | y`.
+> - `R5`: packed region size, `(w << 16) | h`.
+> - `R6`: packed `(dy << 8) | fill` — `dy` is a signed 24-bit pixel
+>   count; `fill` is the palette index for the exposed strip.
+>
+> Returns: `R2`: status.
+>
+> Errors: `EFAULT`, `EPERM` (no `W`), `EREMOTE`, `ESTALE`, `EINVAL`
+> (`O1` is not a framebuffer).
+
+**`0x10F  ObjBlitCopy`** — *Restartable.*
+
+> Copy a rectangular region of pixels from one framebuffer to another,
+> or within a single framebuffer. Source and destination rectangles are
+> each clipped to their own framebuffer and the transfer takes the
+> intersection, so the result is well-defined even when one side would
+> overflow. When source and destination are the same object and the
+> regions overlap, firmware orders the row copies so each is read before
+> any write that would clobber it. This is the compositor primitive: the
+> reference window manager keeps each window's pixels in an offscreen
+> framebuffer and blits the visible region onto the on-screen
+> framebuffer after each paint.
+>
+> Args:
+> - `O1`: destination framebuffer (`TAG_FRAMEBUFFER`; must carry `W`;
+>   must be local).
+> - `O2`: source framebuffer (`TAG_FRAMEBUFFER`; must carry `R`; must be
+>   local). May be the same reference as `O1`.
+> - `R4`: packed source top-left, `(src_x << 16) | src_y`.
+> - `R5`: packed destination top-left, `(dst_x << 16) | dst_y`.
+> - `R6`: packed region size, `(w << 16) | h`.
+>
+> Returns: `R2`: status.
+>
+> Errors: `EFAULT` (a null reference), `EPERM` (`O1` lacks `W` or `O2`
+> lacks `R`), `EREMOTE` (either is not local), `ESTALE`, `EINVAL`
+> (either is not a framebuffer).
+
+The window manager moves the actual text and pixel payloads between a
+client's objects and its framebuffers with the bulk-data primitives
+`ObjFetchBytes` (Section 5.1.3) and `ObjStoreBytes` (Section 5.1.4),
+already specified above. This subsection adds only the two display/input
+object types and the in-framebuffer rendering operations on them.
+
 ## 6. Communication Primitives
 
 **`0x200  InstallHandler`** — *Restartable.*
