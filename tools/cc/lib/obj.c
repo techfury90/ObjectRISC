@@ -304,6 +304,37 @@ obj_adopt_o7(void)
 	return h;
 }
 
+obj_t
+obj_adopt_o10(void)
+{
+	int h, isn;
+
+	h = obj__alloc_handle();
+	if (h < 0)
+		return OBJ_NULL;
+	asm volatile(
+		"omov o1, o10\n"          /* O1 = boot hostfsd-service cap */
+		"oisn %0, o1"
+		: "=r"(isn)
+		:
+		: "r1"
+	);
+	if (isn)
+		return OBJ_NULL;          /* O10 null — nothing to adopt */
+	obj__store_o1(h);
+	obj_inuse |= (1u << h);
+	return h;
+}
+
+void
+obj_park_o8(obj_t h)
+{
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return;
+	obj__load_o1(h);              /* O1 = handle's capability */
+	asm volatile("omov o8, o1");  /* O8 = compat mirror (see obj.h) */
+}
+
 /* --- inspection ----------------------------------------------------- */
 
 int
