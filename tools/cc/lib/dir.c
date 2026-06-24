@@ -28,6 +28,7 @@
  */
 
 #include "liborisc.h"
+#include "obj.h"
 
 #define TAG_DATA           0x4102
 #define TAG_SERVICE        0x4103
@@ -335,17 +336,31 @@ dir_init(void)
 	return 0;
 }
 
-/* dir_register — bind O1 (caller-supplied) to `path` as a leaf. */
+/* Restore the boot O2/O3 the obj.h SEND/poll primitives clobbered, so a
+ * caller's following print etc. keeps working. (O4/self-svc is vestigial
+ * on this path — see wm.c — so it's left alone.) */
+static void
+_dir_restore_or(void)
+{
+	asm volatile("omov o2, o11");
+	asm volatile("omov o3, o15");
+}
+
+/* dir_register — bind O1 (caller-supplied) to `path` as a leaf.
+ *
+ * Phase 4 (foundation validation): migrated onto obj.h — proves the new
+ * obj_make_bytes (TAG_DATA request object via MapObject) + obj_send_3or
+ * (O2 path-bytes, O3 reply mailbox, O4 ref-to-register) keystones. The
+ * other dir ops (walk/mount/list/subscribe) and dir_init / the reply
+ * mailbox bootstrap stay on their proven asm for now; obj_adopt_slot
+ * bridges their raw-O12-slot caps (DIR_SLOT 584, REPLY_MB 552,
+ * DIR_INPUT_REF 624) into handles for this one SEND. */
 int
 dir_register(const char *path)
 {
-	/* Save the caller's O1 (the ref to register) into the dedicated
-	 * input slot IMMEDIATELY — before any other call. dir_init's
-	 * dir_slot_isn does `orefld o1, ...` which clobbers O1; on first
-	 * dir_reply_mailbox_init the inner ObjAlloc leaves REPLY_MB's
-	 * ref in O1. If we save to O13 (or elsewhere) AFTER those calls,
-	 * we'd register the wrong ref. The SEND below pulls O4 from this
-	 * slot directly. */
+	/* Save the caller's O1 (the ref to register) into DIR_INPUT_REF_SLOT
+	 * IMMEDIATELY — dir_init's dir_slot_isn does `orefld o1, ...` which
+	 * clobbers O1. We adopt it back out of the slot below. */
 	asm volatile(
 		"orefst o1, %0(o12)"
 		:
@@ -359,62 +374,40 @@ dir_register(const char *path)
 
 	int len = dir_strlen(path);
 	if (len <= 0 || len >= DIR_PATH_BUF_SIZE) return -1;
+	if (obj_init() != 0) return -6;
 
-	rc = dir_alloc_bytes_o14(DIR_PATH_BUF_SIZE,
-	                          CAP_R | CAP_W | CAP_V | CAP_C);
-	if (rc != 0) return rc;
-	rc = dir_pack_bytes_o1(path, len, DIR_PATH_BUF_SIZE);
-	if (rc != 0) { dir_free_o14_deferred(); return rc; }
+	/* Bridge the three caps the SEND needs out of their raw slots into
+	 * handles, and build the path-bytes request object. */
+	obj_t dir_h   = obj_adopt_slot(DIR_SLOT_OFFSET);
+	obj_t reply_h = obj_adopt_slot(REPLY_MB_SLOT_OFFSET);
+	obj_t ref_h   = obj_adopt_slot(DIR_INPUT_REF_SLOT_OFFSET);
+	obj_t path_h  = obj_make_bytes(path, len,
+	                               CAP_R | CAP_W | CAP_V | CAP_C);
+	if (dir_h < 0 || reply_h < 0 || ref_h < 0 || path_h < 0) {
+		if (path_h >= 0) obj_free(path_h);
+		obj_drop(dir_h); obj_drop(reply_h); obj_drop(ref_h);
+		return -6;
+	}
 
-	/* Derive R+S reply sub-cap. */
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, 9\n"
-		"call  #0x103\n"
-		"nop\n"
-		"orefst o1, 608(o12)\n"
-		"addu  %0, r2, r0"
-		: "=r"(rc) : : "r1", "r2", "r4"
-	);
-	if (rc != 0) { dir_free_o14_deferred(); return rc; }
+	/* SEND: O2 = path bytes, O3 = reply mailbox cap, O4 = ref to
+	 * register; R5 = path length. */
+	obj_send_3or(dir_h, path_h, reply_h, ref_h,
+	             DIR_OP_REGISTER, len, 0, 0);
 
-	/* SEND to oriscdir.
-	 *   O1 = dir mailbox       (DIR_SLOT)
-	 *   O2 = path bytes        (O14)
-	 *   O3 = reply_cap         (DIR_REPLY_SCRATCH)
-	 *   O4 = ref to register   (DIR_INPUT_REF_SLOT, saved at entry)
-	 *   R4 = op
-	 *   R5 = path length */
-	asm volatile(
-		"orefld o1, 584(o12)\n"        /* DIR_SLOT */
-		"omov   o2, o14\n"
-		"orefld o3, 608(o12)\n"        /* DIR_REPLY_SCRATCH */
-		"orefld o4, %2(o12)\n"         /* DIR_INPUT_REF_SLOT */
-		"addiu  r4, r0, %0\n"
-		"addu   r5, %1, r0\n"
-		"addiu  r6, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		: : "i"(DIR_OP_REGISTER), "r"(len),
-		    "i"(DIR_INPUT_REF_SLOT_OFFSET)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
+	/* Block on the reply. The daemon ObjFetchBytes the path before it
+	 * replies, so the reply is a barrier — safe to free the path object
+	 * after it (no async-buffer race). */
+	int out[4];
+	int prc = obj_recv_full(reply_h, out);
+	_dir_restore_or();
 
-	dir_free_o14_deferred();
+	obj_free(path_h);              /* bytes object — daemon done with it */
+	obj_drop(dir_h);               /* handles alias raw slots / caller's */
+	obj_drop(reply_h);             /* ref — drop, never free */
+	obj_drop(ref_h);
 
-	int status, reply_status;
-	asm volatile(
-		"orefld o1, 552(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"addu  %0, r3, r0\n"
-		"addu  %1, r2, r0"
-		: "=r"(reply_status), "=r"(status)
-		: : "r1", "r2", "r3", "r4"
-	);
-	if (status != 0) return -6;
-	return reply_status;
+	if (prc != 0) return -6;
+	return out[0];                 /* reply R3 = status */
 }
 
 /* dir_mount — register a MOUNT at `path` with O1 as the service

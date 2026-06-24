@@ -80,6 +80,12 @@ void  obj_drop(obj_t h);
  * call. Returns OBJ_NULL if that slot is null or the table is full. */
 obj_t obj_adopt_dir_result(void);
 
+/* Adopt the capability in a known libc O12 slot (544 BOOT_PARENT, 552
+ * REPLY_MB, 584 DIR_SLOT, 624 DIR_INPUT_REF) into a handle — a migration
+ * bridge for dir.c / sup.c, whose caps are bootstrapped into raw slots by
+ * other code. OBJ_NULL if the slot is null or the table is full. */
+obj_t obj_adopt_slot(int off);
+
 /* Publish handle `h`'s capability into the DIR_RESULT slot (the inverse
  * of obj_adopt_dir_result). A compatibility bridge: wm_bind_surface
  * receives its resolved surface cap via obj_recv_cap but mirrors it here
@@ -159,6 +165,23 @@ int   obj_send_or(obj_t h, obj_t or_h, int a0, int a1, int a2, int a3);
  * client (host_io, term console, sup, dir, raster, grid) needs. */
 int   obj_send_bytes(obj_t svc, int src, obj_t reply,
                      int a0, int a1, int a2, int a3);
+
+/* SEND to `svc` carrying up to THREE OR-register payloads from handles:
+ * O2 = `or2`, O3 = `or3`, O4 = `or4` (each null when the handle is
+ * OBJ_NULL); R4..R7 = a0..a3. The directory clients need this — a
+ * request is O2 = path-bytes object, O3 = reply mailbox, O4 = the ref
+ * being registered. Returns 0 (SEND traps on error), -1 if `svc` is
+ * invalid. */
+int   obj_send_3or(obj_t svc, obj_t or2, obj_t or3, obj_t or4,
+                   int a0, int a1, int a2, int a3);
+
+/* Build a fresh TAG_DATA byte object holding `len` bytes from `src` (the
+ * object is sized to `len` rounded up to 8; the bytes sit at offset 0),
+ * via ObjAlloc + MapObject + copy + Unmap, and return its handle. For
+ * services (oriscdir) whose wire protocol reads the payload object at
+ * offset 0 — so the boot segment (which obj_send_bytes uses) can't carry
+ * it. obj_free the handle when done. Returns OBJ_NULL on failure. */
+obj_t obj_make_bytes(const char *src, int len, unsigned int caps);
 
 /* Block on the receive queue attached to `h` until a message arrives;
  * returns its R3 word (or <0 on poll error). Caller reads the rest of
