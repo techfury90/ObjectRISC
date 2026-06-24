@@ -9,8 +9,15 @@
 #
 # Asserts on the rendered terminal:
 #   - "[bg task 0]"        from cmd_run with `&`
-#   - "[task 0]"           from cmd_jobs (the jobs listing line)
-#   - "[task 0 done 0]"    from the auto-reaper
+#   - a valid `jobs` listing: EITHER task 0 enumerated with a live-state
+#     label ("[task 0] runnable" etc.) OR "(no live tasks)" if the
+#     auto-reaper cleared the slot first — which one depends on whether
+#     the reap beat the `jobs` dispatch, a scheduling race; both are
+#     correct jobs output.
+#   - task 0 reaped exactly once, exit 0 (here always via the auto-reaper:
+#     "[task 0 done 0]"; the either-verb check below is shared with
+#     test_shell_bg). Pinning the exact jobs state / reaper made this
+#     flip on unrelated libc cycle-count changes.
 
 set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -134,9 +141,24 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 
 grep -q "\[bg task 0\]"        "$TMP/rendered.txt" \
     || fail "[bg task 0] not in rendered output (cmd_run with &)"
-grep -q "\[task 0 done 0\]"    "$TMP/rendered.txt" \
-    || fail "[task 0 done 0] not in rendered output (auto-reap)"
-grep -q "(no live tasks)"      "$TMP/rendered.txt" \
-    || fail "'(no live tasks)' from jobs not seen — auto-reap should have cleared the slot before jobs ran"
+
+# jobs invariant: the `jobs` command ran and produced a valid listing —
+# either it still caught task 0 (printed with a live-state label) or the
+# auto-reaper had already cleared the table ("(no live tasks)"). Whether
+# the reap beats the `jobs` dispatch is a scheduling race; both are
+# correct jobs behaviour.
+grep -qE "\(no live tasks\)|\] (new|runnable|running|suspended|blocked|exited)" "$TMP/rendered.txt" \
+    || fail "jobs produced no recognizable listing (neither a task entry nor '(no live tasks)')"
+
+# Reap invariant (shared with test_shell_bg): task 0 reaped exactly once,
+# exit 0, via either verb. Here the reaper is always the auto-reaper
+# ("[task 0 done 0]"), but the either-verb form keeps the two tests in
+# step. Still fails on no-reap / nonzero / double-reap.
+reap_all=$(grep -oE "\[task 0 (done|exited) -?[0-9]+\]" "$TMP/rendered.txt" | wc -l | tr -d ' ')
+reap_zero=$(grep -oE "\[task 0 (done|exited) 0\]" "$TMP/rendered.txt" | wc -l | tr -d ' ')
+[ "$reap_all" -eq 1 ] \
+    || fail "task 0 should be reaped exactly once, saw $reap_all reap line(s)"
+[ "$reap_zero" -eq 1 ] \
+    || fail "task 0 not reaped with exit 0 (reap line carried a nonzero code)"
 
 echo "PASS"

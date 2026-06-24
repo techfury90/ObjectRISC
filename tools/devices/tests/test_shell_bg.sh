@@ -8,14 +8,19 @@
 # Types:
 #     run hello_term.orx &<RET>     ; spawns guest; shell prints
 #                                   ; "[bg task N]" and yields once
-#     wait 0<RET>                   ; harvests exit code; prints
-#                                   ; "[task 0 exited 0]"
+#     wait 0<RET>                   ; harvests exit code
 #     exit<RET>
 #
 # Asserts the rendered terminal contains:
 #   - "[bg task 0]"                  (cmd_run with & path)
 #   - "hello from inside the Tk window"  (the guest itself)
-#   - "[task 0 exited 0]"            (cmd_wait reporting harvest)
+#   - task 0 reaped exactly once, exit 0, via EITHER verb:
+#     "[task 0 done 0]" (auto-reaper) or "[task 0 exited 0]" (explicit
+#     wait). Which reaper wins is a cooperative-scheduling race — both
+#     mean the bg task ran and was harvested cleanly. orx_unload frees
+#     the task, so only one of the two fires (exactly once). Pinning a
+#     specific verb made this assert an unpromised scheduling detail and
+#     flip on unrelated libc cycle-count changes.
 
 set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -139,7 +144,19 @@ grep -q "\[bg task 0\]"               "$TMP/rendered.txt" \
     || fail "[bg task 0] not found in rendered output"
 grep -q "hello from inside the Tk"     "$TMP/rendered.txt" \
     || fail "guest term_print didn't reach the Tk window"
-grep -q "\[task 0 done 0\]"            "$TMP/rendered.txt" \
-    || fail "auto-reaper didn't print [task 0 done 0]"
+
+# Reap invariant: task 0 is reaped exactly once, with exit code 0, by
+# EITHER path — the auto-reaper ("[task 0 done 0]") or an explicit
+# `wait 0` ("[task 0 exited 0]"). Which one wins is a scheduling race;
+# both prove the bg task ran and was harvested cleanly. orx_unload frees
+# the task, so only one of the two can fire — hence exactly once. (We do
+# NOT accept "the digit 0 appears somewhere": no-reap, a nonzero code,
+# and a double reap must all still fail.)
+reap_all=$(grep -oE "\[task 0 (done|exited) -?[0-9]+\]" "$TMP/rendered.txt" | wc -l | tr -d ' ')
+reap_zero=$(grep -oE "\[task 0 (done|exited) 0\]" "$TMP/rendered.txt" | wc -l | tr -d ' ')
+[ "$reap_all" -eq 1 ] \
+    || fail "task 0 should be reaped exactly once, saw $reap_all reap line(s)"
+[ "$reap_zero" -eq 1 ] \
+    || fail "task 0 not reaped with exit 0 (reap line carried a nonzero code)"
 
 echo "PASS"
