@@ -613,6 +613,26 @@ host display worker with no wire round-trip ([`oriscwm.c:872-880`](../ouroboros/
 > dance; the body itself notes "with oriscterm gone, the WM IS the CONSOLE
 > receiver" ([`oriscwm.c:3672`](../ouroboros/oriscwm.c#L3672)).
 
+> **⚠ Pitfall: async buffer lifetime — corruption that masquerades as a compiler bug.**
+> The data SENDs above (`term_print`, `grid_print_n`, `raster_blit`,
+> `obj_send_bytes`) are **fire-and-forget**: the receiver issues its
+> `OBJ_READ_REQ`/`ObjFetchBytes` for the payload *after* the sending CPU has moved
+> on, and there is **no ack** in the wire protocol. So the source buffer must stay
+> alive **and unchanged** until that async fetch. A buffer on a **stack frame that
+> a later call pops and reuses** — especially a deeper/blocking call like
+> `term_getkey` → `ReceiveQueuePoll` — is overwritten before the fetch, and the
+> receiver pulls garbage. Because the *caller's* source didn't change (only a
+> callee got deeper) and adding a debug print shifts the stack/timing, this looks
+> exactly like a non-deterministic **compiler / register-allocation Heisenbug** —
+> it is not. **Diagnose** it by `print_str`-ing the buffer right before the SEND:
+> correct in memory there but corrupt in the render ⇒ this race. **Fix** it by
+> keeping the buffer alive past the fetch — a sync variant that waits for an ack
+> (`term_print_n_sync`), a persistent caller frame (never a transient callee
+> local), or a `const` data-segment table (term.c's single-char table). This bit
+> the Phase-4 `term.c` migration: `cmd_view`'s status line, async-sent from
+> `view_render`'s frame, was clobbered by the next `term_getkey`; the fix moved
+> the buffer into `cmd_view`'s persistent loop frame.
+
 ---
 
 ## 8. The libc client APIs
