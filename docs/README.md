@@ -23,6 +23,16 @@ state, host-side semantics of each firmware primitive.
 [`HISTORY.md`](HISTORY.md) is the project's development log,
 phase by phase.
 
+## Subsystem guides
+
+Focused, current-architecture walkthroughs of individual subsystems
+(as opposed to the architecture spec above):
+
+- [`wm-terminal-overview.md`](wm-terminal-overview.md) — the Ouroboros
+  window-manager + terminal + graphics stack: how a keystroke reaches a
+  program, how a program draws to the screen, and how it all boots
+  (Phase 60: the WM owns the framebuffer + input and *is* the terminal).
+
 ## Combined PDFs
 
 [`build_pdf.py`](build_pdf.py) merges all seven volumes into a
