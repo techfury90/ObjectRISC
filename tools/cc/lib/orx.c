@@ -295,17 +295,22 @@ freedef_o1(void)
 
 /* Per-hf_read_obj transfer ceiling. hostfsd answers each read by
  * OBJ_WRITE'ing the whole span back in ONE packet, so this also bounds
- * the wire-packet size — and the binding constraint there is the crossbar
- * transport, not the loader: oriscbar relays packets with a non-blocking
- * sendall, and the host UNIX-domain socket buffer is only 8 KiB
- * (net.local.stream.sendspace), so a packet that doesn't fit the send
- * buffer is silently dropped (oriscbar write_packet) and the read hangs.
- * 4 KiB keeps the OBJ_WRITE_REQ comfortably inside that window with margin
- * for other in-flight traffic — still 4x the old 1 KiB stack-bounce chunk,
- * which is enough to make a real app's load latency disappear. Raising it
- * further needs oriscbar to gain proper write-side backpressure (a queue
- * drained on EVENT_WRITE) — a transport fix, out of the load path. */
-#define ORX_READ_CHUNK 0x1000
+ * the wire-packet size. The OBJ_WRITE_REQ rides the wire as a length-
+ * prefixed frame whose payload is `length_words` (a 16-bit field), so the
+ * hard cap is ~256 KiB; we sit well under it at 64 KiB.
+ *
+ * This used to be pinned at 4 KiB by the crossbar transport: oriscbar
+ * relayed packets with a single non-blocking sendall, and the host
+ * UNIX-domain socket buffer is only 8 KiB (net.local.stream.sendspace),
+ * so anything that overran the send buffer was silently dropped and the
+ * read hung. oriscbar now has proper write-side backpressure — it queues
+ * the overflow per-connection and flushes it on EVENT_WRITE — so a packet
+ * larger than the socket buffer is delivered across several writes instead
+ * of dropped. With that lifted, a whole text/data section streams in one
+ * (or a couple of) round-trips instead of dozens, which is the dominant
+ * cost in spawn latency. 64 KiB covers the common case in a single
+ * hf_read_obj. */
+#define ORX_READ_CHUNK 0x10000
 
 /* Read `size` bytes from `fd` directly into the code/data object whose
  * ref lives in orx scratch slot `slot_off` (128 = code, 136 = data).

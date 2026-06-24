@@ -42,13 +42,22 @@ DEFAULT_SOCK = "/tmp/oriscbar.sock"
 
 class Connection:
     """One connected client (CPU or device). We accumulate raw bytes
-    from the socket and parse them into framed messages on demand."""
-    def __init__(self, sock: socket.socket, addr):
+    from the socket and parse them into framed messages on demand, and
+    queue outbound bytes in `outbuf` so a slow peer never makes us drop
+    a packet (see write_packet / flush_outbound)."""
+    def __init__(self, sock: socket.socket, addr,
+                 selector: Optional[selectors.BaseSelector] = None):
         self.sock = sock
         self.addr = addr
         self.buf = bytearray()
+        self.outbuf = bytearray()         # framed bytes queued for the peer
         self.pid: Optional[int] = None    # set after handshake
         self.handshake_done = False
+        # Selector this connection is registered on, so flush_outbound
+        # can toggle EVENT_WRITE interest as outbuf fills / drains.
+        self.selector = selector
+        self.write_registered = False     # is EVENT_WRITE currently armed?
+        self.dead = False                 # close_connection sets this
 
     def read_some(self) -> bool:
         """Pull whatever's available into our buffer. Returns False on
@@ -92,13 +101,52 @@ class Connection:
             pass
 
     def write_packet(self, packet: bytes) -> bool:
-        """Frame and send a packet. Returns False on failure (e.g.,
-        peer closed)."""
-        try:
-            self.sock.sendall(struct.pack(">I", len(packet)) + packet)
-        except OSError:
-            return False
+        """Queue a length-prefixed packet for the peer and try to push
+        it out. Returns False only on a dead connection (a real OSError
+        during flush); a full kernel send buffer is normal backpressure
+        and leaves the bytes queued in outbuf for a later EVENT_WRITE.
+
+        Appending to one contiguous outbuf and always sending from the
+        front preserves FIFO order and length-prefix framing even when
+        an earlier packet only partially drained."""
+        self.outbuf += struct.pack(">I", len(packet)) + packet
+        return self.flush_outbound()
+
+    def flush_outbound(self) -> bool:
+        """Drain as much of outbuf as the kernel will take. Stops on
+        BlockingIOError (send buffer full — leave the remainder queued)
+        or when outbuf empties. Returns False on a real OSError (peer
+        gone) so the caller can close us. Updates EVENT_WRITE interest
+        to match whether bytes remain."""
+        while self.outbuf:
+            try:
+                n = self.sock.send(self.outbuf)
+            except BlockingIOError:
+                break                    # buffer full; keep the rest queued
+            except OSError:
+                return False             # peer closed / broken pipe
+            if n == 0:
+                return False
+            del self.outbuf[:n]
+        self._set_write_interest(bool(self.outbuf))
         return True
+
+    def _set_write_interest(self, want_write: bool) -> None:
+        """Arm/disarm EVENT_WRITE on the selector to match outbuf state.
+        We only register for writability while bytes are queued —
+        otherwise the selector would spin returning the socket as
+        writable every tick. No-op if state is unchanged or we have no
+        selector (pre-registration / handshake path)."""
+        if self.selector is None or want_write == self.write_registered:
+            return
+        events = selectors.EVENT_READ
+        if want_write:
+            events |= selectors.EVENT_WRITE
+        try:
+            self.selector.modify(self.sock, events, data=self)
+            self.write_registered = want_write
+        except (KeyError, ValueError):
+            pass                         # socket already unregistered/closed
 
 
 class Crossbar:
@@ -130,12 +178,13 @@ class Crossbar:
         except (BlockingIOError, InterruptedError):
             return
         csock.setblocking(False)
-        conn = Connection(csock, addr)
+        conn = Connection(csock, addr, self.selector)
         self.selector.register(csock, selectors.EVENT_READ, data=conn)
         self.pending[csock.fileno()] = conn
         self.log(f"accepted fd={csock.fileno()}")
 
     def close_connection(self, conn: Connection) -> None:
+        conn.dead = True
         try:
             self.selector.unregister(conn.sock)
         except KeyError:
@@ -210,11 +259,25 @@ class Crossbar:
         try:
             while not self.shutdown_requested:
                 events = self.selector.select(timeout=0.25)
-                for key, _mask in events:
+                for key, mask in events:
                     if key.data is None:
                         self.accept()
-                    else:
-                        self.handle_readable(key.data)
+                        continue
+                    conn = key.data
+                    # A connection may have been closed earlier in this
+                    # same batch (e.g. handle_readable routed a packet
+                    # to it and the write failed); skip its stale key.
+                    if conn.dead:
+                        continue
+                    # Drain queued outbound bytes first when writable —
+                    # this is how a packet that hit backpressure on a
+                    # busy peer finally gets delivered.
+                    if mask & selectors.EVENT_WRITE:
+                        if not conn.flush_outbound():
+                            self.close_connection(conn)
+                            continue
+                    if mask & selectors.EVENT_READ:
+                        self.handle_readable(conn)
         finally:
             self.close()
 
