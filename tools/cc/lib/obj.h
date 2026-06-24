@@ -80,6 +80,13 @@ void  obj_drop(obj_t h);
  * call. Returns OBJ_NULL if that slot is null or the table is full. */
 obj_t obj_adopt_dir_result(void);
 
+/* Publish handle `h`'s capability into the DIR_RESULT slot (the inverse
+ * of obj_adopt_dir_result). A compatibility bridge: wm_bind_surface
+ * receives its resolved surface cap via obj_recv_cap but mirrors it here
+ * so the legacy direct-616 consumers (vec/raster/pointer init, and
+ * wm_open_session) keep working unchanged. */
+void  obj_park_dir_result(obj_t h);
+
 /* Adopt the capability in boot register O6 (the keyboard service, per
  * liborisc's boot map) as a handle. Reads O6 inside libc so the cap
  * never crosses a call boundary in an O-register. OBJ_NULL if O6 is
@@ -167,5 +174,14 @@ int   obj_poll(obj_t h, int out[4]);
  * writes the R3..R6 payload words to out[0..3]; returns 0, or -1 on poll
  * error. */
 int   obj_recv_full(obj_t h, int out[4]);
+
+/* OR-receive: block on `h`'s queue for a reply that carries a CAPABILITY
+ * in its O2 register (the resolved-surface replies wm_bind_surface and
+ * dir_lookup return), OREFST that cap into a fresh handle slot, and
+ * return the handle. The reply's R3 word (the service's status) is
+ * written to *out_word when non-NULL. Returns OBJ_NULL on poll error, a
+ * null reply cap (e.g. the service replied an error with no cap), or a
+ * full table. The int-only sibling is obj_recv_full. */
+obj_t obj_recv_cap(obj_t h, int *out_word);
 
 #endif /* OBJ_H */

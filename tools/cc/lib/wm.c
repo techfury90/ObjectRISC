@@ -1,71 +1,58 @@
 /*
  * wm.c — libc wrapper for the oriscwm window-manager wire protocol.
  *
- * Mirror of dir.c's shape: a lazy-init slot for the WM mailbox
- * sub-cap (WM_SLOT), populated on first call via dir_walk on
- * "/sys/wm/0", plus per-op helpers that SEND the wire op and poll
- * the per-program reply mailbox (REPLY_MB_SLOT, shared with sup.c
- * and dir.c — all three are synchronous SEND-and-poll, never
- * outstanding simultaneously).
+ * Phase 4: migrated onto the handle-based object API (obj.h). The WM
+ * main-service cap (was WM_SLOT, copied from the dir-walk result) and the
+ * per-program reply mailbox (was REPLY_MB_SLOT, a raw O12 slot shared
+ * with dir.c / sup.c) are now `obj_t` handles in the O12 handle table;
+ * this client gives itself its own mailbox handle (the old sharing was an
+ * alloc optimisation, and all three were strictly synchronous SEND-and-
+ * poll anyway). Each op is one obj_send_bytes (O3 = the reply mailbox
+ * cap) followed by obj_recv_full for the int reply — except
+ * wm_bind_surface, whose reply carries a CAPABILITY in O2, received via
+ * the OR-receive keystone obj_recv_cap.
  *
  * Public API:
  *
  *   int wm_init(void);
- *       Lazy: ensures WM_SLOT is populated.  Returns 0 OK,
- *       WM_NO_DIRECTORY (-6) if neither DIR_SLOT nor BOOT_PARENT_SLOT
- *       is set (so dir_walk can't bootstrap), WM_NO_WM (-2) if
- *       /sys/wm/0 doesn't resolve.
+ *       Lazy: adopts the WM service from dir_walk("/sys/wm/<term>/0").
+ *       Returns 0 OK, WM_NO_DIRECTORY (-6) if dir_walk can't bootstrap,
+ *       WM_NO_WM (-2) if the path doesn't resolve to a LEAF.
  *
  *   int wm_new_window(int type, int *out_wid,
  *                     int *out_w_cells, int *out_h_cells);
- *       SENDs OP_NEW_WINDOW.  Caller MUST place the owner-task
- *       ref in O1 before calling (the ref the WM will task_query
- *       to detect owner exit and auto-destroy).  Pass O1 = null
- *       to opt out of auto-destroy — the WM still allocates the
- *       window but won't watch it.
+ *       SENDs OP_NEW_WINDOW. (The owner-task auto-destroy ref — formerly
+ *       O2, stashed from the caller's O1 — is dropped: it was never wired
+ *       on the WM side and every caller passes a null O1. Re-add a
+ *       two-cap send when auto-destroy is actually implemented.)
  *
  *   int wm_bind_surface(int wid, int kind);
- *       SENDs OP_BIND_SURFACE.  On success, the resolved surface
- *       cap is parked in WM_RESULT_SLOT (= DIR_RESULT_SLOT, same
- *       offset — the slot is generic "last-resolved-ref scratch").
- *       Caller follows up with `orefld oN, %0(o12)` :: "i"(...)
- *       to land it in the desired OPR slot.
+ *       SENDs OP_BIND_SURFACE. The resolved surface cap (reply O2) is
+ *       received with obj_recv_cap and mirrored into DIR_RESULT_SLOT (=
+ *       616) via obj_park_dir_result, so the legacy direct-616 consumers
+ *       (wm_open_session's orefld, and vec/raster/pointer's
+ *       obj_adopt_dir_result) keep working unchanged.
  *
  *   int wm_destroy_window(int wid);
- *       SENDs OP_DESTROY_WINDOW.
+ *   int wm_get_geometry(int wid, int *out);
+ *   int wm_set_title(int wid, const char *title);
+ *   int wm_subscribe_events(int wid, int notify_op);   (stub, no callers)
+ *   int wm_open_session(const char *title, int *out_wid);
  *
- *   int wm_subscribe_events(int wid, int notify_op);
- *       SENDs OP_SUBSCRIBE_EVENTS.  Caller MUST place the notify
- *       cap in O1 before calling (it gets passed in O4 of the
- *       wire SEND).  notify_op is 1..255.  Stub on the WM side
- *       for milestone 2 — accepted and stored, no events fire
- *       yet — but the wire shape is committed.
+ * No-WM fallback unchanged: wm_init returns WM_NO_WM and subsequent calls
+ * short-circuit; callers fall back to direct boot-OPR surfaces.
  *
- * Wire constants — must match ouroboros/oriscwm.c.  The user-
- * visible WIN_TYPE_* / WSURF_* / WIN_E_* live in liborisc.h so
- * client programs can include just that header.
- *
- * No-WM fallback
- * --------------
- * When /sys/wm/0 doesn't resolve (no oriscwm running), wm_init
- * returns WM_NO_WM and the slot stays null.  Subsequent calls to
- * wm_* short-circuit with the same error.  Programs that want the
- * "use the WM if present, fall back otherwise" pattern check
- * wm_init's status and use direct boot-OPR surfaces on miss —
- * exactly the same shape as the supervisor's directory-walk-OR-
- * keep-boot-wired pattern.
+ * Boot-OR hygiene: obj_send_bytes / obj_recv_* use O2/O3/O4 as scratch,
+ * so each helper restores O2 = boot stack (O11) and O3 = boot data (O15)
+ * on the way out (the same O2/O3 restore wm_open_session always did). O4
+ * (the boot self-svc) is deliberately NOT restored: it is vestigial on
+ * this path — dir.c routinely clobbers its O14 save-slot during dir_walk
+ * and nothing consumes it (term.c allocates its own mailbox rather than
+ * reusing the self-svc).
  */
 
 #include "liborisc.h"
-
-#define TAG_DATA           0x4102
-#define TAG_SERVICE        0x4103
-
-#define CAP_R 0x01
-#define CAP_W 0x02
-#define CAP_S 0x08
-#define CAP_V 0x10
-#define CAP_C 0x40
+#include "obj.h"
 
 /* Wire ops on the WM main service (must match oriscwm.c). */
 #define WM_OP_NEW_WINDOW         1
@@ -75,112 +62,48 @@
 #define WM_OP_QUERY_GEOMETRY     5
 #define WM_OP_SET_TITLE          6
 
-/* WM error codes — also surface in liborisc.h.  Mirrored locally for
+/* WM error codes — also surface in liborisc.h. Mirrored locally for
  * the no-WM fallback short-circuit. */
 #define WM_NO_WM         (-2)     /* /sys/wm/0 didn't resolve */
 #define WM_NO_DIRECTORY  (-6)     /* no oriscdir to walk through */
 
-/* Slot offsets in O12.  Mirrored from task.c's central slot map.
- *
- *   544 BOOT_PARENT_SLOT     (boot O8 — stays put)
- *   552 REPLY_MB_SLOT        (per-program mailbox, shared with
- *                             sup.c / dir.c — synchronous SEND-and-
- *                             poll, never outstanding simultaneously)
- *   584 DIR_SLOT             (oriscdir mailbox sub-cap)
- *   608 DIR_REPLY_SCRATCH    (derived reply sub-cap, shared)
- *   616 DIR_RESULT_SLOT      (last-resolved-ref scratch — also
- *                             where wm_bind_surface parks the
- *                             returned surface cap)
- *   680 WM_SLOT              (WM mailbox sub-cap, this file)
- *   688 WM_INPUT_REF_SLOT    (caller's owner-task ref stashed at
- *                             wm_new_window entry; loaded into O2
- *                             of the wire SEND)
- */
-
-#define BOOT_PARENT_SLOT_OFFSET   544
-#define REPLY_MB_SLOT_OFFSET      552
-#define DIR_SLOT_OFFSET           584
-#define DIR_REPLY_SCRATCH_OFFSET  608
+/* DIR_RESULT slot in the O12 task table — wm_bind_surface mirrors the
+ * resolved surface cap here, and wm_open_session OREFLDs it into
+ * O5/O6/O7. Must match task.c's slot map (also obj.c's
+ * OBJ_DIR_RESULT_OFFSET). */
 #define DIR_RESULT_SLOT_OFFSET    616
-#define WM_SLOT_OFFSET            680
-#define WM_INPUT_REF_SLOT_OFFSET  688
 
-/* Stack base VA — used by wm_set_title to compute the byte offset of
- * the title bytes inside the caller's stack ref O11. */
+/* Stack base VA — wm_set_title computes the byte offset of the title
+ * bytes inside the caller's boot stack ref (O11). */
 #define STACK_BOTTOM              0x001f0000U
 
-/* wm_set_title hard cap.  Must match oriscwm.c's MAX_TITLE_LEN
- * (= N_COLS — the title can fill the whole bar with no horizontal
- * padding).  Phase 60 step 14 dropped N_COLS to 80. */
+/* wm_set_title hard cap. Must match oriscwm.c's MAX_TITLE_LEN (= N_COLS;
+ * Phase 60 step 14 dropped N_COLS to 80). */
 #define WM_MAX_TITLE_LEN          80
 
-/* OISN-style probe of WM_SLOT.  Returns 1 if null. */
-static int
-wm_slot_isn(void)
+/* Mailbox caps: R|W|S|V|C (== 0x5b) — same as the other clients' service
+ * mailboxes. */
+#define WM_MBOX_CAPS \
+	(OBJ_CAP_R | OBJ_CAP_W | OBJ_CAP_S | OBJ_CAP_V | OBJ_CAP_C)
+
+/* The WM main service (adopted from the dir-walk result) and our private
+ * reply mailbox, both as object handles. */
+static obj_t wm_svc_h  = OBJ_NULL;
+static obj_t wm_mbox_h = OBJ_NULL;
+
+/* Restore the boot O2/O3 the SEND/poll clobbered (see file header on why
+ * O4 is intentionally left alone). */
+static void
+_wm_restore_or(void)
 {
-	int isn;
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"oisn   %0, o1"
-		: "=r"(isn)
-		: "i"(WM_SLOT_OFFSET)
-		: "r1"
-	);
-	return isn;
+	asm volatile("omov o2, o11");
+	asm volatile("omov o3, o15");
 }
 
-/* Allocate REPLY_MB_SLOT if it's null.  Mirror of dir.c's
- * dir_reply_mailbox_init.  Idempotent — first non-null check
- * fast-returns. */
-static int
-wm_reply_mailbox_init(void)
-{
-	int isn;
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"oisn   %0, o1"
-		: "=r"(isn)
-		: "i"(REPLY_MB_SLOT_OFFSET)
-		: "r1"
-	);
-	if (!isn) return 0;
-
-	int status;
-	asm volatile(
-		"addiu r4, r0, 16\n"
-		"addiu r5, r0, %1\n"
-		"addiu r6, r0, %2\n"
-		"call  #0x100\n"            /* ObjAlloc → O1 */
-		"nop\n"
-		"orefst o1, %3(o12)\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "i"(TAG_SERVICE),
-		  "i"(CAP_R | CAP_W | CAP_S | CAP_V | CAP_C),
-		  "i"(REPLY_MB_SLOT_OFFSET)
-		: "r1", "r2", "r4", "r5", "r6"
-	);
-	if (status != 0) return status;
-
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"addiu r4, r0, 4\n"
-		"call  #0x203\n"            /* ReceiveQueueAttach */
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "i"(REPLY_MB_SLOT_OFFSET)
-		: "r1", "r2", "r3", "r4"
-	);
-	return status;
-}
-
-/* Compose /sys/wm/<my_term>/0 into buf.  Multi-WM (one instance per
+/* Compose /sys/wm/<my_term>/0 into buf. Multi-WM (one instance per
  * terminal, Phase 59 / WM γ.15) means each caller walks the WM that
- * serves its own terminal.  task_my_terminal_idx() returns -1 when
- * the caller has no terminal info (top-level oriscrun boots that
- * skip Phase-51 R4 wiring); fall back to terminal 0 for back-compat
- * with single-WM configurations and pre-multi-WM tests. */
+ * serves its own terminal. task_my_terminal_idx() returns -1 when the
+ * caller has no terminal info; fall back to terminal 0 for back-compat. */
 static void
 wm_render_path(char *buf)
 {
@@ -204,18 +127,19 @@ wm_render_path(char *buf)
 	buf[p] = '\0';
 }
 
-/* Lazy: ensure WM_SLOT is populated.  Strategy:
- *   1. If WM_SLOT is non-null, fast-return.
- *   2. Otherwise dir_walk("/sys/wm/<my_term>/0").  On LEAF success,
- *      the resolved ref is in DIR_RESULT_SLOT; OREFLD it into O1 and
- *      OREFST into WM_SLOT.
- *   3. On dir_walk failure: -6 (no directory) or -2 (path not
- *      found) propagate as WM_NO_DIRECTORY / WM_NO_WM. */
+/* Lazy: adopt the WM service into wm_svc_h.
+ *   1. If already adopted, fast-return.
+ *   2. dir_walk("/sys/wm/<my_term>/0"); on LEAF success the resolved ref
+ *      is in DIR_RESULT_SLOT — adopt it into the handle table.
+ *   3. dir_walk failure: -6 (no directory) / path-not-found map to
+ *      WM_NO_DIRECTORY / WM_NO_WM. */
 int
 wm_init(void)
 {
-	if (!wm_slot_isn())
-		return 0;     /* already populated */
+	if (wm_svc_h >= 0)
+		return 0;                  /* already adopted */
+	if (obj_init() != 0)
+		return WM_NO_DIRECTORY;    /* O12 not up (task_init not run) */
 
 	int kind;
 	char rem[16];
@@ -226,190 +150,107 @@ wm_init(void)
 	if (rc < 0)   return WM_NO_WM;
 	if (kind != DIR_KIND_LEAF) return WM_NO_WM;
 
-	/* Copy DIR_RESULT_SLOT → WM_SLOT. */
-	asm volatile(
-		"orefld o1, %0(o12)\n"
-		"orefst o1, %1(o12)"
-		:
-		: "i"(DIR_RESULT_SLOT_OFFSET),
-		  "i"(WM_SLOT_OFFSET)
-		: "r1"
-	);
-	return 0;
+	wm_svc_h = obj_adopt_dir_result();
+	return (wm_svc_h < 0) ? WM_NO_WM : 0;
 }
 
-/* Send-and-poll skeleton.  Each helper sets up the outgoing SEND
- * (with R4 = op, R5/R6 = window-id / arg, O2/O3/O4 as appropriate)
- * then blocks on REPLY_MB_SLOT for the WM's reply.  Returns the
- * status from the reply (R3 of the dispatched message). */
-
-/* Derive the reply sub-cap of REPLY_MB into DIR_REPLY_SCRATCH.
- * Used by every wm_* SEND. */
+/* Allocate our private reply mailbox + queue if not already up.
+ * Idempotent. */
 static int
-wm_derive_reply_subcap(void)
+wm_reply_mailbox_init(void)
 {
-	int status;
-	asm volatile(
-		"orefld o1, %1(o12)\n"
-		"addiu r4, r0, 9\n"            /* R | S */
-		"call  #0x103\n"               /* ObjDerive → O1 */
-		"nop\n"
-		"orefst o1, %2(o12)\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "i"(REPLY_MB_SLOT_OFFSET),
-		  "i"(DIR_REPLY_SCRATCH_OFFSET)
-		: "r1", "r2", "r4"
-	);
-	return status;
+	if (wm_mbox_h >= 0)
+		return 0;
+	wm_mbox_h = obj_alloc(16, OBJ_TAG_SERVICE, WM_MBOX_CAPS);
+	if (wm_mbox_h < 0)
+		return -1;
+	return obj_queue_attach(wm_mbox_h, 4);
 }
 
-/* OP_NEW_WINDOW: SEND with R4=op, R5=0, R6=type, O2=owner ref
- * (loaded from WM_INPUT_REF_SLOT — caller put it there at entry),
- * O3=reply_cap.  Caller MUST place owner ref in O1 before calling.
- * Reply: R3=status, R4=geom_a, R5=geom_b, R6=window_id. */
+/* Ensure the WM service + reply mailbox are both up. Returns 0, or the
+ * wm_init / mailbox error. */
+static int
+wm_ensure(void)
+{
+	int rc = wm_init();
+	if (rc != 0) return rc;
+	return wm_reply_mailbox_init();
+}
+
+/* Common send + int-reply poll: SEND op with R5=a1, R6=a2 (R7=0), source
+ * segment `src`, reply cap = our mailbox; block for the reply and fill
+ * rep[0..3] = R3..R6. Restores boot O2/O3 on the way out. Returns 0, or
+ * -1 on poll failure. */
+static int
+wm_send_recv(int src, int op, int a1, int a2, int rep[4])
+{
+	obj_send_bytes(wm_svc_h, src, wm_mbox_h, op, a1, a2, 0);
+	int rc = obj_recv_full(wm_mbox_h, rep);
+	_wm_restore_or();
+	return rc;
+}
+
+/* OP_NEW_WINDOW. Reply: R3=status, R4=geom_a, R5=geom_b (w_cells:h_cells),
+ * R6=wid. */
 int
 wm_new_window(int type, int *out_wid,
               int *out_w_cells, int *out_h_cells)
 {
-	/* Stash caller's O1 (owner ref) into WM_INPUT_REF_SLOT
-	 * IMMEDIATELY — same reason as dir_register's stash: wm_init
-	 * and wm_reply_mailbox_init both clobber O1 internally. */
-	asm volatile(
-		"orefst o1, %0(o12)"
-		:
-		: "i"(WM_INPUT_REF_SLOT_OFFSET)
-	);
-
-	int rc = wm_init();
-	if (rc != 0) return rc;
-	rc = wm_reply_mailbox_init();
-	if (rc != 0) return rc;
-	rc = wm_derive_reply_subcap();
+	int rc = wm_ensure();
 	if (rc != 0) return rc;
 
-	/* SEND.
-	 *   O1 = WM main service     (WM_SLOT)
-	 *   O2 = owner ref           (WM_INPUT_REF_SLOT)
-	 *   O3 = reply_cap           (DIR_REPLY_SCRATCH)
-	 *   R4 = op                  (NEW_WINDOW = 1)
-	 *   R5 = 0                   (wid unused for NEW_WINDOW)
-	 *   R6 = type
-	 */
-	asm volatile(
-		"orefld o1, %0(o12)\n"
-		"orefld o2, %1(o12)\n"
-		"orefld o3, %2(o12)\n"
-		"addu   r6, %4, r0\n"       /* type FIRST (pcc R-allocator hygiene) */
-		"addiu  r4, r0, %3\n"       /* op */
-		"addiu  r5, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(WM_SLOT_OFFSET),
-		  "i"(WM_INPUT_REF_SLOT_OFFSET),
-		  "i"(DIR_REPLY_SCRATCH_OFFSET),
-		  "i"(WM_OP_NEW_WINDOW),
-		  "r"(type)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
-
-	/* Block on reply.  R3=status, R4=geom_a, R5=geom_b, R6=wid. */
-	int status, geom_a, geom_b, wid, poll_status;
-	asm volatile(
-		"orefld o1, %5(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"addu  %0, r2, r0\n"
-		"addu  %1, r3, r0\n"
-		"addu  %2, r4, r0\n"
-		"addu  %3, r5, r0\n"
-		"addu  %4, r6, r0"
-		: "=r"(poll_status), "=r"(status),
-		  "=r"(geom_a), "=r"(geom_b), "=r"(wid)
-		: "i"(REPLY_MB_SLOT_OFFSET)
-		: "r1", "r2", "r3", "r4", "r5", "r6"
-	);
-	if (poll_status != 0) return poll_status;
-	if (status != 0)      return status;
+	int rep[4];
+	if (wm_send_recv(OBJ_SRC_NONE, WM_OP_NEW_WINDOW, 0, type, rep) != 0)
+		return -1;
+	int status = rep[0];
+	int geom_b = rep[2];
+	int wid    = rep[3];
+	if (status != 0) return status;
 	if (out_wid)     *out_wid     = wid;
 	if (out_w_cells) *out_w_cells = (geom_b >> 16) & 0xFFFF;
 	if (out_h_cells) *out_h_cells = geom_b & 0xFFFF;
 	return 0;
 }
 
-/* OP_BIND_SURFACE: SEND with R4=op, R5=wid, R6=kind, O3=reply_cap.
- * Reply: R3=status, O2=resolved surface cap.  We park O2 into
- * DIR_RESULT_SLOT before restoring boot ORs so the caller can
- * OREFLD from there. */
+/* OP_BIND_SURFACE. Reply: R3=status, O2=resolved surface cap. */
 int
 wm_bind_surface(int wid, int kind)
 {
-	int rc = wm_init();
-	if (rc != 0) return rc;
-	rc = wm_reply_mailbox_init();
-	if (rc != 0) return rc;
-	rc = wm_derive_reply_subcap();
+	int rc = wm_ensure();
 	if (rc != 0) return rc;
 
-	asm volatile(
-		"orefld o1, %0(o12)\n"
-		"onull  o2\n"
-		"orefld o3, %1(o12)\n"
-		"addu   r5, %3, r0\n"           /* wid FIRST */
-		"addu   r6, %4, r0\n"           /* kind */
-		"addiu  r4, r0, %2\n"           /* op */
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(WM_SLOT_OFFSET),
-		  "i"(DIR_REPLY_SCRATCH_OFFSET),
-		  "i"(WM_OP_BIND_SURFACE),
-		  "r"(wid), "r"(kind)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
+	obj_send_bytes(wm_svc_h, OBJ_SRC_NONE, wm_mbox_h,
+	               WM_OP_BIND_SURFACE, wid, kind, 0);
 
-	/* Block on reply, parking returned O2 into DIR_RESULT_SLOT
-	 * before restoring O2. */
-	int status, poll_status;
-	asm volatile(
-		"orefld o1, %2(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"orefst o2, %3(o12)\n"          /* park resolved cap */
-		"addu  %0, r2, r0\n"
-		"addu  %1, r3, r0"
-		: "=r"(poll_status), "=r"(status)
-		: "i"(REPLY_MB_SLOT_OFFSET),
-		  "i"(DIR_RESULT_SLOT_OFFSET)
-		: "r1", "r2", "r3", "r4"
-	);
-	if (poll_status != 0) return poll_status;
+	/* The resolved surface cap rides the reply's O2. obj_recv_cap lands
+	 * it in a handle; mirror it into DIR_RESULT_SLOT for the legacy
+	 * consumers, then drop our transient handle. */
+	int status = 0;
+	obj_t surf = obj_recv_cap(wm_mbox_h, &status);
+	if (surf >= 0) {
+		obj_park_dir_result(surf);
+		obj_drop(surf);
+	} else if (status == 0) {
+		status = WM_NO_WM;         /* reply ok but no cap / table full */
+	}
+	_wm_restore_or();
 	return status;
 }
 
-/* Phase 60 step 12 — open a brand-new WM-mediated session for the
- * caller, replacing the inherited parent-window CONSOLE / KEYBOARD /
- * GRID caps (in O5 / O6 / O7) with caps for a freshly-allocated
- * window.  After this returns, term_print / term_read / grid_write
- * land in the new window rather than the parent's.
+/* Phase 60 step 12 — open a brand-new WM-mediated session: replace the
+ * inherited parent-window CONSOLE / KEYBOARD / GRID caps (O5/O6/O7) with
+ * caps for a freshly-allocated window. After this returns, term_print /
+ * term_read / grid_write land in the new window. Owner ref is null (no
+ * auto-destroy); callers wm_destroy_window before exit.
  *
- * Owner-task ref is passed as null (no auto-destroy via task_query);
- * callers should wm_destroy_window before exit.  When orx_spawn
- * carries the calling task's own ref in some future revision, this
- * helper can be extended to opt into auto-destroy.
- *
- * `title` may be NULL to skip the wm_set_title round-trip; passing
- * "" sets an empty (visible blank) bar. */
+ * `title` may be NULL to skip the wm_set_title round-trip; "" sets an
+ * empty (visible blank) bar. */
 int
 wm_open_session(const char *title, int *out_wid)
 {
 	int wid = 0, w_cells = 0, h_cells = 0;
 	int rc;
 
-	asm volatile("onull o1");
 	rc = wm_new_window(WIN_TYPE_CONSOLE, &wid, &w_cells, &h_cells);
 	if (rc != 0) goto restore_or;
 
@@ -441,121 +282,46 @@ destroy_and_restore:
 	wm_destroy_window(wid);
 	/* fall through */
 restore_or:
-	/* Restore boot O2 (stack) and O3 (data) from the task_init-parked
-	 * O11 / O15 before returning.  EVERY exit path runs this — the
-	 * wm_init / wm_new_window / wm_bind_surface / wm_set_title round-
-	 * trips have clobbered O2/O3 with SEND/poll scratch even on the
-	 * failure paths (wm_init's dir_walk runs first and is the most
-	 * common failure point on no-WM systems).  If we left O2/O3 in
-	 * that state, a caller calling term_init next would copy the
-	 * garbage back into O11 / O15 (term_init's first omovs blindly
-	 * re-save from O2/O3/O4), corrupting the boot-OR save and
-	 * breaking subsequent term_print stack-relative ObjStoreBytes.
-	 * Requires the caller to have run task_init first — which any
-	 * program that gets here already has. */
-	asm volatile("omov o2, o11");
-	asm volatile("omov o3, o15");
+	/* Restore boot O2 (stack) / O3 (data) from O11 / O15 before
+	 * returning. EVERY exit path runs this — the wm_* round-trips
+	 * clobbered O2/O3 with SEND/poll scratch even on failure paths. If
+	 * we left them clobbered, a caller running term_init next would
+	 * copy the garbage back into O11/O15 (term_init re-saves from
+	 * O2/O3/O4 blindly), corrupting the boot-OR save. Requires the
+	 * caller to have run task_init first (any program here has). */
+	_wm_restore_or();
 	return rc;
 }
 
-/* OP_DESTROY_WINDOW: SEND with R4=op, R5=wid. */
+/* OP_DESTROY_WINDOW. */
 int
 wm_destroy_window(int wid)
 {
-	int rc = wm_init();
-	if (rc != 0) return rc;
-	rc = wm_reply_mailbox_init();
-	if (rc != 0) return rc;
-	rc = wm_derive_reply_subcap();
+	int rc = wm_ensure();
 	if (rc != 0) return rc;
 
-	asm volatile(
-		"orefld o1, %0(o12)\n"
-		"onull  o2\n"
-		"orefld o3, %1(o12)\n"
-		"addu   r5, %3, r0\n"
-		"addiu  r4, r0, %2\n"
-		"addiu  r6, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(WM_SLOT_OFFSET),
-		  "i"(DIR_REPLY_SCRATCH_OFFSET),
-		  "i"(WM_OP_DESTROY_WINDOW),
-		  "r"(wid)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
-
-	int status, poll_status;
-	asm volatile(
-		"orefld o1, %2(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"addu  %0, r2, r0\n"
-		"addu  %1, r3, r0"
-		: "=r"(poll_status), "=r"(status)
-		: "i"(REPLY_MB_SLOT_OFFSET)
-		: "r1", "r2", "r3", "r4"
-	);
-	if (poll_status != 0) return poll_status;
-	return status;
+	int rep[4];
+	if (wm_send_recv(OBJ_SRC_NONE, WM_OP_DESTROY_WINDOW, wid, 0, rep) != 0)
+		return -1;
+	return rep[0];
 }
 
-/* OP_QUERY_GEOMETRY: SEND with R4=op, R5=wid (0 = first live window).
- * Reply: R3=status, R4=geom_a (w_px:h_px), R5=geom_b (w_cells:h_cells),
- * R6=resolved_wid.  Used by tasks that inherited a window via
- * supervisor handoff (no wm_new_window call of their own) and need to
- * know the cell-grid extent of the surface they're rendering into.
- *
- * Output is packed into a 4-int array `out[4]` (avoids the pcc-orisc
- * 4-arg call ceiling that bites on 5-pointer signatures):
- *   out[0] = w_cells, out[1] = h_cells,
- *   out[2] = w_px,    out[3] = h_px. */
+/* OP_QUERY_GEOMETRY (wid 0 = first live window). Reply: R3=status,
+ * R4=geom_a (w_px:h_px), R5=geom_b (w_cells:h_cells), R6=resolved_wid.
+ * Packs into out[4] = {w_cells, h_cells, w_px, h_px}. */
 int
 wm_get_geometry(int wid, int *out)
 {
-	int rc = wm_init();
-	if (rc != 0) return rc;
-	rc = wm_reply_mailbox_init();
-	if (rc != 0) return rc;
-	rc = wm_derive_reply_subcap();
+	int rc = wm_ensure();
 	if (rc != 0) return rc;
 
-	asm volatile(
-		"orefld o1, %0(o12)\n"
-		"onull  o2\n"
-		"orefld o3, %1(o12)\n"
-		"addu   r5, %3, r0\n"           /* wid FIRST */
-		"addiu  r4, r0, %2\n"           /* op */
-		"addiu  r6, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(WM_SLOT_OFFSET),
-		  "i"(DIR_REPLY_SCRATCH_OFFSET),
-		  "i"(WM_OP_QUERY_GEOMETRY),
-		  "r"(wid)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
-
-	int status, geom_a, geom_b, poll_status;
-	asm volatile(
-		"orefld o1, %4(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"addu  %0, r2, r0\n"
-		"addu  %1, r3, r0\n"
-		"addu  %2, r4, r0\n"
-		"addu  %3, r5, r0"
-		: "=r"(poll_status), "=r"(status),
-		  "=r"(geom_a), "=r"(geom_b)
-		: "i"(REPLY_MB_SLOT_OFFSET)
-		: "r1", "r2", "r3", "r4", "r5", "r6"
-	);
-	if (poll_status != 0) return poll_status;
-	if (status != 0)      return status;
+	int rep[4];
+	if (wm_send_recv(OBJ_SRC_NONE, WM_OP_QUERY_GEOMETRY, wid, 0, rep) != 0)
+		return -1;
+	int status = rep[0];
+	int geom_a = rep[1];
+	int geom_b = rep[2];
+	if (status != 0) return status;
 	if (out) {
 		out[0] = (geom_b >> 16) & 0xFFFF;   /* w_cells */
 		out[1] = geom_b & 0xFFFF;           /* h_cells */
@@ -565,24 +331,16 @@ wm_get_geometry(int wid, int *out)
 	return 0;
 }
 
-/* OP_SET_TITLE: SEND with R4=op, R5=wid, R6=packed (len:high16,
- * src_off:low16), O2=boot stack ref (source bytes live in our stack
- * buffer).  Copies the caller's title into a local stack buffer first
- * so the source ref is reliable across the SEND's ObjFetchBytes on
- * the WM side. */
+/* OP_SET_TITLE: byte-data SEND from a stack-local copy of `title`
+ * (R6 = packed len:src_off, O2 = boot stack). The blocking reply poll is
+ * a barrier — the WM ObjFetchBytes the title before replying — so the
+ * stack buffer reliably outlives the fetch (no async-buffer race). */
 int
 wm_set_title(int wid, const char *title)
 {
-	int rc = wm_init();
-	if (rc != 0) return rc;
-	rc = wm_reply_mailbox_init();
-	if (rc != 0) return rc;
-	rc = wm_derive_reply_subcap();
+	int rc = wm_ensure();
 	if (rc != 0) return rc;
 
-	/* Copy the title into a stack-local buffer.  Cap at
-	 * WM_MAX_TITLE_LEN; truncating beyond that is fine — the WM would
-	 * reject the SEND otherwise. */
 	char buf[WM_MAX_TITLE_LEN];
 	int len = 0;
 	while (len < WM_MAX_TITLE_LEN && title[len] != '\0') {
@@ -592,90 +350,25 @@ wm_set_title(int wid, const char *title)
 	int stack_off = (int)((unsigned int)buf - STACK_BOTTOM);
 	int packed = ((len & 0xFFFF) << 16) | (stack_off & 0xFFFF);
 
-	asm volatile(
-		"orefld o1, %0(o12)\n"
-		"omov   o2, o11\n"              /* O2 = boot stack (title src) */
-		"orefld o3, %1(o12)\n"
-		"addu   r5, %3, r0\n"           /* wid */
-		"addu   r6, %4, r0\n"           /* packed (len:src_off) */
-		"addiu  r4, r0, %2\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(WM_SLOT_OFFSET),
-		  "i"(DIR_REPLY_SCRATCH_OFFSET),
-		  "i"(WM_OP_SET_TITLE),
-		  "r"(wid), "r"(packed)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
-
-	int status, poll_status;
-	asm volatile(
-		"orefld o1, %2(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"addu  %0, r2, r0\n"
-		"addu  %1, r3, r0"
-		: "=r"(poll_status), "=r"(status)
-		: "i"(REPLY_MB_SLOT_OFFSET)
-		: "r1", "r2", "r3", "r4"
-	);
-	if (poll_status != 0) return poll_status;
-	return status;
+	int rep[4];
+	if (wm_send_recv(OBJ_SRC_STACK, WM_OP_SET_TITLE, wid, packed, rep) != 0)
+		return -1;
+	return rep[0];
 }
 
-/* OP_SUBSCRIBE_EVENTS: SEND with R4=op, R5=wid, R6=notify_op,
- * O4=notify_cap (caller MUST place in O1 at function entry —
- * we stash via WM_INPUT_REF_SLOT just like wm_new_window does
- * for the owner ref). */
+/* OP_SUBSCRIBE_EVENTS. Milestone-2 stub with no callers; events don't
+ * fire yet. The notify cap (formerly passed in O4 from the caller's O1)
+ * is dropped — re-add a notify-cap send variant when event delivery is
+ * actually implemented. */
 int
 wm_subscribe_events(int wid, int notify_op)
 {
-	asm volatile(
-		"orefst o1, %0(o12)"
-		:
-		: "i"(WM_INPUT_REF_SLOT_OFFSET)
-	);
-
-	int rc = wm_init();
-	if (rc != 0) return rc;
-	rc = wm_reply_mailbox_init();
-	if (rc != 0) return rc;
-	rc = wm_derive_reply_subcap();
+	int rc = wm_ensure();
 	if (rc != 0) return rc;
 
-	asm volatile(
-		"orefld o1, %0(o12)\n"
-		"onull  o2\n"
-		"orefld o3, %1(o12)\n"
-		"orefld o4, %2(o12)\n"
-		"addu   r5, %4, r0\n"
-		"addu   r6, %5, r0\n"
-		"addiu  r4, r0, %3\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(WM_SLOT_OFFSET),
-		  "i"(DIR_REPLY_SCRATCH_OFFSET),
-		  "i"(WM_INPUT_REF_SLOT_OFFSET),
-		  "i"(WM_OP_SUBSCRIBE_EVENTS),
-		  "r"(wid), "r"(notify_op)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
-
-	int status, poll_status;
-	asm volatile(
-		"orefld o1, %2(o12)\n"
-		"addiu r4, r0, -1\n"
-		"call  #0x204\n"
-		"nop\n"
-		"addu  %0, r2, r0\n"
-		"addu  %1, r3, r0"
-		: "=r"(poll_status), "=r"(status)
-		: "i"(REPLY_MB_SLOT_OFFSET)
-		: "r1", "r2", "r3", "r4"
-	);
-	if (poll_status != 0) return poll_status;
-	return status;
+	int rep[4];
+	if (wm_send_recv(OBJ_SRC_NONE, WM_OP_SUBSCRIBE_EVENTS,
+	                 wid, notify_op, rep) != 0)
+		return -1;
+	return rep[0];
 }

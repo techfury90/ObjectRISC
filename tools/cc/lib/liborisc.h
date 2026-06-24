@@ -691,8 +691,8 @@ int dir_subscribe(const char *path, int notify_op);
 #define WIN_E_NOSPC    (-7)
 #define WIN_E_NOTIMPL  (-8)
 
-/* wm_init — lazy: ensure WM_SLOT is populated via dir_walk on
- * "/sys/wm/0".  Returns 0 OK, -6 if no directory available, -2 if
+/* wm_init — lazy: adopt the WM service (via dir_walk on "/sys/wm/0")
+ * into wm.c's obj.h handle.  Returns 0 OK, -6 if no directory available, -2 if
  * /sys/wm/0 doesn't resolve (no oriscwm in this system).  Idempotent;
  * subsequent calls fast-return.
  *
