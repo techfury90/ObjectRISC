@@ -493,7 +493,8 @@ into whatever register or slot it wants. Examples:
 - `wm_open_session` ([`wm.c:406-459`](../tools/cc/lib/wm.c#L406)) binds
   console/keyboard/grid and OREFLDs each `DIR_RESULT_SLOT` straight into `O5/O6/O7`.
 - `vec_init_from_dir_result` / `raster_init_from_dir_result` adopt
-  `DIR_RESULT_SLOT` into a `WM_VECTOR_CAP_SLOT` / an obj-handle.
+  `DIR_RESULT_SLOT` into an obj-handle (`wm_vec_h` / `raster_svc_h`) via
+  `obj_adopt_dir_result` (both migrated — see [`OBJECT_API.md`](OBJECT_API.md)).
 
 > **Stale comment.** The bind-handler doc ([`oriscwm.c:2565-2576`](../ouroboros/oriscwm.c#L2565))
 > says CONSOLE writes are forwarded "to the underlying terminal" and keyboard is
@@ -645,7 +646,9 @@ All live under [`tools/cc/lib/`](../tools/cc/lib). Wire op constants are in
 API** ([`obj.h`](../tools/cc/lib/obj.h)/[`obj.c`](../tools/cc/lib/obj.c)) because
 the v1 C compiler cannot hold a capability *value* across a call — so capabilities
 stay in an 8-slot table in O12 (offset 1704) and the program holds opaque integer
-handles ([`obj.h:1-20`](../tools/cc/lib/obj.h#L1)).
+handles ([`obj.h:1-20`](../tools/cc/lib/obj.h#L1)). The handle API and the
+client-migration pattern have their own guide:
+[`docs/OBJECT_API.md`](OBJECT_API.md) (authoritative for migration status).
 
 ### `obj.{h,c}` — the handle layer
 
@@ -672,10 +675,14 @@ Targets `O5` (console) and `O6` (keyboard); private mailbox in `O9`.
 | `term_getkey` / `term_pollkey` | `ReceiveQueuePoll(O9)` blocking / non-blocking → R3=code, R4=mods |
 | `term_shutdown` / `term_resubscribe` | keyboard SEND with R4=1 (unsub) / R4=0 (re-sub) |
 
-> Still wire-asm (not migrated). Header comments say "oriscterm" and (at
-> [`term.c:195-202`](../tools/cc/lib/term.c#L195)) describe the O9 queue as
-> "depth 16 ... shared with hostfsd responses" — both wrong; it is depth 64 and
-> hostfsd uses O8.
+> The **keyboard path is migrated onto `obj.h`**: the private mailbox is now an
+> `obj_t` handle (`kbd_mbox_h` via `obj_alloc`, not `O9`), the keyboard service is
+> `obj_adopt_o6()`, and `term_getkey` is `obj_recv_full` — so the `O9` /
+> `ReceiveQueuePoll(O9)` details in the table above predate the migration (see
+> [`OBJECT_API.md`](OBJECT_API.md)). The **console path (`term_print*`) is still
+> raw asm** to `O5` ([`term.c:33-34`](../tools/cc/lib/term.c#L33)). Header comments
+> still say "oriscterm" (read "the WM"); the queue is depth 64 (not the "depth 16
+> ... shared with hostfsd" the old comment claims — hostfsd uses O8).
 
 ### `grid.c` — positioned text
 
@@ -686,11 +693,14 @@ terminal pulls the bytes via OBJ_READ_REQ" — read "the WM" and "`ObjFetchBytes
 
 ### `vector.c` — `VEC_OP_*` drawing
 
-Helpers SEND `R4=op, R5=packed1, R6=packed2` to the cap in `WM_VECTOR_CAP_SLOT`@712
-(seeded from `DIR_RESULT_SLOT` by `vec_init_from_dir_result`). Ops
-([`liborisc.h:212-218`](../tools/cc/lib/liborisc.h#L212)): `LINE`=0, `RECT_FILL`=1,
-`RECT_OUTLINE`=2, `OVAL_FILL`=3, `OVAL_OUTLINE`=4, `CLEAR`=5, `SET_COLOR`=6.
-Coordinates packed as two signed-16 halves per word. Still wire-asm.
+Migrated onto `obj.h` (Phase 4). `vec_init_from_dir_result` adopts the WM-mediated
+VECTOR cap from the dir-walk result into a handle (`wm_vec_h`); each helper
+`obj_send`s `R4=op, R5=packed1, R6=packed2` (the old `WM_VECTOR_CAP_SLOT` hand-copy
+is gone). Ops ([`liborisc.h:212-218`](../tools/cc/lib/liborisc.h#L212)): `LINE`=0,
+`RECT_FILL`=1, `RECT_OUTLINE`=2, `OVAL_FILL`=3, `OVAL_OUTLINE`=4, `CLEAR`=5,
+`SET_COLOR`=6. Coordinates packed as two signed-16 halves per word. Vector ops
+carry their whole payload in the int words, so this client is immune to the §7
+async-buffer pitfall.
 
 ### `raster.c` — `RST_OP_*` blits
 

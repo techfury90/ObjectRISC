@@ -32,6 +32,10 @@ Focused, current-architecture walkthroughs of individual subsystems
   window-manager + terminal + graphics stack: how a keystroke reaches a
   program, how a program draws to the screen, and how it all boots
   (Phase 60: the WM owns the framebuffer + input and *is* the terminal).
+- [`OBJECT_API.md`](OBJECT_API.md) — the libc handle-based object API
+  (`obj.{h,c}`): why C programs hold opaque `obj_t` handles instead of
+  capabilities, the 8-slot handle table in the O12 OBJSTORE, the
+  `obj_send_bytes` data keystone, and the client-migration pattern.
 
 ## Combined PDFs
 
