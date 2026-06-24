@@ -341,6 +341,24 @@ class BlockedOnQueue(BlockedSignal):
         self.timeout = timeout
 
 
+class BlockedOnQueueSet(BlockedSignal):
+    """Raised by WaitAnyQueue (#0x206) when EVERY queue in the listed set
+    is empty. The scheduler holds the CPU at the CALL until ANY listed
+    queue receives a message, then returns ERR_OK and advances PC — a
+    pure readiness wait, no message delivery (mirror of BlockedOnQueue
+    but for a set, and it never pops). Infinite block: there is no
+    timeout, so _try_unblock_queue_set only ever advances the PC once a
+    queue is genuinely non-empty.
+
+    `descriptor_indices` is the set of local descriptor indices resolved
+    (and validated) at primitive-entry time. The WM owns every queue in
+    the set (home == self) and is single-threaded while blocked, so the
+    set can't be mutated under us; the wake/unblock checks still re-probe
+    each descriptor defensively before reading its queue."""
+    def __init__(self, descriptor_indices):
+        self.descriptor_indices = descriptor_indices
+
+
 class BlockedOnResponse(BlockedSignal):
     """Raised by remote OL/OS instructions after queueing an OBJ_READ_REQ
     or OBJ_WRITE_REQ on the home CPU. The scheduler holds the CPU at the
@@ -1726,6 +1744,15 @@ class System:
                 # case where the blocking call is term_getkey
                 # (infinite timeout); user code that needs strict
                 # timeout semantics should stay current.
+            elif isinstance(b, BlockedOnQueueSet):
+                # Ready as soon as ANY queue in the set is non-empty.
+                for idx in b.descriptor_indices:
+                    if 0 < idx < len(cpu.descriptors) \
+                            and cpu.descriptors[idx] is not None \
+                            and cpu.descriptors[idx].queue \
+                            and len(cpu.descriptors[idx].queue) > 0:
+                        ready = True
+                        break
             if ready:
                 task.state = TASK_STATE_RUNNABLE
                 cpu.runnable.append(task)
@@ -1737,6 +1764,8 @@ class System:
         b = cpu.blocked_on
         if isinstance(b, BlockedOnQueue):
             return self._try_unblock_queue(cpu, b)
+        if isinstance(b, BlockedOnQueueSet):
+            return self._try_unblock_queue_set(cpu, b)
         if isinstance(b, BlockedOnResponse):
             return self._try_unblock_response(cpu, b)
         if isinstance(b, BlockedOnTaskWait):
@@ -1779,6 +1808,26 @@ class System:
             cpu.blocked_on = None
             return True
         return True   # decremented the timer
+
+    def _try_unblock_queue_set(self, cpu: CPU,
+                               b: 'BlockedOnQueueSet') -> bool:
+        """Resume a WaitAnyQueue once ANY listed queue is non-empty.
+        Pure readiness: we DON'T pop the message (the caller drains it
+        with its own ReceiveQueuePoll) — we just set R2 = ERR_OK and
+        advance past the CALL. Infinite wait, so returning False simply
+        keeps the CPU parked until a queue fills (no timeout to tick)."""
+        for idx in b.descriptor_indices:
+            if 0 < idx < len(cpu.descriptors) \
+                    and cpu.descriptors[idx] is not None \
+                    and cpu.descriptors[idx].queue \
+                    and len(cpu.descriptors[idx].queue) > 0:
+                cpu.set_gpr(2, ERR_OK)
+                cpu.set_gpr(3, 0)
+                cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
+                cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+                cpu.blocked_on = None
+                return True
+        return False   # nothing ready yet — stay blocked (no timeout)
 
     def _try_unblock_response(self, cpu: CPU, b: 'BlockedOnResponse') -> bool:
         """Look for a response packet matching this CPU's outstanding
@@ -4184,6 +4233,96 @@ def primitive_ReceiveQueuePoll(cpu: CPU) -> None:
     )
 
 
+def primitive_WaitAnyQueue(cpu: CPU) -> None:
+    """#0x206 (Object RISC Vol VI §6). A pure readiness wait over a SET
+    of receive queues — the multi-queue companion to ReceiveQueuePoll.
+    Blocks until at least one listed queue is non-empty, then returns
+    WITHOUT delivering any message; the caller drains the actual
+    messages with its existing per-queue ReceiveQueuePoll calls. This
+    keeps the firmware change small and the caller's demux untouched:
+    it's the missing "wait on many queues at once" primitive that lets a
+    multiplexing server (the window manager) idle-block instead of
+    busy-polling each queue on a timeout.
+
+    Args:
+      O2: an OBJSTORE object holding up to R5 packed 64-bit queue
+          references (one 8-byte slot each, OREFST layout). Must carry
+          R (we read it like an OREFLD source).
+      R5: number of references to read from the list (count).
+
+    The queue set is dynamic and larger than the O-registers (a window
+    manager has a per-window queue that comes and goes), so it's passed
+    by memory rather than in registers. Each listed reference is checked
+    exactly like ReceiveQueuePoll's target — V cap, home == this CPU,
+    live descriptor, matching generation, a receive queue attached — but
+    an entry that FAILS validation (null slot, freed/stale window queue,
+    not-a-queue) is SKIPPED, not fatal: the set legitimately holds slots
+    that come and go, and the caller rebuilds it each loop. A genuinely
+    malformed *list object* (O2) still errors.
+
+    Returns:
+      R2: ERR_OK once a listed queue is non-empty (immediately if one
+          already is); ERR_* if the list object itself is unusable.
+      R3: 0 (no payload — this is a readiness wait, not a dequeue).
+
+    Infinite block, no timeout."""
+    listref = cpu.get_opr(2)
+    count   = cpu.get_gpr(5) & 0xFFFFFFFF
+
+    # Validate the list object itself (mirror ReceiveQueuePoll's target
+    # checks, but require R since we read its slots like OREFLD does).
+    if listref == 0:
+        cpu.set_gpr(2, ERR_EFAULT); return
+    if (ref_caps(listref) & CAP_R) == 0:
+        cpu.set_gpr(2, ERR_EPERM); return
+    if ref_home(listref) != cpu.pid:
+        cpu.set_gpr(2, ERR_EREMOTE); return
+    lidx = ref_index(listref)
+    if lidx >= len(cpu.descriptors) or cpu.descriptors[lidx] is None:
+        cpu.set_gpr(2, ERR_ESTALE); return
+    ldesc = cpu.descriptors[lidx]
+    if not ldesc.live or ldesc.generation != ref_generation(listref):
+        cpu.set_gpr(2, ERR_ESTALE); return
+    if not ldesc.objstore:
+        cpu.set_gpr(2, ERR_EINVAL); return
+    if count == 0 or count * 8 > len(ldesc.storage):
+        cpu.set_gpr(2, ERR_EINVAL); return
+
+    # Resolve each listed reference to a local descriptor index, skipping
+    # any entry that doesn't currently name one of our receive queues.
+    indices = []
+    for i in range(count):
+        ref = struct.unpack(">Q",
+                            bytes(ldesc.storage[i*8:i*8+8]))[0]
+        if ref == 0:
+            continue                                   # empty slot
+        if (ref_caps(ref) & CAP_V) == 0:
+            continue
+        if ref_home(ref) != cpu.pid:
+            continue
+        idx = ref_index(ref)
+        if idx >= len(cpu.descriptors) or cpu.descriptors[idx] is None:
+            continue
+        d = cpu.descriptors[idx]
+        if not d.live or d.generation != ref_generation(ref):
+            continue                                   # stale window queue
+        if d.queue is None:
+            continue                                   # not a receive queue
+        indices.append(idx)
+
+    # Immediate return if any resolved queue already has a message.
+    for idx in indices:
+        if cpu.descriptors[idx].queue:
+            cpu.set_gpr(2, ERR_OK); cpu.set_gpr(3, 0)
+            return
+
+    # Otherwise park. The scheduler resumes us the instant any listed
+    # queue receives a message (cross-CPU: poll_incoming appends to the
+    # home queue, then _try_unblock_queue_set advances past this CALL).
+    cpu.set_gpr(3, 0)
+    raise BlockedOnQueueSet(descriptor_indices=indices)
+
+
 def primitive_InstallTrapHandler(cpu: CPU) -> None:
     """Volume VI #0x520. Install a supervisor-mode trap handler for the
     given cause code. Subsequent traps with that cause are delivered to
@@ -4465,6 +4604,7 @@ PRIMITIVE_MIN_MODE = {
     0x200: MODE_SUPERVISOR,  # InstallHandler   — registers trap-like callback
     0x203: MODE_USER,        # ReceiveQueueAttach
     0x204: MODE_USER,        # ReceiveQueuePoll
+    0x206: MODE_USER,        # WaitAnyQueue — readiness wait over a queue set
     0x301: MODE_USER,        # ReadCycles
     0x320: MODE_USER,        # ConsoleWrite     — debug primitive, will move
     0x400: MODE_USER,        # TimeNow
@@ -4539,6 +4679,8 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ReceiveQueueAttach(cpu)
     elif prim == 0x204:
         primitive_ReceiveQueuePoll(cpu)
+    elif prim == 0x206:
+        primitive_WaitAnyQueue(cpu)
     elif prim == 0x301:
         primitive_ReadCycles(cpu)
     elif prim == 0x320:
