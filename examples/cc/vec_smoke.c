@@ -17,8 +17,8 @@
  *   1. task_init + DIR_SLOT promotion + wm_init.
  *   2. wm_new_window(WIN_TYPE_CONSOLE).
  *   3. wm_bind_surface(wid, WSURF_VECTOR) — verify cap non-null.
- *   4. vec_init_from_dir_result() — copy DIR_RESULT_SLOT into
- *      WM_VECTOR_CAP_SLOT (libc reads from there on each SEND).
+ *   4. vec_init_from_dir_result() — adopt the DIR_RESULT_SLOT cap
+ *      into the libc VECTOR handle (obj.h) the vec_*() SENDs use.
  *   5. vec_set_color(2)  (red).
  *   6. vec_line(10, 10, 100, 100).
  *   7. vec_rect_fill(120, 10, 80, 50).
@@ -96,7 +96,7 @@ main(void)
 
 	rc = vec_init_from_dir_result();
 	if (rc != 0) { fail("vec_init_from_dir_result", rc); return 4; }
-	WP("vec_smoke: cap stashed in WM_VECTOR_CAP_SLOT\n");
+	WP("vec_smoke: cap adopted into VECTOR handle\n");
 
 	rc = vec_set_color(2);
 	if (rc != 0) { fail("vec_set_color red", rc); return 5; }
