@@ -5287,6 +5287,14 @@ def main(argv: List[str]) -> int:
                          "CPU a reusable boot target.")
     ap.add_argument("--trace", action="store_true",
                     help="print each retired instruction with register effects")
+    ap.add_argument("--profile", action="store_true",
+                    help="run a daemon-thread statistical sampler that flushes "
+                         "a main-thread phase breakdown + per-CPU instruction "
+                         "counts to /tmp/orisc-profile-pid<N>.txt every ~2s "
+                         "(survives the SIGKILL oriscrun uses to tear down "
+                         "Tk-blocked WM CPUs). Also enabled by the "
+                         "ORISC_PROFILE env var, so `ORISC_PROFILE=1 make boot` "
+                         "profiles every CPU in the fleet (WMs are pid 2/3).")
     ap.add_argument("--max-cycles", type=int, default=None,
                     help="cycle bound. Default 10_000_000 in standalone "
                          "mode (a CI-friendly safety net for runaway "
@@ -5395,9 +5403,130 @@ def main(argv: List[str]) -> int:
     else:
         max_cycles = args.max_cycles
 
+    import os
+    profile_on = args.profile or (
+        os.environ.get("ORISC_PROFILE", "") not in ("", "0"))
+    if not profile_on:
+        try:
+            return system.run(max_cycles)
+        finally:
+            system.crossbar.close()
+
+    # --profile: a statistical sampler running in a DAEMON thread that
+    # flushes to disk every ~2s.  Why not cProfile: the WM CPUs run Tk on
+    # their main thread (oriscrun's own note: "Tcl/Tk's runloop on macOS can
+    # sit on signals briefly") and oriscrun SIGKILLs ~2s after SIGTERM, so a
+    # clean exit-time dump races the kill and loses — only the lighter
+    # supervisor CPUs win it.  A daemon sampler is independent of main-thread
+    # signal delivery, SURVIVES SIGKILL (the last 2s flush is already on
+    # disk), only READS frames (thread-safe), and still yields the
+    # function-level split that decides whether direct-handoff is the right
+    # lever.  Each simorisc is its own process → per-pid file; WMs are 2/3.
+    import threading, collections, atexit
+    import time as _time
+    prof_pid = args.pid if args.connect is not None else 0
+    outpath = "/tmp/orisc-profile-pid%d.txt" % prof_pid
+    # co_name -> coarse phase bucket; first match walking innermost->outer.
+    # NB: C builtins (time.sleep, socket.recv) have no Python frame, so a
+    # main thread parked in them shows as its Python CALLER — `run` itself
+    # (the idle time.sleep at the bottom of the loop) or `poll_incoming`
+    # (the blocking socket recv).  Hence `run` -> idle/loop overhead.
+    PHASE = {
+        "run": "idle / loop overhead (mostly time.sleep waiting for input)",
+        "step": "instruction execution (step)",
+        "dispatch_call": "CALL primitives (render blits / ObjAlloc / fetch)",
+        "_repaint": "display (Tk repaint)",
+        "_drain_pending": "display (Tk repaint)",
+        "tick": "display (Tk pump/repaint)",
+        "_process_requests": "memory requests (OBJ_READ/WRITE byte-fetch)",
+        "_handle_obj_read_req": "memory requests (OBJ_READ/WRITE byte-fetch)",
+        "_handle_obj_write_req": "memory requests (OBJ_READ/WRITE byte-fetch)",
+        "poll_incoming": "crossbar transport (IPC)",
+        "_wake_blocked_tasks": "scheduling (wake/unblock)",
+        "_try_unblock": "scheduling (wake/unblock)",
+        "_try_unblock_queue": "scheduling (wake/unblock)",
+        "_try_unblock_response": "scheduling (wake/unblock)",
+        "dispatch_handler": "scheduling (handler dispatch)",
+    }
+    _buckets = collections.Counter()
+    _inner = collections.Counter()
+    _nsamp = [0]
+    _main_tid = threading.main_thread().ident
+    _stop = threading.Event()
+    _lock = threading.Lock()
+
+    def _write_profile(*_a):
+        try:
+            with _lock:
+                buckets = dict(_buckets)
+                inner = _inner.most_common(30)
+                n = _nsamp[0] or 1
+            with open(outpath, "w") as fh:
+                fh.write("=== simorisc sampling profile  pid=%d ===\n"
+                         % prof_pid)
+                fh.write("samples=%d  (daemon sampler; flush 2s)\n\n"
+                         % _nsamp[0])
+                tot = 0
+                for c in system.cpus:
+                    tot += c.cycles
+                    fh.write("CPU%d instructions=%d\n" % (c.pid, c.cycles))
+                fh.write("total instructions=%d\n\n" % tot)
+                fh.write("--- main-thread time by PHASE (%% of samples) ---\n")
+                for name, cnt in sorted(buckets.items(),
+                                        key=lambda kv: -kv[1]):
+                    fh.write("  %6.2f%%  %s\n" % (100.0 * cnt / n, name))
+                fh.write("\n--- innermost functions (detail) ---\n")
+                for (short, lineno, func), cnt in inner:
+                    fh.write("  %6.2f%%  %s:%d(%s)\n"
+                             % (100.0 * cnt / n, short, lineno, func))
+        except Exception as e:
+            sys.stderr.write("simorisc: profile write failed: %s\n" % e)
+
+    def _classify(fr):
+        f = fr
+        inner_name = None
+        bucket = None
+        while f is not None:
+            nm = f.f_code.co_name
+            if inner_name is None:
+                inner_name = (f.f_code.co_filename.rsplit("/", 1)[-1],
+                              f.f_lineno, nm)
+            if nm == "sleep":
+                bucket = "idle (loop waiting on input/socket)"
+                break
+            if nm in PHASE:
+                bucket = PHASE[nm]
+                break
+            f = f.f_back
+        return (bucket or "other"), inner_name
+
+    def _sampler():
+        last = _time.time()
+        while not _stop.is_set():
+            try:
+                fr = sys._current_frames().get(_main_tid)
+                if fr is not None:
+                    bucket, inner_name = _classify(fr)
+                    with _lock:
+                        _buckets[bucket] += 1
+                        if inner_name is not None:
+                            _inner[inner_name] += 1
+                        _nsamp[0] += 1
+            except Exception:
+                pass
+            if _time.time() - last >= 2.0:
+                _write_profile()
+                last = _time.time()
+            _time.sleep(0.002)
+        _write_profile()
+
+    threading.Thread(target=_sampler, daemon=True).start()
+    atexit.register(_write_profile)
     try:
         return system.run(max_cycles)
     finally:
+        _stop.set()
+        _write_profile()
         system.crossbar.close()
 
 
