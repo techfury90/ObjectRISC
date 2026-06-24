@@ -86,6 +86,12 @@ obj_t obj_adopt_dir_result(void);
  * null or the table is full. */
 obj_t obj_adopt_o6(void);
 
+/* Adopt the capability in boot register O7 (the grid / positioned-text
+ * service, per liborisc's boot map) as a handle. Same read-inside-libc
+ * discipline as obj_adopt_o6. OBJ_NULL if O7 is null or the table is
+ * full. */
+obj_t obj_adopt_o7(void);
+
 /* --- inspection (no memory access) ---------------------------------- */
 
 int   obj_isnull(obj_t h);            /* 1 if the slot holds a null ref */

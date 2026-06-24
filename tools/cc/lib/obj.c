@@ -282,6 +282,28 @@ obj_adopt_o6(void)
 	return h;
 }
 
+obj_t
+obj_adopt_o7(void)
+{
+	int h, isn;
+
+	h = obj__alloc_handle();
+	if (h < 0)
+		return OBJ_NULL;
+	asm volatile(
+		"omov o1, o7\n"           /* O1 = boot grid-service cap */
+		"oisn %0, o1"
+		: "=r"(isn)
+		:
+		: "r1"
+	);
+	if (isn)
+		return OBJ_NULL;          /* O7 null — nothing to adopt */
+	obj__store_o1(h);
+	obj_inuse |= (1u << h);
+	return h;
+}
+
 /* --- inspection ----------------------------------------------------- */
 
 int
