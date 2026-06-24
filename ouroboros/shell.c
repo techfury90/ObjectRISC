@@ -809,15 +809,20 @@ view_status_append_int(char *status, int sp, int v)
 	return sp;
 }
 
+/* `status` is supplied by the caller and MUST outlive this call's async
+ * grid SENDs: grid_print_n is fire-and-forget (the terminal OBJ_READ_REQs
+ * the bytes only after the CPU moves on — see grid.c), so a buffer in
+ * view_render's own frame would be overwritten by the next term_getkey
+ * before the fetch. The caller (cmd_view) keeps it in its persistent
+ * loop frame. */
 static void
-view_render(struct view_state *vs)
+view_render(struct view_state *vs, char *status)
 {
 	int i;
 	int row;
 	int len;
 	int start;
 	int end;
-	char status[VIEW_GRID_COLS];
 	int sp;
 
 	grid_clear();
@@ -855,6 +860,11 @@ cmd_view(const char *cwd, const char *arg)
 {
 	char path[PATH_MAX];
 	char buf[VIEW_BUF_BYTES];
+	/* Status-line buffer kept in cmd_view's frame, not view_render's:
+	 * grid_print_n's async SEND outlives the call, and a view_render-
+	 * local would be clobbered by the next term_getkey before the
+	 * terminal fetches it (the bug that looked like a codegen issue). */
+	char status[VIEW_GRID_COLS];
 	int  line_off[VIEW_MAX_LINES + 1];
 	int  buf_len = 0;
 	int  n_lines = 0;
@@ -920,7 +930,7 @@ cmd_view(const char *cwd, const char *arg)
 		vs.top_row   = top_row;
 		vs.path      = path;
 		vs.truncated = truncated;
-		view_render(&vs);
+		view_render(&vs, status);
 
 		key = term_getkey(&mods);
 		if (key == 'q' || key == 'Q' || key == TK_ESCAPE) {

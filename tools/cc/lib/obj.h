@@ -80,6 +80,12 @@ void  obj_drop(obj_t h);
  * call. Returns OBJ_NULL if that slot is null or the table is full. */
 obj_t obj_adopt_dir_result(void);
 
+/* Adopt the capability in boot register O6 (the keyboard service, per
+ * liborisc's boot map) as a handle. Reads O6 inside libc so the cap
+ * never crosses a call boundary in an O-register. OBJ_NULL if O6 is
+ * null or the table is full. */
+obj_t obj_adopt_o6(void);
+
 /* --- inspection (no memory access) ---------------------------------- */
 
 int   obj_isnull(obj_t h);            /* 1 if the slot holds a null ref */
@@ -136,5 +142,10 @@ int   obj_recv(obj_t h);
  * writes the R3..R6 payload words to out[0..3] and returns 0; returns
  * -1 when the queue is empty or on error. */
 int   obj_poll(obj_t h, int out[4]);
+
+/* Blocking sibling of obj_poll: waits for a message on `h`'s queue, then
+ * writes the R3..R6 payload words to out[0..3]; returns 0, or -1 on poll
+ * error. */
+int   obj_recv_full(obj_t h, int out[4]);
 
 #endif /* OBJ_H */

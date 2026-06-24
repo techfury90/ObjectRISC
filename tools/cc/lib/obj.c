@@ -260,6 +260,28 @@ obj_adopt_dir_result(void)
 	return h;
 }
 
+obj_t
+obj_adopt_o6(void)
+{
+	int h, isn;
+
+	h = obj__alloc_handle();
+	if (h < 0)
+		return OBJ_NULL;
+	asm volatile(
+		"omov o1, o6\n"           /* O1 = boot keyboard-service cap */
+		"oisn %0, o1"
+		: "=r"(isn)
+		:
+		: "r1"
+	);
+	if (isn)
+		return OBJ_NULL;          /* O6 null — nothing to adopt */
+	obj__store_o1(h);
+	obj_inuse |= (1u << h);
+	return h;
+}
+
 /* --- inspection ----------------------------------------------------- */
 
 int
@@ -479,6 +501,37 @@ obj_poll(obj_t h, int out[4])
 	obj__load_o1(h);               /* queue object -> O1 */
 	asm volatile(
 		"addiu r4, r0, 0\n"       /* timeout 0 = non-blocking poll */
+		"call  #0x204\n"          /* ReceiveQueuePoll -> R2 status, R3..R6 */
+		"nop\n"
+		"la    r1, obj__poll_status\n"
+		"sw    r2, 0(r1)\n"
+		"addu  %0, r3, r0\n"
+		"addu  %1, r4, r0\n"
+		"addu  %2, r5, r0\n"
+		"addu  %3, r6, r0"
+		: "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
+		:
+		: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+	);
+	if (obj__poll_status != 0)
+		return -1;
+	out[0] = w0;
+	out[1] = w1;
+	out[2] = w2;
+	out[3] = w3;
+	return 0;
+}
+
+int
+obj_recv_full(obj_t h, int out[4])
+{
+	int w0, w1, w2, w3;
+
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return -1;
+	obj__load_o1(h);               /* queue object -> O1 */
+	asm volatile(
+		"addiu r4, r0, -1\n"      /* timeout -1 = block until a message */
 		"call  #0x204\n"          /* ReceiveQueuePoll -> R2 status, R3..R6 */
 		"nop\n"
 		"la    r1, obj__poll_status\n"
