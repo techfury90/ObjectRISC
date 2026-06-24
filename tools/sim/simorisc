@@ -2355,6 +2355,11 @@ class TkDisplayWorker:
                         lambda ev, c=cpu: self._on_pointer(c, ev,
                                                            PTR_UP,
                                                            ev.num))
+            # Cmd+S dumps the live framebuffer to a native-resolution PNG
+            # (the image's own pixels, untouched by macOS Retina doubling)
+            # for a true 1:1 look; consumed here ("break") so it never
+            # reaches the WM as a keystroke.
+            canvas.bind("<Command-s>", lambda ev, i=idx: self._snapshot(i))
             canvas.focus_set()
             self._tracked[idx] = {
                 "win": win, "image": img,
@@ -2419,6 +2424,27 @@ class TkDisplayWorker:
         btn_state = (1 << button) if evt_type != PTR_UP else 0
         self._enqueue_sink(cpu, 1,
                            [evt_type, packed_xy, button, btn_state])
+
+    def _snapshot(self, idx):
+        """Cmd+S handler: write the live framebuffer to a native-resolution
+        PNG under /tmp.  PhotoImage.write() emits the image's own pixels, so
+        the file is the true 1:1 framebuffer regardless of the Retina display
+        doubling.  Falls back to PPM if this Tk build lacks PNG."""
+        info = self._tracked.get(idx)
+        if info is None:
+            return "break"
+        self._snap_seq = getattr(self, "_snap_seq", 0) + 1
+        base = "/tmp/orisc-fb%d-%03d" % (idx, self._snap_seq)
+        try:
+            info["image"].write(base + ".png", format="png")
+            out = base + ".png"
+        except Exception:
+            info["image"].write(base + ".ppm")
+            out = base + ".ppm"
+        sys.stderr.write("[display] framebuffer snapshot %dx%d -> %s\n"
+                         % (info["width"], info["height"], out))
+        sys.stderr.flush()
+        return "break"
 
     def _repaint(self, info):
         desc = info["desc"]
