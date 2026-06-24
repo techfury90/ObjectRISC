@@ -631,8 +631,8 @@ with worked input and output traces, is the subsystem guide
 `docs/wm-terminal-overview.md`.
 
 Two object type tags are involved (values following the reference
-implementation's `0x410x` type-tag block, Volume V and `CONTRACT.md`
-Section 2):
+implementation's `0x410x` type-tag block — `CONTRACT.md` Section 2 lists
+the existing `0x4100`–`0x4103` code/stack/data/service tags):
 
 - **`TAG_FRAMEBUFFER`** (`0x4106`) — a host-display-backed pixel object
   holding `w × h` bytes, one byte per pixel interpreted as a palette
