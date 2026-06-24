@@ -266,6 +266,35 @@ hf_read(int fd, char *buf, int count)
 	return hf_wait(&discard);
 }
 
+/* --- hf_read_obj — read straight into an arbitrary object handle ------
+ *
+ * Like hf_read, but the destination is the object named by handle `dst`
+ * (which must carry the W cap) rather than a stack buffer: O2 = dst's
+ * cap so hostfsd OBJ_WRITEs the bytes directly into that object, O3 =
+ * our reply mailbox (which is both the session key — hostfsd matches
+ * the subscriber by O3's object — and the reply target). This is the
+ * 3-OR shape of an OP_READ; obj_send_3or lays the registers out
+ * identically to hf_read's obj_send_bytes, only with the destination
+ * pointed at `dst` instead of the boot stack.
+ *
+ * The .orx loader uses it to stream a whole code/data section into its
+ * freshly-ObjAlloc'd object in one round-trip — no 1 KiB stack bounce,
+ * no memcpy. Synchronous (blocks on the reply via hf_wait), so the
+ * object is the live write target across hostfsd's fetch; immune to the
+ * async-buffer-lifetime race that fire-and-forget data SENDs face.
+ *
+ * Returns bytes written (may be < count: hostfsd does one host read()),
+ * 0 at EOF, or negative on error. */
+int
+hf_read_obj(int fd, obj_t dst, int dst_off, int count)
+{
+	int discard;
+
+	obj_send_3or(hostfsd_h, dst, hf_mbox_h, OBJ_NULL,
+	             OP_READ, fd, dst_off, count);
+	return hf_wait(&discard);
+}
+
 /* --- hf_write — buffer can be in stack or data ------------------------- */
 
 int

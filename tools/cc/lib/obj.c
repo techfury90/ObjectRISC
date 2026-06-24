@@ -213,14 +213,18 @@ obj_adopt_dir_result(void)
 	return h;
 }
 
-/* Adopt the capability currently in a known libc O12 slot into a handle.
- * A migration bridge for the directory clients (dir.c / sup.c): their
- * service / parent / reply / input-ref caps are bootstrapped into raw
+/* Adopt the capability currently in a known O12 slot into a handle.
+ * A migration bridge for clients whose caps are bootstrapped into raw
  * O12 slots by other code (task_init, supervisor boot, the caller's O1
  * at entry), and this brings one into the handle world so obj_send_3or /
- * obj_recv_* can use it. `off` must be one of the slot offsets below
- * (OREFLD takes an immediate). OBJ_NULL if the slot is null or the table
- * is full. */
+ * obj_recv_* can use it. Known offsets:
+ *   - the directory clients (dir.c / sup.c): 544 BOOT_PARENT, 552
+ *     REPLY_MB, 584 DIR_SLOT, 624 DIR_INPUT_REF;
+ *   - the .orx loader (orx.c): 128 = its freshly-ObjAlloc'd code object,
+ *     136 = the data object — adopted so hf_read_obj can stream a whole
+ *     section straight into them.
+ * `off` must be one of the slot offsets below (OREFLD takes an
+ * immediate). OBJ_NULL if the slot is null or the table is full. */
 obj_t
 obj_adopt_slot(int off)
 {
@@ -230,6 +234,8 @@ obj_adopt_slot(int off)
 	if (h < 0)
 		return OBJ_NULL;
 	switch (off) {
+	case 128: asm volatile("orefld o1, 128(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
+	case 136: asm volatile("orefld o1, 136(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
 	case 544: asm volatile("orefld o1, 544(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
 	case 552: asm volatile("orefld o1, 552(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
 	case 584: asm volatile("orefld o1, 584(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
