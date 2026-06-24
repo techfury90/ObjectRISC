@@ -81,6 +81,13 @@ int hf_open(const char *path, int flags);
 int hf_opendir(const char *path);                   /* read returns "name\nname\n..." */
 int hf_close(int fd);
 int hf_read(int fd, char *buf, int count);          /* buf MUST be on the stack */
+/* hf_read_obj — like hf_read, but the destination is an obj.h handle
+ * (an obj_t; declared int here since liborisc.h is obj.h-agnostic) whose
+ * object carries the W cap, instead of a stack buffer. hostfsd OBJ_WRITEs
+ * straight into that object, so the .orx loader can stream a whole
+ * code/data section per round-trip. Returns bytes written, 0 at EOF, or
+ * negative on error. */
+int hf_read_obj(int fd, int dst, int dst_off, int count);
 int hf_write(int fd, const char *buf, int count);   /* buf may be stack or data */
 /* Phase 50: filesystem mutation. Both return 0 on success or a
  * negative errno: -3 = ENOENT, -4 = EACCES, -7 = EEXIST (mkdir on

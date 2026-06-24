@@ -4,9 +4,10 @@
  *
  * The supervisor escape from "spawn programs only via linkbootd on
  * a separate CPU." orx_run(path) reads a .orx from the host
- * filesystem, ObjAllocs code/data/stack objects, copies the file's
- * text and data sections into them via temp VA mappings, and
- * TaskCreates a child to run the entry point. The child sees the
+ * filesystem, ObjAllocs code/data/stack objects, streams the file's
+ * text and data sections straight into them (hostfsd OBJ_WRITEs each
+ * section into its object via hf_read_obj — no parent-side mapping or
+ * copy), and TaskCreates a child to run the entry point. The child sees the
  * standard CONTRACT.md §2 layout — code at CODE_VA, data at
  * DATA_VA, stack at STACK_TOP — exactly as a fresh boot would
  * produce, so pcc-compiled C programs Just Work.
@@ -37,18 +38,18 @@
  */
 
 #include "liborisc.h"
+#include "obj.h"
 
 /* Section base VAs from CONTRACT.md §2. */
 #define CODE_VA      0x00010000
 #define DATA_VA      0x00040000
 #define STACK_TOP    0x00200000
 
-/* Loadable-module floor (Vol VI MapObject). Use VAs above 0x100000
- * for the temporary parent-side mappings we use to populate freshly
- * ObjAlloc'd code/data objects. Each load Unmaps after copying so
- * subsequent loads can reuse the same VAs. */
-#define TEMP_CODE_VA 0x00300000
-#define TEMP_DATA_VA 0x00400000
+/* Loadable-module floor (Vol VI MapObject). VAs above 0x100000 are
+ * free for the parent-side temp mappings the loader needs. The code /
+ * data sections are now streamed straight into their objects by hostfsd
+ * (hf_read_obj OBJ_WRITEs them — no parent-side mapping), so the only
+ * remaining temp is the shared argv buffer below. */
 /* Long-lived mapping in the PARENT for the shared argv buffer. Once
  * orx_argv_alloc establishes it, we leave it mapped forever — the
  * per-spawn cost shrinks to a memcpy (no MapObject/Unmap pair). The
@@ -292,66 +293,49 @@ freedef_o1(void)
 	);
 }
 
-/* Load slot ref into O1, then MapObject(O1, va, 0, R+W, length). */
-static int
-orx_map_slot(int slot, unsigned int va, unsigned int length)
-{
-	int status;
-	switch (slot) {
-	case SLOT_CODE:  asm volatile("orefld o1, 128(o12)");  break;
-	case SLOT_DATA:  asm volatile("orefld o1, 136(o12)");  break;
-	case SLOT_STACK: asm volatile("orefld o1, 144(o12)"); break;
-	}
-	/* Reverse order — see orx_alloc_into_slot's comment. */
-	asm volatile(
-		"addu  r7, %3, r0\n"
-		"addiu r6, r0, %2\n"
-		"addu  r5, r0, r0\n"
-		"addu  r4, %1, r0\n"
-		"call  #0x110\n"            /* MapObject */
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "r"(va), "i"(CAP_R | CAP_W), "r"(length)
-		: "r2", "r3", "r4", "r5", "r6", "r7"
-	);
-	return status;
-}
+/* Per-hf_read_obj transfer ceiling. hostfsd answers each read by
+ * OBJ_WRITE'ing the whole span back in ONE packet, so this also bounds
+ * the wire-packet size — and the binding constraint there is the crossbar
+ * transport, not the loader: oriscbar relays packets with a non-blocking
+ * sendall, and the host UNIX-domain socket buffer is only 8 KiB
+ * (net.local.stream.sendspace), so a packet that doesn't fit the send
+ * buffer is silently dropped (oriscbar write_packet) and the read hangs.
+ * 4 KiB keeps the OBJ_WRITE_REQ comfortably inside that window with margin
+ * for other in-flight traffic — still 4x the old 1 KiB stack-bounce chunk,
+ * which is enough to make a real app's load latency disappear. Raising it
+ * further needs oriscbar to gain proper write-side backpressure (a queue
+ * drained on EVENT_WRITE) — a transport fix, out of the load path. */
+#define ORX_READ_CHUNK 0x1000
 
+/* Read `size` bytes from `fd` directly into the code/data object whose
+ * ref lives in orx scratch slot `slot_off` (128 = code, 136 = data).
+ *
+ * The object is freshly ObjAlloc'd (full caps incl. W) but not mapped
+ * anywhere: we adopt its ref into a handle and let hostfsd OBJ_WRITE the
+ * bytes straight into its storage via hf_read_obj. That replaces the old
+ * "map at a temp VA, read into a 1 KiB stack buffer, memcpy" dance — and
+ * because each request moves up to ORX_READ_CHUNK bytes instead of 1 KiB,
+ * a real app loads in a handful of round-trips instead of dozens.
+ *
+ * Returns 0 on success, -1 on adopt/read failure. */
 static int
-orx_unmap(unsigned int va, unsigned int length)
+orx_read_into_slot(int fd, int slot_off, unsigned int size)
 {
-	int status;
-	asm volatile(
-		"addu  r5, %2, r0\n"
-		"addu  r4, %1, r0\n"
-		"call  #0x111\n"            /* Unmap */
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		: "r"(va), "r"(length)
-		: "r2", "r3", "r4", "r5"
-	);
-	return status;
-}
-
-/* Read `size` bytes from `fd` into the parent VA range starting at
- * `temp_va` (which must already be MapObject'd R+W). Buffers in
- * 1 KiB stack chunks; memcpy into the temp VA. */
-static int
-orx_read_into_va(int fd, unsigned int temp_va, unsigned int size)
-{
-	char buf[1024];
+	obj_t dst = obj_adopt_slot(slot_off);
 	unsigned int off = 0;
+	if (dst < 0)
+		return -1;
 	while (off < size) {
 		unsigned int want = size - off;
-		if (want > sizeof(buf)) want = sizeof(buf);
-		int got = vfs_read(fd, buf, (int)want);
-		if (got <= 0)
+		if (want > ORX_READ_CHUNK) want = ORX_READ_CHUNK;
+		int got = hf_read_obj(fd, dst, (int)off, (int)want);
+		if (got <= 0) {
+			obj_drop(dst);          /* release the handle; object lives on */
 			return -1;
-		memcpy((void *)(temp_va + off), buf, (unsigned int)got);
+		}
 		off += (unsigned int)got;
 	}
+	obj_drop(dst);                  /* handle only — the child needs the object */
 	return 0;
 }
 
@@ -770,16 +754,10 @@ orx_spawn(const char *path, const char *args, const char *cwd)
 				SLOT_CODE) != 0) {
 		vfs_close(fd); return -4;
 	}
-	if (orx_map_slot(SLOT_CODE, TEMP_CODE_VA, code_alloc) != 0) {
+	if (orx_read_into_slot(fd, 128, text_size) != 0) {   /* 128 = code slot */
 		orx_free_slot(SLOT_CODE);
 		vfs_close(fd); return -4;
 	}
-	if (orx_read_into_va(fd, TEMP_CODE_VA, text_size) != 0) {
-		orx_unmap(TEMP_CODE_VA, code_alloc);
-		orx_free_slot(SLOT_CODE);
-		vfs_close(fd); return -4;
-	}
-	orx_unmap(TEMP_CODE_VA, code_alloc);
 
 	if (has_data) {
 		if (orx_alloc_into_slot(data_alloc, TAG_DATA,
@@ -788,16 +766,10 @@ orx_spawn(const char *path, const char *args, const char *cwd)
 			orx_free_slot(SLOT_CODE);
 			vfs_close(fd); return -4;
 		}
-		if (orx_map_slot(SLOT_DATA, TEMP_DATA_VA, data_alloc) != 0) {
+		if (orx_read_into_slot(fd, 136, data_size) != 0) {  /* 136 = data slot */
 			orx_free_slot(SLOT_DATA); orx_free_slot(SLOT_CODE);
 			vfs_close(fd); return -4;
 		}
-		if (orx_read_into_va(fd, TEMP_DATA_VA, data_size) != 0) {
-			orx_unmap(TEMP_DATA_VA, data_alloc);
-			orx_free_slot(SLOT_DATA); orx_free_slot(SLOT_CODE);
-			vfs_close(fd); return -4;
-		}
-		orx_unmap(TEMP_DATA_VA, data_alloc);
 	}
 	vfs_close(fd);
 
