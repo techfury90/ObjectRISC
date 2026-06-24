@@ -26,6 +26,15 @@
 #   the just-resumed shell runs through crt0 + main's first console_write
 #   before blocking on the keyboard. cpu0.out contains "S0" even when
 #   the cascade-kill races in immediately afterwards.
+#
+# The assertion is invariant-based, not cycle-pinned (this test used to
+# flake ~1-in-5 under full-suite host load and broke deterministically
+# under libc cycle-count changes, because it grepped S0 unconditionally
+# even when the leader legitimately shut down before resuming any shell).
+# A test-injected SPAWN_RESUMED marker (see the supervisor build below)
+# distinguishes "resumed a shell that never ran" (the bug → FAIL) from
+# "never resumed a shell" (shutdown won the race → not applicable). See
+# the assertion block at the bottom for the full rationale.
 
 set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -118,8 +127,32 @@ build_orx "ouroboros/programs/login.c"      "$TMP/jail/programs/login.orx"
 build_shell "$TMP/shell_with_marker.c"      "$TMP/jail/programs/shell.orx"
 
 # --- supervisor ------------------------------------------------------
+# Inject a SPAWN_RESUMED marker right after handle_spawn_request's
+# task_resume (the op=1 / sup_spawn path — which in this scenario fires
+# ONLY for the shell, since the supervisor resumes sysinit/login directly
+# in main()). The marker prints whenever the leader actually resumed a
+# shell, BEFORE the task_yield that lets it run — so it appears in both
+# the fixed build (resume → yield → shell runs → S0) and the buggy build
+# (resume → no yield → cascade-kill before the shell runs, no S0). It is
+# ABSENT only when no shell was ever resumed (the worker's relayed op=2
+# shutdown won the race to the leader's mailbox before login's spawn
+# request). That distinction is what lets the assertion below tell the
+# genuine bug from the harmless "shutdown raced in first" case — they are
+# otherwise byte-identical on stdout. SUP_PRINT restores O3 from O15
+# (clobbered by orx_spawn) and is the supervisor's own print idiom, so
+# this is safe mid-handler and does not change the resume→yield ordering.
+awk '
+  /if \(t >= 0\) \(void\)task_resume\(t\);/ && !done {
+      print $0
+      print "\tif (t >= 0) SUP_PRINT(\"SPAWN_RESUMED\\n\");"
+      done = 1
+      next
+  }
+  { print }
+' ouroboros/supervisor.c > "$TMP/supervisor_marked.c"
+
 "$CPP" -I tools/cc/arch/orisc -I tools/cc/lib \
-    ouroboros/supervisor.c > "$TMP/sup.i"
+    "$TMP/supervisor_marked.c" > "$TMP/sup.i"
 "$CCOM" < "$TMP/sup.i" > "$TMP/sup.s"
 python3 tools/asm/asmorisc -r "$TMP/sup.s" -o "$TMP/sup.oro"
 python3 tools/ld/orld -o "$TMP/supervisor.orx" \
@@ -212,13 +245,43 @@ cat "$TMP/cpu0.out"
 echo "--- cpu1 stdout ---"
 cat "$TMP/cpu1.out"
 
-# The whole point: shell.main() actually ran on CPU 0. Without the
-# fix, the leader's supervisor sees the worker's relayed op=2 in its
-# mailbox immediately after task_resume(shell) and cascade-kills the
-# shell before scheduling it — so the marker never lands.
-grep -q '^S0$' "$TMP/cpu0.out" \
-    || { echo "FAIL: shell on CPU 0 didn't reach main() (no S0 in cpu0 stdout)" >&2; exit 1; }
+# The guarantee under test: handle_spawn_request must task_yield after
+# task_resume, so a freshly-resumed shell runs its first instruction (S0,
+# injected at the very top of main) before a queued op=2 shutdown
+# cascade-kills it.
+#
+# We assert the INVARIANT, not the exact cross-CPU cycle race (which
+# shifts under host load and any libc cycle-count change — the source of
+# this test's historical ~1-in-5 full-suite flake). The SPAWN_RESUMED
+# marker tells two otherwise-identical stdout shapes apart:
+#
+#   - SPAWN_RESUMED present, S0 absent  → the leader resumed a shell but
+#     it never ran: the genuine bug (resume not followed by a yield). FAIL.
+#   - SPAWN_RESUMED absent               → the leader never resumed a shell
+#     (the worker's relayed op=2 reached the mailbox before login's spawn
+#     request, so the cascade-kill fired first). No shell was ever at
+#     risk; the guarantee is not applicable. NOT a failure — this is the
+#     timing-dependent case the old unconditional `grep S0` flipped on.
+#
+# The worker (CPU 1) has no inbound relayed op=2 during its own shell
+# spawn, so it ALWAYS resumes and runs its shell — we assert it strictly
+# (SPAWN_RESUMED *and* S0). That keeps the test from going vacuous: every
+# run exercises and checks the resume→run guarantee on CPU 1, and the
+# negative build (remove the task_yield) is caught on CPU 0 (SPAWN_RESUMED
+# present, S0 missing).
+fail() { echo "FAIL: $1" >&2; exit 1; }
+
+# CPU 1 (worker): the guarantee always applies here — strict check.
+grep -q '^SPAWN_RESUMED$' "$TMP/cpu1.out" \
+    || fail "CPU 1 (worker) never resumed a shell — test setup broken (expected a reliable worker shell spawn)"
 grep -q '^S0$' "$TMP/cpu1.out" \
-    || { echo "FAIL: shell on CPU 1 didn't reach main() (no S0 in cpu1 stdout)" >&2; exit 1; }
+    || fail "CPU 1 (worker) resumed a shell but it never reached main() (S0)"
+
+# CPU 0 (leader): conditional on a shell actually being resumed, since the
+# spawn-vs-shutdown race may legitimately shut the leader down first.
+if grep -q '^SPAWN_RESUMED$' "$TMP/cpu0.out"; then
+    grep -q '^S0$' "$TMP/cpu0.out" \
+        || fail "CPU 0 (leader) resumed a shell but it never reached main() (S0) — handle_spawn_request didn't let it run before the shutdown cascade"
+fi
 
 echo "PASS"
