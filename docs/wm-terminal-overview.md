@@ -902,14 +902,6 @@ terminal" comments — is all Phase 60.
 
 ## Open questions / things to verify
 
-- **Spec/impl primitive-number reconciliation (one item open).** `CONTRACT.md`
-  §3 now carries the full implemented-primitive table and a conflict log (§3.0.1).
-  The Phase-60 display/input primitives (`#0x10A/#0x10B/#0x10C..#0x10F`) are
-  specified in [`docs/SYSTEM_FIRMWARE_INTERFACE.md` §5.4](SYSTEM_FIRMWARE_INTERFACE.md);
-  the `#0x102`/`ObjRevoke` conflict was resolved by moving `ObjAllocFramebuffer` to
-  `#0x10A` and reserving `#0x102` for `ObjRevoke`. One agreed item is still
-  unlanded: `#0x301` is `ReadCycles` in the implementation but `DeviceQuery` in the
-  spec (§7) — the plan is to bless `ReadCycles` and retire/renumber `DeviceQuery`.
 - **Keyboard binding asymmetry** in the supervisor's per-spawn path
   ([`supervisor.c:927`](../ouroboros/supervisor.c#L927)): relayed/hot-attach
   children resolve keyboard only from `/sys/term/<idx>/keyboard`, which won't

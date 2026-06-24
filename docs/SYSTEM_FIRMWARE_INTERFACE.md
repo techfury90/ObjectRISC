@@ -935,10 +935,35 @@ the firmware integrator and documented in supplementary materials.
 >
 > Returns: `R2`: status. `R3`: number of references actually written.
 
-**`0x301  DeviceQuery`** — *Restartable.*
+**`0x301  ReadCycles`** — *Restartable.*
+
+> Return the calling processor's retired-instruction counter — a local
+> measurement counter, the always-present cousin of `Stat`'s
+> instruction-count counter (Section 10), requiring no counter
+> selection. Intended for benchmarks and bring-up rather than as a
+> production architectural facility; a conforming firmware that has no
+> cycle source may report a coarse or zero counter.
+>
+> By number this primitive falls in the device-and-I/O range; it is
+> placed here because the reference implementation already ships it at
+> `0x301` (see the renumbering note on `DeviceQuery` below, and
+> `CONTRACT.md` Section 3.0.1).
+>
+> No arguments.
+>
+> Returns:
+> - `R2`: status (always `OK`).
+> - `R3`: the counter, low 32 bits. It advances by one per retired
+>   instruction and wraps at 2^32; a measurement spanning more than that
+>   window must sample twice and account for the wrap.
+
+**`0x302  DeviceQuery`** — *Restartable.*
 
 > Return identifying information about a device: its class tag, its
-> revision, and a small fixed-format identifier string.
+> revision, and a small fixed-format identifier string. Renumbered from
+> `0x301` in this revision so that `ReadCycles` — already shipped at
+> `0x301` in the reference implementation — could be specified at the
+> number it occupies.
 >
 > Args:
 > - `O1`: device reference.
