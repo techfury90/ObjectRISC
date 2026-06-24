@@ -27,6 +27,18 @@
  */
 
 #include "liborisc.h"
+#include "obj.h"
+
+/* Phase 4: the keyboard-event mailbox and the keyboard service (boot O6)
+ * are object handles now, not hand-managed caps in O9 / O6. The console
+ * path (term_print*) still talks raw asm to O5 — its byte-data SENDs are
+ * a different shape the handle API doesn't cover yet. */
+static obj_t kbd_mbox_h = OBJ_NULL;   /* our private keyboard-event mailbox */
+static obj_t kbd_svc_h  = OBJ_NULL;   /* the keyboard service (adopted O6) */
+
+/* Mailbox caps mirror the old alloc: R|W|S|V|C (== 0x5b). */
+#define KBD_MBOX_CAPS \
+	(OBJ_CAP_R | OBJ_CAP_W | OBJ_CAP_S | OBJ_CAP_V | OBJ_CAP_C)
 
 /* Section base VAs from CONTRACT.md §2. */
 #define STACK_BOTTOM 0x001f0000
@@ -155,7 +167,7 @@ term_print_only_init(void)
 void
 term_init(void)
 {
-	int status;
+	obj_t sub;
 
 	/* Park the boot O2/O3/O4 into the saved slots. We use raw asm
 	 * (not `register __or __asm__("o11")` style declarations) so pcc
@@ -167,72 +179,33 @@ term_init(void)
 	asm volatile("omov o14, o4");
 	asm volatile("omov o15, o3");
 
-	/* Allocate our own private mailbox service object → O9.
+	(void)obj_init();              /* idempotent; O12 is up after task_init */
+	kbd_svc_h = obj_adopt_o6();    /* the keyboard service (boot O6) */
+
+	/* Allocate our own private mailbox + receive queue (depth 64).
 	 *
-	 * Why not reuse the boot self-svc (O4) the way earlier versions
-	 * of this code did: TaskCreate copies the parent's OPRs to the
-	 * child verbatim, so a backgrounded program that calls term_init
-	 * would derive its kbd subscribe-cap from the SAME O4 the
-	 * parent already used — producing the same ref and getting
-	 * dedup'd by oriscterm. Per-instance service objects let each
-	 * program have its own kbd queue and subscribe ref, which is
-	 * what the Phase 40 focus-switching depends on. */
-	asm volatile(
-		"addiu r4, r0, 16\n"
-		"addiu r5, r0, 0x4103\n"     /* TAG_SERVICE */
-		"addiu r6, r0, 0x5b\n"        /* R|W|S|V|C */
-		"addiu r7, r0, 0\n"
-		"call  #0x100\n"              /* ObjAlloc → O1 = mailbox */
-		"nop\n"
-		"omov  o9, o1\n"              /* O9 = term mailbox (long-lived) */
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		:
-		: "r1", "r2", "r4", "r5", "r6", "r7"
-	);
-	(void)status;
+	 * Why per-instance rather than reusing the boot self-svc (O4):
+	 * TaskCreate copies the parent's OPRs to the child verbatim, so a
+	 * backgrounded program deriving its kbd subscribe-cap from the
+	 * shared O4 would produce the same ref and get dedup'd by
+	 * oriscterm. A private mailbox object gives each program its own
+	 * kbd queue and subscribe ref — what Phase 40 focus-switching
+	 * depends on. */
+	kbd_mbox_h = obj_alloc(16, OBJ_TAG_SERVICE, KBD_MBOX_CAPS);
+	if (kbd_mbox_h < 0) {
+		_term_restore_or();
+		return;
+	}
+	obj_queue_attach(kbd_mbox_h, 64);
 
-	/* Attach a receive queue (depth 16) to O9. This queue is
-	 * shared: keyboard events AND hostfsd responses both land
-	 * here. Known limitation — a long-running hf_read loop
-	 * interleaved with keystrokes can mis-decode messages. The
-	 * right fix is separate per-service queues; for now the depth
-	 * is small enough that excess keystrokes during long
-	 * cmd_cat / cmd_ls runs are dropped at the door rather than
-	 * silently corrupting the response stream. */
-	asm volatile(
-		"omov  o1, o9\n"
-		"addiu r4, r0, 64\n"
-		"call  #0x203\n"
-		"nop\n"
-		"addu  %0, r2, r0"
-		: "=r"(status)
-		:
-		: "r1", "r2", "r3", "r4"
-	);
-	(void)status;
-
-	/* Derive an R|S sub-ref from O9, hand it straight to the kbd
-	 * service via SEND. The derived ref lives in O2 just long
-	 * enough for the SEND to copy it onto the wire; no need to
-	 * park it permanently. */
-	asm volatile(
-		"omov  o1, o9\n"
-		"addiu r4, r0, 9\n"           /* R|S */
-		"call  #0x103\n"              /* ObjDerive → O1 = sub-cap */
-		"nop\n"
-		"omov  o2, o1\n"              /* O2 = sub-cap for SEND */
-		"omov  o1, o6\n"              /* O1 = keyboard service */
-		"onull o3\n"
-		"addiu r4, r0, 0\n"
-		"addiu r5, r0, 0\n"
-		"addiu r6, r0, 0\n"
-		"addiu r7, r0, 0\n"
-		"send  o1"
-		:
-		:
-		: "r1", "r4", "r5", "r6", "r7"
-	);
+	/* Derive an R|S sub-ref and SEND it to the keyboard service to
+	 * subscribe (R4 = 0); the service keeps its own copy, so we drop
+	 * ours. */
+	sub = obj_derive(kbd_mbox_h, OBJ_CAP_R | OBJ_CAP_S);
+	if (sub >= 0) {
+		obj_send_or(kbd_svc_h, sub, 0, 0, 0, 0);
+		obj_drop(sub);
+	}
 	_term_restore_or();
 }
 
@@ -278,46 +251,25 @@ term_init(void)
 void
 term_resubscribe(void)
 {
-	asm volatile(
-		"omov  o1, o9\n"               /* O1 = our mailbox */
-		"addiu r4, r0, 9\n"            /* R|S */
-		"call  #0x103\n"               /* ObjDerive → O1 = sub-cap */
-		"nop\n"
-		"omov  o2, o1\n"               /* O2 = sub-cap to subscribe */
-		"omov  o1, o6\n"               /* O1 = keyboard service */
-		"onull o3\n"
-		"addiu r4, r0, 0\n"            /* R4 = 0 → subscribe */
-		"addiu r5, r0, 0\n"
-		"addiu r6, r0, 0\n"
-		"addiu r7, r0, 0\n"
-		"send  o1"
-		:
-		:
-		: "r1", "r4", "r5", "r6", "r7"
-	);
+	obj_t sub = obj_derive(kbd_mbox_h, OBJ_CAP_R | OBJ_CAP_S);
+	if (sub >= 0) {
+		obj_send_or(kbd_svc_h, sub, 0, 0, 0, 0);   /* R4 = 0 → subscribe */
+		obj_drop(sub);
+	}
 	_term_restore_or();
 }
 
 void
 term_shutdown(void)
 {
-	asm volatile(
-		"omov  o1, o9\n"               /* O1 = our mailbox */
-		"addiu r4, r0, 9\n"            /* R|S — same caps as term_init */
-		"call  #0x103\n"               /* ObjDerive → O1 = sub-cap */
-		"nop\n"
-		"omov  o2, o1\n"               /* O2 = sub-cap to unsubscribe */
-		"omov  o1, o6\n"               /* O1 = keyboard service */
-		"onull o3\n"
-		"addiu r4, r0, 1\n"            /* R4 = 1 → unsubscribe */
-		"addiu r5, r0, 0\n"
-		"addiu r6, r0, 0\n"
-		"addiu r7, r0, 0\n"
-		"send  o1"
-		:
-		:
-		: "r1", "r4", "r5", "r6", "r7"
-	);
+	/* Re-derive the bit-identical sub-cap (ObjDerive is deterministic
+	 * over gen/home/idx/caps) and SEND R4=1 so oriscterm removes our
+	 * one subscriber entry, leaving other subscribers untouched. */
+	obj_t sub = obj_derive(kbd_mbox_h, OBJ_CAP_R | OBJ_CAP_S);
+	if (sub >= 0) {
+		obj_send_or(kbd_svc_h, sub, 1, 0, 0, 0);   /* R4 = 1 → unsubscribe */
+		obj_drop(sub);
+	}
 	_term_restore_or();
 }
 
@@ -509,26 +461,15 @@ term_print_hex(unsigned int n)
 int
 term_getkey(int *out_mods)
 {
-	int status, code, mods;
-	asm volatile(
-		"omov  o1, o9\n"                /* O9 = term mailbox (term_init) */
-		"addiu r4, r0, -1\n"            /* infinite timeout */
-		"call  #0x204\n"                /* ReceiveQueuePoll */
-		"nop\n"
-		"addu  %0, r2, r0\n"
-		"addu  %1, r3, r0\n"
-		"addu  %2, r4, r0"
-		: "=r"(status), "=r"(code), "=r"(mods)
-		:
-		: "r1", "r2", "r3", "r4"
-	);
+	int out[4];
+	int rc = obj_recv_full(kbd_mbox_h, out);   /* blocks for one event */
 	_term_restore_or();
-	if (status != 0) {
+	if (rc != 0) {
 		if (out_mods) *out_mods = 0;
 		return -1;
 	}
-	if (out_mods) *out_mods = mods;
-	return code;
+	if (out_mods) *out_mods = out[1];          /* R4 = mods */
+	return out[0];                              /* R3 = key code */
 }
 
 /* --- term_pollkey: non-blocking peek of the keyboard queue ----------- */
@@ -541,22 +482,11 @@ term_getkey(int *out_mods)
 int
 term_pollkey(int *out_code, int *out_mods)
 {
-	int status, code, mods;
-	asm volatile(
-		"omov  o1, o9\n"                /* O9 = term mailbox (term_init) */
-		"addiu r4, r0, 0\n"            /* timeout 0 = non-blocking */
-		"call  #0x204\n"                /* ReceiveQueuePoll */
-		"nop\n"
-		"addu  %0, r2, r0\n"
-		"addu  %1, r3, r0\n"
-		"addu  %2, r4, r0"
-		: "=r"(status), "=r"(code), "=r"(mods)
-		:
-		: "r1", "r2", "r3", "r4"
-	);
+	int out[4];
+	int rc = obj_poll(kbd_mbox_h, out);
 	_term_restore_or();
-	if (status != 0) return -1;
-	if (out_code) *out_code = code;
-	if (out_mods) *out_mods = mods;
+	if (rc != 0) return -1;
+	if (out_code) *out_code = out[0];          /* R3 = key code */
+	if (out_mods) *out_mods = out[1];          /* R4 = mods */
 	return 0;
 }
