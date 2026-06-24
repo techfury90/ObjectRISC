@@ -92,6 +92,20 @@ obj_t obj_adopt_o6(void);
  * full. */
 obj_t obj_adopt_o7(void);
 
+/* Adopt the capability in boot register O10 (the hostfsd service, per
+ * liborisc's boot map for hostfs-using programs) as a handle. Same
+ * read-inside-libc discipline as obj_adopt_o6. OBJ_NULL if O10 is null
+ * or the table is full. */
+obj_t obj_adopt_o10(void);
+
+/* Park handle `h`'s capability into boot register O8 — a compatibility
+ * mirror for the legacy direct-O8 consumers. host_io's hf mailbox now
+ * lives canonically in the handle table, but term.c's term_print_n_sync
+ * still derives its reply-cap from O8 / blocks on O8, and the supervisor
+ * harvests a child's O8 around TaskCreate, so hf_init mirrors the
+ * mailbox cap here. Drop the mirror once those consumers migrate too. */
+void  obj_park_o8(obj_t h);
+
 /* --- inspection (no memory access) ---------------------------------- */
 
 int   obj_isnull(obj_t h);            /* 1 if the slot holds a null ref */

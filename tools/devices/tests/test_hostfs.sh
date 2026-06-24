@@ -44,6 +44,10 @@ main(void)
     o14_self_save  = o4_self;
     o15_data_save  = o3_data;
 
+    /* hf_init's mailbox now lives in the obj.h handle table (O12),
+     * which task_init sets up — so it must run before hf_init. */
+    task_init();
+
     if (hf_init() != 0) { print_str("INIT-FAIL\n"); return 1; }
 
     fd = hf_open(path_str, HF_O_RDONLY);
