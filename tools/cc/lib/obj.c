@@ -1,7 +1,7 @@
 /*
  * obj.c — handle-based object/capability API (see obj.h).
  *
- * Capabilities live in an 8-slot table at byte offset OBJ_TABLE_OFFSET
+ * Capabilities live in a 16-slot table at byte offset OBJ_TABLE_OFFSET
  * of the O12 task-table OBJSTORE (reserved by task.c's ORX_STATE_BYTES).
  * A program holds opaque `obj_t` handles; libc OREFLDs the capability
  * into O1/O2 for each operation and OREFSTs new ones back. Because the

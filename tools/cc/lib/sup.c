@@ -220,11 +220,13 @@ sup_spawn_at(int target_pid, const char *path,
 	int payload_len = sup_pack_request(reqbuf, path, args, cwd);
 
 	/* Build the request + caps with a SEND-time peak of 3 handles. The
-	 * 8-slot table must also hold the CALLER's persistent handles, and
-	 * the callers here are fat — login carries 5 (term + host_io + grid),
-	 * the shell more — so a 4th handle overflows. Order to stay at 3:
-	 * derive the attenuated reply sub-cap, DROP the mailbox handle, then
-	 * alloc the request + recipient; re-adopt the mailbox for the poll. */
+	 * handle table (OBJ_NHANDLE=16) also holds the CALLER's persistent
+	 * handles, and the callers here are fat — login ~5 (term + host_io +
+	 * grid), the WM-session shell ~6 — so even at peak 3 we'd hit 9 > 8,
+	 * which is exactly why the table grew 8->16 (see obj.h). Keep the peak
+	 * minimal anyway, as headroom. Order to stay at 3: derive the
+	 * attenuated reply sub-cap, DROP the mailbox handle, then alloc the
+	 * request + recipient; re-adopt the mailbox for the poll. */
 	obj_t reply_h      = obj_adopt_slot(REPLY_MB_SLOT_OFFSET);
 	/* Derive a SEND-ONLY (R+S) sub-cap of our reply mailbox — the
 	 * supervisor only needs to SEND its reply, never to read/own our
