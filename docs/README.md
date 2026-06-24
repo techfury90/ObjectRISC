@@ -36,6 +36,18 @@ Focused, current-architecture walkthroughs of individual subsystems
   (`obj.{h,c}`): why C programs hold opaque `obj_t` handles instead of
   capabilities, the 8-slot handle table in the O12 OBJSTORE, the
   `obj_send_bytes` data keystone, and the client-migration pattern.
+- [`supervisor-overview.md`](supervisor-overview.md) — the per-CPU
+  init / session-manager process: the leader/worker model, the
+  spawn-service RPC, cross-CPU spawn relay + round-robin, and hot-attach.
+- [`directory-hostfs-overview.md`](directory-hostfs-overview.md) — the
+  name → reference namespace (`oriscdir` + `dir.c`): the dir-walk /
+  register / inline-register protocol, the `DIR_RESULT_SLOT` hand-off,
+  and how `hostfsd` mounts onto the tree.
+
+The boot path itself (`scripts/boot.sh` → `tools/oriscrun` → `simorisc`:
+the crossbar, process/CPU launch order, the boot-OR register contract) is
+covered in [`wm-terminal-overview.md` §3](wm-terminal-overview.md); a
+dedicated boot guide is a possible follow-up.
 
 ## Combined PDFs
 
