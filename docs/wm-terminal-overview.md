@@ -41,11 +41,14 @@ firmware ([`oriscwm.c:872-900`](../ouroboros/oriscwm.c#L872),
 Concretely, in a `make boot` system:
 
 - **There is no `oriscterm` process.** `scripts/boot.sh`'s actual `exec` launches
-  no terminal device ([`boot.sh:125-132`](../scripts/boot.sh#L125)). `oriscterm`
-  is **legacy/vestigial** — kept only because one test
-  (`test_framebuffer.sh`) still needs the real Tk device's `OBJ_READ/WRITE`
-  framebuffer handlers, and because some direct-terminal demos use it. It is not
-  in the WM-mediated path.
+  no terminal device ([`boot.sh:125-131`](../scripts/boot.sh#L125)). `oriscterm`
+  is **legacy/vestigial** — it survives as the reference Tk device for a handful
+  of direct-terminal demos (all launched via `oriscrun --terminal`), not the
+  WM-mediated path. (`test_framebuffer.sh` exercises the framebuffer
+  `OBJ_READ/WRITE` protocol against `fake_terminal.py`, which implements those
+  handlers itself ([`fake_terminal.py:208-286`](../tools/devices/tests/fake_terminal.py#L208)),
+  **not** the real `oriscterm`; the stale in-script comment claiming otherwise is
+  flagged in [`tools/devices/README.md`](../tools/devices/README.md).)
 - **Nothing is published under `/sys/term/<n>/*`.** The supervisor's attempt to
   walk `/sys/term/<procid>/{console,keyboard,grid}` is *expected to fail* and is
   a no-op; the supervisor separately establishes a WM session via `wm_init`
@@ -900,7 +903,3 @@ terminal" comments — is all Phase 60.
   for the common case, but means a hot-attached terminal's keyboard wiring relies
   entirely on OPR inheritance — worth confirming under a real multi-terminal
   hot-attach.
-- **`oriscterm`'s remaining dependency.** It survives only for
-  `test_framebuffer.sh` (which needs the real Tk device's `OBJ_READ/WRITE`
-  framebuffer handlers) and a few direct-terminal demos. Its `tools/devices/README.md`
-  section does not flag it as legacy; that doc is itself stale.

@@ -85,6 +85,33 @@ connection. CPUs and devices share this discipline equally.
 
 ## oriscterm
 
+> **Legacy / vestigial as of Phase 60 — not used in a WM-mediated boot.**
+> The window manager now owns the framebuffer and the keyboard/pointer
+> input sinks *inside its own CPU* (firmware primitives `#0x102
+> ObjAllocFramebuffer` and `#0x10B ObjAllocInputSink`) and **is** the
+> terminal; `scripts/boot.sh` (the `make boot` path) launches no
+> `oriscterm` — only `oriscwm` CPUs ([`boot.sh:125-131`](../../scripts/boot.sh#L125)).
+> See [`docs/wm-terminal-overview.md`](../../docs/wm-terminal-overview.md)
+> for the current architecture. `oriscterm` survives because:
+>
+> - It is the **reference Tk implementation** of the over-the-wire
+>   console/keyboard/grid/vector/pointer/framebuffer protocol documented
+>   below, and several **direct-terminal demos** still drive it — all via
+>   `oriscrun --terminal pid=16` ([`oriscrun:40,233`](../oriscrun#L40)):
+>   [`run_hello_terminal.sh`](../../examples/run_hello_terminal.sh),
+>   [`run_kbd_echo.sh`](../../examples/cc/run_kbd_echo.sh),
+>   [`run_paint.sh`](../../examples/cc/run_paint.sh), and
+>   [`run_parallel_primes.sh`](../../examples/run_parallel_primes.sh).
+> - The protocol below is the spec that the WM's per-window surface
+>   services reimplement locally.
+>
+> Note: `test_framebuffer.sh` exercises the framebuffer `OBJ_READ/WRITE`
+> protocol against [`fake_terminal.py`](tests/fake_terminal.py) (a headless
+> stand-in that implements those handlers itself,
+> [`fake_terminal.py:208-286`](tests/fake_terminal.py#L208)), **not** the
+> real `oriscterm` — its own in-script comment claiming "only oriscterm"
+> implements them is stale.
+
 A graphical terminal device. Opens a Tk window, connects to the
 crossbar at a chosen pid (typically `16+` to avoid clashing with
 CPU pids), and exposes two *service objects*: a text console and a
