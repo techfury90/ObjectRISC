@@ -655,16 +655,18 @@ take their geometry in packed register words, two signed 16-bit halves
 per word.
 
 > **Numbering note.** This subsection is a reference-implementation
-> extension. It occupies primitive numbers inside the memory-management
-> group (Section 3): `0x102` and `0x10B`–`0x10F`. Number `0x102`
-> nominally names `ObjRevoke` (Section 5.1); the reference firmware does
-> **not** provide `ObjRevoke` and assigns `0x102` to
-> `ObjAllocFramebuffer` instead — so a caller may not assume both are
-> present on the same firmware. Numbers `0x10B`–`0x10F` are otherwise
-> reserved within the group (Sections 3 and 12). A future revision
-> should reserve a dedicated range for the display/input primitives or
-> formally reassign these numbers; until then they are non-portable in
-> the sense of Section 12 and a conforming firmware that omits them
+> extension occupying numbers inside the memory-management group
+> (Section 3): `0x102` and `0x10B`–`0x10F`. Number `0x102` nominally
+> names `ObjRevoke` (Section 5.1); the reference firmware does **not**
+> provide `ObjRevoke` and currently assigns `0x102` to
+> `ObjAllocFramebuffer` — so a caller may not assume both are present,
+> and a program intending capability revocation **must not `CALL
+> #0x102`**. Numbers `0x10B`–`0x10F` are otherwise reserved within the
+> group (Sections 3 and 12). These divergences and their agreed
+> resolutions (move `ObjAllocFramebuffer` off `0x102`; bless the
+> display/input numbers in Section 12) are logged in `CONTRACT.md`
+> Section 3.0.1; until they land, the primitives here are non-portable in
+> the sense of Section 12, and a conforming firmware that omits them
 > returns `ENOSYS`.
 
 **`0x102  ObjAllocFramebuffer`** — *Restartable.*
