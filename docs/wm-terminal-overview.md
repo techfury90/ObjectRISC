@@ -31,7 +31,7 @@ daemon. The window manager was a client of that terminal.
 
 **Phase 60 collapsed the terminal into the window manager.** As of *Phase 60
 step 2/3*, a WM CPU allocates its **own framebuffer** (firmware primitive
-`#0x102 ObjAllocFramebuffer`) and its **own keyboard and pointer input sinks**
+`#0x10A ObjAllocFramebuffer`) and its **own keyboard and pointer input sinks**
 (`#0x10B ObjAllocInputSink`) inside its own `simorisc` process, and the host
 display worker (`--display tk`) mirrors that framebuffer to a Tk window and feeds
 host keystrokes/mouse straight into those sinks. The WM CPU *is* the terminal
@@ -154,7 +154,7 @@ privilege table at [`simorisc:4410-4439`](../tools/sim/simorisc#L4410)):
 |------|------|---------------------|---------|
 | `#0x100` | ObjAlloc | byte object: `R4`=len `R5`=tag `R6`=caps → `O1`=ref | [`simorisc:3267`](../tools/sim/simorisc#L3267) |
 | `#0x101` | ObjFree | free `O1` (needs `V`) | [`simorisc:3805`](../tools/sim/simorisc#L3805) |
-| `#0x102` | **ObjAllocFramebuffer** | `R4`=w `R5`=h `R6`=caps `R7`=flags(bit0=offscreen) → `O1`=1-byte/pixel FB, registers a Tk window unless offscreen | [`simorisc:3279`](../tools/sim/simorisc#L3279) |
+| `#0x10A` | **ObjAllocFramebuffer** | `R4`=w `R5`=h `R6`=caps `R7`=flags(bit0=offscreen) → `O1`=1-byte/pixel FB, registers a Tk window unless offscreen | [`simorisc:3282`](../tools/sim/simorisc#L3282) |
 | `#0x103` | ObjDerive | weaken `O1` by mask `R4` (needs `C`) → `O1` | [`simorisc:3881`](../tools/sim/simorisc#L3881) |
 | `#0x106` | ObjAllocStore | like ObjAlloc but OR-typed (OREFLD/OREFST) storage | [`simorisc:3788`](../tools/sim/simorisc#L3788) |
 | `#0x108` | **ObjFetchBytes** | copy `R6` bytes from `O1`@`R4` (any home) into local `O2`@`R5` → `R3`=count | [`simorisc:3897`](../tools/sim/simorisc#L3897) |
@@ -359,7 +359,7 @@ plain ints (window type, cursor position, z-order, titles). `main()` is at
 
 At boot, `main()` allocates ([`oriscwm.c:4881-4955`](../ouroboros/oriscwm.c#L4881)):
 
-- **Screen framebuffer** — `alloc_local_framebuffer()` calls `#0x102` with
+- **Screen framebuffer** — `alloc_local_framebuffer()` calls `#0x10A` with
   `w=FB_W=1280, h=FB_H=768, caps=R|W, flags=0` (mirror to display), stored at
   `WM_SURF_FRAMEBUFFER_SLOT_OFFSET`=440 ([`oriscwm.c:881-900`](../ouroboros/oriscwm.c#L881)).
 - **Keyboard sink** — `alloc_local_keyboard_sink()` calls `#0x10B` with `kind=0`,
@@ -371,7 +371,7 @@ At boot, `main()` allocates ([`oriscwm.c:4881-4955`](../ouroboros/oriscwm.c#L488
 It also allocates the WM-wide keyboard/pointer *subscribe* services (TAG_SERVICE
 objects clients send subscriptions to), and registers its main service at
 `/sys/wm/<term>/0` via a directory walk built from `--init-r4`. Per-window
-framebuffers are allocated offscreen (`#0x102` with `flags=1`).
+framebuffers are allocated offscreen (`#0x10A` with `flags=1`).
 
 Geometry constants: cells are `CELL_W=8 × CELL_H=16`; the screen FB is
 `1280×768`; each window's content grid is `N_COLS=80 × N_ROWS=24` and its
@@ -891,7 +891,7 @@ The major arc (from `oriscwm.c` phase markers and `docs/HISTORY.md`):
 | 49/51 | terminal pass-through | supervisor injects `/sys/term/<N>/*` console/keyboard/grid into spawned children's OPRs; `terminal_idx` propagation |
 | 58 | **WM β** | WM allocates a *per-window* CONSOLE service so client console writes land in a per-window queue ([`oriscwm.c:166`](../ouroboros/oriscwm.c#L166)) |
 | 59 | **WM γ** | the framebuffer arrives; the WM rasterizes locally. γ.9 adds the GRID service, γ.11 the VECTOR service (`VEC_OP_*`), γ.12 the RASTER service, γ.13 pointer mediation, γ.15 multi-WM (one WM per terminal, `/sys/wm/<N>` paths from `--init-r4`) ([`oriscwm.c:168`](../ouroboros/oriscwm.c#L168)) |
-| 60 | **terminal-firmware unification** | the WM *becomes* the terminal. **step 2:** allocate the framebuffer locally (`#0x102`), drop the `/sys/term/<N>/framebuffer` walk. **step 3:** local keyboard/pointer input sinks (`#0x10B`); oriscterm no longer mediates input. **steps 5–22:** local rect-fill/scroll, offscreen per-window backing stores, title bars + `SET_TITLE`, z-order + window positioning (lifting the 1-window cap), borders, outline dragging, the **focus model**, the desktop root menu, the close box. |
+| 60 | **terminal-firmware unification** | the WM *becomes* the terminal. **step 2:** allocate the framebuffer locally (`#0x10A`, originally `#0x102`), drop the `/sys/term/<N>/framebuffer` walk. **step 3:** local keyboard/pointer input sinks (`#0x10B`); oriscterm no longer mediates input. **steps 5–22:** local rect-fill/scroll, offscreen per-window backing stores, title bars + `SET_TITLE`, z-order + window positioning (lifting the 1-window cap), borders, outline dragging, the **focus model**, the desktop root menu, the close box. |
 
 The practical upshot for a reader: the heavy stack of per-surface services
 (CONSOLE/GRID/VECTOR/RASTER) is WM-β/γ scaffolding; the "WM owns the hardware and
@@ -902,17 +902,14 @@ terminal" comments — is all Phase 60.
 
 ## Open questions / things to verify
 
-- **`CONTRACT.md` §3 implemented-primitive list is stale.** The Phase-60
-  graphics+input primitives (`#0x102/#0x10B/#0x10C..#0x10F`) are now specified in
-  [`docs/SYSTEM_FIRMWARE_INTERFACE.md` §5.4](SYSTEM_FIRMWARE_INTERFACE.md). But
-  `CONTRACT.md` §3 ("The Firmware Primitives the Simulator Must Implement") still
-  omits them — and several others the dispatch table implements (`ObjFetchBytes` /
-  `ObjStoreBytes` `#0x108/#0x109`, `ObjFreeDeferred` `#0x107`, `Unmap` `#0x111`,
-  `TaskKill` `#0x00A`, `TimeNow` `#0x400`, …). Two number conflicts also want
-  resolving: `#0x102` is `ObjAllocFramebuffer` in the implementation but `ObjRevoke`
-  in the spec (§5.1), and `#0x301` is `ReadCycles` in the implementation
-  ([`CONTRACT.md` §3.9](CONTRACT.md)) but `DeviceQuery` in the spec (§7).
-  Reconciling `CONTRACT.md` §3 with the `simorisc` dispatch is an open follow-up.
+- **Spec/impl primitive-number reconciliation (one item open).** `CONTRACT.md`
+  §3 now carries the full implemented-primitive table and a conflict log (§3.0.1).
+  The Phase-60 display/input primitives (`#0x10A/#0x10B/#0x10C..#0x10F`) are
+  specified in [`docs/SYSTEM_FIRMWARE_INTERFACE.md` §5.4](SYSTEM_FIRMWARE_INTERFACE.md);
+  the `#0x102`/`ObjRevoke` conflict was resolved by moving `ObjAllocFramebuffer` to
+  `#0x10A` and reserving `#0x102` for `ObjRevoke`. One agreed item is still
+  unlanded: `#0x301` is `ReadCycles` in the implementation but `DeviceQuery` in the
+  spec (§7) — the plan is to bless `ReadCycles` and retire/renumber `DeviceQuery`.
 - **Keyboard binding asymmetry** in the supervisor's per-spawn path
   ([`supervisor.c:927`](../ouroboros/supervisor.c#L927)): relayed/hot-attach
   children resolve keyboard only from `/sys/term/<idx>/keyboard`, which won't

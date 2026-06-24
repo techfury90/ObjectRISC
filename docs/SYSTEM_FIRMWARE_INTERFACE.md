@@ -654,22 +654,18 @@ source byte, defeating their purpose. A remote reference returns
 take their geometry in packed register words, two signed 16-bit halves
 per word.
 
-> **Numbering note.** This subsection is a reference-implementation
-> extension occupying numbers inside the memory-management group
-> (Section 3): `0x102` and `0x10B`–`0x10F`. Number `0x102` nominally
-> names `ObjRevoke` (Section 5.1); the reference firmware does **not**
-> provide `ObjRevoke` and currently assigns `0x102` to
-> `ObjAllocFramebuffer` — so a caller may not assume both are present,
-> and a program intending capability revocation **must not `CALL
-> #0x102`**. Numbers `0x10B`–`0x10F` are otherwise reserved within the
-> group (Sections 3 and 12). These divergences and their agreed
-> resolutions (move `ObjAllocFramebuffer` off `0x102`; bless the
-> display/input numbers in Section 12) are logged in `CONTRACT.md`
-> Section 3.0.1; until they land, the primitives here are non-portable in
-> the sense of Section 12, and a conforming firmware that omits them
+> **Number allocation.** These primitives are an optional, spec-defined
+> group (Section 12) occupying numbers in the memory-management group:
+> `0x10A` (`ObjAllocFramebuffer`) and `0x10B`–`0x10F` (the input sink and
+> the four blitters). Number `0x102` is **reserved for `ObjRevoke`**
+> (Section 5.1): the reference implementation first placed
+> `ObjAllocFramebuffer` at `0x102` and later moved it to `0x10A` to free
+> `0x102` for capability revocation — that history and the full
+> implemented-primitive list are in `CONTRACT.md` Section 3. Firmware that
+> hosts a display surface implements this group; firmware without one
 > returns `ENOSYS`.
 
-**`0x102  ObjAllocFramebuffer`** — *Restartable.*
+**`0x10A  ObjAllocFramebuffer`** — *Restartable.*
 
 > Allocate a host-display-backed pixel object of `R4 × R5` bytes (one
 > byte per pixel, a palette index). Unless allocated offscreen, the
@@ -1230,5 +1226,14 @@ The reserved primitive numbers within allocated groups (those not
 named in this volume) shall return `ENOSYS` and shall not be
 allocated by implementations to local extensions; future revisions
 of this volume will consume them.
+
+The display and input primitives of Section 5.4 (`0x10A` and
+`0x10B`–`0x10F`) are an **optional group**, defined by this volume
+rather than by any implementation: firmware that hosts a display
+surface implements them, and firmware without one returns `ENOSYS`.
+The numbers they occupy in the memory-management group are allocated
+to them by the present revision. Number `0x102`, vacated when
+`ObjAllocFramebuffer` was relocated to `0x10A`, is reserved for
+`ObjRevoke` (Section 5.1).
 
 — *The Object RISC Architecture Group, 1986*

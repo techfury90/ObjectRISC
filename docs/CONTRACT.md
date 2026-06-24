@@ -256,17 +256,17 @@ subsection here notes a simulator-specific deviation.
 | `0x00A` | `TaskKill`            | U | Vol VI §4.1 | |
 | `0x100` | `ObjAlloc`            | U | Vol VI §5.1; §3.2 | |
 | `0x101` | `ObjFree`             | U | Vol VI §5.1; §3.3 | |
-| `0x102` | `ObjAllocFramebuffer` | U | Vol VI §5.4 | **⚠ number conflict** — see note (a) |
 | `0x103` | `ObjDerive`           | U | Vol VI §5.1; §3.4 | |
 | `0x106` | `ObjAllocStore`       | U | Vol VI §5.1.1; §3.2.1 | |
 | `0x107` | `ObjFreeDeferred`     | U | Vol VI §5.1.2 | |
 | `0x108` | `ObjFetchBytes`       | U | Vol VI §5.1.3 | |
 | `0x109` | `ObjStoreBytes`       | U | Vol VI §5.1.4 | |
-| `0x10B` | `ObjAllocInputSink`   | U | Vol VI §5.4 | Phase 60; reserved-number use, note (c) |
-| `0x10C` | `ObjBlitGlyphs`       | U | Vol VI §5.4 | Phase 60; reserved-number use, note (c) |
-| `0x10D` | `ObjFillRect`         | U | Vol VI §5.4 | Phase 60; reserved-number use, note (c) |
-| `0x10E` | `ObjFbScroll`         | U | Vol VI §5.4 | Phase 60; reserved-number use, note (c) |
-| `0x10F` | `ObjBlitCopy`         | U | Vol VI §5.4 | Phase 60; reserved-number use, note (c) |
+| `0x10A` | `ObjAllocFramebuffer` | U | Vol VI §5.4 | Phase 60; formerly `0x102` (§3.0.1) |
+| `0x10B` | `ObjAllocInputSink`   | U | Vol VI §5.4 | Phase 60 |
+| `0x10C` | `ObjBlitGlyphs`       | U | Vol VI §5.4 | Phase 60 |
+| `0x10D` | `ObjFillRect`         | U | Vol VI §5.4 | Phase 60 |
+| `0x10E` | `ObjFbScroll`         | U | Vol VI §5.4 | Phase 60 |
+| `0x10F` | `ObjBlitCopy`         | U | Vol VI §5.4 | Phase 60 |
 | `0x110` | `MapObject`           | S | Vol VI §5.2; §3.5 | |
 | `0x111` | `Unmap`               | S | Vol VI §5.2 | |
 | `0x200` | `InstallHandler`      | S | Vol VI §6; §3.6 | |
@@ -285,38 +285,31 @@ others — are **not implemented** by this firmware and return `ENOSYS`.
 
 ### 3.0.1 Spec/implementation number conflicts
 
-Three numbers above diverge from Volume VI's allocation. **The
-implemented numbers in the table are authoritative for this firmware**;
-the resolutions below are the agreed direction, and the Volume VI /
-firmware edits that land them are tracked separately (they are the spec
-owner's to make — this contract only records reality and the agreed
-plan).
+Two of the three divergences from Volume VI's number allocation are now
+resolved; one remains. **The implemented numbers in the table above are
+authoritative for this firmware.**
 
-**(a) `0x102` — capability-safety conflict (agreed: move the framebuffer,
-option A).** This firmware runs `ObjAllocFramebuffer` at `0x102`, but
-Volume VI §5.1 names `0x102` `ObjRevoke` — generation-bump capability
-revocation — which this firmware does not implement. A program that
-`CALL #0x102` intending to **revoke** a capability instead invokes the
-framebuffer allocator: the revocation silently does not happen (and the
-revoke-style register setup usually yields `EINVAL`/null `O1`). Because
-revocation is a capability-safety operation, this is the higher-severity
-conflict. **Agreed fix:** move `ObjAllocFramebuffer` to `0x10A` (adjacent
-to the `0x10B–0x10F` display cluster) and reserve `0x102` for `ObjRevoke`.
-Until that firmware change lands the implemented number remains `0x102`;
-**do not call `0x102` expecting revoke semantics.**
+**(a) `0x102` — RESOLVED.** `ObjAllocFramebuffer` formerly occupied
+`0x102`, which Volume VI §5.1 names `ObjRevoke` (generation-bump
+capability revocation). Because `dispatch_call` resolves a number to
+exactly one primitive (else `ENOSYS`), a spec-conformant `CALL #0x102` to
+**revoke** a capability would have silently run the framebuffer allocator
+and never revoked — a latent capability-safety trap. `ObjAllocFramebuffer`
+was relocated to `0x10A`, and `0x102` is now reserved for `ObjRevoke`
+(still unimplemented → `ENOSYS`). `CALL #0x102` is therefore safe again:
+it returns `ENOSYS` rather than mis-dispatching.
 
-**(b) `0x301` — measurement conflict (agreed: bless the implementation,
-option B).** This firmware runs `ReadCycles` at `0x301` (§3.9); Volume VI
-§7 names `0x301` `DeviceQuery`, which this firmware does not implement.
-`ReadCycles` backs a public `read_cycles()` API, so moving it for a
-non-safety reason is not worthwhile. **Agreed fix:** promote `ReadCycles`
-into Volume VI at `0x301` and retire or renumber `DeviceQuery`.
+**(c) `0x10A`–`0x10F` reserved-number use — RESOLVED.** The display and
+input primitives occupy numbers in the memory-management group. Volume VI
+§5.4 now names them and §12 blesses them as an optional group, so they are
+spec-defined primitives rather than non-portable local extensions.
 
-**(c) `0x10B`–`0x10F` (and `0x102` until it moves) — reserved-number
-use.** These occupy numbers that Volume VI §12 reserves within the
-memory-management group and forbids implementations from allocating to
-local extensions. **Agreed fix (option B):** amend Volume VI §12 to
-bless the display/input primitives at these numbers.
+**(b) `0x301` — OPEN (agreed direction: bless the implementation).** This
+firmware runs `ReadCycles` at `0x301` (§3.9); Volume VI §7 names `0x301`
+`DeviceQuery`, which this firmware does not implement. `ReadCycles` backs a
+public `read_cycles()` API, so it stays put. The agreed fix is to promote
+`ReadCycles` into Volume VI at `0x301` and retire or renumber
+`DeviceQuery`; that spec edit has not yet landed.
 
 ### 3.1 `0x001 TaskExit`
 
