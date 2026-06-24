@@ -139,8 +139,13 @@ cat "$TMP/rendered.txt"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-grep -q "\[bg task 0\]"        "$TMP/rendered.txt" \
-    || fail "[bg task 0] not in rendered output (cmd_run with &)"
+# Spawn announcement: match only the "[bg task " PREFIX, not "[bg task 0]"
+# — the concurrent bg guest can interleave between the prefix and "N]"
+# (preempt fires mid-announcement; shifts on any libc cycle-count change).
+# The task number + clean exit are pinned by the reap invariant below.
+# Still fails if no bg task was announced (a real spawn failure).
+grep -q "\[bg task "        "$TMP/rendered.txt" \
+    || fail "no '[bg task' announcement — cmd_run's & path didn't spawn a bg task"
 
 # jobs invariant: the `jobs` command ran and produced a valid listing —
 # either it still caught task 0 (printed with a live-state label) or the
