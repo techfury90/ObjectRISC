@@ -2,7 +2,7 @@
  * fb_local_smoke.c — smoke test for simorisc's TAG_FRAMEBUFFER
  * primitive (Phase 60).
  *
- * Exercises ObjAllocFramebuffer (#0x102) + same-CPU ObjStoreBytes /
+ * Exercises ObjAllocFramebuffer (#0x10A) + same-CPU ObjStoreBytes /
  * ObjFetchBytes round-trip.  No oriscterm in the loop, no
  * /sys/term/<N>/framebuffer walk — the framebuffer is allocated
  * locally on the running CPU, and stores into it never leave the
@@ -65,7 +65,7 @@ main(void)
 		"addiu r4, r0, %1\n"           /* width */
 		"addiu r5, r0, %2\n"           /* height */
 		"addiu r6, r0, 3\n"            /* CAP_R | CAP_W */
-		"call  #0x102\n"               /* ObjAllocFramebuffer */
+		"call  #0x10A\n"               /* ObjAllocFramebuffer */
 		"nop\n"
 		"omov  o5, o1\n"               /* park FB ref */
 		"addu  %0, r2, r0"

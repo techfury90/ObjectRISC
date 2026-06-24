@@ -4422,7 +4422,8 @@ PRIMITIVE_MIN_MODE = {
     0x00A: MODE_USER,        # TaskKill         — external termination by ref
     0x100: MODE_USER,        # ObjAlloc
     0x101: MODE_USER,        # ObjFree
-    0x102: MODE_USER,        # ObjAllocFramebuffer (Phase 60)
+    0x10A: MODE_USER,        # ObjAllocFramebuffer (Phase 60; moved off
+                             # 0x102, which Vol VI reserves for ObjRevoke)
     0x10B: MODE_USER,        # ObjAllocInputSink (Phase 60 step 3)
     0x10C: MODE_USER,        # ObjBlitGlyphs (Phase 60 step 4)
     0x10D: MODE_USER,        # ObjFillRect (Phase 60 step 5)
@@ -4480,7 +4481,7 @@ def dispatch_call(cpu: CPU, prim: int, faulting_pc: int) -> None:
         primitive_ObjAlloc(cpu)
     elif prim == 0x101:
         primitive_ObjFree(cpu)
-    elif prim == 0x102:
+    elif prim == 0x10A:
         primitive_ObjAllocFramebuffer(cpu)
     elif prim == 0x10B:
         primitive_ObjAllocInputSink(cpu)
