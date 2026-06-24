@@ -75,6 +75,26 @@ obj__store_o1(obj_t h)
 	}
 }
 
+/* Store O2 (not O1) into a handle slot — the OR-receive counterpart of
+ * obj__store_o1. obj_recv_cap uses it to land a reply's O2 capability
+ * into the table. O2 survives the call exactly as O1 does for
+ * obj_alloc → obj__store_o1 (the compiler never models O2 as a value
+ * here, so nothing spills it). */
+static void
+obj__store_o2(obj_t h)
+{
+	switch (h) {
+	case 0: asm volatile("orefst o2, 1704(o12)"); break;
+	case 1: asm volatile("orefst o2, 1712(o12)"); break;
+	case 2: asm volatile("orefst o2, 1720(o12)"); break;
+	case 3: asm volatile("orefst o2, 1728(o12)"); break;
+	case 4: asm volatile("orefst o2, 1736(o12)"); break;
+	case 5: asm volatile("orefst o2, 1744(o12)"); break;
+	case 6: asm volatile("orefst o2, 1752(o12)"); break;
+	case 7: asm volatile("orefst o2, 1760(o12)"); break;
+	}
+}
+
 static void
 obj__load_o3(obj_t h)
 {
@@ -258,6 +278,23 @@ obj_adopt_dir_result(void)
 	obj__store_o1(h);             /* O1 still holds the ref (orx.c idiom) */
 	obj_inuse |= (1u << h);
 	return h;
+}
+
+/* Publish handle `h`'s capability back into the DIR_RESULT slot (616) —
+ * the inverse of obj_adopt_dir_result. A compatibility bridge for the
+ * legacy direct-616 consumers: wm_bind_surface receives its resolved
+ * surface cap with obj_recv_cap (into a handle) but still mirrors it
+ * here, because the already-migrated graphics clients
+ * (vec/raster/pointer_init_from_dir_result) and wm_open_session read the
+ * cap straight from 616. Drops away once those consumers take the handle
+ * directly. */
+void
+obj_park_dir_result(obj_t h)
+{
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return;
+	obj__load_o1(h);              /* O1 = handle's capability */
+	asm volatile("orefst o1, %0(o12)" : : "i"(OBJ_DIR_RESULT_OFFSET) : "r1");
 }
 
 obj_t
@@ -604,4 +641,38 @@ obj_recv_full(obj_t h, int out[4])
 	out[2] = w2;
 	out[3] = w3;
 	return 0;
+}
+
+int
+obj_recv_cap(obj_t h, int *out_word)
+{
+	int hh, status, word3, isn;
+
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return OBJ_NULL;
+	hh = obj__alloc_handle();
+	if (hh < 0)
+		return OBJ_NULL;
+	obj__load_o1(h);               /* queue object -> O1 */
+	asm volatile(
+		"addiu r4, r0, -1\n"      /* block until a message */
+		"call  #0x204\n"          /* ReceiveQueuePoll -> R2 status, R3.., O2 = reply cap */
+		"nop\n"
+		"oisn  %2, o2\n"          /* is the reply's O2 capability null? */
+		"addu  %0, r2, r0\n"      /* poll status */
+		"addu  %1, r3, r0"        /* R3 reply word */
+		: "=r"(status), "=r"(word3), "=r"(isn)
+		:
+		: "r2", "r3", "r4", "r5", "r6"
+	);
+	/* Land the reply cap into the handle slot BEFORE any C that might
+	 * touch O2 — the same "O1 survives the call" discipline obj_alloc
+	 * relies on for obj__store_o1. On the error paths the slot holds a
+	 * stale ref but stays un-in-use, so it is never read. */
+	obj__store_o2(hh);
+	if (out_word) *out_word = word3;
+	if (status != 0 || isn)
+		return OBJ_NULL;          /* poll failed, or no cap in the reply */
+	obj_inuse |= (1u << hh);
+	return hh;
 }

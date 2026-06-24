@@ -147,13 +147,16 @@
  *     + 8 (ORX_SLOT_O6_SAVE: transient parent-O6 stash.)
  *     + 8 (ORX_SLOT_CHILD_O7: terminal-pass-through grid sub-cap.)
  *     + 8 (ORX_SLOT_O7_SAVE: transient parent-O7 stash.)
- *     + 8 (WM_SLOT: window-manager mailbox sub-cap.  Populated lazily
- *          by wm.c's wm_init via dir_walk("/sys/wm/0").  Null on
- *          systems without a WM running — wm_init returns -2 and
- *          callers fall back to direct boot-OPR surfaces.)
- *     + 8 (WM_INPUT_REF_SLOT: caller's owner-task ref stashed at
- *          wm_new_window entry, to be passed in O2 of the wire SEND.
- *          Same role as DIR_INPUT_REF_SLOT for dir.c.)
+ *     + 8 (WM_SLOT: reserved/legacy.  wm.c used to park the window-
+ *          manager service sub-cap here (from dir_walk("/sys/wm/0"));
+ *          Phase 4 migrated wm.c onto the obj.h handle table, so the WM
+ *          service is now an obj_t handle and this slot is dead.  Kept
+ *          (not renumbered) so the hardcoded O12 offsets after it stay
+ *          put.)
+ *     + 8 (WM_INPUT_REF_SLOT: reserved/legacy.  Was the owner-task ref
+ *          stashed at wm_new_window entry for O2 of the wire SEND; the
+ *          owner-ref auto-destroy path was never wired (all callers pass
+ *          null) and Phase 4's wm.c migration dropped it.  Dead.)
  *     + 8 (WM_LEADER_CONSOLE_SLOT: supervisor-only — when a leader
  *          succeeds at wm_init + wm_new_window + wm_bind_surface
  *          (CONSOLE), it stashes the WM-mediated CONSOLE sub-cap
