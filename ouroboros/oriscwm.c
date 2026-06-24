@@ -4644,17 +4644,13 @@ poll_pointer_subscribes(void)
 
 static int _wm_ptr_evt_poll_status;
 
-static void
-poll_pointer_events(void)
+/* Dequeue one pointer event from the local TAG_INPUT_SINK.  Returns 0
+ * and fills the out-params if an event was read, nonzero if the sink is
+ * empty.  Factored out of poll_pointer_events so the drain loop below
+ * can pull events one at a time and coalesce them. */
+static int
+poll_one_pointer_event(int *out_type, int *out_xy, int *out_btn, int *out_state)
 {
-	/* Always drain the events sink — the WM may consume an event
-	 * (window drag / raise) independently of whether a client
-	 * subscriber is registered.  Pre-step-16 the early-return on
-	 * no-subscriber was meant to buffer events in the underlying
-	 * ReceiveQueue (depth 64) across the boot/subscribe window;
-	 * now that the WM itself acts on events, we have to read
-	 * them out regardless and discard unconsumed ones if no
-	 * client is listening. */
 	asm volatile("orefld o1, %0(o12)"
 	             :: "i"(WM_PTR_EVENTS_SLOT_OFFSET));
 	int evt_type, packed_xy, button, btn_state;
@@ -4673,8 +4669,21 @@ poll_pointer_events(void)
 		:
 		: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
 	);
-	if (_wm_ptr_evt_poll_status != 0) return;
+	if (_wm_ptr_evt_poll_status != 0)
+		return 1;
+	*out_type  = evt_type;
+	*out_xy    = packed_xy;
+	*out_btn   = button;
+	*out_state = btn_state;
+	return 0;
+}
 
+/* Process one pointer event: WM-side handling (drag / raise / focus /
+ * menu); if not consumed, translate to the focused window's content-
+ * local coords and forward to its subscriber. */
+static void
+dispatch_pointer_event(int evt_type, int packed_xy, int button, int btn_state)
+{
 	/* WM-side handling first: drag / raise / focus update.  If
 	 * consumed (drag in progress, title-bar grab) — swallow. */
 	if (wm_handle_pointer(evt_type, packed_xy, button, btn_state))
@@ -4724,6 +4733,37 @@ poll_pointer_events(void)
 		: "r1", "r4", "r5", "r6", "r7",
 		  "r8", "r9", "r10", "r11"
 	);
+}
+
+/* Drain ALL queued pointer events each pass — previously one per pass,
+ * which made dragging crawl as motion events backed up in the depth-64
+ * sink.  Consecutive WM-consumed drag-motions are coalesced to the
+ * latest position (one outline erase/draw per batch instead of N); only
+ * drag motions are coalesced, so non-drag motions still forward every
+ * point and subscribers (mouse_paint et al.) keep their full stream.  A
+ * button event (or non-drag motion) flushes the latest pending motion
+ * first, so the outline is current before a button-up commits. */
+static void
+poll_pointer_events(void)
+{
+	int have_pending_motion = 0, pending_xy = 0;
+	int evt_type, packed_xy, button, btn_state;
+	for (;;) {
+		if (poll_one_pointer_event(&evt_type, &packed_xy, &button, &btn_state))
+			break;
+		if (evt_type == PTR_EVT_MOTION && drag_active && !menu_active) {
+			have_pending_motion = 1;
+			pending_xy = packed_xy;
+			continue;
+		}
+		if (have_pending_motion) {
+			wm_handle_pointer(PTR_EVT_MOTION, pending_xy, 0, 0);
+			have_pending_motion = 0;
+		}
+		dispatch_pointer_event(evt_type, packed_xy, button, btn_state);
+	}
+	if (have_pending_motion)
+		wm_handle_pointer(PTR_EVT_MOTION, pending_xy, 0, 0);
 }
 
 /* Phase 60 step 18 — focus-model keyboard subscribe / forward.
