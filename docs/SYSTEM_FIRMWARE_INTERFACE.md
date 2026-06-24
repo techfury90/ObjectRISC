@@ -714,25 +714,48 @@ per word.
 
 **`0x10C  ObjBlitGlyphs`** — *Restartable.*
 
-> Render a horizontal run of fixed-cell monochrome glyphs into a
-> framebuffer. The glyph source is a 1-bit-per-pixel font: sixteen
-> bytes per glyph (one byte per scan row, most-significant bit
-> leftmost), ninety-five glyphs beginning at codepoint 32 (space). Each
-> source bit selects the foreground or background palette index for one
-> pixel of an 8×16 destination cell. Bytes outside the printable range
-> (below 32 or above 126) render as a space. Cells that fall outside the
-> framebuffer are dropped.
+> Render a horizontal run of monochrome glyphs into a framebuffer. Two
+> modes share the args below, selected by **bit 31 of `R5`**: the legacy
+> fixed-cell path (bit clear) and the extended proportional path (bit
+> set). The legacy path is the terminal-body fast path and is unchanged.
 >
-> Args:
+> **Legacy mode (`R5` bit 31 clear).** The glyph source is a
+> 1-bit-per-pixel font: sixteen bytes per glyph (one byte per scan row,
+> most-significant bit leftmost), ninety-five glyphs beginning at
+> codepoint 32 (space). Each source bit selects the foreground or
+> background palette index for one pixel of an 8×16 destination cell.
+> Bytes outside the printable range (below 32 or above 126) render as a
+> space. Cells that fall outside the framebuffer are dropped.
+>
+> - `R4`: packed destination cell position, `(cell_x << 16) | cell_y`
+>   (cells are 8×16 pixels).
+> - `R5`: packed render shape, `(n_chars << 16) | (fg << 8) | bg`.
+>
+> **Extended mode (`R5` bit 31 set).** `O2` is a *self-describing* font
+> object whose header fixes the cell geometry, codepoint base, and a
+> per-glyph advance-width table; glyphs are positioned by absolute pixel
+> coordinate and the pen advances per glyph (proportional fonts). The
+> header is a big-endian byte stream: magic `'WMF1'` (u32);
+> `cell_w` (u16); `cell_h` (u16); `codepoint_base` (u16); `n_glyphs`
+> (u16); `flags` (u16, bit 0 = proportional); `bytes_per_row` (u16,
+> `= ceil(cell_w/8)`); then `width_table[n_glyphs]` (u8 advance each,
+> padded to a 4-byte boundary); then
+> `bitmaps[n_glyphs * bytes_per_row * cell_h]` (u8, most-significant bit
+> leftmost). A codepoint outside `[base, base+n_glyphs)` renders blank
+> and advances by `cell_w`.
+>
+> - `R4`: packed destination pixel position, `(pixel_x << 16) | pixel_y`.
+> - `R5`: `(1 << 31) | (transparent << 30) | (n_chars << 16) | (fg << 8) | bg`.
+>   When `transparent`, only set (foreground) pixels are written, so a
+>   pre-filled background shows through the gaps between glyphs.
+>
+> Args (both modes):
 > - `O1`: destination framebuffer (`TAG_FRAMEBUFFER`; must carry `W`;
 >   must be local).
 > - `O2`: font object (must carry `R`; must be local).
 > - `O3`: text object holding the bytes to render (must carry `R`; must
 >   be local).
-> - `R4`: packed destination cell position, `(cell_x << 16) | cell_y`
->   (cells are 8×16 pixels).
-> - `R5`: packed render shape, `(n_chars << 16) | (fg << 8) | bg`.
-> - `R6`: byte offset of the font table within `O2`.
+> - `R6`: byte offset of the font table/object within `O2`.
 > - `R7`: byte offset of the glyph bytes within `O3`.
 >
 > Returns:
@@ -741,8 +764,9 @@ per word.
 >
 > Errors: `EFAULT` (a null reference), `EPERM` (`O1` lacks `W`, or a
 > source lacks `R`), `EREMOTE` (any referenced object is not local),
-> `ESTALE`, `EINVAL` (`O1` is not a framebuffer, or the text range
-> exceeds `O3`'s length).
+> `ESTALE`, `EINVAL` (`O1` is not a framebuffer, the text range exceeds
+> `O3`'s length, or — extended mode — `O2` lacks a valid `'WMF1'` header
+> or is too short for its declared geometry).
 
 **`0x10D  ObjFillRect`** — *Restartable.*
 

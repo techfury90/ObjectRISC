@@ -160,7 +160,7 @@ privilege table at [`simorisc:4410-4439`](../tools/sim/simorisc#L4410)):
 | `#0x108` | **ObjFetchBytes** | copy `R6` bytes from `O1`@`R4` (any home) into local `O2`@`R5` → `R3`=count | [`simorisc:3897`](../tools/sim/simorisc#L3897) |
 | `#0x109` | **ObjStoreBytes** | mirror of `#0x108`, write direction (local `O1` → possibly-remote `O2`) | [`simorisc:3982`](../tools/sim/simorisc#L3982) |
 | `#0x10B` | **ObjAllocInputSink** | `R4`=kind(0=kbd,1=ptr) `R5`=caps → `O1`=`TAG_INPUT_SINK` with auto-attached depth-64 queue | [`simorisc:3740`](../tools/sim/simorisc#L3740) |
-| `#0x10C` | ObjBlitGlyphs | render 8×16 mono glyphs into a FB | [`simorisc:3337`](../tools/sim/simorisc#L3337) |
+| `#0x10C` | ObjBlitGlyphs | render glyphs into a FB — legacy 8×16 cell grid, or extended self-describing proportional font (`R5` bit 31) | [`simorisc:3337`](../tools/sim/simorisc#L3337) |
 | `#0x10D` | ObjFillRect | fill a rect in a FB with a palette index | [`simorisc:3477`](../tools/sim/simorisc#L3477) |
 | `#0x10E` | ObjFbScroll | scroll a FB sub-rect | [`simorisc:3539`](../tools/sim/simorisc#L3539) |
 | `#0x10F` | ObjBlitCopy | rect-copy FB→FB (used to composite) | [`simorisc:3644`](../tools/sim/simorisc#L3644) |

@@ -3412,21 +3412,131 @@ def primitive_ObjAllocFramebuffer(cpu: CPU) -> None:
     cpu.set_gpr(2, ERR_OK); cpu.set_opr(1, ref)
 
 
-def primitive_ObjBlitGlyphs(cpu: CPU) -> None:
-    """Phase 60 step 4 — bulk-render a strip of 8x16 monochrome
-    glyphs into a TAG_FRAMEBUFFER.  Replaces oriscwm's flush_strip
-    inner loop (per-pixel decode + 16 ObjStoreBytes per strip)
-    with a single Python-side render — cuts the rendering cost
-    of one 80-char strip from ~80K simulated WM instructions to
-    one firmware-call's worth.
+# 'WMF1' — magic word at the head of a self-describing WM font object
+# (the extended ObjBlitGlyphs mode below).  Never collides with a legacy
+# font_8x16-style table: byte 0 there is glyph-row data (the space glyph
+# is all-zero), never 0x57.
+FONT_MAGIC = 0x574D4631
 
+
+def _font_u16(storage, off):
+    return (storage[off] << 8) | storage[off + 1]
+
+
+def _blit_glyphs_extended(cpu, fb_desc, font_desc, text_desc,
+                          r4, n_chars, fg, bg, transparent,
+                          font_off, text_off):
+    """Extended ObjBlitGlyphs render path — proportional, pixel-positioned
+    chrome.  The font (O2) is a self-describing object the WM's font
+    manager bakes (tools/gen_wm_font.py):
+
+        off  0  magic 'WMF1'        (u32, big-endian)
+        off  4  cell_w              (u16) glyph bounding-box width, px
+        off  6  cell_h              (u16) rows per glyph
+        off  8  codepoint_base      (u16) first codepoint in the face
+        off 10  n_glyphs            (u16)
+        off 12  flags               (u16) bit0 = proportional (advisory)
+        off 14  bytes_per_row       (u16) = ceil(cell_w / 8)
+        off 16  width_table[n_glyphs]    (u8 advance px each; padded to a
+                                          4-byte boundary)
+        ...     bitmaps[n_glyphs * bytes_per_row * cell_h]  (u8, MSB-first)
+
+    Per-glyph advance comes from width_table (monospace faces just store a
+    uniform width).  R4 packs an absolute top-left PIXEL position, not a
+    cell index.  When `transparent`, only set (fg) pixels are written, so
+    a pre-filled background (e.g. a title bar) shows through the gaps
+    between proportional glyphs."""
+    font_storage = font_desc.storage
+    flen = font_desc.length
+    if font_off < 0 or font_off + 16 > flen:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+    magic = ((font_storage[font_off]     << 24) |
+             (font_storage[font_off + 1] << 16) |
+             (font_storage[font_off + 2] << 8)  |
+              font_storage[font_off + 3])
+    if magic != FONT_MAGIC:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+    cell_w   = _font_u16(font_storage, font_off + 4)
+    cell_h   = _font_u16(font_storage, font_off + 6)
+    base     = _font_u16(font_storage, font_off + 8)
+    n_glyphs = _font_u16(font_storage, font_off + 10)
+    # flags  = _font_u16(font_storage, font_off + 12)  # bit0 proportional
+    bpr      = _font_u16(font_storage, font_off + 14)
+    if cell_w <= 0 or cell_h <= 0 or bpr <= 0:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+
+    widths_off  = font_off + 16
+    # width_table is padded up to a 4-byte boundary so the generator can
+    # emit the whole blob as uint32 .word data (pcc-orisc .ascii bug).
+    bitmaps_off = widths_off + ((n_glyphs + 3) & ~3)
+    glyph_bytes = bpr * cell_h
+    if (widths_off + n_glyphs > flen or
+            bitmaps_off + n_glyphs * glyph_bytes > flen):
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+
+    text_end = text_off + n_chars
+    if text_off < 0 or text_end > text_desc.length:
+        cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+
+    fb_w = fb_desc.fb_width
+    fb_h = fb_desc.fb_height
+    fb_storage   = fb_desc.storage
+    text_storage = text_desc.storage
+
+    pen_x = (r4 >> 16) & 0xFFFF
+    pen_y = r4 & 0xFFFF
+    rendered = 0
+    for g in range(n_chars):
+        if pen_x >= fb_w:
+            break
+        ch = text_storage[text_off + g]
+        gi = ch - base
+        if gi < 0 or gi >= n_glyphs:
+            pen_x += cell_w          # unknown glyph: blank cell, default advance
+            continue
+        advance = font_storage[widths_off + gi]
+        gbase = bitmaps_off + gi * glyph_bytes
+        for r in range(cell_h):
+            row_y = pen_y + r
+            if row_y < 0 or row_y >= fb_h:
+                continue
+            row_off  = gbase + r * bpr
+            row_base = row_y * fb_w
+            for col in range(cell_w):
+                px = pen_x + col
+                if px < 0:
+                    continue
+                if px >= fb_w:
+                    break
+                byte = font_storage[row_off + (col >> 3)]
+                if (byte >> (7 - (col & 7))) & 1:
+                    fb_storage[row_base + px] = fg
+                elif not transparent:
+                    fb_storage[row_base + px] = bg
+        pen_x += advance
+        rendered += 1
+
+    fb_desc.fb_dirty = True
+    cpu.set_gpr(2, ERR_OK)
+    cpu.set_gpr(3, rendered)
+
+
+def primitive_ObjBlitGlyphs(cpu: CPU) -> None:
+    """Phase 60 step 4 — bulk-render a strip of glyphs into a
+    TAG_FRAMEBUFFER.  Replaces oriscwm's flush_strip inner loop
+    (per-pixel decode + 16 ObjStoreBytes per strip) with a single
+    Python-side render — cuts the rendering cost of one 80-char strip
+    from ~80K simulated WM instructions to one firmware-call's worth.
+
+    Two modes, selected by R5 bit 31:
+
+    LEGACY (bit 31 clear) — the terminal-body fast path, unchanged.
     Models a 1bpp-source blitter device: glyph bytes are 8 pixels
     each, MSB-first; output pixels are palette indices (fg if bit
     set, bg otherwise).  The font is laid out as 16 bytes per
     glyph (1 byte per row), 95 glyphs starting at codepoint 32 —
     same shape oriscwm's font_8x16[] uses.
 
-    Inputs:
       O1 = framebuffer ref      (TAG_FRAMEBUFFER, must be local)
       O2 = font ref             (any tag with R caps, must be local;
                                  for oriscwm this is its boot data
@@ -3442,17 +3552,24 @@ def primitive_ObjBlitGlyphs(cpu: CPU) -> None:
       R7 = text_off                            — byte offset of glyph
                                                 bytes in O3
 
-    Outputs:
+    EXTENDED (bit 31 set) — proportional, pixel-positioned chrome for
+    the WM's OPEN LOOK font manager.  O2 is a self-describing font
+    object (see _blit_glyphs_extended); R4 packs an absolute pixel
+    position; advance widths come from the font's own width_table.
+
+      R5 = (1<<31) | (transparent<<30) | (n_chars<<16) | (fg<<8) | bg
+      R4 = packed (pixel_x << 16) | pixel_y
+
+    Outputs (both modes):
       R2 = status (ERR_OK / ERR_EFAULT / ERR_EPERM / ERR_EREMOTE /
                    ERR_ESTALE / ERR_EINVAL)
       R3 = number of glyphs actually rendered (<= n_chars; clipped
            to the framebuffer)
 
-    Off-screen rows / cells drop silently.  Non-printable bytes
-    (ch < 32 or ch > 126) render as a space.  Caller is responsible
+    Off-screen rows / cells drop silently.  In legacy mode, non-printable
+    bytes (ch < 32 or ch > 126) render as a space.  Caller is responsible
     for stashing source data in O11/O15 before invoking — the WM
-    pre-builds its strip on the stack and uses the boot OPRs
-    directly. """
+    pre-builds its strip on the stack and uses the boot OPRs directly. """
     fb_ref   = cpu.get_opr(1)
     font_ref = cpu.get_opr(2)
     text_ref = cpu.get_opr(3)
@@ -3460,16 +3577,13 @@ def primitive_ObjBlitGlyphs(cpu: CPU) -> None:
         cpu.set_gpr(2, ERR_EFAULT); cpu.set_gpr(3, 0); return
 
     r4 = cpu.get_gpr(4)
-    cell_x = (r4 >> 16) & 0xFFFF
-    cell_y = r4 & 0xFFFF
     r5 = cpu.get_gpr(5)
-    n_chars = (r5 >> 16) & 0xFFFF
-    fg      = (r5 >> 8)  & 0xFF
-    bg      = r5 & 0xFF
+    extended = (r5 >> 31) & 1
     font_off = sext32(cpu.get_gpr(6))
     text_off = sext32(cpu.get_gpr(7))
 
-    # Validate caps.  Both fonts and text need R; FB needs W.
+    # Validate caps (shared by both modes).  Both fonts and text need R;
+    # FB needs W.
     if (ref_caps(fb_ref)   & CAP_W) == 0 or \
        (ref_caps(font_ref) & CAP_R) == 0 or \
        (ref_caps(text_ref) & CAP_R) == 0:
@@ -3498,6 +3612,24 @@ def primitive_ObjBlitGlyphs(cpu: CPU) -> None:
     text_desc = cpu.descriptors[text_idx]
     if fb_desc.type_tag != TAG_FRAMEBUFFER:
         cpu.set_gpr(2, ERR_EINVAL); cpu.set_gpr(3, 0); return
+
+    if extended:
+        n_chars     = (r5 >> 16) & 0x3FFF
+        transparent = (r5 >> 30) & 1
+        fg          = (r5 >> 8)  & 0xFF
+        bg          =  r5        & 0xFF
+        _blit_glyphs_extended(cpu, fb_desc, font_desc, text_desc,
+                              r4, n_chars, fg, bg, transparent,
+                              font_off, text_off)
+        return
+
+    # --- legacy 8x16 cell-grid path (terminal body; byte-for-byte
+    # identical to the pre-font-manager primitive) ---
+    cell_x = (r4 >> 16) & 0xFFFF
+    cell_y = r4 & 0xFFFF
+    n_chars = (r5 >> 16) & 0xFFFF
+    fg      = (r5 >> 8)  & 0xFF
+    bg      = r5 & 0xFF
 
     fb_w = fb_desc.fb_width
     fb_h = fb_desc.fb_height
