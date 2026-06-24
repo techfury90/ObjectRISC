@@ -108,9 +108,12 @@ TAG_CODE        = 0x4100
 TAG_STACK       = 0x4101
 TAG_DATA        = 0x4102
 TAG_SERVICE     = 0x4103
-TAG_FRAMEBUFFER = 0x4104   # Phase 60 — host-display-backed pixel object
+TAG_TASK        = 0x4104   # task object (Volume VI Section 4)
 TAG_INPUT_SINK  = 0x4105   # Phase 60 step 3 — host-input-event sink
-TAG_TASK    = 0x4104   # task object (Volume VI Section 4)
+TAG_FRAMEBUFFER = 0x4106   # Phase 60 — host-display-backed pixel object
+                           # (was 0x4104, which collided with TAG_TASK;
+                           # the free paths branch on `== TAG_TASK`, so a
+                           # framebuffer was misclassified as a task)
 
 # Task lifecycle states (Volume VI Section 4.2). Internal numbering;
 # returned by TaskQuery in the low 8 bits of the packed state word.
