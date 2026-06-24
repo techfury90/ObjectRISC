@@ -429,8 +429,9 @@ dir_walk(const char *path, int *kind_out,
 	/* The service cap is dead the moment the SEND returns; drop it now so
 	 * its handle slot is free for obj_recv_cap_full's resolved-ref handle.
 	 * Otherwise dir_walk's peak is 5 simultaneous handles (dir+reply+path+
-	 * rem+resolved), which overflows the 8-slot table once the caller holds
-	 * a few persistent handles of its own (the shell: term+host_io = 4). */
+	 * rem+resolved); with this drop it is 4. Headroom under the 16-slot
+	 * table (OBJ_NHANDLE), and it was a hard overflow back when the table
+	 * was 8 (the shell holds several persistent handles of its own). */
 	obj_drop(dir_h);
 
 	/* Reply: R3=status, R4=kind, R5=rem_len, O2=resolved ref (null for a

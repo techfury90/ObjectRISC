@@ -1,7 +1,7 @@
 /*
  * obj.c — handle-based object/capability API (see obj.h).
  *
- * Capabilities live in an 8-slot table at byte offset OBJ_TABLE_OFFSET
+ * Capabilities live in a 16-slot table at byte offset OBJ_TABLE_OFFSET
  * of the O12 task-table OBJSTORE (reserved by task.c's ORX_STATE_BYTES).
  * A program holds opaque `obj_t` handles; libc OREFLDs the capability
  * into O1/O2 for each operation and OREFSTs new ones back. Because the
@@ -28,102 +28,20 @@ static unsigned int obj_inuse;
  * subsystem ensuring the table is up) doesn't zero out live handles. */
 static int obj_inited;
 
-/* --- slot <-> O-register moves (immediate-offset switch) ------------- */
-
-static void
-obj__load_o1(obj_t h)
-{
-	switch (h) {
-	case 0: asm volatile("orefld o1, 1704(o12)"); break;
-	case 1: asm volatile("orefld o1, 1712(o12)"); break;
-	case 2: asm volatile("orefld o1, 1720(o12)"); break;
-	case 3: asm volatile("orefld o1, 1728(o12)"); break;
-	case 4: asm volatile("orefld o1, 1736(o12)"); break;
-	case 5: asm volatile("orefld o1, 1744(o12)"); break;
-	case 6: asm volatile("orefld o1, 1752(o12)"); break;
-	case 7: asm volatile("orefld o1, 1760(o12)"); break;
-	}
-}
-
-static void
-obj__load_o2(obj_t h)
-{
-	switch (h) {
-	case 0: asm volatile("orefld o2, 1704(o12)"); break;
-	case 1: asm volatile("orefld o2, 1712(o12)"); break;
-	case 2: asm volatile("orefld o2, 1720(o12)"); break;
-	case 3: asm volatile("orefld o2, 1728(o12)"); break;
-	case 4: asm volatile("orefld o2, 1736(o12)"); break;
-	case 5: asm volatile("orefld o2, 1744(o12)"); break;
-	case 6: asm volatile("orefld o2, 1752(o12)"); break;
-	case 7: asm volatile("orefld o2, 1760(o12)"); break;
-	}
-}
-
-static void
-obj__store_o1(obj_t h)
-{
-	switch (h) {
-	case 0: asm volatile("orefst o1, 1704(o12)"); break;
-	case 1: asm volatile("orefst o1, 1712(o12)"); break;
-	case 2: asm volatile("orefst o1, 1720(o12)"); break;
-	case 3: asm volatile("orefst o1, 1728(o12)"); break;
-	case 4: asm volatile("orefst o1, 1736(o12)"); break;
-	case 5: asm volatile("orefst o1, 1744(o12)"); break;
-	case 6: asm volatile("orefst o1, 1752(o12)"); break;
-	case 7: asm volatile("orefst o1, 1760(o12)"); break;
-	}
-}
-
-/* Store O2 (not O1) into a handle slot — the OR-receive counterpart of
- * obj__store_o1. obj_recv_cap uses it to land a reply's O2 capability
- * into the table. O2 survives the call exactly as O1 does for
- * obj_alloc → obj__store_o1 (the compiler never models O2 as a value
- * here, so nothing spills it). */
-static void
-obj__store_o2(obj_t h)
-{
-	switch (h) {
-	case 0: asm volatile("orefst o2, 1704(o12)"); break;
-	case 1: asm volatile("orefst o2, 1712(o12)"); break;
-	case 2: asm volatile("orefst o2, 1720(o12)"); break;
-	case 3: asm volatile("orefst o2, 1728(o12)"); break;
-	case 4: asm volatile("orefst o2, 1736(o12)"); break;
-	case 5: asm volatile("orefst o2, 1744(o12)"); break;
-	case 6: asm volatile("orefst o2, 1752(o12)"); break;
-	case 7: asm volatile("orefst o2, 1760(o12)"); break;
-	}
-}
-
-static void
-obj__load_o3(obj_t h)
-{
-	switch (h) {
-	case 0: asm volatile("orefld o3, 1704(o12)"); break;
-	case 1: asm volatile("orefld o3, 1712(o12)"); break;
-	case 2: asm volatile("orefld o3, 1720(o12)"); break;
-	case 3: asm volatile("orefld o3, 1728(o12)"); break;
-	case 4: asm volatile("orefld o3, 1736(o12)"); break;
-	case 5: asm volatile("orefld o3, 1744(o12)"); break;
-	case 6: asm volatile("orefld o3, 1752(o12)"); break;
-	case 7: asm volatile("orefld o3, 1760(o12)"); break;
-	}
-}
-
-static void
-obj__load_o4(obj_t h)
-{
-	switch (h) {
-	case 0: asm volatile("orefld o4, 1704(o12)"); break;
-	case 1: asm volatile("orefld o4, 1712(o12)"); break;
-	case 2: asm volatile("orefld o4, 1720(o12)"); break;
-	case 3: asm volatile("orefld o4, 1728(o12)"); break;
-	case 4: asm volatile("orefld o4, 1736(o12)"); break;
-	case 5: asm volatile("orefld o4, 1744(o12)"); break;
-	case 6: asm volatile("orefld o4, 1752(o12)"); break;
-	case 7: asm volatile("orefld o4, 1760(o12)"); break;
-	}
-}
+/* --- slot <-> O-register moves (immediate-offset switch) ------------- *
+ * Defined in objslot.c, split out so growing the handle table to 16
+ * slots does not bloat obj.c past the pcc label-number point where a
+ * backend asm-emission bug corrupts obj_send's multi-line SEND template
+ * (an inter-line newline emitted as a literal n). Declared here; the
+ * "OR survives the call" discipline holds across the TU boundary (pcc
+ * never models an O-register as a value, so the register each leaves set
+ * or reads is intact across the call). */
+void obj__load_o1(obj_t h);
+void obj__load_o2(obj_t h);
+void obj__load_o3(obj_t h);
+void obj__load_o4(obj_t h);
+void obj__store_o1(obj_t h);
+void obj__store_o2(obj_t h);
 
 static int
 obj__alloc_handle(void)
@@ -879,4 +797,20 @@ obj_fetch_to_stack(obj_t src, int dst_off, int count)
 		: "r1", "r2", "r4", "r5", "r6"
 	);
 	return status;
+}
+
+task_t
+obj_register_task(obj_t h)
+{
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return -1;
+	/* Load the task ref into O1 and hand off to task.c's slot-table
+	 * enroller, which OREFSTs O1 into the next free task slot. O1 is set
+	 * by obj__load_o1's asm (not modelled by pcc as a value), so it
+	 * survives the immediately-following task_register_o1 call unspilled —
+	 * the same "OR survives the call" discipline obj_alloc/obj_derive rely
+	 * on, and exactly what sup_spawn's hand-written poll asm used to do
+	 * with `omov o1, o2; return task_register_o1();`. */
+	obj__load_o1(h);
+	return task_register_o1();
 }
