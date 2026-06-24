@@ -1,0 +1,42 @@
+Object RISC / Ouroboros — third-party font asset notices
+========================================================
+
+The Object RISC project itself is MIT-licensed (see LICENSE).  This NOTICE
+covers third-party bitmap-font assets baked into the window manager's font
+faces, which carry their own attribution requirements.
+
+OPEN LOOK glyph font and Lucida bitmap fonts
+--------------------------------------------
+
+The WM's OPEN LOOK chrome faces are baked from the OpenLook CD-ROM BDF
+sources (Ian Darwin's OpenLook CD-ROM; the XView/OLGX X11 distribution):
+
+  * font_luRS  — Lucida Sans (proportional), title bars and menus
+  * font_lutRS — Lucida Sans Typewriter (monospace), body face
+  * font_olgl  — the OPEN LOOK glyph font (pushpins, menu marks, rings,
+                 check boxes, 2D menu pins, resize corners, scrollbar
+                 arrows)
+
+These bitmaps are subject to the following copyrights:
+
+  Copyright (c) 1989 Sun Microsystems, Inc.  Mountain View, CA.
+  Copyright (c) 1985, 1986 Bigelow & Holmes.
+
+Lucida is a registered trademark of Bigelow & Holmes.
+
+The fonts are used under the royalty-free copyright / design-patent license
+that accompanies the OpenLook CD-ROM, which permits commercial use of the
+glyph and font assets provided the above copyright notices are carried in
+the documentation and source.  Those notices are reproduced here, and are
+also baked into every generated face's header comment (see
+ouroboros/wm_fonts.h, ouroboros/wm_fonts_olgl.h, and tools/gen_wm_font.py).
+
+The "OPEN LOOK" trademark has expired; the name is free to use.
+
+Sun Microsystems' BDF permission notice (from the olgl source) reads, in
+part: "Permission to use, copy, modify, and distribute this software and
+its documentation for any purpose and without fee is hereby granted,
+provided that the above copyright notices appear in all copies and that
+both those copyright notices and this permission notice appear in
+supporting documentation ... It is provided 'as is' without express or
+implied warranty."

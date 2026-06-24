@@ -575,6 +575,81 @@ static const unsigned int font_8x16[95][4] = {
     /*   '~' */ { 0x00000000, 0x00000031, 0x49460000, 0x00000000 },
 };
 
+/* === Font manager (OPEN LOOK chrome) ================================
+ *
+ * The terminal body renders through font_8x16 on the cell grid via the
+ * LEGACY ObjBlitGlyphs path (unchanged, byte-identical).  Chrome — title
+ * bars, and later menus / pushpins / bevels — renders through this font
+ * manager: a self-describing font face + draw_string, on the EXTENDED
+ * ObjBlitGlyphs path (proportional advance, absolute pixel positioning,
+ * optional transparent background).  One firmware call still renders a
+ * whole string; the WM never blits per-pixel.
+ *
+ * A wm_font_t is a thin descriptor over a `<name>_blob[]` the font
+ * generator bakes (tools/gen_wm_font.py --face) — magic + header +
+ * per-glyph width table + bitmaps, laid out exactly as the firmware's
+ * _blit_glyphs_extended reads it.  cell_w/cell_h/base/n_glyphs are
+ * cached here so the WM can MEASURE a proportional string (to centre a
+ * title) without re-reading the blob header. */
+typedef struct {
+	const unsigned int *blob;  /* self-describing font object (read via O15) */
+	int cell_w;                /* glyph bounding-box width, px */
+	int cell_h;                /* rows per glyph */
+	int base;                  /* first codepoint */
+	int n_glyphs;
+	int flags;                 /* bit0 = proportional */
+} wm_font_t;
+
+/* The baked faces (font_luRS proportional title face, font_lutRS mono
+ * body face).  Generated — see scripts/gen_wm_fonts.sh.  Included here,
+ * after wm_font_t is defined, so the initializers resolve. */
+#include "wm_fonts.h"
+
+/* FONT_MAGIC / flags / R5 shape bits — must match simorisc's extended
+ * ObjBlitGlyphs path. */
+#define FONT_FLAG_PROPORTIONAL  1
+#define FONT_R5_EXTENDED        0x80000000u   /* R5 bit 31 selects ext mode */
+#define FONT_R5_TRANSPARENT     0x40000000u   /* R5 bit 30: skip bg writes  */
+
+/* Width-table byte offset within a face blob: magic(4) + header(12). */
+#define FONT_WIDTHS_OFF  16
+
+/* Advance width (px) of a single codepoint.  Reads the blob's width
+ * table directly (the same bytes the firmware reads) so measuring and
+ * rendering can never disagree.  Out-of-range codepoints advance by the
+ * face's cell width — matching the firmware's unknown-glyph handling. */
+static int
+font_advance(const wm_font_t *font, int cp)
+{
+	int gi = cp - font->base;
+	if (gi < 0 || gi >= font->n_glyphs) return font->cell_w;
+	int byte_off = FONT_WIDTHS_OFF + gi;
+	unsigned int word = font->blob[byte_off >> 2];
+	return (word >> (8 * (3 - (byte_off & 3)))) & 0xFF;
+}
+
+/* Total pixel advance of the first `n` bytes of `text` in `font`. */
+static int
+font_measure(const wm_font_t *font, const unsigned char *text, int n)
+{
+	int w = 0, i;
+	for (i = 0; i < n; i++) w += font_advance(font, text[i]);
+	return w;
+}
+
+/* Pack the EXTENDED ObjBlitGlyphs R5 "shape" word: glyph count, fg/bg
+ * palette indices, the transparent flag, and the mode-select bit. */
+static int
+font_shape(int n, int fg, int bg, int transparent)
+{
+	unsigned int s = FONT_R5_EXTENDED;
+	if (transparent) s |= FONT_R5_TRANSPARENT;
+	s |= ((unsigned int)(n  & 0x3FFF)) << 16;
+	s |= ((unsigned int)(fg & 0xFF))   << 8;
+	s |=  (unsigned int)(bg & 0xFF);
+	return (int)s;
+}
+
 #define MAX_WINDOWS 16
 
 /* === Per-window state in normal C globals ============================= */
@@ -1353,28 +1428,30 @@ fill_rect_window(int packed_xy, int packed_wh, int color)
 	);
 }
 
-/* Render a glyph row into the ACTIVE window FB.  Generic counterpart
- * of screen_blit_glyph_row (which targets the screen FB).  3-arg
- * packed signature for the pcc-orisc 5+-arg-call bug.  Caller packs
- * (cell_x:high16, cell_y:low16) and (n_chars:high16, fg:bits 15..8,
- * bg:bits 7..0).  Source text must live in boot data (O15) — the
- * title buffer and the close-box literal both do.
+/* === Centralized glyph-blit emitters ================================
  *
- * Phase 60 step 22 generalised the old hardcoded blit_title_text into
- * this so the title text and the close box can render with different
- * (start_col, fg/bg) without duplicating the asm. */
+ * One ObjBlitGlyphs (#0x10C) firmware call, fully described by
+ * (packed_xy, packed_shape, font_off, text_off).  Both the LEGACY
+ * cell-grid chrome callers (font_8x16, R5 bit 31 clear) and the
+ * EXTENDED proportional font-manager caller (a wm_font_t face, R5 bit 31
+ * set) funnel through these, so there is exactly one asm site per
+ * destination FB.  O2 = O15 (the font blob lives in boot data) and
+ * O3 = O15 (chrome text — titles, labels — also lives in boot data).
+ * 4-arg signature dodges pcc-orisc's 5+-arg-call bug; the FB slot is an
+ * asm immediate, not a runtime arg.
+ *
+ * (The terminal body strip in flush_strip keeps its own inline emitter:
+ * its text is on the boot STACK, O11, not boot data, and it is the one
+ * latency-critical render path — see flush_strip.) */
 static void
-win_blit_glyph_row(int packed_xy, const unsigned char *text, int packed_shape)
+blit_glyphs_winfb(int packed_xy, int packed_shape, int font_off, int text_off)
 {
-	if (((packed_shape >> 16) & 0xFFFF) == 0) return;
-	int text_off = (int)((unsigned int)text - DATA_VA);
-	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
 	asm volatile(
 		"addu   r8,  %0, r0\n"
 		"addu   r9,  %1, r0\n"
 		"addu   r10, %2, r0\n"
 		"addu   r11, %3, r0\n"
-		"orefld o1, %4(o12)\n"      /* O1 = window FB */
+		"orefld o1, %4(o12)\n"      /* O1 = active window FB */
 		"omov   o2, o15\n"          /* O2 = boot data (font) */
 		"omov   o3, o15\n"          /* O3 = boot data (text) */
 		"addu   r4, r8,  r0\n"
@@ -1392,29 +1469,9 @@ win_blit_glyph_row(int packed_xy, const unsigned char *text, int packed_shape)
 	);
 }
 
-/* Close-box label, in boot data so win_blit_glyph_row can reach it
- * via O15. */
-static const unsigned char close_box_label[] = "[X]";
-
-/* Phase 60 step 19 — screen-FB variant of blit_title_text.  Same
- * ObjBlitGlyphs wire as the window-FB version but targets the
- * SCREEN framebuffer directly (no window backing store).  Used by
- * the desktop menu — its glyphs live above all windows in the
- * compositor order, so painting straight into the screen FB skips
- * a composite step entirely.
- *
- * 3-arg signature (packed_xy, text, packed_shape) because pcc-orisc
- * trips ("adrput: illegal op 57") on calls with 5+ args.  Caller
- * packs (cell_x:high16, cell_y:low16) and (n_chars:high16, fg:bits
- * 15..8, bg:bits 7..0).  Source text must live in our boot data
- * segment — ObjBlitGlyphs reads it through O15 (boot data ref). */
 static void
-screen_blit_glyph_row(int packed_xy, const unsigned char *text,
-                      int packed_shape)
+blit_glyphs_screenfb(int packed_xy, int packed_shape, int font_off, int text_off)
 {
-	if (((packed_shape >> 16) & 0xFFFF) == 0) return;
-	int text_off = (int)((unsigned int)text - DATA_VA);
-	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
 	asm volatile(
 		"addu   r8,  %0, r0\n"
 		"addu   r9,  %1, r0\n"
@@ -1436,6 +1493,58 @@ screen_blit_glyph_row(int packed_xy, const unsigned char *text,
 		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
 		  "r8", "r9", "r10", "r11"
 	);
+}
+
+/* LEGACY cell-grid row blit into the ACTIVE window FB, using font_8x16.
+ * Caller packs (cell_x:high16, cell_y:low16) and (n_chars:high16,
+ * fg:bits 15..8, bg:bits 7..0).  Source text must live in boot data
+ * (O15).  Used for the close box "[X]" (the title text now goes through
+ * the proportional font manager — see win_draw_string). */
+static void
+win_blit_glyph_row(int packed_xy, const unsigned char *text, int packed_shape)
+{
+	if (((packed_shape >> 16) & 0xFFFF) == 0) return;
+	int text_off = (int)((unsigned int)text - DATA_VA);
+	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
+	blit_glyphs_winfb(packed_xy, packed_shape, font_off, text_off);
+}
+
+/* Close-box label, in boot data so win_blit_glyph_row can reach it
+ * via O15. */
+static const unsigned char close_box_label[] = "[X]";
+
+/* EXTENDED proportional string blit into the ACTIVE window FB.  `font`
+ * is a baked face (e.g. font_luRS); packed_xy is an absolute pixel
+ * position (pixel_x:high16, pixel_y:low16); packed_shape comes from
+ * font_shape() (glyph count + fg/bg + transparent + EXTENDED bits).
+ * Source text must live in boot data (O15) — window_titles and the
+ * chrome string literals all do.  One firmware call renders the whole
+ * string; the firmware advances the pen per-glyph from the face's
+ * width table. */
+static void
+win_draw_string(const wm_font_t *font, int packed_xy, int packed_shape,
+                const unsigned char *text)
+{
+	if (((packed_shape >> 16) & 0x3FFF) == 0) return;
+	int text_off = (int)((unsigned int)text - DATA_VA);
+	int font_off = (int)((unsigned int)font->blob - DATA_VA);
+	blit_glyphs_winfb(packed_xy, packed_shape, font_off, text_off);
+}
+
+/* Phase 60 step 19 — screen-FB variant.  LEGACY cell-grid row blit into
+ * the SCREEN framebuffer (no window backing store), using font_8x16.
+ * Used by the desktop menu — its glyphs live above all windows in the
+ * compositor order, so painting straight into the screen FB skips a
+ * composite step entirely.  Same packing as win_blit_glyph_row; source
+ * text must live in boot data (O15). */
+static void
+screen_blit_glyph_row(int packed_xy, const unsigned char *text,
+                      int packed_shape)
+{
+	if (((packed_shape >> 16) & 0xFFFF) == 0) return;
+	int text_off = (int)((unsigned int)text - DATA_VA);
+	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
+	blit_glyphs_screenfb(packed_xy, packed_shape, font_off, text_off);
 }
 
 /* Phase 60 step 8 / step 22 — paint the title bar at the top of the
@@ -1463,22 +1572,35 @@ paint_title_bar(void)
 	           | (TITLE_BAR_PX & 0xFFFF);
 	fill_rect_window(bar_xy, bar_wh, bar_bg);
 
-	/* Centre the title within the cells left of the close box so the
-	 * two never overlap.  Title comes from the ACTIVE window's own
-	 * slot (per-wid since step 22). */
-	int title_cells = N_COLS - CLOSE_BOX_CELLS;
-	int n = (active_wid >= 1 && active_wid <= MAX_WINDOWS)
-	      ? window_title_lens[active_wid - 1] : 0;
-	if (n > title_cells) n = title_cells;
-	if (n > 0) {
-		int start_col = (title_cells - n) / 2 + TITLE_CELL_X_OFF;
-		int packed_xy = ((start_col & 0xFFFF) << 16)
-		              | (TITLE_CELL_Y_OFF & 0xFFFF);
-		int packed_shape = ((n & 0xFFFF) << 16)
-		                 | ((WM_TITLE_TEXT_FG & 0xFF) << 8)
-		                 | (bar_bg & 0xFF);
-		win_blit_glyph_row(packed_xy, window_titles[active_wid - 1],
-		                   packed_shape);
+	/* Title text — proportional Lucida Sans (font_luRS), absolute-pixel
+	 * positioned and centred in the span left of the close box.  This is
+	 * the OPEN LOOK chrome face: the font manager advances the pen per
+	 * glyph from luRS's width table, and renders transparently so the
+	 * filled bar shows through the gaps between proportional glyphs.
+	 * (The body stays 8x16 mono on the cell grid; chrome is off-grid.)
+	 *
+	 * The available span is the cells left of the close box, in pixels;
+	 * we accumulate glyph advances to clamp the title to what fits, then
+	 * centre it.  Title bytes come from the ACTIVE window's own slot
+	 * (per-wid since step 22) and live in boot data (O15). */
+	int avail_px = (N_COLS - CLOSE_BOX_CELLS) * CELL_W;
+	if (active_wid >= 1 && active_wid <= MAX_WINDOWS) {
+		const unsigned char *title = window_titles[active_wid - 1];
+		int n0 = window_title_lens[active_wid - 1];
+		int title_px = 0, n = 0;
+		while (n < n0) {
+			int adv = font_advance(&font_luRS, title[n]);
+			if (title_px + adv > avail_px) break;
+			title_px += adv;
+			n++;
+		}
+		if (n > 0) {
+			int start_x = TITLE_X_OFF_PX + (avail_px - title_px) / 2;
+			int packed_xy = ((start_x & 0xFFFF) << 16)
+			              | (TITLE_Y_OFF_PX & 0xFFFF);
+			int packed_shape = font_shape(n, WM_TITLE_TEXT_FG, bar_bg, 1);
+			win_draw_string(&font_luRS, packed_xy, packed_shape, title);
+		}
 	}
 
 	/* Close box "[X]" in the rightmost CLOSE_BOX_CELLS cells. */

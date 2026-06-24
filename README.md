@@ -387,3 +387,9 @@ silicon. The reference implementation lives in Python.
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+
+The window manager's OPEN LOOK chrome fonts (Lucida Sans / Lucida Sans
+Typewriter and the OPEN LOOK glyph font, baked into `ouroboros/wm_fonts.h`)
+are third-party bitmap assets, © 1989 Sun Microsystems and © 1985, 1986
+Bigelow & Holmes, used under the OpenLook CD-ROM's royalty-free license.
+See [`NOTICE`](NOTICE) for the required attributions.
