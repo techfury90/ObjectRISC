@@ -17,7 +17,7 @@ main:
     addiu r5, r0, 16              ; height
     addiu r6, r0, 0x53            ; caps R|W|V|C (V needed to free)
     addiu r7, r0, 1              ; FB_FLAG_OFFSCREEN — no host display worker
-    call  #0x102                 ; ObjAllocFramebuffer → O1 = ref, R2 = status
+    call  #0x10A                 ; ObjAllocFramebuffer → O1 = ref, R2 = status
     bne   r2, r0, fail
     nop
 
@@ -33,7 +33,7 @@ main:
     addiu r5, r0, 16             ; height
     addiu r6, r0, 0x53           ; caps R|W|V|C
     addiu r7, r0, 1              ; FB_FLAG_OFFSCREEN
-    call  #0x102                 ; ObjAllocFramebuffer → O1 = ref, R2 = status
+    call  #0x10A                 ; ObjAllocFramebuffer → O1 = ref, R2 = status
     bne   r2, r0, fail
     nop
 

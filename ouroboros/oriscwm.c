@@ -870,7 +870,7 @@ alloc_local_pointer_sink(void)
 }
 
 /* Phase 60 step 2 — allocate the framebuffer LOCALLY via the new
- * #0x102 ObjAllocFramebuffer primitive.  The resulting TAG_FRAMEBUFFER
+ * #0x10A ObjAllocFramebuffer primitive.  The resulting TAG_FRAMEBUFFER
  * object is backed by host memory in our own simorisc process; when
  * the parent ran us with `--display tk`, the host worker mirrors
  * stores into a Tk window with no wire RTT.  Replaces the prior
@@ -887,7 +887,7 @@ alloc_local_framebuffer(void)
 		"addiu r5, r0, %2\n"           /* height = FB_H */
 		"addiu r6, r0, 3\n"            /* CAP_R | CAP_W */
 		"addiu r7, r0, 0\n"            /* flags = 0 (mirror to display) */
-		"call  #0x102\n"               /* ObjAllocFramebuffer */
+		"call  #0x10A\n"               /* ObjAllocFramebuffer */
 		"nop\n"
 		"orefst o1, %3(o12)\n"
 		"addu  %0, r2, r0"
@@ -1129,7 +1129,7 @@ alloc_window_fb(int wid)
 		"addiu r5, r0, %2\n"           /* height = USABLE_H_PX */
 		"addiu r6, r0, 3\n"            /* CAP_R | CAP_W */
 		"addiu r7, r0, 1\n"            /* FB_FLAG_OFFSCREEN */
-		"call  #0x102\n"               /* ObjAllocFramebuffer */
+		"call  #0x10A\n"               /* ObjAllocFramebuffer */
 		"nop\n"
 		"orefst o1, %3(o12)\n"         /* stash into ACTIVE */
 		"addu  %0, r2, r0"
@@ -4903,7 +4903,7 @@ main(void)
 	 * Keyboard, pointer, framebuffer are all local: keyboard +
 	 * pointer via the #0x10B ObjAllocInputSink primitive
 	 * (simorisc's display worker enqueues Tk events into the sink
-	 * queues), framebuffer via #0x102 ObjAllocFramebuffer.
+	 * queues), framebuffer via #0x10A ObjAllocFramebuffer.
 	 * forward_console_write replies to the client's reply_cap
 	 * directly — no underlying CONSOLE service to forward to. */
 	status = alloc_local_framebuffer();
