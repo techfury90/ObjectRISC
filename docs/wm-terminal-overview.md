@@ -31,7 +31,7 @@ daemon. The window manager was a client of that terminal.
 
 **Phase 60 collapsed the terminal into the window manager.** As of *Phase 60
 step 2/3*, a WM CPU allocates its **own framebuffer** (firmware primitive
-`#0x102 ObjAllocFramebuffer`) and its **own keyboard and pointer input sinks**
+`#0x10A ObjAllocFramebuffer`) and its **own keyboard and pointer input sinks**
 (`#0x10B ObjAllocInputSink`) inside its own `simorisc` process, and the host
 display worker (`--display tk`) mirrors that framebuffer to a Tk window and feeds
 host keystrokes/mouse straight into those sinks. The WM CPU *is* the terminal
@@ -41,11 +41,14 @@ firmware ([`oriscwm.c:872-900`](../ouroboros/oriscwm.c#L872),
 Concretely, in a `make boot` system:
 
 - **There is no `oriscterm` process.** `scripts/boot.sh`'s actual `exec` launches
-  no terminal device ([`boot.sh:125-132`](../scripts/boot.sh#L125)). `oriscterm`
-  is **legacy/vestigial** — kept only because one test
-  (`test_framebuffer.sh`) still needs the real Tk device's `OBJ_READ/WRITE`
-  framebuffer handlers, and because some direct-terminal demos use it. It is not
-  in the WM-mediated path.
+  no terminal device ([`boot.sh:125-131`](../scripts/boot.sh#L125)). `oriscterm`
+  is **legacy/vestigial** — it survives as the reference Tk device for a handful
+  of direct-terminal demos (all launched via `oriscrun --terminal`), not the
+  WM-mediated path. (`test_framebuffer.sh` exercises the framebuffer
+  `OBJ_READ/WRITE` protocol against `fake_terminal.py`, which implements those
+  handlers itself ([`fake_terminal.py:208-286`](../tools/devices/tests/fake_terminal.py#L208)),
+  **not** the real `oriscterm`; the stale in-script comment claiming otherwise is
+  flagged in [`tools/devices/README.md`](../tools/devices/README.md).)
 - **Nothing is published under `/sys/term/<n>/*`.** The supervisor's attempt to
   walk `/sys/term/<procid>/{console,keyboard,grid}` is *expected to fail* and is
   a no-op; the supervisor separately establishes a WM session via `wm_init`
@@ -151,7 +154,7 @@ privilege table at [`simorisc:4410-4439`](../tools/sim/simorisc#L4410)):
 |------|------|---------------------|---------|
 | `#0x100` | ObjAlloc | byte object: `R4`=len `R5`=tag `R6`=caps → `O1`=ref | [`simorisc:3267`](../tools/sim/simorisc#L3267) |
 | `#0x101` | ObjFree | free `O1` (needs `V`) | [`simorisc:3805`](../tools/sim/simorisc#L3805) |
-| `#0x102` | **ObjAllocFramebuffer** | `R4`=w `R5`=h `R6`=caps `R7`=flags(bit0=offscreen) → `O1`=1-byte/pixel FB, registers a Tk window unless offscreen | [`simorisc:3279`](../tools/sim/simorisc#L3279) |
+| `#0x10A` | **ObjAllocFramebuffer** | `R4`=w `R5`=h `R6`=caps `R7`=flags(bit0=offscreen) → `O1`=1-byte/pixel FB, registers a Tk window unless offscreen | [`simorisc:3282`](../tools/sim/simorisc#L3282) |
 | `#0x103` | ObjDerive | weaken `O1` by mask `R4` (needs `C`) → `O1` | [`simorisc:3881`](../tools/sim/simorisc#L3881) |
 | `#0x106` | ObjAllocStore | like ObjAlloc but OR-typed (OREFLD/OREFST) storage | [`simorisc:3788`](../tools/sim/simorisc#L3788) |
 | `#0x108` | **ObjFetchBytes** | copy `R6` bytes from `O1`@`R4` (any home) into local `O2`@`R5` → `R3`=count | [`simorisc:3897`](../tools/sim/simorisc#L3897) |
@@ -208,9 +211,9 @@ wrapped by `obj_send_bytes` ([`obj.h:119-128`](../tools/cc/lib/obj.h#L119)).
 
 ### The two new object types
 
-Phase 60 added two object type tags ([`simorisc:111-112`](../tools/sim/simorisc#L111)):
+Phase 60 added two object type tags ([`simorisc:112-113`](../tools/sim/simorisc#L112)):
 
-- **`TAG_FRAMEBUFFER = 0x4104`** — a host-display-backed pixel object: `w*h`
+- **`TAG_FRAMEBUFFER = 0x4106`** — a host-display-backed pixel object: `w*h`
   bytes, **one byte per pixel = palette index**. When allocated non-offscreen on
   a `--display tk` CPU, a Tk window opens and mirrors it. The drawing primitives
   (`#0x10C..#0x10F`) operate on it; the display worker repaints it at ~60 Hz
@@ -218,15 +221,14 @@ Phase 60 added two object type tags ([`simorisc:111-112`](../tools/sim/simorisc#
 - **`TAG_INPUT_SINK = 0x4105`** — a host-input event queue. `ObjAllocInputSink`
   makes a zero-byte object with an auto-attached depth-64 queue and registers it
   in the CPU's `input_sinks` dict keyed by `kind` (0=keyboard, 1=pointer)
-  ([`simorisc:3779-3784`](../tools/sim/simorisc#L3779)). Host input is appended as
+  ([`simorisc:3785-3787`](../tools/sim/simorisc#L3785)). Host input is appended as
   an ordinary `SEND_DELIVER`, so the WM drains it with plain `ReceiveQueuePoll`.
 
-> **Flagged anomaly.** `TAG_FRAMEBUFFER` (`0x4104`) and `TAG_TASK` (`0x4104`) are
-> defined to the **same value** ([`simorisc:111`](../tools/sim/simorisc#L111) vs
-> [`simorisc:113`](../tools/sim/simorisc#L113)). `type_tag == TAG_TASK` branches
-> (e.g. `ObjFree` at [`simorisc:3825`](../tools/sim/simorisc#L3825)) would
-> misclassify a framebuffer as a task. This looks like a latent bug, listed in
-> [Open questions](#open-questions--things-to-verify).
+> **Resolved.** Earlier Phase-60 revisions defined `TAG_FRAMEBUFFER` as `0x4104`,
+> the **same value** as `TAG_TASK` — so a framebuffer could be misclassified by a
+> `type_tag == TAG_TASK` branch (e.g. `ObjFree`). Commit `2df5b10` moved
+> `TAG_FRAMEBUFFER` to `0x4106` ([`simorisc:111-115`](../tools/sim/simorisc#L111));
+> the two tags are now distinct.
 
 ---
 
@@ -357,7 +359,7 @@ plain ints (window type, cursor position, z-order, titles). `main()` is at
 
 At boot, `main()` allocates ([`oriscwm.c:4881-4955`](../ouroboros/oriscwm.c#L4881)):
 
-- **Screen framebuffer** — `alloc_local_framebuffer()` calls `#0x102` with
+- **Screen framebuffer** — `alloc_local_framebuffer()` calls `#0x10A` with
   `w=FB_W=1280, h=FB_H=768, caps=R|W, flags=0` (mirror to display), stored at
   `WM_SURF_FRAMEBUFFER_SLOT_OFFSET`=440 ([`oriscwm.c:881-900`](../ouroboros/oriscwm.c#L881)).
 - **Keyboard sink** — `alloc_local_keyboard_sink()` calls `#0x10B` with `kind=0`,
@@ -369,7 +371,7 @@ At boot, `main()` allocates ([`oriscwm.c:4881-4955`](../ouroboros/oriscwm.c#L488
 It also allocates the WM-wide keyboard/pointer *subscribe* services (TAG_SERVICE
 objects clients send subscriptions to), and registers its main service at
 `/sys/wm/<term>/0` via a directory walk built from `--init-r4`. Per-window
-framebuffers are allocated offscreen (`#0x102` with `flags=1`).
+framebuffers are allocated offscreen (`#0x10A` with `flags=1`).
 
 Geometry constants: cells are `CELL_W=8 × CELL_H=16`; the screen FB is
 `1280×768`; each window's content grid is `N_COLS=80 × N_ROWS=24` and its
@@ -491,7 +493,8 @@ into whatever register or slot it wants. Examples:
 - `wm_open_session` ([`wm.c:406-459`](../tools/cc/lib/wm.c#L406)) binds
   console/keyboard/grid and OREFLDs each `DIR_RESULT_SLOT` straight into `O5/O6/O7`.
 - `vec_init_from_dir_result` / `raster_init_from_dir_result` adopt
-  `DIR_RESULT_SLOT` into a `WM_VECTOR_CAP_SLOT` / an obj-handle.
+  `DIR_RESULT_SLOT` into an obj-handle (`wm_vec_h` / `raster_svc_h`) via
+  `obj_adopt_dir_result` (both migrated — see [`OBJECT_API.md`](OBJECT_API.md)).
 
 > **Stale comment.** The bind-handler doc ([`oriscwm.c:2565-2576`](../ouroboros/oriscwm.c#L2565))
 > says CONSOLE writes are forwarded "to the underlying terminal" and keyboard is
@@ -643,7 +646,9 @@ All live under [`tools/cc/lib/`](../tools/cc/lib). Wire op constants are in
 API** ([`obj.h`](../tools/cc/lib/obj.h)/[`obj.c`](../tools/cc/lib/obj.c)) because
 the v1 C compiler cannot hold a capability *value* across a call — so capabilities
 stay in an 8-slot table in O12 (offset 1704) and the program holds opaque integer
-handles ([`obj.h:1-20`](../tools/cc/lib/obj.h#L1)).
+handles ([`obj.h:1-20`](../tools/cc/lib/obj.h#L1)). The handle API and the
+client-migration pattern have their own guide:
+[`docs/OBJECT_API.md`](OBJECT_API.md) (authoritative for migration status).
 
 ### `obj.{h,c}` — the handle layer
 
@@ -670,10 +675,14 @@ Targets `O5` (console) and `O6` (keyboard); private mailbox in `O9`.
 | `term_getkey` / `term_pollkey` | `ReceiveQueuePoll(O9)` blocking / non-blocking → R3=code, R4=mods |
 | `term_shutdown` / `term_resubscribe` | keyboard SEND with R4=1 (unsub) / R4=0 (re-sub) |
 
-> Still wire-asm (not migrated). Header comments say "oriscterm" and (at
-> [`term.c:195-202`](../tools/cc/lib/term.c#L195)) describe the O9 queue as
-> "depth 16 ... shared with hostfsd responses" — both wrong; it is depth 64 and
-> hostfsd uses O8.
+> The **keyboard path is migrated onto `obj.h`**: the private mailbox is now an
+> `obj_t` handle (`kbd_mbox_h` via `obj_alloc`, not `O9`), the keyboard service is
+> `obj_adopt_o6()`, and `term_getkey` is `obj_recv_full` — so the `O9` /
+> `ReceiveQueuePoll(O9)` details in the table above predate the migration (see
+> [`OBJECT_API.md`](OBJECT_API.md)). The **console path (`term_print*`) is still
+> raw asm** to `O5` ([`term.c:33-34`](../tools/cc/lib/term.c#L33)). Header comments
+> still say "oriscterm" (read "the WM"); the queue is depth 64 (not the "depth 16
+> ... shared with hostfsd" the old comment claims — hostfsd uses O8).
 
 ### `grid.c` — positioned text
 
@@ -684,11 +693,14 @@ terminal pulls the bytes via OBJ_READ_REQ" — read "the WM" and "`ObjFetchBytes
 
 ### `vector.c` — `VEC_OP_*` drawing
 
-Helpers SEND `R4=op, R5=packed1, R6=packed2` to the cap in `WM_VECTOR_CAP_SLOT`@712
-(seeded from `DIR_RESULT_SLOT` by `vec_init_from_dir_result`). Ops
-([`liborisc.h:212-218`](../tools/cc/lib/liborisc.h#L212)): `LINE`=0, `RECT_FILL`=1,
-`RECT_OUTLINE`=2, `OVAL_FILL`=3, `OVAL_OUTLINE`=4, `CLEAR`=5, `SET_COLOR`=6.
-Coordinates packed as two signed-16 halves per word. Still wire-asm.
+Migrated onto `obj.h` (Phase 4). `vec_init_from_dir_result` adopts the WM-mediated
+VECTOR cap from the dir-walk result into a handle (`wm_vec_h`); each helper
+`obj_send`s `R4=op, R5=packed1, R6=packed2` (the old `WM_VECTOR_CAP_SLOT` hand-copy
+is gone). Ops ([`liborisc.h:212-218`](../tools/cc/lib/liborisc.h#L212)): `LINE`=0,
+`RECT_FILL`=1, `RECT_OUTLINE`=2, `OVAL_FILL`=3, `OVAL_OUTLINE`=4, `CLEAR`=5,
+`SET_COLOR`=6. Coordinates packed as two signed-16 halves per word. Vector ops
+carry their whole payload in the int words, so this client is immune to the §7
+async-buffer pitfall.
 
 ### `raster.c` — `RST_OP_*` blits
 
@@ -879,7 +891,7 @@ The major arc (from `oriscwm.c` phase markers and `docs/HISTORY.md`):
 | 49/51 | terminal pass-through | supervisor injects `/sys/term/<N>/*` console/keyboard/grid into spawned children's OPRs; `terminal_idx` propagation |
 | 58 | **WM β** | WM allocates a *per-window* CONSOLE service so client console writes land in a per-window queue ([`oriscwm.c:166`](../ouroboros/oriscwm.c#L166)) |
 | 59 | **WM γ** | the framebuffer arrives; the WM rasterizes locally. γ.9 adds the GRID service, γ.11 the VECTOR service (`VEC_OP_*`), γ.12 the RASTER service, γ.13 pointer mediation, γ.15 multi-WM (one WM per terminal, `/sys/wm/<N>` paths from `--init-r4`) ([`oriscwm.c:168`](../ouroboros/oriscwm.c#L168)) |
-| 60 | **terminal-firmware unification** | the WM *becomes* the terminal. **step 2:** allocate the framebuffer locally (`#0x102`), drop the `/sys/term/<N>/framebuffer` walk. **step 3:** local keyboard/pointer input sinks (`#0x10B`); oriscterm no longer mediates input. **steps 5–22:** local rect-fill/scroll, offscreen per-window backing stores, title bars + `SET_TITLE`, z-order + window positioning (lifting the 1-window cap), borders, outline dragging, the **focus model**, the desktop root menu, the close box. |
+| 60 | **terminal-firmware unification** | the WM *becomes* the terminal. **step 2:** allocate the framebuffer locally (`#0x10A`, originally `#0x102`), drop the `/sys/term/<N>/framebuffer` walk. **step 3:** local keyboard/pointer input sinks (`#0x10B`); oriscterm no longer mediates input. **steps 5–22:** local rect-fill/scroll, offscreen per-window backing stores, title bars + `SET_TITLE`, z-order + window positioning (lifting the 1-window cap), borders, outline dragging, the **focus model**, the desktop root menu, the close box. |
 
 The practical upshot for a reader: the heavy stack of per-surface services
 (CONSOLE/GRID/VECTOR/RASTER) is WM-β/γ scaffolding; the "WM owns the hardware and
@@ -890,15 +902,6 @@ terminal" comments — is all Phase 60.
 
 ## Open questions / things to verify
 
-- **`TAG_FRAMEBUFFER == TAG_TASK == 0x4104`** ([`simorisc:111`](../tools/sim/simorisc#L111),
-  [`:113`](../tools/sim/simorisc#L113)). Whether this is ever exercised
-  destructively (a framebuffer slot hitting a `type_tag == TAG_TASK` branch in
-  `ObjFree`/`ObjFreeDeferred`) I did not trace to a concrete failure — but it
-  looks like a latent bug, not intentional aliasing.
-- **`docs/SYSTEM_FIRMWARE_INTERFACE.md` / `CONTRACT.md` coverage of the Phase-60
-  primitives.** The `#0x102/#0x10B/#0x10C..#0x10F` graphics+input primitives are
-  fully implemented in `simorisc` but I did not confirm they are yet written into
-  the formal firmware spec volumes; if not, that is a spec/implementation gap.
 - **Keyboard binding asymmetry** in the supervisor's per-spawn path
   ([`supervisor.c:927`](../ouroboros/supervisor.c#L927)): relayed/hot-attach
   children resolve keyboard only from `/sys/term/<idx>/keyboard`, which won't
@@ -906,7 +909,3 @@ terminal" comments — is all Phase 60.
   for the common case, but means a hot-attached terminal's keyboard wiring relies
   entirely on OPR inheritance — worth confirming under a real multi-terminal
   hot-attach.
-- **`oriscterm`'s remaining dependency.** It survives only for
-  `test_framebuffer.sh` (which needs the real Tk device's `OBJ_READ/WRITE`
-  framebuffer handlers) and a few direct-terminal demos. Its `tools/devices/README.md`
-  section does not flag it as legacy; that doc is itself stale.

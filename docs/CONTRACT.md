@@ -233,8 +233,86 @@ the data ref) before exiting.
 
 ## 3. The Firmware Primitives the Simulator Must Implement
 
-The simulator implements the primitives below. Every other `CALL`
-primitive number returns `R2 = 4` (`ENOSYS`).
+The authoritative set of primitives this firmware implements is the
+`PRIMITIVE_MIN_MODE` dispatch gate in `tools/sim/simorisc`: a `CALL`
+number present there runs its primitive (subject to the listed minimum
+caller mode); **any number not present returns `R2 = 4` (`ENOSYS`)**.
+The complete set is tabulated below. The numbered subsections that
+follow (§3.1–§3.10) give host-side detail for a representative subset;
+every primitive marked "Vol VI" follows that volume's ABI unless a
+subsection here notes a simulator-specific deviation.
+
+| `CALL` | Primitive | Mode | Specified in | Notes |
+|--------|-----------|:----:|--------------|-------|
+| `0x000` | `TaskCreate`          | S | Vol VI §4.1 | |
+| `0x001` | `TaskExit`            | U | Vol VI §4.1; §3.1 | |
+| `0x002` | `TaskResume`          | S | Vol VI §4.1 | |
+| `0x003` | `TaskSuspend`         | S | Vol VI §4.1 | |
+| `0x004` | `TaskYield`           | U | Vol VI §4.1 | |
+| `0x005` | `TaskCurrent`         | U | Vol VI §4.1 | |
+| `0x007` | `TaskWait`            | U | Vol VI §4.1 | |
+| `0x008` | `TaskQuery`           | U | Vol VI §4.1 | |
+| `0x009` | `InstallProgram`      | S | Vol VI §4.1 | |
+| `0x00A` | `TaskKill`            | U | Vol VI §4.1 | |
+| `0x100` | `ObjAlloc`            | U | Vol VI §5.1; §3.2 | |
+| `0x101` | `ObjFree`             | U | Vol VI §5.1; §3.3 | |
+| `0x103` | `ObjDerive`           | U | Vol VI §5.1; §3.4 | |
+| `0x106` | `ObjAllocStore`       | U | Vol VI §5.1.1; §3.2.1 | |
+| `0x107` | `ObjFreeDeferred`     | U | Vol VI §5.1.2 | |
+| `0x108` | `ObjFetchBytes`       | U | Vol VI §5.1.3 | |
+| `0x109` | `ObjStoreBytes`       | U | Vol VI §5.1.4 | |
+| `0x10A` | `ObjAllocFramebuffer` | U | Vol VI §5.4 | Phase 60; formerly `0x102` (§3.0.1) |
+| `0x10B` | `ObjAllocInputSink`   | U | Vol VI §5.4 | Phase 60 |
+| `0x10C` | `ObjBlitGlyphs`       | U | Vol VI §5.4 | Phase 60 |
+| `0x10D` | `ObjFillRect`         | U | Vol VI §5.4 | Phase 60 |
+| `0x10E` | `ObjFbScroll`         | U | Vol VI §5.4 | Phase 60 |
+| `0x10F` | `ObjBlitCopy`         | U | Vol VI §5.4 | Phase 60 |
+| `0x110` | `MapObject`           | S | Vol VI §5.2; §3.5 | |
+| `0x111` | `Unmap`               | S | Vol VI §5.2 | |
+| `0x200` | `InstallHandler`      | S | Vol VI §6; §3.6 | |
+| `0x203` | `ReceiveQueueAttach`  | U | Vol VI §6; §3.7 | |
+| `0x204` | `ReceiveQueuePoll`    | U | Vol VI §6; §3.8 | |
+| `0x301` | `ReadCycles`          | U | Vol VI §7; §3.9 | |
+| `0x320` | `ConsoleWrite`        | U | Vol VI §7; §3.10 | |
+| `0x400` | `TimeNow`             | U | Vol VI §8 | |
+| `0x410` | `ClockResolution`     | U | Vol VI §8 | |
+| `0x520` | `InstallTrapHandler`  | S | Vol VI §9 | |
+
+(Mode: U = user, S = supervisor, per Volume VI §2.4.) Volume VI
+primitives **not** in this table — `ObjRevoke`, `ObjMigrate`, `ObjQuery`,
+`Protect`, `DeviceQuery`, the semaphore/event/timer/guest groups, and
+others — are **not implemented** by this firmware and return `ENOSYS`.
+
+### 3.0.1 Spec/implementation number conflicts
+
+All three divergences from Volume VI's number allocation have been
+resolved. **The implemented numbers in the table above are authoritative
+for this firmware.** This subsection is kept as the rationale log for why
+those numbers sit where they do.
+
+**(a) `0x102` — RESOLVED.** `ObjAllocFramebuffer` formerly occupied
+`0x102`, which Volume VI §5.1 names `ObjRevoke` (generation-bump
+capability revocation). Because `dispatch_call` resolves a number to
+exactly one primitive (else `ENOSYS`), a spec-conformant `CALL #0x102` to
+**revoke** a capability would have silently run the framebuffer allocator
+and never revoked — a latent capability-safety trap. `ObjAllocFramebuffer`
+was relocated to `0x10A`, and `0x102` is now reserved for `ObjRevoke`
+(still unimplemented → `ENOSYS`). `CALL #0x102` is therefore safe again:
+it returns `ENOSYS` rather than mis-dispatching.
+
+**(c) `0x10A`–`0x10F` reserved-number use — RESOLVED.** The display and
+input primitives occupy numbers in the memory-management group. Volume VI
+§5.4 now names them and §12 blesses them as an optional group, so they are
+spec-defined primitives rather than non-portable local extensions.
+
+**(b) `0x301` — RESOLVED.** This firmware runs `ReadCycles` at `0x301`
+(§3.9); Volume VI §7 formerly named `0x301` `DeviceQuery`, which this
+firmware does not implement. Because `ReadCycles` backs a public
+`read_cycles()` API, it was kept in place and instead **promoted into
+Volume VI at `0x301`**, with `DeviceQuery` **renumbered to `0x302`**. (Of
+the two sanctioned dispositions, renumbering was chosen over retiring
+`DeviceQuery` because `DeviceList` (`0x300`) still needs a query companion
+and Volume VI §12 requires the pair.)
 
 ### 3.1 `0x001 TaskExit`
 
@@ -404,6 +482,9 @@ implementing this `CALL`), and wraps at 2^32. For benchmark loops
 that take more than ~4 billion instructions to complete, sample
 twice and check for wrap explicitly; for everything that fits in a
 single 32-bit window, subtract.
+
+`ReadCycles` is also specified in Volume VI Section 7, promoted there at
+`0x301` (displacing `DeviceQuery` to `0x302`); see Section 3.0.1.
 
 ### 3.10 `0x320 ConsoleWrite`
 
