@@ -6339,7 +6339,9 @@ step 2.
 Mechanism details:
 
 - **`primitive_ObjAllocFramebuffer(W, H, caps) -> ref`**: allocates
-  a W×H byte object with type tag `TAG_FRAMEBUFFER` (0x4104).  Same
+  a W×H byte object with type tag `TAG_FRAMEBUFFER` (originally
+  0x4104, later moved to 0x4106 — it collided with `TAG_TASK`, and
+  the object-free paths branch on `== TAG_TASK`).  Same
   ObjStoreBytes / ObjFetchBytes path as any other object — no new
   wire ops.  Stores into a TAG_FRAMEBUFFER mark `desc.fb_dirty` so
   the host worker knows when to repaint.
