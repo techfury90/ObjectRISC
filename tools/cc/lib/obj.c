@@ -110,6 +110,21 @@ obj__load_o3(obj_t h)
 	}
 }
 
+static void
+obj__load_o4(obj_t h)
+{
+	switch (h) {
+	case 0: asm volatile("orefld o4, 1704(o12)"); break;
+	case 1: asm volatile("orefld o4, 1712(o12)"); break;
+	case 2: asm volatile("orefld o4, 1720(o12)"); break;
+	case 3: asm volatile("orefld o4, 1728(o12)"); break;
+	case 4: asm volatile("orefld o4, 1736(o12)"); break;
+	case 5: asm volatile("orefld o4, 1744(o12)"); break;
+	case 6: asm volatile("orefld o4, 1752(o12)"); break;
+	case 7: asm volatile("orefld o4, 1760(o12)"); break;
+	}
+}
+
 static int
 obj__alloc_handle(void)
 {
@@ -275,6 +290,36 @@ obj_adopt_dir_result(void)
 	);
 	if (isn)
 		return OBJ_NULL;          /* dir result was null — nothing to adopt */
+	obj__store_o1(h);             /* O1 still holds the ref (orx.c idiom) */
+	obj_inuse |= (1u << h);
+	return h;
+}
+
+/* Adopt the capability currently in a known libc O12 slot into a handle.
+ * A migration bridge for the directory clients (dir.c / sup.c): their
+ * service / parent / reply / input-ref caps are bootstrapped into raw
+ * O12 slots by other code (task_init, supervisor boot, the caller's O1
+ * at entry), and this brings one into the handle world so obj_send_3or /
+ * obj_recv_* can use it. `off` must be one of the slot offsets below
+ * (OREFLD takes an immediate). OBJ_NULL if the slot is null or the table
+ * is full. */
+obj_t
+obj_adopt_slot(int off)
+{
+	int h, isn;
+
+	h = obj__alloc_handle();
+	if (h < 0)
+		return OBJ_NULL;
+	switch (off) {
+	case 544: asm volatile("orefld o1, 544(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
+	case 552: asm volatile("orefld o1, 552(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
+	case 584: asm volatile("orefld o1, 584(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
+	case 624: asm volatile("orefld o1, 624(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
+	default:  return OBJ_NULL;
+	}
+	if (isn)
+		return OBJ_NULL;          /* slot was null — nothing to adopt */
 	obj__store_o1(h);             /* O1 still holds the ref (orx.c idiom) */
 	obj_inuse |= (1u << h);
 	return h;
@@ -553,6 +598,101 @@ obj_send_bytes(obj_t svc, int src, obj_t reply,
 }
 
 int
+obj_send_3or(obj_t svc, obj_t or2, obj_t or3, obj_t or4,
+             int a0, int a1, int a2, int a3)
+{
+	if (svc < 0 || svc >= OBJ_NHANDLE || (obj_inuse & (1u << svc)) == 0)
+		return -1;
+	/* Load each OR payload from its handle slot (OREFLD writes only its
+	 * target reg, so the three loads don't disturb each other), or null
+	 * the slot for an OBJ_NULL handle. Same "the compiler never models an
+	 * OR as a value, so nothing spills it across the helper calls"
+	 * discipline obj_send_bytes relies on — extended to O4. */
+	obj__load_o1(svc);                 /* recipient -> O1 */
+	if (or2 >= 0 && or2 < OBJ_NHANDLE && (obj_inuse & (1u << or2)))
+		obj__load_o2(or2);
+	else
+		asm volatile("onull o2");
+	if (or3 >= 0 && or3 < OBJ_NHANDLE && (obj_inuse & (1u << or3)))
+		obj__load_o3(or3);
+	else
+		asm volatile("onull o3");
+	if (or4 >= 0 && or4 < OBJ_NHANDLE && (obj_inuse & (1u << or4)))
+		obj__load_o4(or4);
+	else
+		asm volatile("onull o4");
+	asm volatile(
+		"addu r7, %3, r0\n"
+		"addu r6, %2, r0\n"
+		"addu r5, %1, r0\n"
+		"addu r4, %0, r0\n"
+		"send o1"
+		:
+		: "r"(a0), "r"(a1), "r"(a2), "r"(a3)
+		: "r4", "r5", "r6", "r7"
+	);
+	return 0;
+}
+
+/* Fixed staging-buffer size for obj_make_bytes. The object is always
+ * this many bytes; the service reads only the first `len`. A fixed size
+ * lets us pass it as an asm *immediate* — crucial, because pcc-orisc
+ * corrupts a size held in a C variable across the obj_alloc call (it
+ * reloads as <=0, so MapObject returns EINVAL). dir.c hit the same wall
+ * and uses a fixed DIR_PATH_BUF_SIZE the same way. `len` must be
+ * <= OBJ_BYTES_MAX. The staging VA is 0x600000 (above the 0x500000 argv
+ * mapping, matching dir.c/sup.c). */
+#define OBJ_BYTES_MAX  256
+
+obj_t
+obj_make_bytes(const char *src, int len, unsigned int caps)
+{
+	obj_t h;
+	int status, i;
+	char *dst;
+
+	if (len <= 0 || len > OBJ_BYTES_MAX)
+		return OBJ_NULL;
+	h = obj_alloc(OBJ_BYTES_MAX, OBJ_TAG_DATA, caps);
+	if (h < 0)
+		return OBJ_NULL;
+
+	obj__load_o1(h);                   /* O1 = the fresh bytes object */
+	asm volatile(                      /* MapObject(O1, VA, off=0, R|W, MAX) */
+		"lui   r4, 0x60\n"
+		"addu  r5, r0, r0\n"
+		"addiu r6, r0, %1\n"
+		"addiu r7, r0, %2\n"           /* size as an IMMEDIATE, not a var */
+		"call  #0x110\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(OBJ_CAP_R | OBJ_CAP_W), "i"(OBJ_BYTES_MAX)
+		: "r1", "r2", "r4", "r5", "r6", "r7"
+	);
+	if (status != 0) { obj_free(h); return OBJ_NULL; }
+
+	/* pcc rejects (char *)0x600000 as a literal cast; synthesize the VA
+	 * via lui+ori, exactly as dir.c does. */
+	asm volatile("lui %0, 0x60\n ori %0, %0, 0" : "=r"(dst));
+	for (i = 0; i < len && i < OBJ_BYTES_MAX; i++)
+		dst[i] = src[i];
+
+	asm volatile(                      /* Unmap(VA, MAX) */
+		"lui   r4, 0x60\n"
+		"addiu r5, r0, %1\n"
+		"call  #0x111\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(OBJ_BYTES_MAX)
+		: "r2", "r3", "r4", "r5"
+	);
+	if (status != 0) { obj_free(h); return OBJ_NULL; }
+	return h;
+}
+
+int
 obj_recv(obj_t h)
 {
 	int status, word;
@@ -675,4 +815,68 @@ obj_recv_cap(obj_t h, int *out_word)
 		return OBJ_NULL;          /* poll failed, or no cap in the reply */
 	obj_inuse |= (1u << hh);
 	return hh;
+}
+
+obj_t
+obj_recv_cap_full(obj_t h, int out[4])
+{
+	int hh, w0, w1, w2, w3;
+
+	if (h < 0 || h >= OBJ_NHANDLE || (obj_inuse & (1u << h)) == 0)
+		return OBJ_NULL;
+	hh = obj__alloc_handle();
+	if (hh < 0)
+		return OBJ_NULL;
+	obj__load_o1(h);               /* queue object -> O1 */
+	/* Four asm outputs is the ceiling, so the poll STATUS (R2) is sw'd to
+	 * obj__poll_status (the obj_recv_full idiom), leaving R3..R6 for
+	 * out[]; the O2 cap is OREFST'd into the handle slot right after. */
+	asm volatile(
+		"addiu r4, r0, -1\n"      /* block until a message */
+		"call  #0x204\n"          /* ReceiveQueuePoll -> R2 st, R3..R6, O2 = cap */
+		"nop\n"
+		"la    r1, obj__poll_status\n"
+		"sw    r2, 0(r1)\n"
+		"addu  %0, r3, r0\n"
+		"addu  %1, r4, r0\n"
+		"addu  %2, r5, r0\n"
+		"addu  %3, r6, r0"
+		: "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
+		:
+		: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+	);
+	/* Land the cap (still in O2) into the slot before any C touches O2.
+	 * Unlike obj_recv_cap, a NULL reply cap is NOT a failure here — a
+	 * dir_walk on a plain directory resolves no ref, yet R3..R6 are still
+	 * valid. So we keep the handle on any successful poll (the caller
+	 * checks obj_isnull / parks it); only a poll error returns OBJ_NULL. */
+	obj__store_o2(hh);
+	out[0] = w0; out[1] = w1; out[2] = w2; out[3] = w3;
+	if (obj__poll_status != 0)
+		return OBJ_NULL;          /* poll itself failed */
+	obj_inuse |= (1u << hh);
+	return hh;
+}
+
+int
+obj_fetch_to_stack(obj_t src, int dst_off, int count)
+{
+	int status;
+
+	if (src < 0 || src >= OBJ_NHANDLE || (obj_inuse & (1u << src)) == 0)
+		return -1;
+	obj__load_o1(src);             /* O1 = source object */
+	asm volatile(
+		"omov  o2, o11\n"         /* O2 = boot stack (destination) */
+		"addiu r4, r0, 0\n"       /* src offset 0 */
+		"addu  r5, %1, r0\n"      /* dst offset within the stack */
+		"addu  r6, %2, r0\n"      /* byte count */
+		"call  #0x108\n"          /* ObjFetchBytes -> R2 = status */
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "r"(dst_off), "r"(count)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	return status;
 }
