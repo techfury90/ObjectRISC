@@ -25,7 +25,12 @@
 typedef int obj_t;
 
 #define OBJ_NULL      (-1)
-#define OBJ_NHANDLE   8
+/* 16 slots: 8 was too tight once the whole libc migrated — a fat caller
+ * like the WM-session shell holds ~6 persistent service handles, leaving
+ * too little headroom for a multi-handle op (sup_spawn / dir_walk peak at
+ * 3-4). task.c reserves OBJ_NHANDLE*8 bytes for the table via
+ * ORX_STATE_BYTES; keep the two in sync. */
+#define OBJ_NHANDLE   16
 
 /* Byte offset of the handle table within the O12 task-table OBJSTORE.
  * Sits just past the compiler OR-spill anchor (1696); task.c reserves
@@ -221,5 +226,13 @@ obj_t obj_recv_cap_full(obj_t h, int out[4]);
  * written remainder / listing into a caller's stack buffer (dir_walk,
  * dir_list). Returns firmware status (0 = ok). */
 int   obj_fetch_to_stack(obj_t src, int dst_off, int count);
+
+/* Enroll the task whose ref handle `h` holds into the libc task table
+ * (task.c's task_register_o1, which reads O1) and return the resulting
+ * task_t — the bridge for a spawn reply: obj_recv_cap lands the new
+ * task's ref in a handle, this hands it to the task layer. The handle is
+ * NOT consumed (caller obj_drop's it); the task table holds its own copy.
+ * Returns -1 if the handle is invalid or the task table is full. */
+task_t obj_register_task(obj_t h);
 
 #endif /* OBJ_H */
