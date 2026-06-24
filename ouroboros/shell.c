@@ -576,9 +576,13 @@ cmd_echo(const char *arg)
  * silently lose the tail.  No-op (with a soft note) when the WM isn't
  * mediating the session. */
 static void
-cmd_title(const char *arg)
+cmd_title(int wid, const char *arg)
 {
-	int rc = wm_set_title(0, arg);
+	/* Title the caller's OWN window (`wid`), not a hardcoded 0 — the
+	 * shell passes its wm_wid from wm_open_session, so `title` retitles
+	 * the window it was issued from (correct for non-zero / multi-term
+	 * windows, where wid 0 was the wrong target). */
+	int rc = wm_set_title(wid, arg);
 	if (rc != 0) {
 		term_print("title: WM unavailable\n");
 	}
@@ -1258,7 +1262,7 @@ main(void)
 		} else if (strcmp(line, "echo") == 0) {
 			cmd_echo(arg);
 		} else if (strcmp(line, "title") == 0) {
-			cmd_title(arg);
+			cmd_title(wm_wid, arg);
 		} else if (strcmp(line, "run") == 0) {
 			if (*arg == 0) term_print("usage: run <path> [&]\n");
 			else cmd_run(cwd, arg);
