@@ -75,6 +75,21 @@ obj__store_o1(obj_t h)
 	}
 }
 
+static void
+obj__load_o3(obj_t h)
+{
+	switch (h) {
+	case 0: asm volatile("orefld o3, 1704(o12)"); break;
+	case 1: asm volatile("orefld o3, 1712(o12)"); break;
+	case 2: asm volatile("orefld o3, 1720(o12)"); break;
+	case 3: asm volatile("orefld o3, 1728(o12)"); break;
+	case 4: asm volatile("orefld o3, 1736(o12)"); break;
+	case 5: asm volatile("orefld o3, 1744(o12)"); break;
+	case 6: asm volatile("orefld o3, 1752(o12)"); break;
+	case 7: asm volatile("orefld o3, 1760(o12)"); break;
+	}
+}
+
 static int
 obj__alloc_handle(void)
 {
@@ -389,6 +404,38 @@ obj_send_or(obj_t h, obj_t or_h, int a0, int a1, int a2, int a3)
 		:
 		: "r"(a0), "r"(a1), "r"(a2), "r"(a3)
 		: "r4", "r5", "r6", "r7", "o3", "o4"
+	);
+	return 0;
+}
+
+int
+obj_send_bytes(obj_t svc, int src, obj_t reply,
+               int a0, int a1, int a2, int a3)
+{
+	if (svc < 0 || svc >= OBJ_NHANDLE || (obj_inuse & (1u << svc)) == 0)
+		return -1;
+	obj__load_o1(svc);             /* service -> O1 */
+	if (src == OBJ_SRC_STACK)
+		asm volatile("omov o2, o11");   /* boot stack ref -> O2 */
+	else if (src == OBJ_SRC_DATA)
+		asm volatile("omov o2, o15");   /* boot data ref -> O2 */
+	else
+		asm volatile("onull o2");       /* OBJ_SRC_NONE */
+	if (reply >= 0 && reply < OBJ_NHANDLE && (obj_inuse & (1u << reply)))
+		obj__load_o3(reply);   /* reply-cap -> O3 (leaves O1/O2) */
+	else
+		asm volatile("onull o3");
+	/* O1/O2/O3 are set; the send reads them. Only O4 + R4..R7 here. */
+	asm volatile(
+		"onull o4\n"
+		"addu r7, %3, r0\n"
+		"addu r6, %2, r0\n"
+		"addu r5, %1, r0\n"
+		"addu r4, %0, r0\n"
+		"send o1"
+		:
+		: "r"(a0), "r"(a1), "r"(a2), "r"(a3)
+		: "r4", "r5", "r6", "r7", "o4"
 	);
 	return 0;
 }

@@ -110,6 +110,23 @@ int   obj_send(obj_t h, int a0, int a1, int a2, int a3);
  * mailbox (subscribe). Returns 0 (SEND traps on error). */
 int   obj_send_or(obj_t h, obj_t or_h, int a0, int a1, int a2, int a3);
 
+/* Source segment for obj_send_bytes' O2 — where the payload bytes live
+ * so the service can ObjFetchBytes them. */
+#define OBJ_SRC_NONE   0       /* no byte payload — null O2 */
+#define OBJ_SRC_STACK  1       /* boot stack ref (O11): stack-local buffers */
+#define OBJ_SRC_DATA   2       /* boot data ref (O15): static/global buffers */
+
+/* The data-send keystone: SEND a byte-data request to service `svc`.
+ * O2 = the `src` segment ref (OBJ_SRC_STACK/DATA, or null for
+ * OBJ_SRC_NONE) so the service ObjFetchBytes the payload; O3 = `reply`'s
+ * mailbox cap (the reply-cap) or null when reply == OBJ_NULL; R4..R7 =
+ * a0..a3 (op + the byte offset/count and any params — the caller
+ * computes the offset into the chosen segment). Returns 0 (SEND traps on
+ * error), -1 if `svc` is invalid. This is what every message-with-data
+ * client (host_io, term console, sup, dir, raster, grid) needs. */
+int   obj_send_bytes(obj_t svc, int src, obj_t reply,
+                     int a0, int a1, int a2, int a3);
+
 /* Block on the receive queue attached to `h` until a message arrives;
  * returns its R3 word (or <0 on poll error). Caller reads the rest of
  * the payload via a follow-up obj_recv variant in a later revision. */
