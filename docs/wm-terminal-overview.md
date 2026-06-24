@@ -208,9 +208,9 @@ wrapped by `obj_send_bytes` ([`obj.h:119-128`](../tools/cc/lib/obj.h#L119)).
 
 ### The two new object types
 
-Phase 60 added two object type tags ([`simorisc:111-112`](../tools/sim/simorisc#L111)):
+Phase 60 added two object type tags ([`simorisc:112-113`](../tools/sim/simorisc#L112)):
 
-- **`TAG_FRAMEBUFFER = 0x4104`** — a host-display-backed pixel object: `w*h`
+- **`TAG_FRAMEBUFFER = 0x4106`** — a host-display-backed pixel object: `w*h`
   bytes, **one byte per pixel = palette index**. When allocated non-offscreen on
   a `--display tk` CPU, a Tk window opens and mirrors it. The drawing primitives
   (`#0x10C..#0x10F`) operate on it; the display worker repaints it at ~60 Hz
@@ -218,15 +218,14 @@ Phase 60 added two object type tags ([`simorisc:111-112`](../tools/sim/simorisc#
 - **`TAG_INPUT_SINK = 0x4105`** — a host-input event queue. `ObjAllocInputSink`
   makes a zero-byte object with an auto-attached depth-64 queue and registers it
   in the CPU's `input_sinks` dict keyed by `kind` (0=keyboard, 1=pointer)
-  ([`simorisc:3779-3784`](../tools/sim/simorisc#L3779)). Host input is appended as
+  ([`simorisc:3785-3787`](../tools/sim/simorisc#L3785)). Host input is appended as
   an ordinary `SEND_DELIVER`, so the WM drains it with plain `ReceiveQueuePoll`.
 
-> **Flagged anomaly.** `TAG_FRAMEBUFFER` (`0x4104`) and `TAG_TASK` (`0x4104`) are
-> defined to the **same value** ([`simorisc:111`](../tools/sim/simorisc#L111) vs
-> [`simorisc:113`](../tools/sim/simorisc#L113)). `type_tag == TAG_TASK` branches
-> (e.g. `ObjFree` at [`simorisc:3825`](../tools/sim/simorisc#L3825)) would
-> misclassify a framebuffer as a task. This looks like a latent bug, listed in
-> [Open questions](#open-questions--things-to-verify).
+> **Resolved.** Earlier Phase-60 revisions defined `TAG_FRAMEBUFFER` as `0x4104`,
+> the **same value** as `TAG_TASK` — so a framebuffer could be misclassified by a
+> `type_tag == TAG_TASK` branch (e.g. `ObjFree`). Commit `2df5b10` moved
+> `TAG_FRAMEBUFFER` to `0x4106` ([`simorisc:111-115`](../tools/sim/simorisc#L111));
+> the two tags are now distinct.
 
 ---
 
@@ -890,11 +889,6 @@ terminal" comments — is all Phase 60.
 
 ## Open questions / things to verify
 
-- **`TAG_FRAMEBUFFER == TAG_TASK == 0x4104`** ([`simorisc:111`](../tools/sim/simorisc#L111),
-  [`:113`](../tools/sim/simorisc#L113)). Whether this is ever exercised
-  destructively (a framebuffer slot hitting a `type_tag == TAG_TASK` branch in
-  `ObjFree`/`ObjFreeDeferred`) I did not trace to a concrete failure — but it
-  looks like a latent bug, not intentional aliasing.
 - **`docs/SYSTEM_FIRMWARE_INTERFACE.md` / `CONTRACT.md` coverage of the Phase-60
   primitives.** The `#0x102/#0x10B/#0x10C..#0x10F` graphics+input primitives are
   fully implemented in `simorisc` but I did not confirm they are yet written into
