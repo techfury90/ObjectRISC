@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """snapshot_desktop.py — render the WM desktop with the OPEN LOOK gray-on-blue
 palette, driving the REAL simorisc firmware ops + the REAL palette LUT, and
-pixel-check the key colors against the spec.
+pixel-check the key colors / geometry against the spec.
 
 Mirrors oriscwm.c's paint sequence (paint_window_chrome -> paint_window_face ->
-paint_title_bar -> paint_window_border) and its layout #defines, painting into a
-single screen framebuffer with ObjFillRect (#0x10D) + ObjBlitGlyphs (#0x10C).
-The colors come from simorisc's VEC_PALETTE_HEX, so what this renders is exactly
-what the live WM composites.
+paint_title_bar [-> paint_menu_button] -> paint_window_border) and its layout
+#defines, painting into a single screen framebuffer with ObjFillRect (#0x10D)
++ ObjBlitGlyphs (#0x10C).  The colors come from simorisc's VEC_PALETTE_HEX, so
+what this renders is exactly what the live WM composites.
 
-Renders both the OLD dev palette and the NEW OPEN LOOK palette (before/after) so
-the recolor is visible side by side.  Writes /tmp/orisc-desktop-{before,after}.ppm
-and asserts the OPEN LOOK colors.
+Renders the prior FLAT title bar (before) and the OPEN LOOK olwm title bar this
+PR introduces (after), so the rework is visible side by side.  The olwm title
+bar (after): a 24px bar flush under the 2px black border, a raised window-menu
+button (▽) at the left, the olwm focus model (flat BG1 unfocused vs a recessed
+BG3/BG2/white stripe focused), a 1px black separator below the bar, and no
+"[X]" close box.  Writes /tmp/orisc-desktop-{before,after}.ppm and asserts the
+after geometry/colors.
 
 Usage:  python3 tools/devices/tests/snapshot_desktop.py
 """
@@ -32,35 +36,43 @@ BDF = ("/Users/lando/Downloads/OpenLookCDROM-master/src/lib/"
        "xview3.2p1-X11R6-LinuxElf/fonts/bdf")
 PID = 7
 
-# oriscwm.c layout #defines
+# --- oriscwm.c layout #defines (kept in sync by hand) ----------------------
 CELL_W, CELL_H = 8, 16
 N_COLS = 80
 BORDER_LINE_PX = 2
-TITLE_BAR_PX = CELL_H
 CELL_AREA_W_PX = CELL_W * N_COLS                       # 640
 USABLE_W_PX = (N_COLS + 2) * CELL_W                    # 656
 TITLE_X_OFF_PX = CELL_W                                # 8
-TITLE_Y_OFF_PX = CELL_H                                # 16
-TITLE_CELL_X_OFF = TITLE_CELL_Y_OFF = 1
-CLOSE_BOX_CELLS = 3
 CONTENT_X_OFF_PX = CELL_W                              # 8
-CONTENT_Y_OFF_PX = (1 + 1) * CELL_H                    # 32 (border + title)
+CONTENT_Y_OFF_PX = (1 + 1) * CELL_H                    # 32 (border + title cells)
 USABLE_H_PX = (2 + 1 + 8) * CELL_H                     # short window: 8 content rows
 CELL_AREA_H_PX = 8 * CELL_H
 
-# Palette index schemes (must match simorisc VEC_PALETTE_HEX + oriscwm.c).
-# OPEN LOOK olwm chrome (CURRENT): a FLAT 2px BLACK window border (idx 14) and a
-# FLAT BG1/white title bar — NO bevel on the frame or title bar.  Sampled from
-# the OpenWindows reference (docs/images/openwindows_ipx.png): the olwm frame is
-# a solid 2px black outline and the title strip is flat BG1.  OPEN LOOK reserves
-# beveling for buttons/controls, not the window frame.
-OPENLOOK = dict(workspace=9, face=10, content=0, border=14,
-                title_focus=8, title_unfocus=10, title_text=14,
-                body_fg=1, body_bg=0, bevel=False, hi=11, sh=13, edge=2)
-# The prior (#135/#136) look this PR replaces — a 1px black outline + raised
-# White/BG3 bevel on the frame & title bar — kept only as the before/after
-# contrast image (the WM no longer renders it).
-BEVELED = dict(OPENLOOK, border=13, bevel=True)
+# NEW olwm title-bar geometry (the "after").
+TITLE_BAR_PX = 24
+TITLE_Y_OFF_PX = BORDER_LINE_PX                        # 2 (flush under border)
+MENU_BTN_W = TITLE_BAR_PX                              # 24 (title-bar-height square)
+TITLE_TEXT_Y_OFF_PX = TITLE_Y_OFF_PX + (TITLE_BAR_PX - CELL_H) // 2   # 6
+OL_MENU_MARK_CP = 22                                   # olgl ▽ menu mark
+OL_MENU_MARK_W, OL_MENU_MARK_H = 16, 15                # ink box (top-left of 47x47 cell)
+BEVEL_RAISED, BEVEL_FILL = 0x01, 0x02
+
+# PRIOR flat title-bar geometry (the "before" contrast image).
+TITLE_BAR_PX_OLD = CELL_H                              # 16
+TITLE_Y_OFF_PX_OLD = CELL_H                            # 16 (one cell row below border)
+TITLE_CELL_X_OFF = TITLE_CELL_Y_OFF = 1
+CLOSE_BOX_CELLS = 3
+
+# Palette indices (must match simorisc VEC_PALETTE_HEX + oriscwm.c).
+WORKSPACE = 9     # OPEN LOOK blue #40a0c0
+BG1 = 10          # window face / flat title bar   #cccccc
+WHITE_I = 11      # olgx highlight / pane          #f5f5f5
+BG2 = 12          # olgx mid / recessed stripe face #b8b8b8
+BG3 = 13          # olgx shadow                    #666666
+OLW = 8           # pure white #ffffff (prior focused bar)
+BLACK = 14        # text / border / separator      #000000
+NAVY = 0          # window content bg
+BODY_FG = 1       # body text
 
 
 def _desc(storage, type_tag=0, fb_w=0, fb_h=0):
@@ -84,28 +96,33 @@ class FakeCPU:
 
 
 class Scene:
+    # font descriptor indices into self.descs
+    F_LURS, F_TEXT, F_LUTRS, F_OLGL = 2, 3, 4, 5
+
     def __init__(self, w, h):
         self.w, self.h = w, h
         self.fb = bytearray(w * h)
         luRS, _ = face_blob(f"{BDF}/75dpi/luRS12.bdf", 32, 95, (12, 16), True)
         lutRS, _ = face_blob(f"{BDF}/100dpi/lutRS10.bdf", 32, 95, (8, 16), False)
+        olgl, _ = face_blob(f"{BDF}/misc/olgl12.bdf", 19, 167, (47, 47), False)
         self.luRS = luRS
         self.lutRS = lutRS
         self.lutRS_bitmaps_off = 16 + ((95 + 3) & ~3)
         self.descs = [None,
                       _desc(self.fb, type_tag=sim.TAG_FRAMEBUFFER, fb_w=w, fb_h=h),
-                      _desc(bytearray(luRS)),       # idx2 luRS
-                      _desc(bytearray(b"")),        # idx3 text (rebound per call)
-                      _desc(bytearray(lutRS))]      # idx4 lutRS
+                      _desc(bytearray(luRS)),       # F_LURS
+                      _desc(bytearray(b"")),        # F_TEXT (rebound per call)
+                      _desc(bytearray(lutRS)),      # F_LUTRS
+                      _desc(bytearray(olgl))]       # F_OLGL
 
     def _cpu(self, font_idx=None, text=None):
         if text is not None:
-            self.descs[3] = _desc(bytearray(text))
+            self.descs[self.F_TEXT] = _desc(bytearray(text))
         c = FakeCPU(self.descs)
         c.set_opr(1, _ref(1, sim.CAP_R | sim.CAP_W))
         if font_idx:
             c.set_opr(2, _ref(font_idx, sim.CAP_R))
-            c.set_opr(3, _ref(3, sim.CAP_R))
+            c.set_opr(3, _ref(self.F_TEXT, sim.CAP_R))
         return c
 
     def fill(self, x, y, w, h, color):
@@ -115,13 +132,29 @@ class Scene:
         c.set_gpr(6, color)
         sim.primitive_ObjFillRect(c)
 
-    def bevel(self, x, y, w, h, hi, sh, e):
-        """Raised olgx bevel edges: hi (White) top+left, sh (BG3)
-        bottom+right; shadow drawn last so it wins the shared corners."""
+    def bevel_raised_edges(self, x, y, w, h, hi, sh, e):
+        """Prior look: raised olgx bevel edges only (no fill): hi top+left,
+        sh bottom+right; shadow last so it wins the shared corners."""
         self.fill(x, y, w, e, hi)              # top
         self.fill(x, y, e, h, hi)              # left
         self.fill(x, y + h - e, w, e, sh)      # bottom
         self.fill(x + w - e, y, e, h, sh)      # right
+
+    def draw_bevel_box(self, x, y, w, h, mode):
+        """Mirror oriscwm.c draw_bevel_box: RAISED = White TL / BG1 face /
+        BG3 BR; PRESSED = BG3 TL / BG2 face / White BR.  BEVEL_FILL fills
+        the face first; the BR (shadow) edges are drawn last so they win
+        the shared corners.  2px edges."""
+        e = 2
+        raised = mode & BEVEL_RAISED
+        hi = WHITE_I if raised else BG3        # top-left edge
+        lo = BG3 if raised else WHITE_I        # bottom-right edge
+        if mode & BEVEL_FILL:
+            self.fill(x, y, w, h, BG1 if raised else BG2)
+        self.fill(x, y, w, e, hi)              # top
+        self.fill(x, y, e, h, hi)              # left
+        self.fill(x, y + h - e, w, e, lo)      # bottom (last → wins corners)
+        self.fill(x + w - e, y, e, h, lo)      # right
 
     def adv_luRS(self, cp):
         gi = cp - 32
@@ -129,66 +162,96 @@ class Scene:
 
     def draw_title(self, x, y, text, fg, bg):
         # proportional luRS, transparent over the bar
-        c = self._cpu(font_idx=2, text=text)
+        c = self._cpu(font_idx=self.F_LURS, text=text)
         c.set_gpr(4, ((x & 0xFFFF) << 16) | (y & 0xFFFF))
         c.set_gpr(5, 0x80000000 | 0x40000000 | (len(text) << 16) | (fg << 8) | bg)
         c.set_gpr(6, 0); c.set_gpr(7, 0)
         sim.primitive_ObjBlitGlyphs(c)
 
+    def draw_menu_mark(self, x, y, fg, bg):
+        # olgl ▽ menu mark (cp 22), EXTENDED transparent blit
+        c = self._cpu(font_idx=self.F_OLGL, text=bytes([OL_MENU_MARK_CP]))
+        c.set_gpr(4, ((x & 0xFFFF) << 16) | (y & 0xFFFF))
+        c.set_gpr(5, 0x80000000 | 0x40000000 | (1 << 16) | (fg << 8) | bg)
+        c.set_gpr(6, 0); c.set_gpr(7, 0)
+        sim.primitive_ObjBlitGlyphs(c)
+
     def draw_cells(self, cell_x, cell_y, text, fg, bg):
         # legacy 8x16 mono via the lutRS bitmap region
-        c = self._cpu(font_idx=4, text=text)
+        c = self._cpu(font_idx=self.F_LUTRS, text=text)
         c.set_gpr(4, ((cell_x & 0xFFFF) << 16) | (cell_y & 0xFFFF))
         c.set_gpr(5, (len(text) << 16) | (fg << 8) | bg)
         c.set_gpr(6, self.lutRS_bitmaps_off); c.set_gpr(7, 0)
         sim.primitive_ObjBlitGlyphs(c)
 
-    def window(self, wx, wy, title, focused, scheme, body_lines):
-        """Mirror handle_new_window: face -> content -> title bar -> border."""
-        # paint_window_face: gray face, then content area navy
-        self.fill(wx, wy, USABLE_W_PX, USABLE_H_PX, scheme["face"])
+    def _face_content_body(self, wx, wy, body_lines):
+        """Shared: gray face, navy content area, mono body text."""
+        self.fill(wx, wy, USABLE_W_PX, USABLE_H_PX, BG1)
         self.fill(wx + CONTENT_X_OFF_PX, wy + CONTENT_Y_OFF_PX,
-                  CELL_AREA_W_PX, CELL_AREA_H_PX, scheme["content"])
-        # title bar: fill focus face, then (beveled) raised edges, then text
-        bar_bg = scheme["title_focus"] if focused else scheme["title_unfocus"]
-        self.fill(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX,
-                  CELL_AREA_W_PX, TITLE_BAR_PX, bar_bg)
-        if scheme["bevel"]:
-            self.bevel(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX,
-                       CELL_AREA_W_PX, TITLE_BAR_PX,
-                       scheme["hi"], scheme["sh"], scheme["edge"])
+                  CELL_AREA_W_PX, CELL_AREA_H_PX, NAVY)
+        for i, line in enumerate(body_lines):
+            self.draw_cells((wx + CONTENT_X_OFF_PX) // CELL_W,
+                            (wy + CONTENT_Y_OFF_PX) // CELL_H + i,
+                            line.encode(), BODY_FG, NAVY)
+
+    def _flat_border(self, wx, wy):
+        """Flat 2px black olwm window frame (both before and after)."""
+        self.fill(wx, wy, USABLE_W_PX, BORDER_LINE_PX, BLACK)
+        self.fill(wx, wy + USABLE_H_PX - BORDER_LINE_PX, USABLE_W_PX, BORDER_LINE_PX, BLACK)
+        self.fill(wx, wy, BORDER_LINE_PX, USABLE_H_PX, BLACK)
+        self.fill(wx + USABLE_W_PX - BORDER_LINE_PX, wy, BORDER_LINE_PX, USABLE_H_PX, BLACK)
+
+    def window_flat(self, wx, wy, title, focused, body_lines):
+        """PRIOR look (before): flat 16px title bar floating one cell below
+        the border, white-focused / BG1-unfocused, with a "[X]" close box."""
+        self._face_content_body(wx, wy, body_lines)
+        bar_bg = OLW if focused else BG1
+        self.fill(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX_OLD,
+                  CELL_AREA_W_PX, TITLE_BAR_PX_OLD, bar_bg)
         avail = (N_COLS - CLOSE_BOX_CELLS) * CELL_W
         tb = title.encode()
         tpx = 0; n = 0
         while n < len(tb) and tpx + self.adv_luRS(tb[n]) <= avail:
             tpx += self.adv_luRS(tb[n]); n += 1
         sx = wx + TITLE_X_OFF_PX + (avail - tpx) // 2
-        self.draw_title(sx, wy + TITLE_Y_OFF_PX, tb[:n], scheme["title_text"], bar_bg)
+        self.draw_title(sx, wy + TITLE_Y_OFF_PX_OLD, tb[:n], BLACK, bar_bg)
         box_col = (wx // CELL_W) + TITLE_CELL_X_OFF + (N_COLS - CLOSE_BOX_CELLS)
         self.draw_cells(box_col, (wy // CELL_H) + TITLE_CELL_Y_OFF,
-                        b"[X]", scheme["title_text"], bar_bg)
-        # console body text (legacy mono, gray on navy)
-        for i, line in enumerate(body_lines):
-            self.draw_cells((wx + CONTENT_X_OFF_PX) // CELL_W,
-                            (wy + CONTENT_Y_OFF_PX) // CELL_H + i,
-                            line.encode(), scheme["body_fg"], scheme["content"])
-        # frame: the OPEN LOOK scheme draws a FLAT BORDER_LINE_PX (2px) black
-        # border (non-bevel branch, border=14); the legacy BEVELED scheme keeps
-        # the 1px black outline + raised bevel for the before/after contrast.
-        if scheme["bevel"]:
-            blk = 14   # WM_OL_BLACK
-            self.fill(wx, wy, USABLE_W_PX, 1, blk)                       # top
-            self.fill(wx, wy + USABLE_H_PX - 1, USABLE_W_PX, 1, blk)     # bottom
-            self.fill(wx, wy, 1, USABLE_H_PX, blk)                       # left
-            self.fill(wx + USABLE_W_PX - 1, wy, 1, USABLE_H_PX, blk)     # right
-            self.bevel(wx + 1, wy + 1, USABLE_W_PX - 2, USABLE_H_PX - 2,
-                       scheme["hi"], scheme["sh"], scheme["edge"])
-        else:
-            b = scheme["border"]
-            self.fill(wx, wy, USABLE_W_PX, BORDER_LINE_PX, b)
-            self.fill(wx, wy + USABLE_H_PX - BORDER_LINE_PX, USABLE_W_PX, BORDER_LINE_PX, b)
-            self.fill(wx, wy, BORDER_LINE_PX, USABLE_H_PX, b)
-            self.fill(wx + USABLE_W_PX - BORDER_LINE_PX, wy, BORDER_LINE_PX, USABLE_H_PX, b)
+                        b"[X]", BLACK, bar_bg)
+        self._flat_border(wx, wy)
+
+    def window_olwm(self, wx, wy, title, focused, body_lines):
+        """NEW olwm look (after): 24px bar flush under the border, raised
+        window-menu button (▽) at the left, recessed focus stripe (focused)
+        vs flat BG1 (unfocused), 1px black separator below, no "[X]"."""
+        self._face_content_body(wx, wy, body_lines)
+        # Bar base: flat BG1 for both focus states.
+        self.fill(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX,
+                  CELL_AREA_W_PX, TITLE_BAR_PX, BG1)
+        span_x = wx + TITLE_X_OFF_PX + MENU_BTN_W
+        span_w = CELL_AREA_W_PX - MENU_BTN_W
+        # Focused: recessed stripe (PRESSED bevel) across the title-text area.
+        if focused:
+            self.draw_bevel_box(span_x, wy + TITLE_Y_OFF_PX, span_w, TITLE_BAR_PX,
+                                BEVEL_FILL)
+        # Raised window-menu button + ▽ glyph, on top, at the left.
+        self.draw_bevel_box(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX,
+                            MENU_BTN_W, TITLE_BAR_PX, BEVEL_RAISED | BEVEL_FILL)
+        gx = wx + TITLE_X_OFF_PX + (MENU_BTN_W - OL_MENU_MARK_W) // 2
+        gy = wy + TITLE_Y_OFF_PX + (TITLE_BAR_PX - OL_MENU_MARK_H) // 2
+        self.draw_menu_mark(gx, gy, BLACK, BG1)
+        # Title text centred in the span right of the button, v-centred.
+        tb = title.encode()
+        tpx = 0; n = 0
+        while n < len(tb) and tpx + self.adv_luRS(tb[n]) <= span_w:
+            tpx += self.adv_luRS(tb[n]); n += 1
+        sx = span_x + (span_w - tpx) // 2
+        text_bg = BG2 if focused else BG1
+        self.draw_title(sx, wy + TITLE_TEXT_Y_OFF_PX, tb[:n], BLACK, text_bg)
+        # 1px black separator directly below the bar.
+        self.fill(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX + TITLE_BAR_PX,
+                  CELL_AREA_W_PX, 1, BLACK)
+        self._flat_border(wx, wy)
 
     def save(self, path):
         lut = sim._build_palette_lut()
@@ -202,49 +265,65 @@ class Scene:
         return tuple(lut[self.fb[y * self.w + x]])
 
 
-def render(scheme, path):
+def render(olwm, path):
     W, H = 760, 540
     s = Scene(W, H)
-    s.fill(0, 0, W, H, scheme["workspace"])
-    s.window(40, 40, "Object RISC Shell", True, scheme,
-             ["$ ls", "hello.orx  shell.orx", "$ "])
-    s.window(96, 300, "ps", False, scheme, ["PID  CMD", "  1  shell"])
+    s.fill(0, 0, W, H, WORKSPACE)
+    paint = s.window_olwm if olwm else s.window_flat
+    paint(40, 40, "Object RISC Shell", True,
+          ["$ ls", "hello.orx  shell.orx", "$ "])
+    paint(96, 300, "ps", False, ["PID  CMD", "  1  shell"])
     s.save(path)
     return s
 
 
 if __name__ == "__main__":
-    render(BEVELED, "/tmp/orisc-desktop-before.ppm")   # prior #135/#136 bevel look
-    s = render(OPENLOOK, "/tmp/orisc-desktop-after.ppm")
-    # Pixel-check the flat OPEN LOOK frame on the AFTER.  Focused window wx=40
-    # wy=40, USABLE 656x176, 2px border; unfocused 'ps' wx=96 wy=300.
-    BG1, BLUE, OLW, BLACK = (204, 204, 204), (64, 160, 192), \
-        (255, 255, 255), (0, 0, 0)
+    render(False, "/tmp/orisc-desktop-before.ppm")   # prior flat 16px bar + [X]
+    s = render(True, "/tmp/orisc-desktop-after.ppm")  # OPEN LOOK olwm title bars
+
+    # --- Pixel-check the AFTER (olwm) geometry + focus model ---------------
+    # Focused window wx=40 wy=40: border y40-41, bar y42-65, separator y66,
+    # BG1 pad y67-71, content y72+.  Menu button x48-71, title span x72-687.
+    BG1c, BG2c, BG3c = (204, 204, 204), (184, 184, 184), (102, 102, 102)
+    WHITEc, BLACKc, BLUEc, NAVYc = (245, 245, 245), (0, 0, 0), \
+        (64, 160, 192), (10, 10, 20)
     checks = [
-        ("workspace",               s.px(10, 10),  BLUE),
-        ("window face",             s.px(50, 50),  BG1),
-        # flat 2px BLACK window border (no bevel): both border px are black,
-        # the face shows immediately inside — top / left / bottom / right.
-        ("border top px0",          s.px(300, 40),  BLACK),
-        ("border top px1",          s.px(300, 41),  BLACK),
-        ("face inside top",         s.px(300, 42),  BG1),
-        ("border left px0",         s.px(40, 120),  BLACK),
-        ("border left px1",         s.px(41, 120),  BLACK),
-        ("face inside left",        s.px(42, 120),  BG1),
-        ("border bottom px0",       s.px(300, 214), BLACK),
-        ("border bottom px1",       s.px(300, 215), BLACK),
-        ("border right px0",        s.px(694, 120), BLACK),
-        ("border right px1",        s.px(695, 120), BLACK),
-        # flat title bars — NO bevel highlight/shadow.  focused=white bar,
-        # unfocused=BG1 bar; the old bevel edge rows now read the bar color.
-        ("focused title face",      s.px(300, 62),  OLW),
-        ("focused title bottom row (flat)", s.px(300, 71), OLW),
-        ("unfocused title face",    s.px(300, 322), BG1),
-        ("unfocused title top row (flat)",  s.px(300, 316), BG1),
-        ("unfocused title bottom row (flat)", s.px(300, 331), BG1),
+        ("workspace",                     s.px(10, 10),  BLUEc),
+        ("window face (left ring pad)",   s.px(44, 100), BG1c),
+        # flat 2px black border, title bar flush under it (y42 = bar, not pad)
+        ("border top px0",                s.px(300, 40), BLACKc),
+        ("border top px1",                s.px(300, 41), BLACKc),
+        ("border left px0",               s.px(40, 120), BLACKc),
+        ("border left px1",               s.px(41, 120), BLACKc),
+        # focused: recessed stripe — BG3 top / BG2 face / white bottom
+        ("focused stripe top edge (BG3)", s.px(680, 42), BG3c),
+        ("focused stripe top edge px1",   s.px(680, 43), BG3c),
+        ("focused stripe face (BG2)",     s.px(680, 50), BG2c),
+        ("focused stripe bottom (white)", s.px(680, 64), WHITEc),
+        ("focused stripe bottom px1",     s.px(680, 65), WHITEc),
+        # raised menu button (White TL / BG1 face / BG3 BR), focused window
+        ("menu btn top edge (white)",     s.px(60, 42),  WHITEc),
+        ("menu btn left edge (white)",    s.px(48, 55),  WHITEc),
+        ("menu btn face (BG1)",           s.px(50, 44),  BG1c),
+        ("menu btn shadow BR (BG3)",      s.px(70, 64),  BG3c),
+        ("menu mark ▽ ink (black)",       s.px(58, 46),  BLACKc),
+        # 1px black separator below the focused bar
+        ("separator (black)",             s.px(300, 66), BLACKc),
+        # content still at y-offset 32: BG1 pad above, navy content at y72
+        ("BG1 frame pad above content",   s.px(300, 70), BG1c),
+        ("content navy at y32 offset",    s.px(300, 72), NAVYc),
+        # unfocused window wx=96 wy=300: flat BG1 bar (no stripe), menu btn,
+        # separator.  bar y302-325, separator y326, menu btn x104-127.
+        ("unfocused flat bar top (BG1)",  s.px(680, 302), BG1c),
+        ("unfocused flat bar face (BG1)", s.px(680, 310), BG1c),
+        ("unfocused menu btn (white)",    s.px(116, 302), WHITEc),
+        ("unfocused menu mark ▽ (black)", s.px(114, 306), BLACKc),
+        ("unfocused separator (black)",   s.px(300, 326), BLACKc),
     ]
     for name, got, want in checks:
         assert got == want, f"{name}: {got} != {want}"
-    print("OPEN LOOK frame colors OK: " + "; ".join(f"{n}={g}" for n, g, _ in checks))
-    print("wrote /tmp/orisc-desktop-before.ppm (prior bevel) and "
-          "/tmp/orisc-desktop-after.ppm (flat 2px black border)")
+    print("OPEN LOOK olwm title bars OK:")
+    for n, g, _ in checks:
+        print(f"  {n} = {g}")
+    print("wrote /tmp/orisc-desktop-before.ppm (prior flat bar + [X]) and "
+          "/tmp/orisc-desktop-after.ppm (olwm menu button + focus stripe)")

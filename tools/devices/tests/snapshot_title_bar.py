@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """snapshot_title_bar.py — render a WM title bar exactly as paint_title_bar
-composes it, driving the REAL simorisc firmware ops, and write a PPM.
+composes it (OPEN LOOK olwm look), driving the REAL simorisc firmware ops,
+and write a PPM.
 
 This is the headless companion to the WM's Cmd+S framebuffer snapshot: it
 reproduces oriscwm.c's title-bar layout (its own #define constants, mirrored
-below) and paints it with the same three firmware primitives the WM uses —
+below) and paints it with the same firmware primitives the WM uses —
 
-  * ObjFillRect    (#0x10D)  the bright-white focused bar
-  * ObjBlitGlyphs  (#0x10C, EXTENDED)  the proportional Lucida Sans title
-  * ObjBlitGlyphs  (#0x10C, LEGACY)    the "[X]" close box (8x16 mono)
+  * ObjFillRect    (#0x10D)  the flat BG1 bar base + 1px black separator
+  * ObjBlitGlyphs  (#0x10C, EXTENDED)  the raised menu button's ▽ mark
+                                       (olgl cp 22) and the proportional
+                                       Lucida Sans title (luRS)
+  * the recessed focus stripe / raised menu button via ObjFillRect bevels
 
 so the pixels are produced by the shipping firmware, not a re-implementation.
-The close box is rendered through the legacy path against the lutRS face's
-own 8x16 bitmap region — the same shape font_8x16 has — so both paths are
-exercised against real baked data.
+Renders a FOCUSED bar by default (pass `--unfocused` for the flat variant).
 
-Usage:  python3 tools/devices/tests/snapshot_title_bar.py ["Window Title"]
+Usage:  python3 tools/devices/tests/snapshot_title_bar.py ["Window Title"] [--unfocused]
 Writes /tmp/orisc-title-bar.ppm.
 """
 import importlib.machinery
@@ -39,19 +40,21 @@ PID = 7
 # --- oriscwm.c title-bar layout constants (kept in sync by hand) -----------
 CELL_W, CELL_H = 8, 16
 N_COLS = 80
-BORDER_CELLS_X = BORDER_CELLS_Y = 1
-TITLE_BAR_PX = CELL_H                       # 16
+BORDER_LINE_PX = 2
+TITLE_BAR_PX = 24
 CELL_AREA_W_PX = CELL_W * N_COLS            # 640
-USABLE_W_PX = (N_COLS + 2 * BORDER_CELLS_X) * CELL_W   # 656
-TITLE_X_OFF_PX = BORDER_CELLS_X * CELL_W    # 8
-TITLE_Y_OFF_PX = BORDER_CELLS_Y * CELL_H    # 16
-TITLE_CELL_X_OFF = BORDER_CELLS_X           # 1
-TITLE_CELL_Y_OFF = BORDER_CELLS_Y           # 1
-CLOSE_BOX_CELLS = 3
-WM_BG_COLOR = 0                             # navy
-WM_BORDER_COLOR = 1
-WM_TITLE_FOCUSED_BG = 8                     # bright white
-WM_TITLE_TEXT_FG = WM_BG_COLOR             # navy text
+USABLE_W_PX = (N_COLS + 2) * CELL_W         # 656
+TITLE_X_OFF_PX = CELL_W                      # 8
+TITLE_Y_OFF_PX = BORDER_LINE_PX             # 2 (flush under the 2px border)
+TITLE_TEXT_Y_OFF_PX = TITLE_Y_OFF_PX + (TITLE_BAR_PX - CELL_H) // 2   # 6
+MENU_BTN_W = TITLE_BAR_PX                    # 24
+OL_MENU_MARK_CP = 22
+OL_MENU_MARK_W, OL_MENU_MARK_H = 16, 15
+BEVEL_RAISED, BEVEL_FILL = 0x01, 0x02
+
+# palette indices
+BG1, WHITE_I, BG2, BG3, BLACK = 10, 11, 12, 13, 14
+WM_TITLE_TEXT_FG = BLACK
 
 
 def _desc(storage, type_tag=0, fb_w=0, fb_h=0):
@@ -75,70 +78,91 @@ class FakeCPU:
 
 
 def main():
-    title = (sys.argv[1] if len(sys.argv) > 1 else "Object RISC Shell").encode()
+    argv = [a for a in sys.argv[1:] if a != "--unfocused"]
+    focused = "--unfocused" not in sys.argv
+    title = (argv[0] if argv else "Object RISC Shell").encode()
 
-    luRS, luRS_i = face_blob(f"{BDF}/75dpi/luRS12.bdf", 32, 95, (12, 16), True)
-    lutRS, _ = face_blob(f"{BDF}/100dpi/lutRS10.bdf", 32, 95, (8, 16), False)
-    # The legacy path reads 16-byte glyphs from font_off; lutRS's bitmap
-    # region (after magic+header+padded widths) is exactly that layout.
-    lutRS_bitmaps_off = 16 + ((95 + 3) & ~3)
+    luRS, _ = face_blob(f"{BDF}/75dpi/luRS12.bdf", 32, 95, (12, 16), True)
+    olgl, _ = face_blob(f"{BDF}/misc/olgl12.bdf", 19, 167, (47, 47), False)
 
-    fb_w, fb_h = USABLE_W_PX, TITLE_Y_OFF_PX + TITLE_BAR_PX + 4   # border + bar
-    fb = bytearray([WM_BG_COLOR] * fb_w * fb_h)
-    # font + text descriptors live alongside the FB
-    text_buf = bytearray(title) + b"[X]"
+    F_LURS, F_TEXT, F_OLGL = 2, 3, 4
+    fb_w = USABLE_W_PX
+    fb_h = TITLE_Y_OFF_PX + TITLE_BAR_PX + 1 + 4   # border + bar + separator + pad
+    fb = bytearray([BG1] * fb_w * fb_h)
     descs = [None,
              _desc(fb, type_tag=sim.TAG_FRAMEBUFFER, fb_w=fb_w, fb_h=fb_h),
-             _desc(bytearray(luRS)),          # idx 2: luRS face (extended)
-             _desc(text_buf),                 # idx 3: title + "[X]"
-             _desc(bytearray(lutRS))]         # idx 4: lutRS face (legacy)
+             _desc(bytearray(luRS)),          # F_LURS
+             _desc(bytearray(b"")),           # F_TEXT (rebound per call)
+             _desc(bytearray(olgl))]          # F_OLGL
 
-    def cpu_for(font_idx):
-        c = FakeCPU(descs)
-        c.set_opr(1, _ref(1, sim.CAP_R | sim.CAP_W))
-        c.set_opr(2, _ref(font_idx, sim.CAP_R))
-        c.set_opr(3, _ref(3, sim.CAP_R))
-        return c
+    def cpu0():
+        c = FakeCPU(descs); c.set_opr(1, _ref(1, sim.CAP_R | sim.CAP_W)); return c
 
-    # 1) Fill the focused title bar bright white (ObjFillRect).
-    c = FakeCPU(descs); c.set_opr(1, _ref(1, sim.CAP_R | sim.CAP_W))
-    c.set_gpr(4, (TITLE_X_OFF_PX << 16) | TITLE_Y_OFF_PX)
-    c.set_gpr(5, (CELL_AREA_W_PX << 16) | TITLE_BAR_PX)
-    c.set_gpr(6, WM_TITLE_FOCUSED_BG)
-    sim.primitive_ObjFillRect(c)
+    def cpu_font(font_idx, text):
+        descs[F_TEXT] = _desc(bytearray(text))
+        c = cpu0(); c.set_opr(2, _ref(font_idx, sim.CAP_R))
+        c.set_opr(3, _ref(F_TEXT, sim.CAP_R)); return c
 
-    # 2) Centre + draw the proportional title (extended ObjBlitGlyphs).
-    avail_px = (N_COLS - CLOSE_BOX_CELLS) * CELL_W
-    # measure via the same width table the firmware uses
+    def fill(x, y, w, h, color):
+        c = cpu0()
+        c.set_gpr(4, ((x & 0xFFFF) << 16) | (y & 0xFFFF))
+        c.set_gpr(5, ((w & 0xFFFF) << 16) | (h & 0xFFFF))
+        c.set_gpr(6, color)
+        sim.primitive_ObjFillRect(c)
+
+    def bevel_box(x, y, w, h, mode):
+        e = 2
+        raised = mode & BEVEL_RAISED
+        hi = WHITE_I if raised else BG3
+        lo = BG3 if raised else WHITE_I
+        if mode & BEVEL_FILL:
+            fill(x, y, w, h, BG1 if raised else BG2)
+        fill(x, y, w, e, hi)
+        fill(x, y, e, h, hi)
+        fill(x, y + h - e, w, e, lo)
+        fill(x + w - e, y, e, h, lo)
+
+    def blit(font_idx, x, y, text, fg, bg):
+        c = cpu_font(font_idx, text)
+        c.set_gpr(4, ((x & 0xFFFF) << 16) | (y & 0xFFFF))
+        c.set_gpr(5, 0x80000000 | 0x40000000 | (len(text) << 16) | (fg << 8) | bg)
+        c.set_gpr(6, 0); c.set_gpr(7, 0)
+        sim.primitive_ObjBlitGlyphs(c)
+
     def adv(cp):
         gi = cp - 32
-        if gi < 0 or gi >= 95:
-            return luRS_i["cell_w"]
-        return luRS[16 + gi]
-    title_px = 0; n = 0
-    while n < len(title) and title_px + adv(title[n]) <= avail_px:
-        title_px += adv(title[n]); n += 1
-    start_x = TITLE_X_OFF_PX + (avail_px - title_px) // 2
-    c = cpu_for(2)
-    c.set_gpr(4, (start_x << 16) | TITLE_Y_OFF_PX)
-    c.set_gpr(5, 0x80000000 | 0x40000000 | (n << 16)
-              | (WM_TITLE_TEXT_FG << 8) | WM_TITLE_FOCUSED_BG)   # ext+transparent
-    c.set_gpr(6, 0); c.set_gpr(7, 0)
-    sim.primitive_ObjBlitGlyphs(c)
+        return luRS[16 + gi] if 0 <= gi < 95 else 12
 
-    # 3) Close box "[X]" via the LEGACY cell path (lutRS bitmap region).
-    box_col = TITLE_CELL_X_OFF + (N_COLS - CLOSE_BOX_CELLS)
-    c = cpu_for(4)
-    c.set_gpr(4, (box_col << 16) | TITLE_CELL_Y_OFF)
-    c.set_gpr(5, (CLOSE_BOX_CELLS << 16) | (WM_TITLE_TEXT_FG << 8) | WM_TITLE_FOCUSED_BG)
-    c.set_gpr(6, lutRS_bitmaps_off)
-    c.set_gpr(7, len(title))          # "[X]" starts after the title in text_buf
-    sim.primitive_ObjBlitGlyphs(c)
+    # 0) 2px black top border (the WM chrome).
+    fill(0, 0, fb_w, BORDER_LINE_PX, BLACK)
 
-    # 4) A 2px top border line (ObjFillRect), like the WM chrome.
-    c = FakeCPU(descs); c.set_opr(1, _ref(1, sim.CAP_R | sim.CAP_W))
-    c.set_gpr(4, 0); c.set_gpr(5, (fb_w << 16) | 2); c.set_gpr(6, WM_BORDER_COLOR)
-    sim.primitive_ObjFillRect(c)
+    # 1) Bar base: flat BG1, both focus states.
+    fill(TITLE_X_OFF_PX, TITLE_Y_OFF_PX, CELL_AREA_W_PX, TITLE_BAR_PX, BG1)
+
+    span_x = TITLE_X_OFF_PX + MENU_BTN_W
+    span_w = CELL_AREA_W_PX - MENU_BTN_W
+
+    # 2) Focused: recessed stripe (PRESSED bevel) across the title-text area.
+    if focused:
+        bevel_box(span_x, TITLE_Y_OFF_PX, span_w, TITLE_BAR_PX, BEVEL_FILL)
+
+    # 3) Raised window-menu button + ▽ glyph (olgl cp 22).
+    bevel_box(TITLE_X_OFF_PX, TITLE_Y_OFF_PX, MENU_BTN_W, TITLE_BAR_PX,
+              BEVEL_RAISED | BEVEL_FILL)
+    gx = TITLE_X_OFF_PX + (MENU_BTN_W - OL_MENU_MARK_W) // 2
+    gy = TITLE_Y_OFF_PX + (TITLE_BAR_PX - OL_MENU_MARK_H) // 2
+    blit(F_OLGL, gx, gy, bytes([OL_MENU_MARK_CP]), WM_TITLE_TEXT_FG, BG1)
+
+    # 4) Centre + draw the proportional title (extended ObjBlitGlyphs).
+    tpx = 0; n = 0
+    while n < len(title) and tpx + adv(title[n]) <= span_w:
+        tpx += adv(title[n]); n += 1
+    start_x = span_x + (span_w - tpx) // 2
+    text_bg = BG2 if focused else BG1
+    blit(F_LURS, start_x, TITLE_TEXT_Y_OFF_PX, title[:n], WM_TITLE_TEXT_FG, text_bg)
+
+    # 5) 1px black separator directly below the bar.
+    fill(TITLE_X_OFF_PX, TITLE_Y_OFF_PX + TITLE_BAR_PX, CELL_AREA_W_PX, 1, BLACK)
 
     lut = sim._build_palette_lut()
     rgb = b"".join(lut[b] for b in fb)
@@ -146,8 +170,8 @@ def main():
     with open(out, "wb") as fh:
         fh.write(b"P6\n%d %d\n255\n" % (fb_w, fb_h))
         fh.write(rgb)
-    print(f"wrote {out}  ({fb_w}x{fb_h}); title '{title.decode()}' "
-          f"{n} glyphs, {title_px}px, start_x={start_x}")
+    print(f"wrote {out}  ({fb_w}x{fb_h}); {'focused' if focused else 'unfocused'} "
+          f"title '{title.decode()}' {n} glyphs, {tpx}px, start_x={start_x}")
 
 
 if __name__ == "__main__":
