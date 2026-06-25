@@ -429,12 +429,12 @@
 #define WM_FG_COLOR        1    /* terminal-body text (light gray) */
 #define WM_WORKSPACE_COLOR 9    /* desktop background — OPEN LOOK blue #40a0c0 */
 #define WM_FACE_BG1        10   /* window face / unfocused title — BG1 #cccccc */
-#define WM_FACE_WHITE      11   /* olgx highlight / pane — White #f5f5f5 (bevel: next PR) */
-#define WM_FACE_BG2        12   /* olgx mid — BG2 #b8b8b8 (bevel: next PR) */
-#define WM_FACE_BG3        13   /* olgx shadow / frame outline — BG3 #666666 */
+#define WM_FACE_WHITE      11   /* olgx button highlight / pane — White #f5f5f5 */
+#define WM_FACE_BG2        12   /* olgx button mid — BG2 #b8b8b8 */
+#define WM_FACE_BG3        13   /* olgx button shadow — BG3 #666666 */
 #define WM_OL_WHITE        8    /* pure white #ffffff — focused title bar */
-#define WM_OL_BLACK        14   /* text / outlines #000000 */
-#define WM_BORDER_COLOR    WM_FACE_BG3  /* gray frame outline (flat; bevel next PR) */
+#define WM_OL_BLACK        14   /* text / window border #000000 */
+#define WM_BORDER_COLOR    WM_OL_BLACK  /* flat 2px black olwm window frame */
 /* Title bar uses inverse-video: bar bg = fg-gray, text = bg-navy.
  * (Vestigial — paint_title_bar uses the WM_TITLE_* indices below.) */
 #define WM_TITLE_BAR_BG WM_FG_COLOR
@@ -1642,12 +1642,11 @@ paint_title_bar(void)
 	           | (TITLE_BAR_PX & 0xFFFF);
 	fill_rect_window(bar_xy, bar_wh, bar_bg);
 
-	/* Raised bevel around the title strip — consistent with the window
-	 * frame.  Drawn before the title text + close box so they sit on top.
-	 * On a focused (pure-white) bar the White highlight is ~invisible
-	 * against the white face (correct OPEN LOOK — don't "fix" it); the
-	 * BG3 shadow still reads.  On an unfocused (BG1) bar both edges read. */
-	draw_bevel_box(bar_xy, bar_wh, BEVEL_RAISED);
+	/* No bevel on the title strip — the OpenWindows reference
+	 * (docs/images/openwindows_ipx.png) shows a FLAT BG1 title bar
+	 * (sampled: 24px of solid #cccccc, no White top edge / BG3 bottom
+	 * edge).  OPEN LOOK bevels buttons, not the frame or title bar; the
+	 * 2px black window border (paint_window_border) delimits the bar. */
 
 	/* Title text — proportional Lucida Sans (font_luRS), absolute-pixel
 	 * positioned and centred in the span left of the close box.  This is
@@ -1769,42 +1768,38 @@ paint_window_chrome(void)
 	                 WM_WORKSPACE_COLOR);
 }
 
-/* Paint the window's outer frame: a 1px BLACK outline at the very edge
- * (OPEN LOOK spec — "Black = window outlines"; matches the real
- * OpenWindows shot, docs/images/openwindows_ipx.png), with the RAISED
- * bevel (White highlight top/left, BG3 shadow bottom/right, over the BG1
- * face from paint_window_face) inset just inside it.  So the window reads
- * as a black-outlined raised slab off the blue workspace, not a bare gray
- * bevel.  Edges only (the interior is the face + content + title bar);
- * called from handle_new_window after the title bar.  Window-local
- * coords, targets WM_ACTIVE_FB_SLOT (same as paint_title_bar's fills). */
+/* Paint the window's outer frame: a flat BORDER_LINE_PX-wide (2px) BLACK
+ * border at the outermost pixels of the window FB.  Sampled from the real
+ * OpenWindows shot (docs/images/openwindows_ipx.png): the olwm window
+ * frame is a SOLID 2px black outline — NOT a 3D bevel.  OPEN LOOK reserves
+ * beveling for buttons/controls (the window-menu button, oblong buttons,
+ * scrollbar elevators), never the window frame or title bar.  Edges only;
+ * the interior is the BG1 face + title bar + content.  Called from
+ * handle_new_window after the title bar.  Window-local coords, targets
+ * WM_ACTIVE_FB_SLOT (same as paint_title_bar's fills). */
 static void
 paint_window_border(void)
 {
 	int w = USABLE_W_PX, h = USABLE_H_PX;
+	int e = BORDER_LINE_PX;   /* 2px, per the OpenWindows olwm frame */
 
-	/* 1px black outline around the outermost edge. */
 	fill_rect_window(((0 & 0xFFFF) << 16) | (0 & 0xFFFF),
-	                 ((w & 0xFFFF) << 16) | 1, WM_OL_BLACK);             /* top    */
-	fill_rect_window(((0 & 0xFFFF) << 16) | ((h - 1) & 0xFFFF),
-	                 ((w & 0xFFFF) << 16) | 1, WM_OL_BLACK);             /* bottom */
+	                 ((w & 0xFFFF) << 16) | e, WM_OL_BLACK);            /* top    */
+	fill_rect_window(((0 & 0xFFFF) << 16) | ((h - e) & 0xFFFF),
+	                 ((w & 0xFFFF) << 16) | e, WM_OL_BLACK);            /* bottom */
 	fill_rect_window(((0 & 0xFFFF) << 16) | (0 & 0xFFFF),
-	                 (1 << 16) | (h & 0xFFFF), WM_OL_BLACK);             /* left   */
-	fill_rect_window((((w - 1) & 0xFFFF) << 16) | (0 & 0xFFFF),
-	                 (1 << 16) | (h & 0xFFFF), WM_OL_BLACK);             /* right  */
-
-	/* Raised bevel inset 1px inside the black outline. */
-	draw_bevel_box((1 << 16) | 1,
-	               (((w - 2) & 0xFFFF) << 16) | ((h - 2) & 0xFFFF),
-	               BEVEL_RAISED);
+	                 (e << 16) | (h & 0xFFFF), WM_OL_BLACK);            /* left   */
+	fill_rect_window((((w - e) & 0xFFFF) << 16) | (0 & 0xFFFF),
+	                 (e << 16) | (h & 0xFFFF), WM_OL_BLACK);            /* right  */
 }
 
 /* Palette PR — paint the window's gray FACE (BG1) across the whole
  * backing store, then restore the cell-content area to the terminal bg
  * so the console interior is unchanged.  The title bar + border paint on
  * top, giving the OPEN LOOK light-gray window frame on the blue
- * workspace.  Flat fills only — the raised White/BG1/BG3 bevel is the
- * next PR.  Called once at window creation (handle_new_window) before
+ * workspace.  Flat fills — the OPEN LOOK frame/title bar are flat (the
+ * White/BG2/BG3 bevel colors are for buttons/controls, not the frame).
+ * Called once at window creation (handle_new_window) before
  * paint_title_bar; VEC/RST_OP_CLEAR only repaint the content area, so the
  * face persists for the window's lifetime. */
 static void
