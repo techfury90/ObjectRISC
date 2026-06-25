@@ -49,11 +49,18 @@ USABLE_H_PX = (2 + 1 + 8) * CELL_H                     # short window: 8 content
 CELL_AREA_H_PX = 8 * CELL_H
 
 # Palette index schemes (must match simorisc VEC_PALETTE_HEX + oriscwm.c).
-# hi/sh = bevel highlight (White #f5f5f5) / shadow (BG3 #666666); edge px.
-BEVELED = dict(workspace=9, face=10, content=0, border=13,
-               title_focus=8, title_unfocus=10, title_text=14,
-               body_fg=1, body_bg=0, bevel=True, hi=11, sh=13, edge=2)
-FLAT = dict(BEVELED, bevel=False)        # the palette PR look (this PR's "before")
+# OPEN LOOK olwm chrome (CURRENT): a FLAT 2px BLACK window border (idx 14) and a
+# FLAT BG1/white title bar — NO bevel on the frame or title bar.  Sampled from
+# the OpenWindows reference (docs/images/openwindows_ipx.png): the olwm frame is
+# a solid 2px black outline and the title strip is flat BG1.  OPEN LOOK reserves
+# beveling for buttons/controls, not the window frame.
+OPENLOOK = dict(workspace=9, face=10, content=0, border=14,
+                title_focus=8, title_unfocus=10, title_text=14,
+                body_fg=1, body_bg=0, bevel=False, hi=11, sh=13, edge=2)
+# The prior (#135/#136) look this PR replaces — a 1px black outline + raised
+# White/BG3 bevel on the frame & title bar — kept only as the before/after
+# contrast image (the WM no longer renders it).
+BEVELED = dict(OPENLOOK, border=13, bevel=True)
 
 
 def _desc(storage, type_tag=0, fb_w=0, fb_h=0):
@@ -165,9 +172,9 @@ class Scene:
             self.draw_cells((wx + CONTENT_X_OFF_PX) // CELL_W,
                             (wy + CONTENT_Y_OFF_PX) // CELL_H + i,
                             line.encode(), scheme["body_fg"], scheme["content"])
-        # frame: a 1px BLACK window outline (OPEN LOOK "Black = window
-        # outlines") with the raised bevel inset just inside it; or the
-        # palette PR's flat BG3 lines for the non-bevel scheme.
+        # frame: the OPEN LOOK scheme draws a FLAT BORDER_LINE_PX (2px) black
+        # border (non-bevel branch, border=14); the legacy BEVELED scheme keeps
+        # the 1px black outline + raised bevel for the before/after contrast.
         if scheme["bevel"]:
             blk = 14   # WM_OL_BLACK
             self.fill(wx, wy, USABLE_W_PX, 1, blk)                       # top
@@ -207,35 +214,37 @@ def render(scheme, path):
 
 
 if __name__ == "__main__":
-    render(FLAT, "/tmp/orisc-desktop-before.ppm")     # palette PR look (flat)
-    s = render(BEVELED, "/tmp/orisc-desktop-after.ppm")
-    # Pixel-check the raised bevel on the AFTER.  Focused window wx=40 wy=40,
-    # USABLE 656x176, edge 2px; unfocused 'ps' wx=96 wy=300.
-    WHITE, BG1, BG3, BLUE, OLW, BLACK = (245, 245, 245), (204, 204, 204), \
-        (102, 102, 102), (64, 160, 192), (255, 255, 255), (0, 0, 0)
+    render(BEVELED, "/tmp/orisc-desktop-before.ppm")   # prior #135/#136 bevel look
+    s = render(OPENLOOK, "/tmp/orisc-desktop-after.ppm")
+    # Pixel-check the flat OPEN LOOK frame on the AFTER.  Focused window wx=40
+    # wy=40, USABLE 656x176, 2px border; unfocused 'ps' wx=96 wy=300.
+    BG1, BLUE, OLW, BLACK = (204, 204, 204), (64, 160, 192), \
+        (255, 255, 255), (0, 0, 0)
     checks = [
         ("workspace",               s.px(10, 10),  BLUE),
         ("window face",             s.px(50, 50),  BG1),
-        # 1px black window outline at the outermost edge
-        ("frame outline (top)",     s.px(300, 40),  BLACK),
-        ("frame outline (left)",    s.px(40, 120),  BLACK),
-        ("frame outline (bottom)",  s.px(300, 215), BLACK),
-        ("frame outline (right)",   s.px(695, 120), BLACK),
-        # raised bevel inset 1px inside the outline
-        ("frame highlight (top)",   s.px(300, 41),  WHITE),
-        ("frame highlight (left)",  s.px(41, 120),  WHITE),
-        ("frame shadow (bottom)",   s.px(300, 214), BG3),
-        ("frame shadow (right)",    s.px(694, 120), BG3),
-        # focused (white) bar: highlight ~invisible, shadow still reads
-        ("focused title face",      s.px(300, 62), OLW),
-        ("focused title shadow",    s.px(300, 71), BG3),
-        # unfocused (BG1) bar: both bevel edges read
+        # flat 2px BLACK window border (no bevel): both border px are black,
+        # the face shows immediately inside — top / left / bottom / right.
+        ("border top px0",          s.px(300, 40),  BLACK),
+        ("border top px1",          s.px(300, 41),  BLACK),
+        ("face inside top",         s.px(300, 42),  BG1),
+        ("border left px0",         s.px(40, 120),  BLACK),
+        ("border left px1",         s.px(41, 120),  BLACK),
+        ("face inside left",        s.px(42, 120),  BG1),
+        ("border bottom px0",       s.px(300, 214), BLACK),
+        ("border bottom px1",       s.px(300, 215), BLACK),
+        ("border right px0",        s.px(694, 120), BLACK),
+        ("border right px1",        s.px(695, 120), BLACK),
+        # flat title bars — NO bevel highlight/shadow.  focused=white bar,
+        # unfocused=BG1 bar; the old bevel edge rows now read the bar color.
+        ("focused title face",      s.px(300, 62),  OLW),
+        ("focused title bottom row (flat)", s.px(300, 71), OLW),
         ("unfocused title face",    s.px(300, 322), BG1),
-        ("unfocused title highlight", s.px(300, 316), WHITE),
-        ("unfocused title shadow",  s.px(300, 331), BG3),
+        ("unfocused title top row (flat)",  s.px(300, 316), BG1),
+        ("unfocused title bottom row (flat)", s.px(300, 331), BG1),
     ]
     for name, got, want in checks:
         assert got == want, f"{name}: {got} != {want}"
-    print("bevel colors OK: " + "; ".join(f"{n}={g}" for n, g, _ in checks))
-    print("wrote /tmp/orisc-desktop-before.ppm (flat) and "
-          "/tmp/orisc-desktop-after.ppm (raised bevels)")
+    print("OPEN LOOK frame colors OK: " + "; ".join(f"{n}={g}" for n, g, _ in checks))
+    print("wrote /tmp/orisc-desktop-before.ppm (prior bevel) and "
+          "/tmp/orisc-desktop-after.ppm (flat 2px black border)")
