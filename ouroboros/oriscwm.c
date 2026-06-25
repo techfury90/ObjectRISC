@@ -343,12 +343,22 @@
 #define FB_W            1280
 #define FB_H            768
 
-/* Per-window title bar (Phase 60 step 8).  Lives just inside the
- * top border of each window's backing store; the cell content area
- * follows it.  16 px = one cell row, fits a 16-px glyph with zero
- * vertical padding. */
+/* Per-window title bar (Phase 60 step 8; regrown for the OPEN LOOK olwm
+ * chrome).  Lives flush under the 2px black top border of each window's
+ * backing store; the cell content area follows it.
+ *
+ * The bar's PIXEL height (24px, matching the OpenWindows reference) is now
+ * decoupled from the chrome CELL budget.  TITLE_BAR_CELLS stays 1 so the
+ * content cell area, CONTENT_Y_OFF_PX (=32) and USABLE_H_PX are unchanged
+ * (the window size and compositor are untouched); the 32px of chrome above
+ * the content is just REDISTRIBUTED: 2px border + 24px title bar + 1px
+ * black separator + 5px BG1 frame pad = 32px (see the layout comment below
+ * and paint_title_bar). */
 #define TITLE_BAR_CELLS 1
-#define TITLE_BAR_PX    (CELL_H * TITLE_BAR_CELLS)   /* 16 */
+#define TITLE_BAR_PX    24
+/* Window-menu button: a title-bar-height raised square at the bar's left
+ * edge (the ▽ "abbreviated menu button" — paint_menu_button). */
+#define MENU_BTN_W      TITLE_BAR_PX
 
 /* Per-window border (Phase 60 step 15).  Each window FB has a
  * cell-aligned outer ring (1 cell wide on every side); inside that
@@ -359,11 +369,13 @@
  * fraction.
  *
  * Layout inside each window FB (with BORDER_CELLS_X=BORDER_CELLS_Y=1,
- * BORDER_LINE_PX=2, TITLE_BAR_CELLS=1):
+ * BORDER_LINE_PX=2, TITLE_BAR_PX=24).  The chrome above the content is the
+ * same 32px (2 cell rows) as before, just redistributed for the olwm look:
  *   y px       what
  *   0..1       top border line                              (2 px)
- *   2..15      top border ring padding                      (14 px bg)
- *   16..31     title bar                                    (16 px)
+ *   2..25      title bar (flush under the border)           (24 px)
+ *   26         title / content separator (1px black)        (1 px)
+ *   27..31     BG1 frame pad                                (5 px bg)
  *   32..415    cell content area (24 rows × 16 px)          (384 px)
  *   416..429   bottom border ring padding                   (14 px bg)
  *   430..431   bottom border line                           (2 px)
@@ -406,7 +418,11 @@
 #define CONTENT_X_OFF_PX    (CONTENT_CELL_X_OFF * CELL_W)
 #define CONTENT_Y_OFF_PX    (CONTENT_CELL_Y_OFF * CELL_H)
 #define TITLE_X_OFF_PX      (TITLE_CELL_X_OFF * CELL_W)
-#define TITLE_Y_OFF_PX      (TITLE_CELL_Y_OFF * CELL_H)
+/* Title bar is now FLUSH under the 2px black top border (was one cell row
+ * = 16px below it); pixel-positioned, decoupled from TITLE_CELL_Y_OFF. */
+#define TITLE_Y_OFF_PX      BORDER_LINE_PX
+/* Title text top — vertically centre the 16px font face in the 24px bar. */
+#define TITLE_TEXT_Y_OFF_PX (TITLE_Y_OFF_PX + (TITLE_BAR_PX - CELL_H) / 2)
 
 /* Per-window border occupies the entire visible chrome now — there
  * is no screen-wide chrome any more.  CELL_ORIGIN_* survives only
@@ -432,28 +448,41 @@
 #define WM_FACE_WHITE      11   /* olgx button highlight / pane — White #f5f5f5 */
 #define WM_FACE_BG2        12   /* olgx button mid — BG2 #b8b8b8 */
 #define WM_FACE_BG3        13   /* olgx button shadow — BG3 #666666 */
-#define WM_OL_WHITE        8    /* pure white #ffffff — focused title bar */
-#define WM_OL_BLACK        14   /* text / window border #000000 */
+#define WM_OL_WHITE        8    /* pure white #ffffff (unused by the title bar
+                                 * since the olwm focus rework — kept as a
+                                 * palette slot) */
+#define WM_OL_BLACK        14   /* text / window border / separator #000000 */
 #define WM_BORDER_COLOR    WM_OL_BLACK  /* flat 2px black olwm window frame */
 /* Title bar uses inverse-video: bar bg = fg-gray, text = bg-navy.
  * (Vestigial — paint_title_bar uses the WM_TITLE_* indices below.) */
 #define WM_TITLE_BAR_BG WM_FG_COLOR
 #define WM_TITLE_BAR_FG WM_BG_COLOR
 
-/* Phase 60 step 22 — focus indicator.  The focused window's title bar
- * is pure white (#ffffff); unfocused windows get the gray window face
- * (BG1 #cccccc).  Text is black on both so it reads at either
- * brightness.  This is the OPEN LOOK gray-on-blue chrome. */
-#define WM_TITLE_FOCUSED_BG    WM_OL_WHITE   /* #ffffff — has keyboard focus */
-#define WM_TITLE_UNFOCUSED_BG  WM_FACE_BG1   /* #cccccc — not focused */
-#define WM_TITLE_TEXT_FG       WM_OL_BLACK   /* black text on either bar */
+/* Focus indicator — olwm's drawHeaderBar3D / drawHeaderNoFocus3D model
+ * (winframe.c:1005-1024), replacing the old pure-white focused bar.
+ *
+ * The bar's base is the FLAT gray window face (BG1) for BOTH focus states.
+ * Focus is shown by a RECESSED stripe drawn across the title-text area of
+ * the FOCUSED window only — draw_bevel_box in PRESSED mode (BEVEL_FILL,
+ * no BEVEL_RAISED): BG3 #666 top-left edge / BG2 #b8b8b8 face / white
+ * bottom-right edge.  Unfocused windows stay flat BG1.  Title text is
+ * black on either.  Verified vs docs/images/openwindows_ipx.png: focused
+ * emacs name-stripe = BG3 top / BG2 face / white bottom; unfocused cmdtool
+ * bar = flat BG1. */
+#define WM_TITLE_BG            WM_FACE_BG1   /* flat title-bar base, both states */
+#define WM_TITLE_STRIPE_FACE   WM_FACE_BG2   /* recessed focus-stripe face (BG2) */
+#define WM_TITLE_TEXT_FG       WM_OL_BLACK   /* black title text */
 
-/* Phase 60 step 22 — close box.  A "[X]" affordance occupies the
- * rightmost CLOSE_BOX_CELLS cells of every window's title bar; a
- * left-click there destroys the window.  The centred title text is
- * laid out within (N_COLS - CLOSE_BOX_CELLS) cells so it never
- * collides with the box. */
-#define CLOSE_BOX_CELLS  3         /* "[X]" */
+/* Window-menu button mark — the ▽ "abbreviated menu button" glyph in the
+ * OPEN LOOK glyph font (olgl codepoint 22, font_olgl in wm_fonts_olgl.h),
+ * rendered transparently in black and centred in the raised menu button
+ * (paint_menu_button).  A left-click (SELECT) on the button destroys the
+ * window — the interim behaviour inherited from the old "[X]" close box
+ * (real OPEN LOOK SELECT iconifies).  The glyph's ink box is 16x15 px
+ * anchored at the top-left of the 47x47 olgl cell. */
+#define OL_MENU_MARK_CP  22
+#define OL_MENU_MARK_W   16
+#define OL_MENU_MARK_H   15
 
 /* Title string storage — single window for v1, becomes per-wid when
  * multi-window lands.  Sized to the max title that fits the bar with
@@ -621,6 +650,10 @@ typedef struct {
  * body face).  Generated — see scripts/gen_wm_fonts.sh.  Included here,
  * after wm_font_t is defined, so the initializers resolve. */
 #include "wm_fonts.h"
+/* The OPEN LOOK glyph face (font_olgl) — UI marks (pushpins, the ▽ menu
+ * mark, scrollbar arrows, …).  Same wm_font_t descriptor, baked from
+ * olgl12.bdf; the title bar's window-menu button renders codepoint 22. */
+#include "wm_fonts_olgl.h"
 
 /* FONT_MAGIC / flags / R5 shape bits — must match simorisc's extended
  * ObjBlitGlyphs path. */
@@ -724,7 +757,7 @@ static int           drag_outline_x, drag_outline_y;
  * bug: closing a window stamped its title onto the new top window).
  * Per-wid storage fixes it: each window keeps its own title and
  * repaints reproduce it faithfully.  Lives in the data segment so
- * win_blit_glyph_row can reach it via O15 (boot data ref). */
+ * win_draw_string can reach it via O15 (boot data ref). */
 static unsigned char window_titles[MAX_WINDOWS][MAX_TITLE_LEN];
 static int           window_title_lens[MAX_WINDOWS];
 
@@ -1565,23 +1598,11 @@ blit_glyphs_screenfb(int packed_xy, int packed_shape, int font_off, int text_off
 	);
 }
 
-/* LEGACY cell-grid row blit into the ACTIVE window FB, using font_8x16.
- * Caller packs (cell_x:high16, cell_y:low16) and (n_chars:high16,
- * fg:bits 15..8, bg:bits 7..0).  Source text must live in boot data
- * (O15).  Used for the close box "[X]" (the title text now goes through
- * the proportional font manager — see win_draw_string). */
-static void
-win_blit_glyph_row(int packed_xy, const unsigned char *text, int packed_shape)
-{
-	if (((packed_shape >> 16) & 0xFFFF) == 0) return;
-	int text_off = (int)((unsigned int)text - DATA_VA);
-	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
-	blit_glyphs_winfb(packed_xy, packed_shape, font_off, text_off);
-}
-
-/* Close-box label, in boot data so win_blit_glyph_row can reach it
- * via O15. */
-static const unsigned char close_box_label[] = "[X]";
+/* Window-menu mark text — a single byte (olgl codepoint 22, the ▽
+ * "abbreviated menu button" glyph), in boot data so win_draw_string can
+ * reach it via O15.  Rendered through the EXTENDED font-manager path with
+ * font_olgl, not the legacy cell path. */
+static const unsigned char menu_mark_str[] = { OL_MENU_MARK_CP, 0 };
 
 /* EXTENDED proportional string blit into the ACTIVE window FB.  `font`
  * is a baked face (e.g. font_luRS); packed_xy is an absolute pixel
@@ -1605,8 +1626,8 @@ win_draw_string(const wm_font_t *font, int packed_xy, int packed_shape,
  * the SCREEN framebuffer (no window backing store), using font_8x16.
  * Used by the desktop menu — its glyphs live above all windows in the
  * compositor order, so painting straight into the screen FB skips a
- * composite step entirely.  Same packing as win_blit_glyph_row; source
- * text must live in boot data (O15). */
+ * composite step entirely.  Same packing as the legacy cell-grid blit;
+ * source text must live in boot data (O15). */
 static void
 screen_blit_glyph_row(int packed_xy, const unsigned char *text,
                       int packed_shape)
@@ -1617,81 +1638,118 @@ screen_blit_glyph_row(int packed_xy, const unsigned char *text,
 	blit_glyphs_screenfb(packed_xy, packed_shape, font_off, text_off);
 }
 
-/* Phase 60 step 8 / step 22 — paint the title bar at the top of the
- * window FB.  Bar bg is brightness-coded by focus (bright white when
- * active_wid == focused_wid, gray otherwise); title text (centred)
- * and the "[X]" close box render navy on whichever bar color.  After
- * painting the window-local title bar region we composite it onto the
- * screen.
+/* OPEN LOOK window-menu button — a raised beveled square at the LEFT of
+ * the title bar, on EVERY window (focus-independent), with the ▽ "menu
+ * mark" glyph (olgl cp 22) centred in it.  The raised face is the olgx
+ * RAISED bevel (White top-left / BG1 face / BG3 bottom-right) via
+ * draw_bevel_box; the glyph renders transparently in black on top so only
+ * its ink lands (the 47x47 olgl cell's empty area shows the button face).
+ *
+ * SELECT (left-click) on the button destroys the window — see
+ * point_in_menu_button / wm_handle_pointer.  Targets the ACTIVE window FB
+ * (caller set_active_window's first), same as the rest of paint_title_bar. */
+static void
+paint_menu_button(void)
+{
+	int btn_xy = ((TITLE_X_OFF_PX & 0xFFFF) << 16)
+	           | (TITLE_Y_OFF_PX & 0xFFFF);
+	int btn_wh = ((MENU_BTN_W & 0xFFFF) << 16)
+	           | (TITLE_BAR_PX & 0xFFFF);
+	draw_bevel_box(btn_xy, btn_wh, BEVEL_RAISED | BEVEL_FILL);
+
+	/* Centre the 16x15 ▽ ink (anchored at the olgl cell's top-left) in
+	 * the MENU_BTN_W x TITLE_BAR_PX button. */
+	int gx = TITLE_X_OFF_PX + (MENU_BTN_W - OL_MENU_MARK_W) / 2;
+	int gy = TITLE_Y_OFF_PX + (TITLE_BAR_PX - OL_MENU_MARK_H) / 2;
+	int packed_xy = ((gx & 0xFFFF) << 16) | (gy & 0xFFFF);
+	int packed_shape = font_shape(1, WM_TITLE_TEXT_FG, WM_TITLE_BG, 1);
+	win_draw_string(&font_olgl, packed_xy, packed_shape, menu_mark_str);
+}
+
+/* Phase 60 step 8 / OPEN LOOK olwm rework — paint the title bar at the top
+ * of the window FB.  The bar is flush under the 2px black border, 24px
+ * tall, with a 1px black separator below it.  Layout left-to-right: the
+ * raised window-menu button (▽), then the centred proportional title text;
+ * focus is shown by a recessed stripe behind the title area (focused) vs a
+ * flat BG1 bar (unfocused) — the olwm drawHeaderBar3D / drawHeaderNoFocus3D
+ * model.  After painting we composite the bar + separator onto the screen.
  *
  * Called from handle_new_window, wm_set_title, and repaint_title_bar
- * (focus changes).  active_wid must be set to the target window
- * first (set_active_window) — fill_rect_window / win_blit_glyph_row /
- * composite_window_region all key off it. */
+ * (focus changes).  active_wid must be set to the target window first
+ * (set_active_window) — fill_rect_window / draw_bevel_box / win_draw_string
+ * / composite_window_region all key off it. */
 static void
 paint_title_bar(void)
 {
-	/* Title bar lives inside the border ring at
-	 * (TITLE_X_OFF_PX, TITLE_Y_OFF_PX), extent
-	 * (CELL_AREA_W_PX, TITLE_BAR_PX). */
-	int bar_bg = (active_wid == focused_wid)
-	           ? WM_TITLE_FOCUSED_BG : WM_TITLE_UNFOCUSED_BG;
+	int focused = (active_wid == focused_wid);
+
+	/* Bar base: the flat gray window face (BG1) for BOTH focus states
+	 * (olwm drawHeaderNoFocus3D).  Extent (CELL_AREA_W_PX, TITLE_BAR_PX)
+	 * at (TITLE_X_OFF_PX, TITLE_Y_OFF_PX). */
 	int bar_xy = ((TITLE_X_OFF_PX & 0xFFFF) << 16)
 	           | (TITLE_Y_OFF_PX & 0xFFFF);
 	int bar_wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
 	           | (TITLE_BAR_PX & 0xFFFF);
-	fill_rect_window(bar_xy, bar_wh, bar_bg);
+	fill_rect_window(bar_xy, bar_wh, WM_TITLE_BG);
 
-	/* No bevel on the title strip — the OpenWindows reference
-	 * (docs/images/openwindows_ipx.png) shows a FLAT BG1 title bar
-	 * (sampled: 24px of solid #cccccc, no White top edge / BG3 bottom
-	 * edge).  OPEN LOOK bevels buttons, not the frame or title bar; the
-	 * 2px black window border (paint_window_border) delimits the bar. */
+	/* The title-text area is the bar span to the RIGHT of the menu
+	 * button; the title is centred within it. */
+	int span_x = TITLE_X_OFF_PX + MENU_BTN_W;
+	int span_w = CELL_AREA_W_PX - MENU_BTN_W;
+
+	/* Focus indicator (olwm drawHeaderBar3D): the FOCUSED window gets a
+	 * RECESSED stripe across the title-text area — draw_bevel_box PRESSED
+	 * (BEVEL_FILL, no BEVEL_RAISED) = BG3 top-left / BG2 face / white
+	 * bottom-right.  Unfocused windows stay flat BG1. */
+	if (focused) {
+		int stripe_xy = ((span_x & 0xFFFF) << 16)
+		              | (TITLE_Y_OFF_PX & 0xFFFF);
+		int stripe_wh = ((span_w & 0xFFFF) << 16)
+		              | (TITLE_BAR_PX & 0xFFFF);
+		draw_bevel_box(stripe_xy, stripe_wh, BEVEL_FILL);
+	}
+
+	/* Raised window-menu button (▽) on top, at the left of the bar. */
+	paint_menu_button();
 
 	/* Title text — proportional Lucida Sans (font_luRS), absolute-pixel
-	 * positioned and centred in the span left of the close box.  This is
-	 * the OPEN LOOK chrome face: the font manager advances the pen per
-	 * glyph from luRS's width table, and renders transparently so the
-	 * filled bar shows through the gaps between proportional glyphs.
-	 * (The body stays 8x16 mono on the cell grid; chrome is off-grid.)
-	 *
-	 * The available span is the cells left of the close box, in pixels;
-	 * we accumulate glyph advances to clamp the title to what fits, then
-	 * centre it.  Title bytes come from the ACTIVE window's own slot
-	 * (per-wid since step 22) and live in boot data (O15). */
-	int avail_px = (N_COLS - CLOSE_BOX_CELLS) * CELL_W;
+	 * positioned, centred in the span right of the menu button and
+	 * vertically centred in the 24px bar.  Rendered transparently so the
+	 * flat fill / recessed stripe shows through the gaps between glyphs.
+	 * Title bytes come from the ACTIVE window's own slot (per-wid) and
+	 * live in boot data (O15). */
 	if (active_wid >= 1 && active_wid <= MAX_WINDOWS) {
 		const unsigned char *title = window_titles[active_wid - 1];
 		int n0 = window_title_lens[active_wid - 1];
 		int title_px = 0, n = 0;
 		while (n < n0) {
 			int adv = font_advance(&font_luRS, title[n]);
-			if (title_px + adv > avail_px) break;
+			if (title_px + adv > span_w) break;
 			title_px += adv;
 			n++;
 		}
 		if (n > 0) {
-			int start_x = TITLE_X_OFF_PX + (avail_px - title_px) / 2;
+			int start_x = span_x + (span_w - title_px) / 2;
 			int packed_xy = ((start_x & 0xFFFF) << 16)
-			              | (TITLE_Y_OFF_PX & 0xFFFF);
-			int packed_shape = font_shape(n, WM_TITLE_TEXT_FG, bar_bg, 1);
+			              | (TITLE_TEXT_Y_OFF_PX & 0xFFFF);
+			int text_bg = focused ? WM_TITLE_STRIPE_FACE : WM_TITLE_BG;
+			int packed_shape = font_shape(n, WM_TITLE_TEXT_FG, text_bg, 1);
 			win_draw_string(&font_luRS, packed_xy, packed_shape, title);
 		}
 	}
 
-	/* Close box "[X]" in the rightmost CLOSE_BOX_CELLS cells. */
+	/* 1px black separator directly below the bar (window-local
+	 * y = TITLE_Y_OFF_PX + TITLE_BAR_PX), spanning the bar width. */
 	{
-		int box_col = TITLE_CELL_X_OFF + (N_COLS - CLOSE_BOX_CELLS);
-		int packed_xy = ((box_col & 0xFFFF) << 16)
-		              | (TITLE_CELL_Y_OFF & 0xFFFF);
-		int packed_shape = ((CLOSE_BOX_CELLS & 0xFFFF) << 16)
-		                 | ((WM_TITLE_TEXT_FG & 0xFF) << 8)
-		                 | (bar_bg & 0xFF);
-		win_blit_glyph_row(packed_xy, close_box_label, packed_shape);
+		int sep_xy = ((TITLE_X_OFF_PX & 0xFFFF) << 16)
+		           | ((TITLE_Y_OFF_PX + TITLE_BAR_PX) & 0xFFFF);
+		int sep_wh = ((CELL_AREA_W_PX & 0xFFFF) << 16) | 1;
+		fill_rect_window(sep_xy, sep_wh, WM_OL_BLACK);
 	}
 
+	/* Composite the bar + the separator row below it. */
 	composite_window_region(TITLE_X_OFF_PX, TITLE_Y_OFF_PX,
-	                        CELL_AREA_W_PX, TITLE_BAR_PX);
+	                        CELL_AREA_W_PX, TITLE_BAR_PX + 1);
 }
 
 /* Phase 60 step 22 — repaint wid's title bar (focus-color refresh).
@@ -4671,17 +4729,19 @@ point_in_title_bar(int wid, int px, int py)
 	return (px >= tx_lo && px < tx_hi && py >= ty_lo && py < ty_hi);
 }
 
-/* Phase 60 step 22 — true if (px, py) is inside wid's close box (the
- * rightmost CLOSE_BOX_CELLS cells of the title bar).  Checked before
- * the general title-bar drag test so a close-box click destroys
- * rather than starts a drag. */
+/* True if (px, py) is inside wid's window-menu button (the raised ▽ square
+ * at the LEFT of the title bar — TITLE_X_OFF_PX..+MENU_BTN_W over the bar
+ * height).  Checked before the general title-bar drag test so a button
+ * click (SELECT) destroys the window rather than starting a drag.  (This
+ * replaced the old rightmost-cells close box; SELECT keeps that close
+ * behaviour for now — real OPEN LOOK SELECT iconifies.) */
 static int
-point_in_close_box(int wid, int px, int py)
+point_in_menu_button(int wid, int px, int py)
 {
 	int wx = window_pos_x[wid - 1];
 	int wy = window_pos_y[wid - 1];
-	int bx_lo = wx + TITLE_X_OFF_PX + (N_COLS - CLOSE_BOX_CELLS) * CELL_W;
-	int bx_hi = wx + TITLE_X_OFF_PX + CELL_AREA_W_PX;
+	int bx_lo = wx + TITLE_X_OFF_PX;
+	int bx_hi = bx_lo + MENU_BTN_W;
 	int by_lo = wy + TITLE_Y_OFF_PX;
 	int by_hi = by_lo + TITLE_BAR_PX;
 	return (px >= bx_lo && px < bx_hi && py >= by_lo && py < by_hi);
@@ -4963,11 +5023,11 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 		if (button != PTR_BTN_LEFT) return 0;
 		int t = topmost_window_at(px, py);
 		if (t == 0) return 0;
-		/* Close box takes priority over raise/drag — clicking it
-		 * destroys the window outright.  Check before raise_window
-		 * so we don't bother re-stacking a window we're about to
-		 * tear down. */
-		if (point_in_close_box(t, px, py)) {
+		/* The window-menu button takes priority over raise/drag — a
+		 * SELECT (left-click) on it destroys the window outright (the
+		 * interim close behaviour).  Check before raise_window so we
+		 * don't bother re-stacking a window we're about to tear down. */
+		if (point_in_menu_button(t, px, py)) {
 			window_teardown(t);
 			return 1;
 		}
