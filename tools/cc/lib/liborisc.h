@@ -223,6 +223,15 @@ int  menu_run(int col, int row, const char *items, int n);
 #define VEC_OP_OVAL_OUTLINE 0x04
 #define VEC_OP_CLEAR        0x05
 #define VEC_OP_SET_COLOR    0x06
+#define VEC_OP_TEXT_MOVE    0x07   /* set text pen: packed1=(x<<16)|y, packed2=face id */
+#define VEC_OP_TEXT_CHAR    0x08   /* draw one glyph at the pen in the pen color, advance */
+
+/* Font faces for vec_text* (face ids must match oriscwm's text_face_lookup):
+ * the WM owns the baked Lucida + OPEN LOOK faces and advances the pen per
+ * glyph (only it holds the proportional width tables). */
+#define FONT_FACE_PROP   0   /* proportional Lucida Sans (luRS) — titles/headings */
+#define FONT_FACE_MONO   1   /* monospace Lucida Typewriter (lutRS) — body text   */
+#define FONT_FACE_GLYPH  2   /* OPEN LOOK glyph font (olgl) — UI marks            */
 
 int  vec_init_from_dir_result(void);                 /* adopt DIR_RESULT_SLOT cap into the VECTOR handle */
 int  vec_line(int x1, int y1, int x2, int y2);
@@ -232,6 +241,9 @@ int  vec_oval_fill(int x, int y, int w, int h);
 int  vec_oval_outline(int x, int y, int w, int h);
 int  vec_clear(void);
 int  vec_set_color(int palette_idx);
+int  vec_text_move(int face, int x, int y);          /* set the text pen position + face   */
+int  vec_text_char(int c);                            /* draw one glyph at the pen, advance */
+int  vec_text(int face, int x, int y, const char *s); /* move + stream a whole string       */
 
 /* ---- raster.c — WM-mediated raster blit (Phase 59 / WM γ.12) ----
  *

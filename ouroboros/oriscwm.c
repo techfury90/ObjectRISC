@@ -737,6 +737,13 @@ static int    window_subscribe_op[MAX_WINDOWS]; /* notify_op (0 = none) */
 static int    window_cur_col[MAX_WINDOWS];      /* cursor col within cell grid */
 static int    window_cur_row[MAX_WINDOWS];      /* cursor row within cell grid */
 static unsigned char window_vec_color[MAX_WINDOWS]; /* current pen palette idx */
+/* Per-window TEXT pen (VEC_OP_TEXT_MOVE / _CHAR): content-relative position +
+ * selected font face.  Only the WM holds the proportional width tables, so it
+ * advances the pen per glyph — vec_text_char on the client just streams a
+ * codepoint and the pen walks forward here. */
+static int           window_text_x[MAX_WINDOWS];
+static int           window_text_y[MAX_WINDOWS];
+static unsigned char window_text_face[MAX_WINDOWS];
 
 /* Phase 60 step 11 — per-wid screen position + z-order.  The window
  * FB at WM_WINDOW_FB_BASE+(wid-1)*8 composites onto the screen FB
@@ -805,22 +812,24 @@ static int           window_title_lens[MAX_WINDOWS];
  * buffers with parallel offset arrays because the .word LABEL
  * path resolved to `DATA_BASE + offset_in_obj` at assemble time,
  * ignoring this .oro's actual placement in the linked image. */
-#define DESKTOP_MENU_N 5
+#define DESKTOP_MENU_N 6
 static const char *const desktop_menu_labels[DESKTOP_MENU_N] = {
 	"Shell",
 	"Edit",
 	"Mouse Paint",
 	"Menu Demo",
+	"Font Demo",
 	"Cancel",
 };
 static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
-	5, 4, 11, 9, 6,
+	5, 4, 11, 9, 9, 6,
 };
 static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
 	"/programs/shell.orx",
 	"/programs/edit.orx",
 	"/programs/mouse_paint.orx",
 	"/programs/menudemo.orx",
+	"/programs/font_demo.orx",
 	(const char *)0,         /* Cancel — dismiss, no spawn */
 };
 
@@ -4400,6 +4409,21 @@ vec_unpack_lo(int packed)
  * the same reason WSURF_GRID's clear sentinel is — no per-window
  * backing store yet (full-FB clear would also wipe console + grid
  * rendering).  Pending the per-window backing-store milestone. */
+/* Scratch byte for client glyph rendering — lives in boot DATA (O15) so
+ * win_draw_string can reach it the same way window_titles does.  The WM
+ * drains vector ops one at a time, so a single shared byte is race-free. */
+static unsigned char wm_text_scratch[2];
+
+/* Map a client font-face id (FONT_FACE_* in liborisc.h) to a baked face.
+ * Out-of-range falls back to the proportional Lucida face. */
+static const wm_font_t *
+text_face_lookup(int id)
+{
+	if (id == FONT_FACE_MONO)  return &font_lutRS;
+	if (id == FONT_FACE_GLYPH) return &font_olgl;
+	return &font_luRS;
+}
+
 static void
 forward_vector_write(int wid, int op, int packed1, int packed2)
 {
@@ -4425,6 +4449,37 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		       | (CELL_AREA_H_PX & 0xFFFF);
 		fill_rect_window(xy, wh, WM_BG_COLOR);
 		composite_content_area();
+		return;
+	}
+
+	if (op == VEC_OP_TEXT_MOVE) {
+		window_text_x[slot]    = vec_unpack_hi(packed1);
+		window_text_y[slot]    = vec_unpack_lo(packed1);
+		int f = packed2;
+		if (f < 0 || f > FONT_FACE_GLYPH) f = FONT_FACE_PROP;
+		window_text_face[slot] = (unsigned char)f;
+		return;
+	}
+	if (op == VEC_OP_TEXT_CHAR) {
+		const wm_font_t *face = text_face_lookup(window_text_face[slot]);
+		int cp  = packed1 & 0xFF;
+		int adv = font_advance(face, cp);
+		/* Content-relative pen -> absolute window-FB pixel: win_draw_string
+		 * takes absolute coords, unlike fb_blit_row's content-relative ones,
+		 * so add the content origin here to match the vec_* draw space. */
+		int ax = window_text_x[slot] + CONTENT_X_OFF_PX;
+		int ay = window_text_y[slot] + CONTENT_Y_OFF_PX;
+		wm_text_scratch[0] = (unsigned char)cp;
+		int pxy = ((ax & 0xFFFF) << 16) | (ay & 0xFFFF);
+		win_draw_string(face, pxy,
+		                font_shape(1, cur_vec_color, WM_BG_COLOR, 1),
+		                wm_text_scratch);
+		window_text_x[slot] += adv;
+		/* Composite only THIS glyph's box, not the whole content area — keeps
+		 * the per-char drain cheap so a long string can't back up the depth-64
+		 * vector queue (and gives the Markdown viewer a fast path). */
+		composite_window_region(ax, ay, adv > 0 ? adv : face->cell_w,
+		                        face->cell_h);
 		return;
 	}
 
