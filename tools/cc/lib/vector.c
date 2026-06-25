@@ -129,3 +129,34 @@ vec_set_color(int palette_idx)
 {
 	return _vec_send(VEC_OP_SET_COLOR, palette_idx, 0);
 }
+
+/* vec_text_move — position the per-surface text pen at pixel (x, y) and select
+ * a font face (FONT_FACE_*).  Subsequent vec_text_char draws advance the pen. */
+int
+vec_text_move(int face, int x, int y)
+{
+	return _vec_send(VEC_OP_TEXT_MOVE, _vec_pack(x, y), face);
+}
+
+/* vec_text_char — draw one glyph `c` at the text pen in the current pen color
+ * (vec_set_color), transparently, then advance the pen by the glyph's width.
+ * Only the WM knows the proportional advance, so it advances the pen for us. */
+int
+vec_text_char(int c)
+{
+	return _vec_send(VEC_OP_TEXT_CHAR, c & 0xFF, 0);
+}
+
+/* vec_text — convenience: move the pen to (x, y) in `face`, then stream the
+ * whole NUL-terminated string.  Color is whatever vec_set_color last set.
+ * (One SEND per glyph for now — fine for labels/specimens; a batched path can
+ * land later behind this same API when the Markdown viewer needs throughput.) */
+int
+vec_text(int face, int x, int y, const char *s)
+{
+	if (vec_text_move(face, x, y) != 0)
+		return -1;
+	while (*s)
+		vec_text_char((unsigned char)*s++);
+	return 0;
+}
