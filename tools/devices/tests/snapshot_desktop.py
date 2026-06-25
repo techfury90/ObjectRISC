@@ -50,11 +50,16 @@ CELL_AREA_H_PX = 8 * CELL_H
 
 # NEW olwm title-bar geometry (the "after").
 TITLE_BAR_PX = 24
+TITLE_INSET = 3                                        # top gap: border -> float (3px)
+TITLE_INNER_PX = 16                                    # float height (bottom gap = 5px)
 TITLE_Y_OFF_PX = BORDER_LINE_PX                        # 2 (flush under border)
-MENU_BTN_W = TITLE_BAR_PX                              # 24 (title-bar-height square)
-TITLE_TEXT_Y_OFF_PX = TITLE_Y_OFF_PX + (TITLE_BAR_PX - CELL_H) // 2   # 6
-OL_MENU_MARK_CP = 22                                   # olgl ▽ menu mark
-OL_MENU_MARK_W, OL_MENU_MARK_H = 16, 15                # ink box (top-left of 47x47 cell)
+MENU_BTN_W = TITLE_INNER_PX                            # 16 (floating square)
+TITLE_BAR_X = 5                                        # bar/stripe/separator left edge
+MENU_BTN_X = 14                                        # menu button left edge (on stripe)
+TITLE_BAR_W = USABLE_W_PX - 2 * TITLE_BAR_X                           # 646 (symmetric)
+TITLE_TEXT_Y_OFF_PX = TITLE_Y_OFF_PX + TITLE_INSET + (TITLE_INNER_PX - CELL_H) // 2  # 5
+OL_MM_UL, OL_MM_LR, OL_MM_FILL = 45, 46, 47            # olgl ▽ mark layers (UL/LR/fill)
+OL_MENU_MARK_W, OL_MENU_MARK_H = 7, 7                  # 7x7 engraved mark
 BEVEL_RAISED, BEVEL_FILL = 0x01, 0x02
 
 # PRIOR flat title-bar geometry (the "before" contrast image).
@@ -144,8 +149,8 @@ class Scene:
         """Mirror oriscwm.c draw_bevel_box: RAISED = White TL / BG1 face /
         BG3 BR; PRESSED = BG3 TL / BG2 face / White BR.  BEVEL_FILL fills
         the face first; the BR (shadow) edges are drawn last so they win
-        the shared corners.  2px edges."""
-        e = 2
+        the shared corners.  1px chisel edges."""
+        e = 1
         raised = mode & BEVEL_RAISED
         hi = WHITE_I if raised else BG3        # top-left edge
         lo = BG3 if raised else WHITE_I        # bottom-right edge
@@ -168,13 +173,15 @@ class Scene:
         c.set_gpr(6, 0); c.set_gpr(7, 0)
         sim.primitive_ObjBlitGlyphs(c)
 
-    def draw_menu_mark(self, x, y, fg, bg):
-        # olgl ▽ menu mark (cp 22), EXTENDED transparent blit
-        c = self._cpu(font_idx=self.F_OLGL, text=bytes([OL_MENU_MARK_CP]))
-        c.set_gpr(4, ((x & 0xFFFF) << 16) | (y & 0xFFFF))
-        c.set_gpr(5, 0x80000000 | 0x40000000 | (1 << 16) | (fg << 8) | bg)
-        c.set_gpr(6, 0); c.set_gpr(7, 0)
-        sim.primitive_ObjBlitGlyphs(c)
+    def draw_menu_mark(self, x, y):
+        # olgl ▽ menu mark — 3 engraved layers (UL=BG3, LR=white, fill=BG2),
+        # each an EXTENDED transparent blit (olgx_draw_menu_mark's 3D recipe).
+        for cp, fg in ((OL_MM_UL, BG3), (OL_MM_LR, WHITE_I), (OL_MM_FILL, BG2)):
+            c = self._cpu(font_idx=self.F_OLGL, text=bytes([cp]))
+            c.set_gpr(4, ((x & 0xFFFF) << 16) | (y & 0xFFFF))
+            c.set_gpr(5, 0x80000000 | 0x40000000 | (1 << 16) | (fg << 8) | BG1)
+            c.set_gpr(6, 0); c.set_gpr(7, 0)
+            sim.primitive_ObjBlitGlyphs(c)
 
     def draw_cells(self, cell_x, cell_y, text, fg, bg):
         # legacy 8x16 mono via the lutRS bitmap region
@@ -225,22 +232,22 @@ class Scene:
         window-menu button (▽) at the left, recessed focus stripe (focused)
         vs flat BG1 (unfocused), 1px black separator below, no "[X]"."""
         self._face_content_body(wx, wy, body_lines)
-        # Bar base: flat BG1 for both focus states.
-        self.fill(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX,
-                  CELL_AREA_W_PX, TITLE_BAR_PX, BG1)
-        span_x = wx + TITLE_X_OFF_PX + MENU_BTN_W
-        span_w = CELL_AREA_W_PX - MENU_BTN_W
-        # Focused: recessed stripe (PRESSED bevel) across the title-text area.
+        inner_y = wy + TITLE_Y_OFF_PX + TITLE_INSET
+        # Bar base: flat BG1 (both states), spans (TITLE_BAR_X, TITLE_BAR_W).
+        self.fill(wx + TITLE_BAR_X, wy + TITLE_Y_OFF_PX, TITLE_BAR_W, TITLE_BAR_PX, BG1)
+        # Focused: recessed stripe spanning the WHOLE bar (button paints over it).
         if focused:
-            self.draw_bevel_box(span_x, wy + TITLE_Y_OFF_PX, span_w, TITLE_BAR_PX,
-                                BEVEL_FILL)
-        # Raised window-menu button + ▽ glyph, on top, at the left.
-        self.draw_bevel_box(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX,
-                            MENU_BTN_W, TITLE_BAR_PX, BEVEL_RAISED | BEVEL_FILL)
-        gx = wx + TITLE_X_OFF_PX + (MENU_BTN_W - OL_MENU_MARK_W) // 2
-        gy = wy + TITLE_Y_OFF_PX + (TITLE_BAR_PX - OL_MENU_MARK_H) // 2
-        self.draw_menu_mark(gx, gy, BLACK, BG1)
+            self.draw_bevel_box(wx + TITLE_BAR_X, inner_y, TITLE_BAR_W,
+                                TITLE_INNER_PX, BEVEL_FILL)
+        # Raised menu button ON TOP at MENU_BTN_X + ▽ engraved mark.
+        self.draw_bevel_box(wx + MENU_BTN_X, inner_y,
+                            MENU_BTN_W, TITLE_INNER_PX, BEVEL_RAISED | BEVEL_FILL)
+        gx = wx + MENU_BTN_X + (MENU_BTN_W - OL_MENU_MARK_W) // 2
+        gy = inner_y + (TITLE_INNER_PX - OL_MENU_MARK_H) // 2
+        self.draw_menu_mark(gx, gy)
         # Title text centred in the span right of the button, v-centred.
+        span_x = wx + MENU_BTN_X + MENU_BTN_W + TITLE_INSET
+        span_w = (TITLE_BAR_X + TITLE_BAR_W) - MENU_BTN_X - MENU_BTN_W - 2 * TITLE_INSET
         tb = title.encode()
         tpx = 0; n = 0
         while n < len(tb) and tpx + self.adv_luRS(tb[n]) <= span_w:
@@ -249,8 +256,8 @@ class Scene:
         text_bg = BG2 if focused else BG1
         self.draw_title(sx, wy + TITLE_TEXT_Y_OFF_PX, tb[:n], BLACK, text_bg)
         # 1px black separator directly below the bar.
-        self.fill(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX + TITLE_BAR_PX,
-                  CELL_AREA_W_PX, 1, BLACK)
+        self.fill(wx + TITLE_BAR_X, wy + TITLE_Y_OFF_PX + TITLE_BAR_PX,
+                  TITLE_BAR_W, 1, BLACK)
         self._flat_border(wx, wy)
 
     def save(self, path):
@@ -282,42 +289,53 @@ if __name__ == "__main__":
     s = render(True, "/tmp/orisc-desktop-after.ppm")  # OPEN LOOK olwm title bars
 
     # --- Pixel-check the AFTER (olwm) geometry + focus model ---------------
-    # Focused window wx=40 wy=40: border y40-41, bar y42-65, separator y66,
-    # BG1 pad y67-71, content y72+.  Menu button x48-71, title span x72-687.
+    # Focused window wx=40 wy=40 (window-origin = screen(40,40)): border y40-41,
+    # bar y42-65, button+stripe float y45-60 (3px top gap), separator y66.  In
+    # window-x: stripe/bar start at TITLE_BAR_X=5 (screen 45); the menu button
+    # sits ON TOP at MENU_BTN_X=14 (screen 54), x14-29 (screen 54-69).
     BG1c, BG2c, BG3c = (204, 204, 204), (184, 184, 184), (102, 102, 102)
     WHITEc, BLACKc, BLUEc, NAVYc = (245, 245, 245), (0, 0, 0), \
         (64, 160, 192), (10, 10, 20)
     checks = [
         ("workspace",                     s.px(10, 10),  BLUEc),
-        ("window face (left ring pad)",   s.px(44, 100), BG1c),
-        # flat 2px black border, title bar flush under it (y42 = bar, not pad)
+        ("window face (left ring pad)",   s.px(43, 100), BG1c),
+        # flat 2px black border, title bar flush under it
         ("border top px0",                s.px(300, 40), BLACKc),
         ("border top px1",                s.px(300, 41), BLACKc),
         ("border left px0",               s.px(40, 120), BLACKc),
         ("border left px1",               s.px(41, 120), BLACKc),
-        # focused: recessed stripe — BG3 top / BG2 face / white bottom
-        ("focused stripe top edge (BG3)", s.px(680, 42), BG3c),
-        ("focused stripe top edge px1",   s.px(680, 43), BG3c),
-        ("focused stripe face (BG2)",     s.px(680, 50), BG2c),
-        ("focused stripe bottom (white)", s.px(680, 64), WHITEc),
-        ("focused stripe bottom px1",     s.px(680, 65), WHITEc),
-        # raised menu button (White TL / BG1 face / BG3 BR), focused window
-        ("menu btn top edge (white)",     s.px(60, 42),  WHITEc),
-        ("menu btn left edge (white)",    s.px(48, 55),  WHITEc),
-        ("menu btn face (BG1)",           s.px(50, 44),  BG1c),
-        ("menu btn shadow BR (BG3)",      s.px(70, 64),  BG3c),
-        ("menu mark ▽ ink (black)",       s.px(58, 46),  BLACKc),
-        # 1px black separator below the focused bar
+        # the stripe FLOATS: BG1 bar base shows above (y44) and below (y63) it
+        ("bar base above float (BG1)",    s.px(200, 44), BG1c),
+        ("bar base below float (BG1)",    s.px(200, 63), BG1c),
+        # stripe starts at wx5 (screen45): BG3 left edge, then BG2 face LEFT of
+        # the button (screen48 = wx8) — proves the stripe runs under the button
+        ("stripe left edge wx5 (BG3)",    s.px(45, 52),  BG3c),
+        ("stripe face left-of-btn (BG2)", s.px(48, 52),  BG2c),
+        # focused recessed stripe right of the button: BG3 top / BG2 / white bottom
+        ("focused stripe top edge (BG3)", s.px(200, 45), BG3c),
+        ("focused stripe face (BG2)",     s.px(200, 52), BG2c),
+        ("focused stripe bottom (white)", s.px(200, 60), WHITEc),
+        # SYMMETRIC right edge (focused window right border at screen x695 = wxmax):
+        # white stripe edge at wxmax-5, 3px BG1 pad, 2px black border
+        ("right border wxmax (black)",    s.px(695, 52), BLACKc),
+        ("right pad wxmax-2 (BG1)",       s.px(693, 52), BG1c),
+        ("stripe right edge wxmax-5 (wht)",s.px(690, 52), WHITEc),
+        ("stripe face wxmax-6 (BG2)",     s.px(689, 52), BG2c),
+        # raised menu button ON TOP at wx14 (screen54): White L / BG1 face / BG3 R
+        ("menu btn left edge wx14 (wht)", s.px(54, 52),  WHITEc),
+        ("menu btn face (BG1)",           s.px(56, 48),  BG1c),
+        ("menu btn right edge wx29 (BG3)",s.px(69, 52),  BG3c),
+        # 1px black separator below the bar (now spans from wx5)
         ("separator (black)",             s.px(300, 66), BLACKc),
+        ("separator left wx6 (black)",    s.px(46, 66),  BLACKc),
         # content still at y-offset 32: BG1 pad above, navy content at y72
         ("BG1 frame pad above content",   s.px(300, 70), BG1c),
         ("content navy at y32 offset",    s.px(300, 72), NAVYc),
-        # unfocused window wx=96 wy=300: flat BG1 bar (no stripe), menu btn,
-        # separator.  bar y302-325, separator y326, menu btn x104-127.
-        ("unfocused flat bar top (BG1)",  s.px(680, 302), BG1c),
-        ("unfocused flat bar face (BG1)", s.px(680, 310), BG1c),
-        ("unfocused menu btn (white)",    s.px(116, 302), WHITEc),
-        ("unfocused menu mark ▽ (black)", s.px(114, 306), BLACKc),
+        # unfocused window wx=96 wy=300: flat BG1 bar (NO stripe), button at wx14
+        # (screen 110).  bar y302-325, float y306-321, separator y326.
+        ("unfocused flat bar (BG1)",      s.px(300, 310), BG1c),
+        ("unfocused no stripe l-of-btn",  s.px(104, 312), BG1c),
+        ("unfocused menu btn (white)",    s.px(110, 312), WHITEc),
         ("unfocused separator (black)",   s.px(300, 326), BLACKc),
     ]
     for name, got, want in checks:
