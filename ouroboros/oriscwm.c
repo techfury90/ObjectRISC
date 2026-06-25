@@ -415,21 +415,38 @@
 #define CELL_ORIGIN_X   (CELL_W)         /* 8  — one cell column */
 #define CELL_ORIGIN_Y   (CELL_H)         /* 16 — one cell row */
 
-/* Palette indices (matching VEC_PALETTE in tools/devices/oriscterm). */
-#define WM_BG_COLOR  0    /* dark navy background */
-#define WM_FG_COLOR  1    /* light gray foreground */
-#define WM_BORDER_COLOR 1 /* same fg gray for the chrome line */
-/* Title bar uses inverse-video: bar bg = fg-gray, text = bg-navy. */
+/* Palette indices into simorisc's VEC_PALETTE_HEX (8-bit indexed FB).
+ * These are INDICES, not RGB — the RGB lives only in VEC_PALETTE_HEX;
+ * keep the two in sync.  Indices 1-8 are the dev accent ramp (mouse_paint
+ * cycles them); the OPEN LOOK gray-on-blue scheme lives at 9-14 (the
+ * palette PR — matched to the real OpenWindows 3 shot,
+ * docs/images/openwindows_ipx.png).
+ *
+ * The terminal body keeps its existing colors (WM_BG/FG) so the cell
+ * grid is untouched; only the chrome (workspace, frame, title) moves to
+ * the OPEN LOOK indices. */
+#define WM_BG_COLOR        0    /* terminal-body / window-content bg (navy) */
+#define WM_FG_COLOR        1    /* terminal-body text (light gray) */
+#define WM_WORKSPACE_COLOR 9    /* desktop background — OPEN LOOK blue #40a0c0 */
+#define WM_FACE_BG1        10   /* window face / unfocused title — BG1 #cccccc */
+#define WM_FACE_WHITE      11   /* olgx highlight / pane — White #f5f5f5 (bevel: next PR) */
+#define WM_FACE_BG2        12   /* olgx mid — BG2 #b8b8b8 (bevel: next PR) */
+#define WM_FACE_BG3        13   /* olgx shadow / frame outline — BG3 #666666 */
+#define WM_OL_WHITE        8    /* pure white #ffffff — focused title bar */
+#define WM_OL_BLACK        14   /* text / outlines #000000 */
+#define WM_BORDER_COLOR    WM_FACE_BG3  /* gray frame outline (flat; bevel next PR) */
+/* Title bar uses inverse-video: bar bg = fg-gray, text = bg-navy.
+ * (Vestigial — paint_title_bar uses the WM_TITLE_* indices below.) */
 #define WM_TITLE_BAR_BG WM_FG_COLOR
 #define WM_TITLE_BAR_FG WM_BG_COLOR
 
-/* Phase 60 step 22 — focus indicator.  The focused window's title
- * bar gets a brighter bar (palette 8 = bright white); unfocused
- * windows keep the dimmer gray (palette 1).  Text stays navy on
- * both so it reads at either brightness. */
-#define WM_TITLE_FOCUSED_BG    8   /* bright white — has keyboard focus */
-#define WM_TITLE_UNFOCUSED_BG  WM_FG_COLOR  /* gray — not focused */
-#define WM_TITLE_TEXT_FG       WM_BG_COLOR  /* navy text on either bar */
+/* Phase 60 step 22 — focus indicator.  The focused window's title bar
+ * is pure white (#ffffff); unfocused windows get the gray window face
+ * (BG1 #cccccc).  Text is black on both so it reads at either
+ * brightness.  This is the OPEN LOOK gray-on-blue chrome. */
+#define WM_TITLE_FOCUSED_BG    WM_OL_WHITE   /* #ffffff — has keyboard focus */
+#define WM_TITLE_UNFOCUSED_BG  WM_FACE_BG1   /* #cccccc — not focused */
+#define WM_TITLE_TEXT_FG       WM_OL_BLACK   /* black text on either bar */
 
 /* Phase 60 step 22 — close box.  A "[X]" affordance occupies the
  * rightmost CLOSE_BOX_CELLS cells of every window's title bar; a
@@ -1370,7 +1387,7 @@ recompose_after_destroy(int sx, int sy, int w, int h)
 {
 	int packed_xy = ((sx & 0xFFFF) << 16) | (sy & 0xFFFF);
 	int packed_wh = ((w  & 0xFFFF) << 16) | (h  & 0xFFFF);
-	fill_rect_packed(packed_xy, packed_wh, WM_BG_COLOR);
+	fill_rect_packed(packed_xy, packed_wh, WM_WORKSPACE_COLOR);
 	composite_screen_rect(sx, sy, w, h);
 	/* No screen chrome border to repaint — per-window borders are
 	 * inside each remaining window's FB and re-blitted as part of
@@ -1689,7 +1706,7 @@ paint_window_chrome(void)
 {
 	fill_rect_packed(((0 & 0xFFFF) << 16) | (0 & 0xFFFF),
 	                 ((FB_W & 0xFFFF) << 16) | (FB_H & 0xFFFF),
-	                 WM_BG_COLOR);
+	                 WM_WORKSPACE_COLOR);
 }
 
 /* Paint the four border lines INSIDE the active window's FB at the
@@ -1714,6 +1731,27 @@ paint_window_border(void)
 	fill_rect_window(bot_xy,   top_wh,  WM_BORDER_COLOR);
 	fill_rect_window(left_xy,  left_wh, WM_BORDER_COLOR);
 	fill_rect_window(right_xy, left_wh, WM_BORDER_COLOR);
+}
+
+/* Palette PR — paint the window's gray FACE (BG1) across the whole
+ * backing store, then restore the cell-content area to the terminal bg
+ * so the console interior is unchanged.  The title bar + border paint on
+ * top, giving the OPEN LOOK light-gray window frame on the blue
+ * workspace.  Flat fills only — the raised White/BG1/BG3 bevel is the
+ * next PR.  Called once at window creation (handle_new_window) before
+ * paint_title_bar; VEC/RST_OP_CLEAR only repaint the content area, so the
+ * face persists for the window's lifetime. */
+static void
+paint_window_face(void)
+{
+	int all_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
+	int all_wh = ((USABLE_W_PX & 0xFFFF) << 16) | (USABLE_H_PX & 0xFFFF);
+	fill_rect_window(all_xy, all_wh, WM_FACE_BG1);
+	int c_xy = ((CONTENT_X_OFF_PX & 0xFFFF) << 16)
+	         | (CONTENT_Y_OFF_PX & 0xFFFF);
+	int c_wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
+	         | (CELL_AREA_H_PX & 0xFFFF);
+	fill_rect_window(c_xy, c_wh, WM_BG_COLOR);
 }
 
 /* Phase 60 step 3 superseded subscribe_term_pointer (the
@@ -2499,6 +2537,11 @@ handle_new_window(int wtype)
 			repaint_title_bar(prev_focus);
 	}
 	set_active_window(wid);
+
+	/* Palette PR — lay down the gray window face first (the freshly
+	 * allocated FB is zero-filled = terminal bg); the title bar + border
+	 * paint on top of it. */
+	paint_window_face();
 
 	/* Phase 60 step 8 — paint the title bar so the window is visibly
 	 * framed from creation.  Title is initially empty; the client
@@ -4477,7 +4520,7 @@ recompose_full_screen(void)
 {
 	int packed_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
 	int packed_wh = ((FB_W & 0xFFFF) << 16) | (FB_H & 0xFFFF);
-	fill_rect_packed(packed_xy, packed_wh, WM_BG_COLOR);
+	fill_rect_packed(packed_xy, packed_wh, WM_WORKSPACE_COLOR);
 	composite_screen_rect(0, 0, FB_W, FB_H);
 }
 
@@ -4537,7 +4580,7 @@ erase_screen_rect(int sx, int sy, int w, int h)
 {
 	int packed_xy = ((sx & 0xFFFF) << 16) | (sy & 0xFFFF);
 	int packed_wh = ((w  & 0xFFFF) << 16) | (h  & 0xFFFF);
-	fill_rect_packed(packed_xy, packed_wh, WM_BG_COLOR);
+	fill_rect_packed(packed_xy, packed_wh, WM_WORKSPACE_COLOR);
 	composite_screen_rect(sx, sy, w, h);
 }
 
