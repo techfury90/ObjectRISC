@@ -49,12 +49,11 @@ USABLE_H_PX = (2 + 1 + 8) * CELL_H                     # short window: 8 content
 CELL_AREA_H_PX = 8 * CELL_H
 
 # Palette index schemes (must match simorisc VEC_PALETTE_HEX + oriscwm.c).
-NEW = dict(workspace=9, face=10, content=0, border=13,
-           title_focus=8, title_unfocus=10, title_text=14,
-           body_fg=1, body_bg=0)
-OLD = dict(workspace=0, face=0, content=0, border=1,
-           title_focus=8, title_unfocus=1, title_text=0,
-           body_fg=1, body_bg=0)
+# hi/sh = bevel highlight (White #f5f5f5) / shadow (BG3 #666666); edge px.
+BEVELED = dict(workspace=9, face=10, content=0, border=13,
+               title_focus=8, title_unfocus=10, title_text=14,
+               body_fg=1, body_bg=0, bevel=True, hi=11, sh=13, edge=2)
+FLAT = dict(BEVELED, bevel=False)        # the palette PR look (this PR's "before")
 
 
 def _desc(storage, type_tag=0, fb_w=0, fb_h=0):
@@ -109,6 +108,14 @@ class Scene:
         c.set_gpr(6, color)
         sim.primitive_ObjFillRect(c)
 
+    def bevel(self, x, y, w, h, hi, sh, e):
+        """Raised olgx bevel edges: hi (White) top+left, sh (BG3)
+        bottom+right; shadow drawn last so it wins the shared corners."""
+        self.fill(x, y, w, e, hi)              # top
+        self.fill(x, y, e, h, hi)              # left
+        self.fill(x, y + h - e, w, e, sh)      # bottom
+        self.fill(x + w - e, y, e, h, sh)      # right
+
     def adv_luRS(self, cp):
         gi = cp - 32
         return self.luRS[16 + gi] if 0 <= gi < 95 else 12
@@ -135,10 +142,14 @@ class Scene:
         self.fill(wx, wy, USABLE_W_PX, USABLE_H_PX, scheme["face"])
         self.fill(wx + CONTENT_X_OFF_PX, wy + CONTENT_Y_OFF_PX,
                   CELL_AREA_W_PX, CELL_AREA_H_PX, scheme["content"])
-        # title bar
+        # title bar: fill focus face, then (beveled) raised edges, then text
         bar_bg = scheme["title_focus"] if focused else scheme["title_unfocus"]
         self.fill(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX,
                   CELL_AREA_W_PX, TITLE_BAR_PX, bar_bg)
+        if scheme["bevel"]:
+            self.bevel(wx + TITLE_X_OFF_PX, wy + TITLE_Y_OFF_PX,
+                       CELL_AREA_W_PX, TITLE_BAR_PX,
+                       scheme["hi"], scheme["sh"], scheme["edge"])
         avail = (N_COLS - CLOSE_BOX_CELLS) * CELL_W
         tb = title.encode()
         tpx = 0; n = 0
@@ -154,12 +165,16 @@ class Scene:
             self.draw_cells((wx + CONTENT_X_OFF_PX) // CELL_W,
                             (wy + CONTENT_Y_OFF_PX) // CELL_H + i,
                             line.encode(), scheme["body_fg"], scheme["content"])
-        # border (flat BG3 lines)
-        b = scheme["border"]
-        self.fill(wx, wy, USABLE_W_PX, BORDER_LINE_PX, b)
-        self.fill(wx, wy + USABLE_H_PX - BORDER_LINE_PX, USABLE_W_PX, BORDER_LINE_PX, b)
-        self.fill(wx, wy, BORDER_LINE_PX, USABLE_H_PX, b)
-        self.fill(wx + USABLE_W_PX - BORDER_LINE_PX, wy, BORDER_LINE_PX, USABLE_H_PX, b)
+        # frame: raised bevel (this PR) or the palette PR's flat BG3 lines
+        if scheme["bevel"]:
+            self.bevel(wx, wy, USABLE_W_PX, USABLE_H_PX,
+                       scheme["hi"], scheme["sh"], scheme["edge"])
+        else:
+            b = scheme["border"]
+            self.fill(wx, wy, USABLE_W_PX, BORDER_LINE_PX, b)
+            self.fill(wx, wy + USABLE_H_PX - BORDER_LINE_PX, USABLE_W_PX, BORDER_LINE_PX, b)
+            self.fill(wx, wy, BORDER_LINE_PX, USABLE_H_PX, b)
+            self.fill(wx + USABLE_W_PX - BORDER_LINE_PX, wy, BORDER_LINE_PX, USABLE_H_PX, b)
 
     def save(self, path):
         lut = sim._build_palette_lut()
@@ -185,21 +200,29 @@ def render(scheme, path):
 
 
 if __name__ == "__main__":
-    render(OLD, "/tmp/orisc-desktop-before.ppm")
-    s = render(NEW, "/tmp/orisc-desktop-after.ppm")
-    # pixel-check the OPEN LOOK colors against the spec / reference.
-    # Focused window: wx=40 wy=40; border y/x[40,42); face margin; title
-    # bar y[56,72); content below.  Sample clear (non-text) spots.
-    ws = s.px(10, 10)               # workspace desktop
-    face = s.px(44, 46)             # left/top face margin (BG1)
-    titlebar = s.px(600, 62)        # focused title bar, right of the title text
-    border = s.px(40, 100)          # left border line
-    uf = s.px(600, 322)             # unfocused 'ps' title bar (wy=300 -> bar y[316,332))
-    assert ws == (64, 160, 192), f"workspace {ws} != #40a0c0"
-    assert titlebar == (255, 255, 255), f"focused title bar {titlebar} != #ffffff"
-    assert face == (204, 204, 204), f"window face {face} != #cccccc"
-    assert border == (102, 102, 102), f"border {border} != #666666"
-    assert uf == (204, 204, 204), f"unfocused title {uf} != #cccccc"
-    print("desktop colors OK: workspace=#40a0c0 titlebar=#ffffff "
-          "face=#cccccc border=#666666 unfocused-title=#cccccc")
-    print("wrote /tmp/orisc-desktop-before.ppm and /tmp/orisc-desktop-after.ppm")
+    render(FLAT, "/tmp/orisc-desktop-before.ppm")     # palette PR look (flat)
+    s = render(BEVELED, "/tmp/orisc-desktop-after.ppm")
+    # Pixel-check the raised bevel on the AFTER.  Focused window wx=40 wy=40,
+    # USABLE 656x176, edge 2px; unfocused 'ps' wx=96 wy=300.
+    WHITE, BG1, BG3, BLUE, OLW = (245, 245, 245), (204, 204, 204), \
+        (102, 102, 102), (64, 160, 192), (255, 255, 255)
+    checks = [
+        ("workspace",               s.px(10, 10),  BLUE),
+        ("window face",             s.px(50, 50),  BG1),
+        ("frame highlight (top)",   s.px(300, 40), WHITE),
+        ("frame highlight (left)",  s.px(40, 120), WHITE),
+        ("frame shadow (bottom)",   s.px(300, 214), BG3),
+        ("frame shadow (right)",    s.px(694, 120), BG3),
+        # focused (white) bar: highlight ~invisible, shadow still reads
+        ("focused title face",      s.px(300, 62), OLW),
+        ("focused title shadow",    s.px(300, 71), BG3),
+        # unfocused (BG1) bar: both bevel edges read
+        ("unfocused title face",    s.px(300, 322), BG1),
+        ("unfocused title highlight", s.px(300, 316), WHITE),
+        ("unfocused title shadow",  s.px(300, 331), BG3),
+    ]
+    for name, got, want in checks:
+        assert got == want, f"{name}: {got} != {want}"
+    print("bevel colors OK: " + "; ".join(f"{n}={g}" for n, g, _ in checks))
+    print("wrote /tmp/orisc-desktop-before.ppm (flat) and "
+          "/tmp/orisc-desktop-after.ppm (raised bevels)")
