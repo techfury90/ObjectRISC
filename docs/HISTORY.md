@@ -7077,6 +7077,94 @@ launching multiple windows stacks them with a 32-px cascade
 offset rather than perfectly overlapping; closing a window leaves
 the screen pixels beneath cleanly redrawn.
 
+## Phase 60 steps 15–22 — window-management chrome
+
+The remaining Phase-60 window-management steps, completing the
+"WM owns the screen" picture begun in step 11:
+
+- Per-window borders (step 15): a cell-aligned outer ring with a
+  crisp gray line at the outermost pixels of each window FB.
+- Outline-style dragging (steps 16–17): a title-bar grab tracks
+  the pointer with a 2-px outline rectangle drawn straight on the
+  screen FB; button-up snaps the window to the outline's position
+  (the window itself stays put during the drag).
+- The focus model (step 18): a `focused_wid` global plus
+  per-window subscriber tables. Keyboard/pointer events route to
+  the focused window; `set_focus` repaints the old + new title
+  bars; click-to-focus raises and focuses the topmost window under
+  the pointer; destroy auto-reverts focus to the new topmost.
+- The desktop root menu (step 19) and the title-bar close box
+  (later superseded by the OPEN LOOK window-menu button).
+
+## Phase 4 (object API) — the `obj.h` handle migration completes
+
+The v1 C compiler can't hold a capability *value* across a call,
+so cap-bearing libc state moved onto a handle-based object API:
+caps live in an 8-slot table in O12, programs hold opaque integer
+handles, and `obj_alloc` / `obj_derive` / `obj_send_*` /
+`obj_recv` wrap the underlying `#0x100`-family primitives. All the
+terminal-using clients were migrated — pointer, raster/keystone,
+term (keyboard path), vector, grid, host_io, wm, dir, and the
+supervisor — leaving only the OPRs that own the O12 table itself
+(`orx.c` / `task.c`) on raw object asm. The migration pattern and
+per-client status live in [`OBJECT_API.md`](OBJECT_API.md).
+
+## Phase 60 (olwm) — OPEN LOOK chrome
+
+The WM chrome was reworked to look like late-1980s OPEN LOOK
+(`olwm`), matched against a real OpenWindows 3 / SunOS 4.1.4
+screenshot (`docs/images/openwindows_ipx.png`). The arc:
+
+- Font manager: the extended `#0x10C ObjBlitGlyphs` mode (R5 bit
+  31 = self-describing, proportional, pixel-positioned,
+  optional-transparent; the legacy 8×16 cell path stays
+  byte-identical). Faces `font_luRS` (proportional title),
+  `font_lutRS` (mono body), and `font_olgl` (UI glyphs) are baked
+  from real OPEN LOOK / Lucida BDFs by `tools/gen_wm_font.py`,
+  carrying the Sun + Bigelow & Holmes copyright notices.
+- Palette: a solid `#40a0c0` workspace and a gray window color
+  group `{White, BG1, BG2, BG3}` *derived* from BG1 `#cccccc` by
+  the olgx HSV math (`olgx_color_group` in simorisc), at
+  `VEC_PALETTE_HEX` indices 8–14.
+- Bevels: `draw_bevel_box` paints the olgx 3-colour control bevel
+  (raised = White / BG1 / BG3; pressed = BG3 / BG2 / White; 1-px
+  edges), reserved for controls — never the frame.
+- The window frame became a flat 2-px black border (the olgx
+  bevel is for buttons, not the frame).
+- Title bars: a 24-px bar flush under the border; focus shown by a
+  recessed name-stripe (pressed bevel) on the focused window vs a
+  flat BG1 bar otherwise (the `drawHeaderBar3D` /
+  `drawHeaderNoFocus3D` model), with proportional Lucida Sans
+  titles centred in the bar.
+- The window-menu button: a raised beveled square with the 3-layer
+  engraved ▽ menu mark (olgl cps 45/46/47 = BG3/white/BG2),
+  replacing the close box. SELECT (left-click) currently destroys
+  the window — an interim stand-in for the real OPEN LOOK
+  iconify behaviour.
+
+## Phase 61 — the event-driven WM + spawn-load latency
+
+The WM main loop stopped timeout-polling. It now blocks on the new
+`WaitAnyQueue` firmware primitive (`#0x206`) — a pure readiness
+wait over a *set* of receive queues — refilling a fixed-layout
+wait-set OBJSTORE each iteration with every queue the WM owns (the
+main service queue, all per-window CONSOLE/GRID/VECTOR/RASTER
+queues, and the keyboard/pointer service + sink queues), then
+draining whatever is ready with non-blocking `ReceiveQueuePoll`s.
+A truly idle WM now parks the CPU and burns no instructions; any
+input or write wakes it with no `~100ms` floor, and `WM_POLL_TICKS`
+is retired.
+
+Paired with it, the spawn-load latency that dominated program
+launch was cut: `orx.c` now reads each `.orx` section *directly
+into* its freshly-allocated code/data object via hostfsd
+`OBJ_WRITE` (no map-and-`memcpy`), moving up to `ORX_READ_CHUNK`
+= 64 KiB per request instead of 1 KiB; and `oriscbar` gained
+write-side backpressure (per-connection `outbuf` flushed on
+`EVENT_WRITE`) so a wire packet larger than the host socket buffer
+is delivered across several writes instead of silently dropped —
+which is what let the 64-KiB chunk size pay off.
+
 ## Where things stand now
 
 - 7 architecture volumes plus the integration contract, revised to
