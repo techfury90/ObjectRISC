@@ -356,9 +356,15 @@
  * and paint_title_bar). */
 #define TITLE_BAR_CELLS 1
 #define TITLE_BAR_PX    24
-/* Window-menu button: a title-bar-height raised square at the bar's left
- * edge (the ▽ "abbreviated menu button" — paint_menu_button). */
-#define MENU_BTN_W      TITLE_BAR_PX
+/* The window-menu button and the focus stripe FLOAT inside the 24px bar, inset
+ * TITLE_INSET px from its top/bottom and from each other (matching the
+ * OpenWindows reference — they don't run edge-to-edge / full-height).  The
+ * floating inner height = TITLE_BAR_PX - 2*INSET. */
+#define TITLE_INSET     4
+#define TITLE_INNER_PX  (TITLE_BAR_PX - 2 * TITLE_INSET)   /* 16 */
+/* Window-menu button: a small raised square (TITLE_INNER_PX tall) floating at
+ * the bar's left, with the ▽ menu mark centred in it (paint_menu_button). */
+#define MENU_BTN_W      TITLE_INNER_PX
 
 /* Per-window border (Phase 60 step 15).  Each window FB has a
  * cell-aligned outer ring (1 cell wide on every side); inside that
@@ -473,16 +479,20 @@
 #define WM_TITLE_STRIPE_FACE   WM_FACE_BG2   /* recessed focus-stripe face (BG2) */
 #define WM_TITLE_TEXT_FG       WM_OL_BLACK   /* black title text */
 
-/* Window-menu button mark — the ▽ "abbreviated menu button" glyph in the
- * OPEN LOOK glyph font (olgl codepoint 22, font_olgl in wm_fonts_olgl.h),
- * rendered transparently in black and centred in the raised menu button
- * (paint_menu_button).  A left-click (SELECT) on the button destroys the
- * window — the interim behaviour inherited from the old "[X]" close box
- * (real OPEN LOOK SELECT iconifies).  The glyph's ink box is 16x15 px
- * anchored at the top-left of the 47x47 olgl cell. */
-#define OL_MENU_MARK_CP  22
-#define OL_MENU_MARK_W   16
-#define OL_MENU_MARK_H   15
+/* Window-menu button mark — the OPEN LOOK ▽ vertical menu mark, drawn as the
+ * authentic 3-layer olgx glyph (olgx_draw_menu_mark, 3D path, ol_button.c): the
+ * UL edge (olgl cp 45) in BG3, the LR edge (cp 46) in white, the fill (cp 47) in
+ * BG2 — a 7x7 ENGRAVED ▽ centred on the raised button.  This replaces the
+ * whole-button cp 22 glyph (OLG_ABBREV_MENU_BUTTON), which is the 2D mono button
+ * sprite — drawing it on top of our draw_bevel_box double-drew the box.  A
+ * left-click (SELECT) destroys the window — interim behaviour from the old "[X]"
+ * (real OPEN LOOK SELECT iconifies).  All three layers are 7x7 anchored
+ * top-left in the olgl cell. */
+#define OL_MENU_MARK_UL_CP    45   /* ▽ upper-left edge  — drawn BG3   */
+#define OL_MENU_MARK_LR_CP    46   /* ▽ lower-right edge — drawn white */
+#define OL_MENU_MARK_FILL_CP  47   /* ▽ interior fill    — drawn BG2   */
+#define OL_MENU_MARK_W   7
+#define OL_MENU_MARK_H   7
 
 /* Title string storage — single window for v1, becomes per-wid when
  * multi-window lands.  Sized to the max title that fits the bar with
@@ -1499,7 +1509,7 @@ fill_rect_window(int packed_xy, int packed_wh, int color)
  *
  * 3-arg packed signature (pcc-orisc 5+-arg-call bug): packed_xy =
  * (x<<16)|y, packed_wh = (w<<16)|h, packed_mode = flag bits below. */
-#define BEVEL_EDGE_PX  2
+#define BEVEL_EDGE_PX  1        /* 1px chisel — matches the OpenWindows olgx look */
 #define BEVEL_RAISED   0x01     /* else pressed / recessed */
 #define BEVEL_FILL     0x02     /* fill the interior face before the edges */
 
@@ -1598,11 +1608,13 @@ blit_glyphs_screenfb(int packed_xy, int packed_shape, int font_off, int text_off
 	);
 }
 
-/* Window-menu mark text — a single byte (olgl codepoint 22, the ▽
- * "abbreviated menu button" glyph), in boot data so win_draw_string can
- * reach it via O15.  Rendered through the EXTENDED font-manager path with
- * font_olgl, not the legacy cell path. */
-static const unsigned char menu_mark_str[] = { OL_MENU_MARK_CP, 0 };
+/* Window-menu mark text — the three olgl ▽ menu-mark layers (UL/LR/fill), each
+ * a single byte in boot data so win_draw_string can reach it via O15.  Rendered
+ * through the EXTENDED font-manager path with font_olgl (not the legacy cell
+ * path), one transparent blit per layer in its olgx color (BG3/white/BG2). */
+static const unsigned char mm_ul_str[]   = { OL_MENU_MARK_UL_CP, 0 };
+static const unsigned char mm_lr_str[]   = { OL_MENU_MARK_LR_CP, 0 };
+static const unsigned char mm_fill_str[] = { OL_MENU_MARK_FILL_CP, 0 };
 
 /* EXTENDED proportional string blit into the ACTIVE window FB.  `font`
  * is a baked face (e.g. font_luRS); packed_xy is an absolute pixel
@@ -1638,12 +1650,13 @@ screen_blit_glyph_row(int packed_xy, const unsigned char *text,
 	blit_glyphs_screenfb(packed_xy, packed_shape, font_off, text_off);
 }
 
-/* OPEN LOOK window-menu button — a raised beveled square at the LEFT of
- * the title bar, on EVERY window (focus-independent), with the ▽ "menu
- * mark" glyph (olgl cp 22) centred in it.  The raised face is the olgx
- * RAISED bevel (White top-left / BG1 face / BG3 bottom-right) via
- * draw_bevel_box; the glyph renders transparently in black on top so only
- * its ink lands (the 47x47 olgl cell's empty area shows the button face).
+/* OPEN LOOK window-menu button — a small RAISED beveled square FLOATING at the
+ * LEFT of the title bar (inset TITLE_INSET px top/bottom), on EVERY window
+ * (focus-independent), with the ▽ menu mark centred in it.  The raised face is
+ * the olgx RAISED bevel (White top-left / BG1 face / BG3 bottom-right) via
+ * draw_bevel_box.  The mark is the authentic 3-layer engraved ▽: its UL edge
+ * (BG3), LR edge (white), and fill (BG2), each blit transparently so they
+ * composite on the BG1 face (olgx_draw_menu_mark's 3D recipe).
  *
  * SELECT (left-click) on the button destroys the window — see
  * point_in_menu_button / wm_handle_pointer.  Targets the ACTIVE window FB
@@ -1651,19 +1664,20 @@ screen_blit_glyph_row(int packed_xy, const unsigned char *text,
 static void
 paint_menu_button(void)
 {
-	int btn_xy = ((TITLE_X_OFF_PX & 0xFFFF) << 16)
-	           | (TITLE_Y_OFF_PX & 0xFFFF);
-	int btn_wh = ((MENU_BTN_W & 0xFFFF) << 16)
-	           | (TITLE_BAR_PX & 0xFFFF);
+	int bx = TITLE_X_OFF_PX;
+	int by = TITLE_Y_OFF_PX + TITLE_INSET;
+	int btn_xy = ((bx & 0xFFFF) << 16) | (by & 0xFFFF);
+	int btn_wh = ((MENU_BTN_W & 0xFFFF) << 16) | (TITLE_INNER_PX & 0xFFFF);
 	draw_bevel_box(btn_xy, btn_wh, BEVEL_RAISED | BEVEL_FILL);
 
-	/* Centre the 16x15 ▽ ink (anchored at the olgl cell's top-left) in
-	 * the MENU_BTN_W x TITLE_BAR_PX button. */
-	int gx = TITLE_X_OFF_PX + (MENU_BTN_W - OL_MENU_MARK_W) / 2;
-	int gy = TITLE_Y_OFF_PX + (TITLE_BAR_PX - OL_MENU_MARK_H) / 2;
-	int packed_xy = ((gx & 0xFFFF) << 16) | (gy & 0xFFFF);
-	int packed_shape = font_shape(1, WM_TITLE_TEXT_FG, WM_TITLE_BG, 1);
-	win_draw_string(&font_olgl, packed_xy, packed_shape, menu_mark_str);
+	/* Centre the 7x7 ▽ in the MENU_BTN_W x TITLE_INNER_PX button and blit the
+	 * three engraved layers (UL=BG3, LR=white, fill=BG2), transparently. */
+	int gx = bx + (MENU_BTN_W - OL_MENU_MARK_W) / 2;
+	int gy = by + (TITLE_INNER_PX - OL_MENU_MARK_H) / 2;
+	int gxy = ((gx & 0xFFFF) << 16) | (gy & 0xFFFF);
+	win_draw_string(&font_olgl, gxy, font_shape(1, WM_FACE_BG3,   WM_TITLE_BG, 1), mm_ul_str);
+	win_draw_string(&font_olgl, gxy, font_shape(1, WM_FACE_WHITE, WM_TITLE_BG, 1), mm_lr_str);
+	win_draw_string(&font_olgl, gxy, font_shape(1, WM_FACE_BG2,   WM_TITLE_BG, 1), mm_fill_str);
 }
 
 /* Phase 60 step 8 / OPEN LOOK olwm rework — paint the title bar at the top
@@ -1692,20 +1706,22 @@ paint_title_bar(void)
 	           | (TITLE_BAR_PX & 0xFFFF);
 	fill_rect_window(bar_xy, bar_wh, WM_TITLE_BG);
 
-	/* The title-text area is the bar span to the RIGHT of the menu
-	 * button; the title is centred within it. */
-	int span_x = TITLE_X_OFF_PX + MENU_BTN_W;
-	int span_w = CELL_AREA_W_PX - MENU_BTN_W;
+	/* The title-text area is the bar span to the RIGHT of the menu button,
+	 * inset by TITLE_INSET (a gap after the button + a matching right margin)
+	 * so the focus stripe floats like the reference; the title centres in it. */
+	int span_x = TITLE_X_OFF_PX + MENU_BTN_W + TITLE_INSET;
+	int span_w = CELL_AREA_W_PX - MENU_BTN_W - 2 * TITLE_INSET;
 
 	/* Focus indicator (olwm drawHeaderBar3D): the FOCUSED window gets a
 	 * RECESSED stripe across the title-text area — draw_bevel_box PRESSED
 	 * (BEVEL_FILL, no BEVEL_RAISED) = BG3 top-left / BG2 face / white
-	 * bottom-right.  Unfocused windows stay flat BG1. */
+	 * bottom-right.  Inset TITLE_INSET px top/bottom so it FLOATS in the bar
+	 * (a 16px band, not full height).  Unfocused windows stay flat BG1. */
 	if (focused) {
 		int stripe_xy = ((span_x & 0xFFFF) << 16)
-		              | (TITLE_Y_OFF_PX & 0xFFFF);
+		              | ((TITLE_Y_OFF_PX + TITLE_INSET) & 0xFFFF);
 		int stripe_wh = ((span_w & 0xFFFF) << 16)
-		              | (TITLE_BAR_PX & 0xFFFF);
+		              | (TITLE_INNER_PX & 0xFFFF);
 		draw_bevel_box(stripe_xy, stripe_wh, BEVEL_FILL);
 	}
 

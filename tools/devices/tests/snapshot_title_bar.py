@@ -47,9 +47,11 @@ USABLE_W_PX = (N_COLS + 2) * CELL_W         # 656
 TITLE_X_OFF_PX = CELL_W                      # 8
 TITLE_Y_OFF_PX = BORDER_LINE_PX             # 2 (flush under the 2px border)
 TITLE_TEXT_Y_OFF_PX = TITLE_Y_OFF_PX + (TITLE_BAR_PX - CELL_H) // 2   # 6
-MENU_BTN_W = TITLE_BAR_PX                    # 24
-OL_MENU_MARK_CP = 22
-OL_MENU_MARK_W, OL_MENU_MARK_H = 16, 15
+TITLE_INSET = 4                              # button + stripe float inset
+TITLE_INNER_PX = TITLE_BAR_PX - 2 * TITLE_INSET   # 16
+MENU_BTN_W = TITLE_INNER_PX                   # 16 (floating square)
+OL_MM_UL, OL_MM_LR, OL_MM_FILL = 45, 46, 47   # olgl ▽ mark layers (UL/LR/fill)
+OL_MENU_MARK_W, OL_MENU_MARK_H = 7, 7         # 7x7 engraved mark
 BEVEL_RAISED, BEVEL_FILL = 0x01, 0x02
 
 # palette indices
@@ -111,7 +113,7 @@ def main():
         sim.primitive_ObjFillRect(c)
 
     def bevel_box(x, y, w, h, mode):
-        e = 2
+        e = 1
         raised = mode & BEVEL_RAISED
         hi = WHITE_I if raised else BG3
         lo = BG3 if raised else WHITE_I
@@ -139,19 +141,22 @@ def main():
     # 1) Bar base: flat BG1, both focus states.
     fill(TITLE_X_OFF_PX, TITLE_Y_OFF_PX, CELL_AREA_W_PX, TITLE_BAR_PX, BG1)
 
-    span_x = TITLE_X_OFF_PX + MENU_BTN_W
-    span_w = CELL_AREA_W_PX - MENU_BTN_W
+    span_x = TITLE_X_OFF_PX + MENU_BTN_W + TITLE_INSET
+    span_w = CELL_AREA_W_PX - MENU_BTN_W - 2 * TITLE_INSET
+    inner_y = TITLE_Y_OFF_PX + TITLE_INSET
 
-    # 2) Focused: recessed stripe (PRESSED bevel) across the title-text area.
+    # 2) Focused: recessed stripe (PRESSED bevel) FLOATING in the title-text area.
     if focused:
-        bevel_box(span_x, TITLE_Y_OFF_PX, span_w, TITLE_BAR_PX, BEVEL_FILL)
+        bevel_box(span_x, inner_y, span_w, TITLE_INNER_PX, BEVEL_FILL)
 
-    # 3) Raised window-menu button + ▽ glyph (olgl cp 22).
-    bevel_box(TITLE_X_OFF_PX, TITLE_Y_OFF_PX, MENU_BTN_W, TITLE_BAR_PX,
+    # 3) Raised floating window-menu button + ▽ engraved mark (olgl 45/46/47 in
+    #    BG3/white/BG2, one transparent blit per layer).
+    bevel_box(TITLE_X_OFF_PX, inner_y, MENU_BTN_W, TITLE_INNER_PX,
               BEVEL_RAISED | BEVEL_FILL)
     gx = TITLE_X_OFF_PX + (MENU_BTN_W - OL_MENU_MARK_W) // 2
-    gy = TITLE_Y_OFF_PX + (TITLE_BAR_PX - OL_MENU_MARK_H) // 2
-    blit(F_OLGL, gx, gy, bytes([OL_MENU_MARK_CP]), WM_TITLE_TEXT_FG, BG1)
+    gy = inner_y + (TITLE_INNER_PX - OL_MENU_MARK_H) // 2
+    for cp, fg in ((OL_MM_UL, BG3), (OL_MM_LR, WHITE_I), (OL_MM_FILL, BG2)):
+        blit(F_OLGL, gx, gy, bytes([cp]), fg, BG1)
 
     # 4) Centre + draw the proportional title (extended ObjBlitGlyphs).
     tpx = 0; n = 0
