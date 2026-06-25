@@ -1445,6 +1445,59 @@ fill_rect_window(int packed_xy, int packed_wh, int color)
 	);
 }
 
+/* === OPEN LOOK 3D bevels ============================================
+ *
+ * The olgx 3-color bevel (libolgx ol_draw.c): every raised/recessed
+ * chrome element composites three colors from the window's gray group
+ * {White, BG1, BG2, BG3} (the palette PR).  RAISED = White highlight on
+ * the top + left edges, BG1 face, BG3 shadow on the bottom + right
+ * edges; PRESSED = inverted (BG3 top-left, BG2 face, White bottom-right).
+ * The shadow edges are drawn last so they win the top-right and
+ * bottom-left corners — the classic raised look.
+ *
+ * draw_bevel_box draws the four BEVEL_EDGE_PX-wide edges and, when the
+ * BEVEL_FILL bit is set, the interior face first.  Edges-only (no FILL)
+ * is the beveled FRAME form used for the window outline and the
+ * title-bar strip — their interiors are already painted (the gray
+ * window face; the focus-coded title bar), so the bevel only adds the
+ * highlight/shadow ring.  All fills go through fill_rect_window
+ * (#0x10D ObjFillRect) on the active window FB; a bevel is a handful of
+ * cheap edge fills.
+ *
+ * 3-arg packed signature (pcc-orisc 5+-arg-call bug): packed_xy =
+ * (x<<16)|y, packed_wh = (w<<16)|h, packed_mode = flag bits below. */
+#define BEVEL_EDGE_PX  2
+#define BEVEL_RAISED   0x01     /* else pressed / recessed */
+#define BEVEL_FILL     0x02     /* fill the interior face before the edges */
+
+static void
+draw_bevel_box(int packed_xy, int packed_wh, int packed_mode)
+{
+	int x = (packed_xy >> 16) & 0xFFFF;
+	int y =  packed_xy        & 0xFFFF;
+	int w = (packed_wh >> 16) & 0xFFFF;
+	int h =  packed_wh        & 0xFFFF;
+	int e = BEVEL_EDGE_PX;
+	int raised = packed_mode & BEVEL_RAISED;
+	int hi = raised ? WM_FACE_WHITE : WM_FACE_BG3;    /* top-left edge */
+	int lo = raised ? WM_FACE_BG3   : WM_FACE_WHITE;  /* bottom-right edge */
+
+	if (packed_mode & BEVEL_FILL) {
+		int face = raised ? WM_FACE_BG1 : WM_FACE_BG2;
+		fill_rect_window(packed_xy, packed_wh, face);
+	}
+	/* top + left highlight (for raised) */
+	fill_rect_window(((x & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((w & 0xFFFF) << 16) | (e & 0xFFFF), hi);
+	fill_rect_window(((x & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((e & 0xFFFF) << 16) | (h & 0xFFFF), hi);
+	/* bottom + right shadow (for raised) — last, so they win the corners */
+	fill_rect_window(((x & 0xFFFF) << 16) | ((y + h - e) & 0xFFFF),
+	                 ((w & 0xFFFF) << 16) | (e & 0xFFFF), lo);
+	fill_rect_window((((x + w - e) & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((e & 0xFFFF) << 16) | (h & 0xFFFF), lo);
+}
+
 /* === Centralized glyph-blit emitters ================================
  *
  * One ObjBlitGlyphs (#0x10C) firmware call, fully described by
@@ -1589,6 +1642,13 @@ paint_title_bar(void)
 	           | (TITLE_BAR_PX & 0xFFFF);
 	fill_rect_window(bar_xy, bar_wh, bar_bg);
 
+	/* Raised bevel around the title strip — consistent with the window
+	 * frame.  Drawn before the title text + close box so they sit on top.
+	 * On a focused (pure-white) bar the White highlight is ~invisible
+	 * against the white face (correct OPEN LOOK — don't "fix" it); the
+	 * BG3 shadow still reads.  On an unfocused (BG1) bar both edges read. */
+	draw_bevel_box(bar_xy, bar_wh, BEVEL_RAISED);
+
 	/* Title text — proportional Lucida Sans (font_luRS), absolute-pixel
 	 * positioned and centred in the span left of the close box.  This is
 	 * the OPEN LOOK chrome face: the font manager advances the pen per
@@ -1709,28 +1769,19 @@ paint_window_chrome(void)
 	                 WM_WORKSPACE_COLOR);
 }
 
-/* Paint the four border lines INSIDE the active window's FB at the
- * outermost pixels of the cell-aligned outer ring.  Called from
- * handle_new_window after the title bar; cheap (four fill_rects).
- * Borders are in window-local coords and target WM_ACTIVE_FB_SLOT
- * (same as paint_title_bar's fills). */
+/* Paint the window's outer frame as a RAISED OPEN LOOK bevel: White
+ * highlight on the top + left edges, BG3 shadow on the bottom + right,
+ * over the BG1 window face (already laid down by paint_window_face).  So
+ * the window reads as raised off the blue workspace — the big depth cue.
+ * Edges only (the interior is the face + content + title bar); called
+ * from handle_new_window after the title bar.  Window-local coords,
+ * targets WM_ACTIVE_FB_SLOT (same as paint_title_bar's fills). */
 static void
 paint_window_border(void)
 {
-	int wfb_w = USABLE_W_PX;
-	int wfb_h = USABLE_H_PX;
-	int top_xy  = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
-	int top_wh  = ((wfb_w & 0xFFFF) << 16) | (BORDER_LINE_PX & 0xFFFF);
-	int bot_xy  = ((0 & 0xFFFF) << 16)
-	            | ((wfb_h - BORDER_LINE_PX) & 0xFFFF);
-	int left_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
-	int left_wh = ((BORDER_LINE_PX & 0xFFFF) << 16) | (wfb_h & 0xFFFF);
-	int right_xy = (((wfb_w - BORDER_LINE_PX) & 0xFFFF) << 16)
-	             | (0 & 0xFFFF);
-	fill_rect_window(top_xy,   top_wh,  WM_BORDER_COLOR);
-	fill_rect_window(bot_xy,   top_wh,  WM_BORDER_COLOR);
-	fill_rect_window(left_xy,  left_wh, WM_BORDER_COLOR);
-	fill_rect_window(right_xy, left_wh, WM_BORDER_COLOR);
+	int all_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
+	int all_wh = ((USABLE_W_PX & 0xFFFF) << 16) | (USABLE_H_PX & 0xFFFF);
+	draw_bevel_box(all_xy, all_wh, BEVEL_RAISED);
 }
 
 /* Palette PR — paint the window's gray FACE (BG1) across the whole
