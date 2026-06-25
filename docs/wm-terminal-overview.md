@@ -837,6 +837,20 @@ self-describing `'WMF1'` font object via `_blit_glyphs_extended`
 ([`primitive_ObjBlitGlyphs`, `simorisc:3582`](../tools/sim/simorisc#L3582)). The
 spec side is [Vol VI §5.4, `0x10C`](SYSTEM_FIRMWARE_INTERFACE.md).
 
+**Client font service.** The three faces are no longer chrome-only — a program can
+draw proportional Lucida and OPEN LOOK glyphs into its own window through two vector
+ops, `VEC_OP_TEXT_MOVE` / `VEC_OP_TEXT_CHAR`
+([`forward_vector_write`, `oriscwm.c:4455`](../ouroboros/oriscwm.c#L4455)). The WM
+keeps a per-window text pen (`window_text_{x,y,face}[]`,
+[`oriscwm.c:744`](../ouroboros/oriscwm.c#L744)) and an id→face map (`text_face_lookup`,
+[`oriscwm.c:4420`](../ouroboros/oriscwm.c#L4420)): `TEXT_MOVE` sets the pen + face;
+`TEXT_CHAR` draws one glyph at the pen (via `win_draw_string` into a boot-DATA scratch
+byte) and advances by `font_advance` — only the WM holds the width tables, so it walks
+the pen and the client just streams codepoints. `TEXT_CHAR` composites only the
+**glyph's box** (`composite_window_region`, not the whole content area), so a full page
+of text can't back up the depth-64 vector queue. This is the path the Markdown viewer
+will render through; the client side is §9 `vector.c`.
+
 ---
 
 ## 9. The libc client APIs
@@ -902,6 +916,17 @@ is gone). Ops ([`liborisc.h:212-218`](../tools/cc/lib/liborisc.h#L212)): `LINE`=
 `SET_COLOR`=6. Coordinates packed as two signed-16 halves per word. Vector ops
 carry their whole payload in the int words, so this client is immune to the §7
 async-buffer pitfall.
+
+**Text — the client font service.** `vec_text(face, x, y, str)`
+([`liborisc.h:246`](../tools/cc/lib/liborisc.h#L246)) draws a string in a baked face at
+content-relative pixel `(x, y)` in the current pen colour; `vec_text_move` /
+`vec_text_char` are the underlying ops (`TEXT_MOVE`=7, `TEXT_CHAR`=8,
+[`liborisc.h:226`](../tools/cc/lib/liborisc.h#L226)). `face` is `FONT_FACE_PROP`
+(proportional Lucida `luRS`), `FONT_FACE_MONO` (mono `lutRS`), or `FONT_FACE_GLYPH`
+(OPEN LOOK `olgl`). The WM advances the pen per glyph (§8 *Font manager*), so the
+client streams one codepoint per `TEXT_CHAR`. Specimen:
+`ouroboros/programs/font_demo.c` (the desktop menu's **Font Demo**); wire test:
+`examples/cc/font_smoke.c`.
 
 ### `raster.c` — `RST_OP_*` blits
 
