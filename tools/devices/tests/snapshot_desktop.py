@@ -165,9 +165,16 @@ class Scene:
             self.draw_cells((wx + CONTENT_X_OFF_PX) // CELL_W,
                             (wy + CONTENT_Y_OFF_PX) // CELL_H + i,
                             line.encode(), scheme["body_fg"], scheme["content"])
-        # frame: raised bevel (this PR) or the palette PR's flat BG3 lines
+        # frame: a 1px BLACK window outline (OPEN LOOK "Black = window
+        # outlines") with the raised bevel inset just inside it; or the
+        # palette PR's flat BG3 lines for the non-bevel scheme.
         if scheme["bevel"]:
-            self.bevel(wx, wy, USABLE_W_PX, USABLE_H_PX,
+            blk = 14   # WM_OL_BLACK
+            self.fill(wx, wy, USABLE_W_PX, 1, blk)                       # top
+            self.fill(wx, wy + USABLE_H_PX - 1, USABLE_W_PX, 1, blk)     # bottom
+            self.fill(wx, wy, 1, USABLE_H_PX, blk)                       # left
+            self.fill(wx + USABLE_W_PX - 1, wy, 1, USABLE_H_PX, blk)     # right
+            self.bevel(wx + 1, wy + 1, USABLE_W_PX - 2, USABLE_H_PX - 2,
                        scheme["hi"], scheme["sh"], scheme["edge"])
         else:
             b = scheme["border"]
@@ -204,13 +211,19 @@ if __name__ == "__main__":
     s = render(BEVELED, "/tmp/orisc-desktop-after.ppm")
     # Pixel-check the raised bevel on the AFTER.  Focused window wx=40 wy=40,
     # USABLE 656x176, edge 2px; unfocused 'ps' wx=96 wy=300.
-    WHITE, BG1, BG3, BLUE, OLW = (245, 245, 245), (204, 204, 204), \
-        (102, 102, 102), (64, 160, 192), (255, 255, 255)
+    WHITE, BG1, BG3, BLUE, OLW, BLACK = (245, 245, 245), (204, 204, 204), \
+        (102, 102, 102), (64, 160, 192), (255, 255, 255), (0, 0, 0)
     checks = [
         ("workspace",               s.px(10, 10),  BLUE),
         ("window face",             s.px(50, 50),  BG1),
-        ("frame highlight (top)",   s.px(300, 40), WHITE),
-        ("frame highlight (left)",  s.px(40, 120), WHITE),
+        # 1px black window outline at the outermost edge
+        ("frame outline (top)",     s.px(300, 40),  BLACK),
+        ("frame outline (left)",    s.px(40, 120),  BLACK),
+        ("frame outline (bottom)",  s.px(300, 215), BLACK),
+        ("frame outline (right)",   s.px(695, 120), BLACK),
+        # raised bevel inset 1px inside the outline
+        ("frame highlight (top)",   s.px(300, 41),  WHITE),
+        ("frame highlight (left)",  s.px(41, 120),  WHITE),
         ("frame shadow (bottom)",   s.px(300, 214), BG3),
         ("frame shadow (right)",    s.px(694, 120), BG3),
         # focused (white) bar: highlight ~invisible, shadow still reads

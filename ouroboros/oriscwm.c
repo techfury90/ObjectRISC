@@ -1769,19 +1769,34 @@ paint_window_chrome(void)
 	                 WM_WORKSPACE_COLOR);
 }
 
-/* Paint the window's outer frame as a RAISED OPEN LOOK bevel: White
- * highlight on the top + left edges, BG3 shadow on the bottom + right,
- * over the BG1 window face (already laid down by paint_window_face).  So
- * the window reads as raised off the blue workspace — the big depth cue.
- * Edges only (the interior is the face + content + title bar); called
- * from handle_new_window after the title bar.  Window-local coords,
- * targets WM_ACTIVE_FB_SLOT (same as paint_title_bar's fills). */
+/* Paint the window's outer frame: a 1px BLACK outline at the very edge
+ * (OPEN LOOK spec — "Black = window outlines"; matches the real
+ * OpenWindows shot, docs/images/openwindows_ipx.png), with the RAISED
+ * bevel (White highlight top/left, BG3 shadow bottom/right, over the BG1
+ * face from paint_window_face) inset just inside it.  So the window reads
+ * as a black-outlined raised slab off the blue workspace, not a bare gray
+ * bevel.  Edges only (the interior is the face + content + title bar);
+ * called from handle_new_window after the title bar.  Window-local
+ * coords, targets WM_ACTIVE_FB_SLOT (same as paint_title_bar's fills). */
 static void
 paint_window_border(void)
 {
-	int all_xy = ((0 & 0xFFFF) << 16) | (0 & 0xFFFF);
-	int all_wh = ((USABLE_W_PX & 0xFFFF) << 16) | (USABLE_H_PX & 0xFFFF);
-	draw_bevel_box(all_xy, all_wh, BEVEL_RAISED);
+	int w = USABLE_W_PX, h = USABLE_H_PX;
+
+	/* 1px black outline around the outermost edge. */
+	fill_rect_window(((0 & 0xFFFF) << 16) | (0 & 0xFFFF),
+	                 ((w & 0xFFFF) << 16) | 1, WM_OL_BLACK);             /* top    */
+	fill_rect_window(((0 & 0xFFFF) << 16) | ((h - 1) & 0xFFFF),
+	                 ((w & 0xFFFF) << 16) | 1, WM_OL_BLACK);             /* bottom */
+	fill_rect_window(((0 & 0xFFFF) << 16) | (0 & 0xFFFF),
+	                 (1 << 16) | (h & 0xFFFF), WM_OL_BLACK);             /* left   */
+	fill_rect_window((((w - 1) & 0xFFFF) << 16) | (0 & 0xFFFF),
+	                 (1 << 16) | (h & 0xFFFF), WM_OL_BLACK);             /* right  */
+
+	/* Raised bevel inset 1px inside the black outline. */
+	draw_bevel_box((1 << 16) | 1,
+	               (((w - 2) & 0xFFFF) << 16) | ((h - 2) & 0xFFFF),
+	               BEVEL_RAISED);
 }
 
 /* Palette PR — paint the window's gray FACE (BG1) across the whole
