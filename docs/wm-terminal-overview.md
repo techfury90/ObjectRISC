@@ -52,7 +52,7 @@ Concretely, in a `make boot` system:
 - **Nothing is published under `/sys/term/<n>/*`.** The supervisor's attempt to
   walk `/sys/term/<procid>/{console,keyboard,grid}` is *expected to fail* and is
   a no-op; the supervisor separately establishes a WM session via `wm_init`
-  (details in [§9](#9-the-supervisors-role)).
+  (details in [§10](#10-the-supervisors-role)).
 
 Stale comments to distrust (non-exhaustive; each is flagged again in context):
 
@@ -281,7 +281,7 @@ irreducible wire every CPU needs to bootstrap directory walks.
 > `ouroboros/README.md`'s boot section are likewise pre-Phase-60.
 
 There is **no `make test` / no aggregating runner** for the device tests; see
-[§11](#11-testing--headless-input).
+[§12](#12-testing--headless-input).
 
 ### The boot-OR register contract
 
@@ -311,7 +311,7 @@ and `term_init` ([`term.c:9-21`](../tools/cc/lib/term.c#L9)) do this parking:
 | `O14` | boot **self-service** ref | `term_init` (from O4) |
 | `O15` | boot **data** ref | `task_init` / `term_init` (from O3) |
 
-For a **terminal-using program** (after the supervisor's WM handoff, [§9](#9-the-supervisors-role)),
+For a **terminal-using program** (after the supervisor's WM handoff, [§10](#10-the-supervisors-role)),
 the surface caps live in the boot service registers
 ([`term.c:11-16`](../tools/cc/lib/term.c#L11), [`grid.c:21-23`](../tools/cc/lib/grid.c#L21)):
 
@@ -340,7 +340,7 @@ language can't represent capability values, *all* cap-bearing per-window state
 lives in O12 objstore slots, not C globals
 ([`oriscwm.c:670-671`](../ouroboros/oriscwm.c#L670)); the C globals hold only
 plain ints (window type, cursor position, z-order, titles). `main()` is at
-[`oriscwm.c:4846`](../ouroboros/oriscwm.c#L4846).
+[`oriscwm.c:5384`](../ouroboros/oriscwm.c#L5384).
 
 ### Responsibilities
 
@@ -351,8 +351,9 @@ plain ints (window type, cursor position, z-order, titles). `main()` is at
 3. **Serve per-window surfaces** — a CONSOLE, GRID, VECTOR, and RASTER service
    object per window; clients SEND drawing requests to these.
 4. **Composite** every window's offscreen framebuffer onto the screen
-   framebuffer in z-order, draw chrome (title bar, border, close box), and run a
-   desktop menu + window dragging.
+   framebuffer in z-order, draw OPEN LOOK chrome (title bar with focus stripe +
+   window-menu button, flat black border — there is no close box; see
+   [§8](#8-open-look-chrome)), and run a desktop menu + window dragging.
 5. **Route input** to the focused window's keyboard/pointer subscriber.
 
 ### Local hardware ownership
@@ -378,21 +379,21 @@ Geometry constants: cells are `CELL_W=8 × CELL_H=16`; the screen FB is
 offscreen FB is `656×432` ([`oriscwm.c:318-374`](../ouroboros/oriscwm.c#L318)).
 The window table holds at most `MAX_WINDOWS=16` ([`oriscwm.c:556`](../ouroboros/oriscwm.c#L556)).
 
-### The main loop
+### The main loop (event-driven)
 
-The loop ([`oriscwm.c:4995-5033`](../ouroboros/oriscwm.c#L4995)) is:
+The loop ([`oriscwm.c:5544`](../ouroboros/oriscwm.c#L5544)) is **event-driven**
+(Phase 61). It is no longer a timeout poll; each iteration:
 
 ```c
 for (;;) {
-    int status = poll_one_request(&op, &wid_or_zero, &arg);   // ReceiveQueuePoll, ~100ms timeout
+    wm_block_until_ready();                     // WaitAnyQueue (#0x206): park until ANY queue is non-empty
+    int status = poll_one_request(&op, &wid_or_zero, &arg);   // ReceiveQueuePoll, timeout 0 (non-blocking)
     if (status == 0) {
         stash_reply_cap_o3();                  // save sender's reply mailbox (their O3)
-        switch (op) {                          // WM_OP_NEW_WINDOW / BIND_SURFACE / …
-            …  handle_new_window / handle_bind_surface / handle_destroy_window
-               handle_subscribe_events / handle_query_geometry / handle_set_title
-        }
+        if (op == WM_OP_NEW_WINDOW) …          // handle_new_window / handle_bind_surface / handle_destroy_window
+        …                                      // handle_subscribe_events / handle_query_geometry / handle_set_title
     } else {
-        scan_owner_exits();                    // timeout → auto-destroy windows whose owner exited
+        scan_owner_exits();                    // no service request this wake → auto-destroy windows whose owner exited
     }
     poll_window_consoles();   poll_window_grids();                // non-blocking drains,
     poll_window_vectors();    poll_window_rasters();              // each loops wid = 1..16
@@ -401,35 +402,90 @@ for (;;) {
 }
 ```
 
-So each iteration **blocks up to ~100ms (`WM_POLL_TICKS`) on the main control
-queue**, then **non-blocking-drains every per-window surface queue and both input
-sinks** (`ReceiveQueuePoll` with `timeout=0`,
-e.g. [`poll_window_consoles`, `oriscwm.c:3791`](../ouroboros/oriscwm.c#L3791)).
-The per-window polls iterate all 16 window slots, skipping freed ones.
+The key change from earlier phases is the **first line**.
+`wm_block_until_ready` ([`oriscwm.c:3433`](../ouroboros/oriscwm.c#L3433)) refills
+a fixed-layout *wait-set* OBJSTORE (allocated once at boot by `alloc_wait_set`
+[`oriscwm.c:3403`](../ouroboros/oriscwm.c#L3403)) with **every queue cap the WM
+owns** — the main service queue, all per-window CONSOLE/GRID/VECTOR/RASTER
+queues, and the keyboard/pointer service + input-sink queues — then `CALL #0x206`
+**WaitAnyQueue** ([`oriscwm.c:3536`](../ouroboros/oriscwm.c#L3536)) **parks the
+CPU until at least one of them is non-empty**. The refill is straight-line
+`OREFLD`/`OREFST` over fixed O12 offsets; empty/freed per-window slots copy
+through as null/stale refs that WaitAnyQueue skips, so the call always passes the
+full fixed count (`WM_WAITSET_COUNT = 69`, [`oriscwm.c:313`](../ouroboros/oriscwm.c#L313)).
 
-> **Stale comment.** The loop's doc comment ([`oriscwm.c:4982`](../ouroboros/oriscwm.c#L4982))
-> still says step 2 will "forward writes to the underlying terminal." It renders
-> locally.
+WaitAnyQueue is a pure *readiness* wait — it dequeues nothing. After it returns,
+the loop **non-blocking-drains** the main service queue
+(`poll_one_request`, [`oriscwm.c:3556`](../ouroboros/oriscwm.c#L3556)) and then
+every per-window surface queue and both input sinks with `ReceiveQueuePoll`
+`timeout=0` (e.g. [`poll_window_consoles`, `oriscwm.c:4287`](../ouroboros/oriscwm.c#L4287)).
+The per-window polls iterate all 16 window slots, skipping freed ones. If a
+backlog remains, WaitAnyQueue returns immediately on the next iteration (a queue
+is still non-empty), so the WM keeps draining without idling — work-driven, never
+busy-waiting.
+
+The practical effect: **a truly idle WM burns no instructions** (the firmware
+parks the CPU), and any keystroke, pointer event, surface write, or service
+request wakes it the instant it lands — no `~100ms` interactive-latency floor.
+The old timeout-poll constant `WM_POLL_TICKS` is **retired** (it survives only in
+explanatory comments). The auto-destroy owner-exit scan, which the old loop fired
+on each timeout, now fires on any wake that carried no service request
+([`scan_owner_exits`, `oriscwm.c:3345`](../ouroboros/oriscwm.c#L3345)).
+
+### Latency: idle WM + spawn-load batching
+
+The event-driven loop above is one half of the interactive-latency work; the
+other half is **spawn load**, which dominated the visible delay when launching a
+program (the `.orx` was streamed in tiny chunks over many serial cross-process
+round-trips). Two changes cut it:
+
+- **Direct-to-object reads.** `orx_read_into_slot`
+  ([`orx.c:327`](../tools/cc/lib/orx.c#L327)) adopts the freshly-`ObjAlloc`'d
+  code/data object into a handle and has `hostfsd` `OBJ_WRITE` the file bytes
+  **straight into its storage**, replacing the old "map at a temp VA, read into a
+  1 KiB stack buffer, `memcpy`" dance. Each request now moves up to
+  `ORX_READ_CHUNK = 0x10000` (**64 KiB**, [`orx.c:313`](../tools/cc/lib/orx.c#L313)),
+  so a section streams in a handful of round-trips instead of dozens.
+- **Crossbar write-side backpressure.** The 64 KiB chunk only helps because
+  `oriscbar` no longer **silently drops** wire packets larger than the host
+  socket buffer: each connection now queues overflow bytes in an `outbuf` and
+  flushes them on `EVENT_WRITE` ([`oriscbar:46-123`](../tools/sim/oriscbar#L46)),
+  so a large packet is delivered across several writes instead of lost (which
+  used to hang the receiver).
 
 ### Focus model
 
-`focused_wid` ([`oriscwm.c:972`](../ouroboros/oriscwm.c#L972)) is the window that
-receives keyboard input and into whose content area pointer events route.
+`focused_wid` ([`oriscwm.c:1145`](../ouroboros/oriscwm.c#L1145)) is the window
+that receives keyboard input and into whose content area pointer events route.
+
+Focus is shown the OPEN LOOK *olwm* way (the `drawHeaderBar3D` /
+`drawHeaderNoFocus3D` model): the **focused** window gets a **recessed name
+stripe** across its title bar, and **unfocused** windows show a **flat BG1** bar
+— *not* the old white-vs-gray brightness swap. The stripe rendering lives in
+[§8](#8-open-look-chrome); the mechanics below are unchanged:
 
 - **Set-on-create:** `handle_new_window` sets `focused_wid = wid` immediately
-  ([`oriscwm.c:2353`](../ouroboros/oriscwm.c#L2353)), so a freshly-spawned
-  program's subsequent keyboard subscribe lands in *its own* window slot.
+  ([`oriscwm.c:2685`](../ouroboros/oriscwm.c#L2685)), so a freshly-spawned
+  program's subsequent keyboard subscribe lands in *its own* window slot. (It
+  also repaints the previously-focused window first, so only one bar reads as
+  focused at a time.)
 - **Click-to-focus:** a left button-down hit-tests the topmost window at the
-  click point and raises it ([`wm_handle_pointer`, `oriscwm.c:4555-4583`](../ouroboros/oriscwm.c#L4555));
-  because forwarding always targets `focused_wid` and the raised window becomes
-  focused, the click moves focus. `set_focus` repaints both title bars
-  ([`oriscwm.c:983-991`](../ouroboros/oriscwm.c#L983)).
-- **Auto-revert:** destroying a window refocuses the new topmost
-  ([`oriscwm.c:1099-1107`](../ouroboros/oriscwm.c#L1099)).
+  click point and raises it ([`wm_handle_pointer` → `raise_window`,
+  `oriscwm.c:5065`](../ouroboros/oriscwm.c#L5065)); because forwarding always
+  targets `focused_wid` and the raised window becomes focused, the click moves
+  focus. `set_focus` ([`oriscwm.c:1157`](../ouroboros/oriscwm.c#L1157)) repaints
+  both the old and new title bars (`repaint_title_bar`,
+  [`oriscwm.c:1790`](../ouroboros/oriscwm.c#L1790)) so the stripe tracks focus.
+- **Auto-revert:** destroying a window refocuses the new topmost via
+  `refocus_to_topmost` ([`oriscwm.c:1272`](../ouroboros/oriscwm.c#L1272)), called
+  from both the close path ([`oriscwm.c:3111`](../ouroboros/oriscwm.c#L3111)) and
+  the owner-exit auto-destroy ([`oriscwm.c:3377`](../ouroboros/oriscwm.c#L3377)).
 - Both input polls early-return unless `focused_wid` is a live window, so input
   is gated by focus.
 
-Compositing is covered together with the output trace in [§7](#7-output-flow-end-to-end).
+Compositing is covered together with the output trace in
+[§7](#7-output-flow-end-to-end); the chrome it draws is detailed in
+[§8](#8-open-look-chrome).
 
 ---
 
@@ -554,7 +610,7 @@ A few details that make this concrete:
   so the WM cannot tell injected input from a real keypress
   ([`simorisc:1099-1102`](../tools/sim/simorisc#L1099)). The CPU is selected by
   the packet's `dst_pid`; `kind` selects keyboard vs pointer sink. See
-  [§11](#11-testing--headless-input).
+  [§12](#12-testing--headless-input).
 
 ---
 
@@ -605,9 +661,13 @@ rather than raw pixels:
 
 **Compositing.** Each window paints into its own **offscreen** FB; the WM then
 `ObjBlitCopy`-composites the dirty region of each window onto the **screen** FB
-in z-order (`composite_screen_rect` [`oriscwm.c:1224`](../ouroboros/oriscwm.c#L1224)),
-adding chrome (title bar, border, close box) and the desktop menu when active.
-There is no explicit "present" call — because the screen FB was allocated
+in z-order (`composite_screen_rect` [`oriscwm.c:1397`](../ouroboros/oriscwm.c#L1397)),
+adding OPEN LOOK chrome and the desktop menu when active. At window creation
+(`handle_new_window`) the chrome paints in order **`paint_window_face` →
+`paint_title_bar` (focus stripe + menu button + title) → `paint_window_border`**
+([`oriscwm.c:2694`](../ouroboros/oriscwm.c#L2694)) — the full palette, bevel, and
+title-bar anatomy are detailed in [§8](#8-open-look-chrome). There is no explicit
+"present" call — because the screen FB was allocated
 non-offscreen, every `ObjBlitCopy` into it is mirrored to the Tk window by the
 host display worker with no wire round-trip ([`oriscwm.c:872-880`](../ouroboros/oriscwm.c#L872)).
 
@@ -638,7 +698,148 @@ host display worker with no wire round-trip ([`oriscwm.c:872-880`](../ouroboros/
 
 ---
 
-## 8. The libc client APIs
+## 8. OPEN LOOK chrome
+
+The window frames, title bars, and workspace are rendered to look like
+late-1980s **OPEN LOOK** (the Sun/AT&T `olwm` look). The reference is a
+ground-truth OpenWindows 3 / SunOS 4.1.4 screenshot kept in the repo at
+[`docs/images/openwindows_ipx.png`](images/openwindows_ipx.png); the palette and
+3-D math below were matched against it.
+
+> **Provenance (stated factually).** The chrome reuses real OPEN LOOK font and
+> glyph assets. The generated font headers carry the upstream copyright notices —
+> *"(c) 1989 Sun Microsystems"* and *"(c) 1985, 1986 Bigelow & Holmes; Lucida is
+> a B&H trademark"* — and point at the project `NOTICE`
+> ([`wm_fonts.h:1-11`](../ouroboros/wm_fonts.h#L1)). This document only records
+> that those notices are carried in the code and docs; it makes no legal claim.
+
+### Palette / the gray color group
+
+The 8-bit indexed framebuffer holds one palette index per pixel; the chrome uses
+indices **8–14**, defined as `WM_*` constants in
+[`oriscwm.c:466-477`](../ouroboros/oriscwm.c#L466) and given RGB in simorisc's
+`VEC_PALETTE_HEX` ([`simorisc:2292`](../tools/sim/simorisc#L2292)). The OPEN LOOK
+window face is a *gray color group* `{White, BG1, BG2, BG3}` **derived** from a
+single base face color BG1 `#cccccc` by the olgx HSV algorithm
+(`olgx_color_group`, [`simorisc:2241`](../tools/sim/simorisc#L2241) — from base
+value V: White = V·1.2, BG2 = V·0.9, BG3 = V·0.5, with a 40% value floor). For a
+gray (zero-saturation) BG1 this reduces to plain RGB scaling, reproducing the
+grays sampled from the reference shot exactly.
+
+| Idx | `WM_*` constant | RGB | Role |
+|-----|-----------------|-----|------|
+| 8  | `WM_OL_WHITE`    | `#ffffff` | pure white (dev-ramp top; not used by the title bar since the olwm focus rework) |
+| 9  | `WM_WORKSPACE_COLOR` | `#40a0c0` | desktop workspace (bright cyan-blue) |
+| 10 | `WM_FACE_BG1`    | `#cccccc` | window face / unfocused title bar (group base) |
+| 11 | `WM_FACE_WHITE`  | `#f5f5f5` | olgx highlight / content pane (= V·1.2) |
+| 12 | `WM_FACE_BG2`    | `#b8b8b8` | olgx bevel mid / focus-stripe face (= V·0.9) |
+| 13 | `WM_FACE_BG3`    | `#666666` | olgx shadow / frame outline (= V·0.5) |
+| 14 | `WM_OL_BLACK`    | `#000000` | text, window border, separators |
+
+The workspace is a solid fill of `WM_WORKSPACE_COLOR` across the whole screen FB
+(`paint_window_chrome`, [`oriscwm.c:1853`](../ouroboros/oriscwm.c#L1853)); the
+terminal *content* area keeps its existing navy/gray (`WM_BG_COLOR` /
+`WM_FG_COLOR`), so only the chrome moved to the OPEN LOOK indices.
+
+### The olgx 3-colour bevel
+
+`draw_bevel_box(packed_xy, packed_wh, packed_mode)`
+([`oriscwm.c:1533`](../ouroboros/oriscwm.c#L1533)) is the one olgx control bevel.
+It paints `BEVEL_EDGE_PX = 1`-pixel edges (and, when `BEVEL_FILL` is set, the
+interior face first) in two modes:
+
+- **Raised** (`BEVEL_RAISED`): **White** top-left edges, **BG1** face, **BG3**
+  bottom-right edges.
+- **Pressed / recessed** (no `BEVEL_RAISED`): **BG3** top-left, **BG2** face,
+  **White** bottom-right — the inverse.
+
+The bottom/right shadow edges paint last so they win the corners. Bevels are
+reserved for *controls* (the window-menu button; the recessed focus stripe);
+the window frame and title-bar base are deliberately flat.
+
+### Title-bar anatomy
+
+Each window's 656×432 backing store devotes its top 32 px of chrome to (top to
+bottom): a **flat 2 px black window border** line, the **24 px title bar** flush
+beneath it, a **1 px black separator**, then 5 px of BG1 frame pad before the
+cell content. The border is painted by `paint_window_border`
+([`oriscwm.c:1870`](../ouroboros/oriscwm.c#L1870)) — a solid
+`BORDER_LINE_PX = 2` black outline (idx `WM_OL_BLACK`), *not* a 3-D bevel,
+matching `olwm`, which beveled controls but never the frame. The bar itself is
+painted by `paint_title_bar` ([`oriscwm.c:1712`](../ouroboros/oriscwm.c#L1712)):
+
+1. **Bar base** — a flat `WM_FACE_BG1` fill spanning the bar, for *both* focus
+   states (`drawHeaderNoFocus3D`).
+2. **Focus stripe** — the **focused** window only gets a **recessed name
+   stripe** spanning the bar, drawn with `draw_bevel_box` in pressed mode
+   (`BEVEL_FILL`, no `BEVEL_RAISED`) = BG3 top-left / BG2 face / White
+   bottom-right (`drawHeaderBar3D`, [`oriscwm.c:1730`](../ouroboros/oriscwm.c#L1730)).
+   Unfocused windows stay flat BG1. (This is the visual half of the focus model
+   in [§4](#4-the-window-manager-oriscwmc).)
+3. **Window-menu button** — a small **raised** beveled square floating at the
+   bar's left, painted *on top of* the stripe by `paint_menu_button`
+   ([`oriscwm.c:1681`](../ouroboros/oriscwm.c#L1681)). Centred in it is the
+   3-layer engraved **▽** menu mark, rendered as three transparent `font_olgl`
+   glyphs in their olgx colors — upper-left edge (olgl cp 45) in **BG3**,
+   lower-right edge (cp 46) in **white**, fill (cp 47) in **BG2**
+   (`OL_MENU_MARK_*_CP`, [`oriscwm.c:507`](../ouroboros/oriscwm.c#L507)).
+4. **Title text** — proportional Lucida Sans (`font_luRS`), absolute-pixel
+   positioned and centred in the span to the right of the menu button, blitted
+   transparently so the stripe/face shows through the glyph gaps.
+5. **Separator** — a 1 px black line directly below the bar.
+
+Geometry constants ([`oriscwm.c:357-447`](../ouroboros/oriscwm.c#L357)):
+`TITLE_BAR_PX = 24`; the bar is flush under the border (`TITLE_Y_OFF_PX = 2`);
+`TITLE_BAR_X = 5` is the stripe/base/separator left edge and the bar spans
+**symmetrically** with `TITLE_BAR_W = USABLE_W_PX - 2*TITLE_BAR_X` (= 646);
+`MENU_BTN_X = 14` puts the button on top of the stripe; the button and stripe
+**float** inside the 24 px bar at `TITLE_INSET = 3` px below the top and
+`TITLE_INNER_PX = 16` px tall (so the bottom gap is 24−3−16 = 5 px, a touch
+high, matching the reference); `MENU_BTN_W = TITLE_INNER_PX = 16`.
+
+> **Interim behaviour.** A left-click (SELECT) on the window-menu button
+> currently **destroys the window** (`point_in_menu_button`,
+> [`oriscwm.c:4770`](../ouroboros/oriscwm.c#L4770) → `window_teardown`,
+> [`oriscwm.c:5062`](../ouroboros/oriscwm.c#L5062)) — a stand-in for the real
+> OPEN LOOK SELECT-iconifies behaviour, which is future work. It replaced the
+> older rightmost-cells close box (there is no close box now).
+
+### Font manager
+
+The terminal *body* renders through the embedded `font_8x16` cell array on the
+**legacy** `ObjBlitGlyphs` path (unchanged, byte-identical). *Chrome* renders
+through a small **font manager**: a self-describing font face (`wm_font_t`,
+[`oriscwm.c:666`](../ouroboros/oriscwm.c#L666)) plus `win_draw_string`
+([`oriscwm.c:1644`](../ouroboros/oriscwm.c#L1644)), on the **extended**
+`ObjBlitGlyphs` path — proportional advance, absolute-pixel positioning, optional
+transparent background. One firmware call still renders a whole string;
+`font_measure` / `font_advance` ([`oriscwm.c:698`](../ouroboros/oriscwm.c#L698))
+read the same width table the firmware reads, so measuring (to centre a title)
+and rendering can never disagree.
+
+Three faces are baked by `tools/gen_wm_font.py --face` and `#include`d
+([`oriscwm.c:678`](../ouroboros/oriscwm.c#L678)):
+
+- **`font_luRS`** — proportional Lucida Sans, the **title** face
+  ([`wm_fonts.h:159`](../ouroboros/wm_fonts.h#L159)).
+- **`font_lutRS`** — mono Lucida Typewriter, the **body** face
+  ([`wm_fonts.h:246`](../ouroboros/wm_fonts.h#L246)). Baked and available; the
+  terminal cell grid still renders body text through the embedded `font_8x16`,
+  so this face is not yet wired into the body path.
+- **`font_olgl`** — the OPEN LOOK **glyph** face (UI marks: the ▽ menu mark,
+  pushpins, scrollbar arrows), [`wm_fonts_olgl.h:1998`](../ouroboros/wm_fonts_olgl.h#L1998).
+
+The extended mode is selected by **bit 31 of `R5`** in `#0x10C ObjBlitGlyphs`
+(`FONT_R5_EXTENDED`, with `FONT_R5_TRANSPARENT` at bit 30); the firmware reads a
+self-describing `'WMF1'` font object via `_blit_glyphs_extended`
+([`simorisc:3484`](../tools/sim/simorisc#L3484)), while the legacy 8×16 cell path
+(bit 31 clear) is byte-identical to the pre-font-manager primitive
+([`primitive_ObjBlitGlyphs`, `simorisc:3582`](../tools/sim/simorisc#L3582)). The
+spec side is [Vol VI §5.4, `0x10C`](SYSTEM_FIRMWARE_INTERFACE.md).
+
+---
+
+## 9. The libc client APIs
 
 All live under [`tools/cc/lib/`](../tools/cc/lib). Wire op constants are in
 [`liborisc.h`](../tools/cc/lib/liborisc.h); the WM-side decoders are in
@@ -733,7 +934,7 @@ surfaces.
 
 ---
 
-## 9. The supervisor's role
+## 10. The supervisor's role
 
 [`ouroboros/supervisor.c`](../ouroboros/supervisor.c) is each CPU's init process;
 `main()` is at [`supervisor.c:1788`](../ouroboros/supervisor.c#L1788). The leader
@@ -794,7 +995,7 @@ OPRs just before `TaskCreate` ([`supervisor.c:890-964`](../ouroboros/supervisor.
 
 ---
 
-## 10. The simulator's role (`tools/sim/simorisc`)
+## 11. The simulator's role (`tools/sim/simorisc`)
 
 [`tools/sim/simorisc`](../tools/sim/simorisc) is a pure-Python ISA simulator; one
 process = one CPU. In a multi-process boot it connects to an external `oriscbar`
@@ -834,7 +1035,7 @@ treats all CPUs identically apart from `pid` and whether `--display tk` gave it 
 
 ---
 
-## 11. Testing & headless input
+## 12. Testing & headless input
 
 The headless harness is
 [`tools/devices/tests/fake_terminal.py`](../tools/devices/tests/fake_terminal.py)
@@ -880,7 +1081,7 @@ a subscriber/surface device).
 
 ---
 
-## 12. Evolution / phase history
+## 13. Evolution / phase history
 
 A reader hitting odd-looking code will usually find a phase tag explaining it.
 The major arc (from `oriscwm.c` phase markers and `docs/HISTORY.md`):
@@ -892,6 +1093,9 @@ The major arc (from `oriscwm.c` phase markers and `docs/HISTORY.md`):
 | 58 | **WM β** | WM allocates a *per-window* CONSOLE service so client console writes land in a per-window queue ([`oriscwm.c:166`](../ouroboros/oriscwm.c#L166)) |
 | 59 | **WM γ** | the framebuffer arrives; the WM rasterizes locally. γ.9 adds the GRID service, γ.11 the VECTOR service (`VEC_OP_*`), γ.12 the RASTER service, γ.13 pointer mediation, γ.15 multi-WM (one WM per terminal, `/sys/wm/<N>` paths from `--init-r4`) ([`oriscwm.c:168`](../ouroboros/oriscwm.c#L168)) |
 | 60 | **terminal-firmware unification** | the WM *becomes* the terminal. **step 2:** allocate the framebuffer locally (`#0x10A`, originally `#0x102`), drop the `/sys/term/<N>/framebuffer` walk. **step 3:** local keyboard/pointer input sinks (`#0x10B`); oriscterm no longer mediates input. **steps 5–22:** local rect-fill/scroll, offscreen per-window backing stores, title bars + `SET_TITLE`, z-order + window positioning (lifting the 1-window cap), borders, outline dragging, the **focus model**, the desktop root menu, the close box. |
+| 4 (object-API) | **`obj.h` handle migration** | the libc clients move off raw object asm onto the handle-based `obj.h` API (caps in an O12 table, programs hold opaque ints) — see [`OBJECT_API.md`](OBJECT_API.md) |
+| 60 (olwm) | **OPEN LOOK chrome rework** | the font manager (extended `#0x10C`, baked `font_luRS`/`font_lutRS`/`font_olgl` faces); the gray palette + olgx color group; the `draw_bevel_box` 3-colour bevel; the flat 2 px black border; recessed-stripe title bars; the ▽ window-menu button replacing the close box ([§8](#8-open-look-chrome)) |
+| 61 | **event-driven WM** | the main loop blocks on `WaitAnyQueue` (`#0x206`) over the WM's queue set instead of timeout-polling — `WM_POLL_TICKS` retired, idle WM ~0 instr; paired with spawn-load batching (`ORX_READ_CHUNK` 64 KiB) + `oriscbar` write-side backpressure ([§4](#4-the-window-manager-oriscwmc)) |
 
 The practical upshot for a reader: the heavy stack of per-surface services
 (CONSOLE/GRID/VECTOR/RASTER) is WM-β/γ scaffolding; the "WM owns the hardware and
