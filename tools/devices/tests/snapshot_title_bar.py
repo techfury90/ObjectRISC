@@ -44,12 +44,15 @@ BORDER_LINE_PX = 2
 TITLE_BAR_PX = 24
 CELL_AREA_W_PX = CELL_W * N_COLS            # 640
 USABLE_W_PX = (N_COLS + 2) * CELL_W         # 656
-TITLE_X_OFF_PX = CELL_W                      # 8
+TITLE_X_OFF_PX = CELL_W                      # 8 (content cell offset)
 TITLE_Y_OFF_PX = BORDER_LINE_PX             # 2 (flush under the 2px border)
-TITLE_TEXT_Y_OFF_PX = TITLE_Y_OFF_PX + (TITLE_BAR_PX - CELL_H) // 2   # 6
-TITLE_INSET = 4                              # button + stripe float inset
-TITLE_INNER_PX = TITLE_BAR_PX - 2 * TITLE_INSET   # 16
+TITLE_INSET = 3                              # top gap: border -> float (3px)
+TITLE_INNER_PX = 16                          # float height (bottom gap = 5px)
+TITLE_TEXT_Y_OFF_PX = TITLE_Y_OFF_PX + TITLE_INSET + (TITLE_INNER_PX - CELL_H) // 2  # 5
 MENU_BTN_W = TITLE_INNER_PX                   # 16 (floating square)
+TITLE_BAR_X = 5                              # bar/stripe/separator left edge
+MENU_BTN_X = 14                              # menu button left edge (on stripe)
+TITLE_BAR_W = USABLE_W_PX - 2 * TITLE_BAR_X   # 646 (symmetric inset)
 OL_MM_UL, OL_MM_LR, OL_MM_FILL = 45, 46, 47   # olgl ▽ mark layers (UL/LR/fill)
 OL_MENU_MARK_W, OL_MENU_MARK_H = 7, 7         # 7x7 engraved mark
 BEVEL_RAISED, BEVEL_FILL = 0x01, 0x02
@@ -138,27 +141,27 @@ def main():
     # 0) 2px black top border (the WM chrome).
     fill(0, 0, fb_w, BORDER_LINE_PX, BLACK)
 
-    # 1) Bar base: flat BG1, both focus states.
-    fill(TITLE_X_OFF_PX, TITLE_Y_OFF_PX, CELL_AREA_W_PX, TITLE_BAR_PX, BG1)
-
-    span_x = TITLE_X_OFF_PX + MENU_BTN_W + TITLE_INSET
-    span_w = CELL_AREA_W_PX - MENU_BTN_W - 2 * TITLE_INSET
     inner_y = TITLE_Y_OFF_PX + TITLE_INSET
 
-    # 2) Focused: recessed stripe (PRESSED bevel) FLOATING in the title-text area.
-    if focused:
-        bevel_box(span_x, inner_y, span_w, TITLE_INNER_PX, BEVEL_FILL)
+    # 1) Bar base: flat BG1 (both states), spans (TITLE_BAR_X, TITLE_BAR_W).
+    fill(TITLE_BAR_X, TITLE_Y_OFF_PX, TITLE_BAR_W, TITLE_BAR_PX, BG1)
 
-    # 3) Raised floating window-menu button + ▽ engraved mark (olgl 45/46/47 in
-    #    BG3/white/BG2, one transparent blit per layer).
-    bevel_box(TITLE_X_OFF_PX, inner_y, MENU_BTN_W, TITLE_INNER_PX,
+    # 2) Focused: recessed stripe spanning the WHOLE bar (button paints over it).
+    if focused:
+        bevel_box(TITLE_BAR_X, inner_y, TITLE_BAR_W, TITLE_INNER_PX, BEVEL_FILL)
+
+    # 3) Raised menu button ON TOP at MENU_BTN_X + ▽ engraved mark (olgl 45/46/47
+    #    in BG3/white/BG2, one transparent blit per layer).
+    bevel_box(MENU_BTN_X, inner_y, MENU_BTN_W, TITLE_INNER_PX,
               BEVEL_RAISED | BEVEL_FILL)
-    gx = TITLE_X_OFF_PX + (MENU_BTN_W - OL_MENU_MARK_W) // 2
+    gx = MENU_BTN_X + (MENU_BTN_W - OL_MENU_MARK_W) // 2
     gy = inner_y + (TITLE_INNER_PX - OL_MENU_MARK_H) // 2
     for cp, fg in ((OL_MM_UL, BG3), (OL_MM_LR, WHITE_I), (OL_MM_FILL, BG2)):
         blit(F_OLGL, gx, gy, bytes([cp]), fg, BG1)
 
-    # 4) Centre + draw the proportional title (extended ObjBlitGlyphs).
+    # 4) Centre + draw the proportional title right of the button.
+    span_x = MENU_BTN_X + MENU_BTN_W + TITLE_INSET
+    span_w = (TITLE_BAR_X + TITLE_BAR_W) - span_x - TITLE_INSET
     tpx = 0; n = 0
     while n < len(title) and tpx + adv(title[n]) <= span_w:
         tpx += adv(title[n]); n += 1
@@ -167,7 +170,7 @@ def main():
     blit(F_LURS, start_x, TITLE_TEXT_Y_OFF_PX, title[:n], WM_TITLE_TEXT_FG, text_bg)
 
     # 5) 1px black separator directly below the bar.
-    fill(TITLE_X_OFF_PX, TITLE_Y_OFF_PX + TITLE_BAR_PX, CELL_AREA_W_PX, 1, BLACK)
+    fill(TITLE_BAR_X, TITLE_Y_OFF_PX + TITLE_BAR_PX, TITLE_BAR_W, 1, BLACK)
 
     lut = sim._build_palette_lut()
     rgb = b"".join(lut[b] for b in fb)

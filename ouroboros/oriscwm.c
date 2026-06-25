@@ -356,12 +356,13 @@
  * and paint_title_bar). */
 #define TITLE_BAR_CELLS 1
 #define TITLE_BAR_PX    24
-/* The window-menu button and the focus stripe FLOAT inside the 24px bar, inset
- * TITLE_INSET px from its top/bottom and from each other (matching the
- * OpenWindows reference — they don't run edge-to-edge / full-height).  The
- * floating inner height = TITLE_BAR_PX - 2*INSET. */
-#define TITLE_INSET     4
-#define TITLE_INNER_PX  (TITLE_BAR_PX - 2 * TITLE_INSET)   /* 16 */
+/* The window-menu button and the focus stripe FLOAT inside the 24px bar:
+ * TITLE_INSET px below the top border, TITLE_INNER_PX tall.  The reference's
+ * name-stripe sits slightly HIGH — 3px above / 5px below — so the top inset and
+ * the height are decoupled (not symmetric): top gap = TITLE_INSET (3px), bottom
+ * gap = TITLE_BAR_PX - TITLE_INSET - TITLE_INNER_PX = 5px. */
+#define TITLE_INSET     3     /* gap from the top border down to the float */
+#define TITLE_INNER_PX  16    /* float (button/stripe) height */
 /* Window-menu button: a small raised square (TITLE_INNER_PX tall) floating at
  * the bar's left, with the ▽ menu mark centred in it (paint_menu_button). */
 #define MENU_BTN_W      TITLE_INNER_PX
@@ -427,8 +428,23 @@
 /* Title bar is now FLUSH under the 2px black top border (was one cell row
  * = 16px below it); pixel-positioned, decoupled from TITLE_CELL_Y_OFF. */
 #define TITLE_Y_OFF_PX      BORDER_LINE_PX
-/* Title text top — vertically centre the 16px font face in the 24px bar. */
-#define TITLE_TEXT_Y_OFF_PX (TITLE_Y_OFF_PX + (TITLE_BAR_PX - CELL_H) / 2)
+/* Title text top — vertically centre the 16px font face in the floating stripe
+ * (TITLE_INSET below the border), so it rides up with the button + stripe. */
+#define TITLE_TEXT_Y_OFF_PX (TITLE_Y_OFF_PX + TITLE_INSET + (TITLE_INNER_PX - CELL_H) / 2)
+
+/* OPEN LOOK title-bar element X positions (window-local px; origin = the window
+ * top-left INCLUDING the 2px black border).  Sampled from the OpenWindows
+ * reference: the recessed focus STRIPE / bar base / separator start at
+ * TITLE_BAR_X and span the bar (TITLE_BAR_W); the raised menu BUTTON sits ON
+ * TOP of the stripe at MENU_BTN_X (so the stripe shows to its left + right).
+ * Content cells stay at TITLE_X_OFF_PX (=8, cell-aligned) — the bar is pixel-
+ * positioned and a touch wider on the left. */
+#define TITLE_BAR_X   5     /* bar base / focus stripe / separator left edge */
+#define MENU_BTN_X    14    /* menu button left edge (over the stripe)        */
+/* Bar spans SYMMETRICALLY — inset TITLE_BAR_X (2px border + 3px pad) on BOTH
+ * sides, so the stripe's white right edge lands at wxmax-5, mirroring the BG3
+ * left edge at wx5 (right pad = 3px BG1, then the 2px black border). */
+#define TITLE_BAR_W   (USABLE_W_PX - 2 * TITLE_BAR_X)                  /* 646 */
 
 /* Per-window border occupies the entire visible chrome now — there
  * is no screen-wide chrome any more.  CELL_ORIGIN_* survives only
@@ -1664,7 +1680,7 @@ screen_blit_glyph_row(int packed_xy, const unsigned char *text,
 static void
 paint_menu_button(void)
 {
-	int bx = TITLE_X_OFF_PX;
+	int bx = MENU_BTN_X;
 	int by = TITLE_Y_OFF_PX + TITLE_INSET;
 	int btn_xy = ((bx & 0xFFFF) << 16) | (by & 0xFFFF);
 	int btn_wh = ((MENU_BTN_W & 0xFFFF) << 16) | (TITLE_INNER_PX & 0xFFFF);
@@ -1698,35 +1714,34 @@ paint_title_bar(void)
 	int focused = (active_wid == focused_wid);
 
 	/* Bar base: the flat gray window face (BG1) for BOTH focus states
-	 * (olwm drawHeaderNoFocus3D).  Extent (CELL_AREA_W_PX, TITLE_BAR_PX)
-	 * at (TITLE_X_OFF_PX, TITLE_Y_OFF_PX). */
-	int bar_xy = ((TITLE_X_OFF_PX & 0xFFFF) << 16)
+	 * (olwm drawHeaderNoFocus3D).  Spans (TITLE_BAR_X, TITLE_BAR_W) — wide
+	 * enough to also clear the recessed stripe when a window defocuses. */
+	int bar_xy = ((TITLE_BAR_X & 0xFFFF) << 16)
 	           | (TITLE_Y_OFF_PX & 0xFFFF);
-	int bar_wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
+	int bar_wh = ((TITLE_BAR_W & 0xFFFF) << 16)
 	           | (TITLE_BAR_PX & 0xFFFF);
 	fill_rect_window(bar_xy, bar_wh, WM_TITLE_BG);
 
-	/* The title-text area is the bar span to the RIGHT of the menu button,
-	 * inset by TITLE_INSET (a gap after the button + a matching right margin)
-	 * so the focus stripe floats like the reference; the title centres in it. */
-	int span_x = TITLE_X_OFF_PX + MENU_BTN_W + TITLE_INSET;
-	int span_w = CELL_AREA_W_PX - MENU_BTN_W - 2 * TITLE_INSET;
-
 	/* Focus indicator (olwm drawHeaderBar3D): the FOCUSED window gets a
-	 * RECESSED stripe across the title-text area — draw_bevel_box PRESSED
+	 * RECESSED stripe spanning the WHOLE bar (TITLE_BAR_X..+TITLE_BAR_W),
+	 * inset TITLE_INSET px top/bottom so it floats — draw_bevel_box PRESSED
 	 * (BEVEL_FILL, no BEVEL_RAISED) = BG3 top-left / BG2 face / white
-	 * bottom-right.  Inset TITLE_INSET px top/bottom so it FLOATS in the bar
-	 * (a 16px band, not full height).  Unfocused windows stay flat BG1. */
+	 * bottom-right.  The menu button paints OVER it.  Unfocused = flat BG1. */
 	if (focused) {
-		int stripe_xy = ((span_x & 0xFFFF) << 16)
+		int stripe_xy = ((TITLE_BAR_X & 0xFFFF) << 16)
 		              | ((TITLE_Y_OFF_PX + TITLE_INSET) & 0xFFFF);
-		int stripe_wh = ((span_w & 0xFFFF) << 16)
+		int stripe_wh = ((TITLE_BAR_W & 0xFFFF) << 16)
 		              | (TITLE_INNER_PX & 0xFFFF);
 		draw_bevel_box(stripe_xy, stripe_wh, BEVEL_FILL);
 	}
 
-	/* Raised window-menu button (▽) on top, at the left of the bar. */
+	/* Raised window-menu button (▽) ON TOP of the stripe, at MENU_BTN_X. */
 	paint_menu_button();
+
+	/* Title text centres in the span to the RIGHT of the menu button (with a
+	 * TITLE_INSET gap after the button and before the bar's right edge). */
+	int span_x = MENU_BTN_X + MENU_BTN_W + TITLE_INSET;
+	int span_w = (TITLE_BAR_X + TITLE_BAR_W) - span_x - TITLE_INSET;
 
 	/* Title text — proportional Lucida Sans (font_luRS), absolute-pixel
 	 * positioned, centred in the span right of the menu button and
@@ -1757,15 +1772,15 @@ paint_title_bar(void)
 	/* 1px black separator directly below the bar (window-local
 	 * y = TITLE_Y_OFF_PX + TITLE_BAR_PX), spanning the bar width. */
 	{
-		int sep_xy = ((TITLE_X_OFF_PX & 0xFFFF) << 16)
+		int sep_xy = ((TITLE_BAR_X & 0xFFFF) << 16)
 		           | ((TITLE_Y_OFF_PX + TITLE_BAR_PX) & 0xFFFF);
-		int sep_wh = ((CELL_AREA_W_PX & 0xFFFF) << 16) | 1;
+		int sep_wh = ((TITLE_BAR_W & 0xFFFF) << 16) | 1;
 		fill_rect_window(sep_xy, sep_wh, WM_OL_BLACK);
 	}
 
 	/* Composite the bar + the separator row below it. */
-	composite_window_region(TITLE_X_OFF_PX, TITLE_Y_OFF_PX,
-	                        CELL_AREA_W_PX, TITLE_BAR_PX + 1);
+	composite_window_region(TITLE_BAR_X, TITLE_Y_OFF_PX,
+	                        TITLE_BAR_W, TITLE_BAR_PX + 1);
 }
 
 /* Phase 60 step 22 — repaint wid's title bar (focus-color refresh).
@@ -4756,7 +4771,7 @@ point_in_menu_button(int wid, int px, int py)
 {
 	int wx = window_pos_x[wid - 1];
 	int wy = window_pos_y[wid - 1];
-	int bx_lo = wx + TITLE_X_OFF_PX;
+	int bx_lo = wx + MENU_BTN_X;
 	int bx_hi = bx_lo + MENU_BTN_W;
 	int by_lo = wy + TITLE_Y_OFF_PX;
 	int by_hi = by_lo + TITLE_BAR_PX;
