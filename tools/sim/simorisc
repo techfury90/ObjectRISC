@@ -24,6 +24,7 @@ the home CPU's local descriptor table.
 """
 
 import argparse
+import colorsys
 import re
 import struct
 import sys
@@ -2237,10 +2238,67 @@ def to_u32(v: int) -> int:
 # (TAG_FRAMEBUFFER is just a plain bytearray) but skips Tk; lets CI
 # and smoke tests exercise the same firmware path without a display.
 
+def olgx_color_group(bg1_hex):
+    """OPEN LOOK 3D color group {White, BG1, BG2, BG3} from a base face
+    color BG1, via the olgx HSV algorithm (libolgx ol_color.c
+    `olgx_hsv_to_3D`): work in HSV; from base V — White = V*1.2 (VMUL),
+    BG2 = V*0.9, BG3 = V*0.5 (SDIV/2 group), clamped to a 40% value floor
+    (VMIN).  If White's value clips past 100% it is pinned to full value
+    and its saturation halved, driving it toward pure white.
+
+    For a gray BG1 (S=0) this reduces to plain RGB scaling; for a colored
+    window tint (a later PR) the HSV path keeps the highlight tinted.
+    BG1 #cccccc -> White #f5f5f5, BG2 #b8b8b8, BG3 #666666 — exactly the
+    grays sampled from the real OpenWindows shot (docs/images/
+    openwindows_ipx.png).  Returns a dict of '#rrggbb' strings."""
+    r, g, b = (int(bg1_hex[i:i + 2], 16) for i in (1, 3, 5))
+    h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+    VMUL, BG2_MUL, BG3_MUL, VMIN = 1.2, 0.9, 0.5, 0.40
+
+    def _hex(hh, ss, vv):
+        rr, gg, bb = colorsys.hsv_to_rgb(hh, ss, max(0.0, min(1.0, vv)))
+        return "#%02x%02x%02x" % (round(rr * 255), round(gg * 255),
+                                  round(bb * 255))
+
+    vw, sw = v * VMUL, s
+    if vw > 1.0:                       # highlight clips -> pin V, halve S
+        vw, sw = 1.0, s / 2.0
+    return {
+        "white": _hex(h, sw, vw),
+        "bg1":   bg1_hex,
+        "bg2":   _hex(h, s, max(VMIN, v * BG2_MUL)),
+        "bg3":   _hex(h, s, max(VMIN, v * BG3_MUL)),
+    }
+
+
+# OPEN LOOK gray-on-blue.  The window's gray color group is DERIVED from
+# BG1 via olgx_color_group (not hand-typed), so a future colored-tint PR
+# reuses the same math.
+_OL_GRAY = olgx_color_group("#cccccc")
+
+# Index -> RGB for the 8-bit indexed framebuffer.
+#   0-8   the development accent ramp.  mouse_paint cycles 1..8; idx 8
+#         (pure white) doubles as the OPEN LOOK focused-title-bar white.
+#         These are NOT repurposed by the OPEN LOOK scheme.
+#   9-14  OPEN LOOK gray-on-blue (real OpenWindows 3 / SunOS 4.1.4 —
+#         docs/images/openwindows_ipx.png; the WM's chrome constants map
+#         onto these in oriscwm.c):
+#           9  workspace desktop  #40a0c0   bright cyan-blue
+#          10  window face / unfocused title  BG1 #cccccc
+#          11  highlight / content pane       White #f5f5f5  (bevel: next PR)
+#          12  bevel mid                      BG2 #b8b8b8    (bevel: next PR)
+#          13  frame outline / shadow         BG3 #666666
+#          14  text / outlines                #000000
 VEC_PALETTE_HEX = {
     0: "#0a0a14", 1: "#d8d8d8", 2: "#ff5555", 3: "#55ff55",
     4: "#5599ff", 5: "#ffd866", 6: "#66ddff", 7: "#ff66ff",
     8: "#ffffff",
+    9:  "#40a0c0",
+    10: _OL_GRAY["bg1"],
+    11: _OL_GRAY["white"],
+    12: _OL_GRAY["bg2"],
+    13: _OL_GRAY["bg3"],
+    14: "#000000",
 }
 
 # Key codepoints sent to TAG_INPUT_SINK (kind=0) subscribers.  Mirror
