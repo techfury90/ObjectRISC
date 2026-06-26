@@ -26,6 +26,7 @@ the home CPU's local descriptor table.
 import argparse
 import colorsys
 import re
+import select
 import struct
 import sys
 import time
@@ -2195,7 +2196,23 @@ class System:
                         or (in_socket_mode and draining):
                     if in_socket_mode and not self.crossbar.connected:
                         break
-                    time.sleep(0.001)
+                    # Idle wait. No runnable work this tick; we're blocked on
+                    # something a socket packet (an IPC reply / SEND) will
+                    # deliver. Rather than sleep a fixed quantum and re-poll —
+                    # which made every cross-crossbar round-trip wait out up to
+                    # a full ~1 ms timer even though the reply bytes were
+                    # already in the socket — block in select() on the crossbar
+                    # socket, so an arriving packet wakes us at once. The 1 ms
+                    # timeout is now only a ceiling for non-socket wakeups
+                    # (deferred-free / reset deadlines, host display ticks).
+                    _sock = getattr(self.crossbar, "sock", None)
+                    if _sock is not None:
+                        try:
+                            select.select([_sock], (), (), 0.001)
+                        except (OSError, ValueError):
+                            time.sleep(0.001)
+                    else:
+                        time.sleep(0.001)
                     ticks += 1
                     # Phase 60 — pump the host display worker on idle
                     # ticks too, so a screen with no firmware activity
@@ -5050,9 +5067,18 @@ def step(cpu: CPU) -> None:
     word = cpu.fetch_instr(pc)
     op = (word >> 26) & 0x3F
 
-    pre_gpr = cpu.gpr.copy()
-    pre_opr = cpu.opr.copy()
-    pre_hi, pre_lo = cpu.hi, cpu.lo
+    # Snapshot the register file for the instruction trace ONLY when tracing
+    # is on. emit_trace (the sole consumer) early-returns when trace is off,
+    # so copying the whole GPR+OPR file on every instruction was pure
+    # overhead in the normal untraced case — it showed up as ~2 list copies
+    # per instruction in the profile.
+    if cpu.trace_enabled:
+        pre_gpr = cpu.gpr.copy()
+        pre_opr = cpu.opr.copy()
+        pre_hi, pre_lo = cpu.hi, cpu.lo
+    else:
+        pre_gpr = pre_opr = None
+        pre_hi = pre_lo = 0
 
     branch_target: Optional[int] = None
     def take_branch(target: int) -> None:
