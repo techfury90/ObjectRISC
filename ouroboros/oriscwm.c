@@ -744,6 +744,12 @@ static unsigned char window_vec_color[MAX_WINDOWS]; /* current pen palette idx *
 static int           window_text_x[MAX_WINDOWS];
 static int           window_text_y[MAX_WINDOWS];
 static unsigned char window_text_face[MAX_WINDOWS];
+/* Per-window "content drawn since last composite" flag.  Vector ops draw into
+ * the window FB and set this instead of compositing; poll_window_vectors
+ * composites ONCE after draining a window's burst — so a page of text is one
+ * screen update, not one per op (and the stack behind an overlapping window
+ * flashes at most once per burst, not per op). */
+static unsigned char window_vec_dirty[MAX_WINDOWS];
 
 /* Phase 60 step 11 — per-wid screen position + z-order.  The window
  * FB at WM_WINDOW_FB_BASE+(wid-1)*8 composites onto the screen FB
@@ -4449,14 +4455,14 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 	}
 	if (op == VEC_OP_CLEAR) {
 		/* Repaint the cell-content area to bg via ObjFillRect on
-		 * the window FB, then composite once.  Border + title bar
-		 * stay put. */
+		 * the window FB; the composite is deferred to the drain end
+		 * (window_vec_dirty).  Border + title bar stay put. */
 		int xy = ((CONTENT_X_OFF_PX & 0xFFFF) << 16)
 		       | (CONTENT_Y_OFF_PX & 0xFFFF);
 		int wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
 		       | (CELL_AREA_H_PX & 0xFFFF);
 		fill_rect_window(xy, wh, WM_BG_COLOR);
-		composite_content_area();
+		window_vec_dirty[slot] = 1;
 		return;
 	}
 
@@ -4483,11 +4489,7 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		                font_shape(1, cur_vec_color, WM_BG_COLOR, 1),
 		                wm_text_scratch);
 		window_text_x[slot] += adv;
-		/* Composite only THIS glyph's box, not the whole content area — keeps
-		 * the per-char drain cheap so a long string can't back up the depth-64
-		 * vector queue (and gives the Markdown viewer a fast path). */
-		composite_window_region(ax, ay, adv > 0 ? adv : face->cell_w,
-		                        face->cell_h);
+		window_vec_dirty[slot] = 1;   /* composite deferred to the drain end */
 		return;
 	}
 	if (op == VEC_OP_TEXT_RUN) {
@@ -4510,13 +4512,13 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		int ay = window_text_y[slot] + CONTENT_Y_OFF_PX;
 		int pxy = ((ax & 0xFFFF) << 16) | (ay & 0xFFFF);
 		/* ONE firmware call renders the whole batch (the firmware advances the
-		 * pen per glyph from the width table) and ONE composite covers the
-		 * batch's box — ~8x fewer SENDs / blits / composites than per-char. */
+		 * pen per glyph from the width table); the composite is deferred to the
+		 * drain end, so a page of text is one screen update, not one per run. */
 		win_draw_string(face, pxy,
 		                font_shape(n, cur_vec_color, WM_BG_COLOR, 1),
 		                wm_text_scratch);
 		window_text_x[slot] += w;
-		composite_window_region(ax, ay, w > 0 ? w : face->cell_w, face->cell_h);
+		window_vec_dirty[slot] = 1;
 		return;
 	}
 
@@ -4540,7 +4542,7 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		/* Unknown op: drop silently — clients see no error since
 		 * vector SENDs are fire-and-forget anyway. */
 	}
-	if (painted) composite_content_area();
+	if (painted) window_vec_dirty[slot] = 1;
 }
 
 /* See poll_window_grids — same status-via-global trick, capped at 4
@@ -4581,6 +4583,19 @@ poll_window_vectors(void)
 			if (_wm_vector_poll_status != 0) break;   /* queue empty */
 			set_active_window(wid);
 			forward_vector_write(wid, op, packed1, packed2);
+		}
+
+		/* Composite ONCE for the whole drained burst.  forward_vector_write
+		 * only marks window_vec_dirty now, so a vec_text page (or any run of
+		 * ops) is a single screen update instead of one composite per op —
+		 * that per-op compositing was both the residual specimen latency AND
+		 * the intermittent navy/black flash (each composite re-blit the
+		 * window stack bottom-to-top, briefly showing the window behind). */
+		int vslot = wid - 1;
+		if (window_vec_dirty[vslot]) {
+			set_active_window(wid);
+			composite_content_area();
+			window_vec_dirty[vslot] = 0;
 		}
 	}
 }
