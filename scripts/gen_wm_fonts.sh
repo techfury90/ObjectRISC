@@ -36,54 +36,28 @@ if [ ! -d "$OPENLOOK_BDF" ]; then
     exit 1
 fi
 
-BANNER='/* wm_fonts.h — GENERATED self-describing WM font faces.  DO NOT EDIT.
+BANNER='/* wm_fonts.h — GENERATED.  DO NOT EDIT.  Regenerate: sh scripts/gen_wm_fonts.sh
  *
- * Regenerate with:  sh scripts/gen_wm_fonts.sh
+ * The lutRS monospace face is the WM'"'"'s single compiled-in FAILSAFE font.  The
+ * WM loads all four faces (luRS / luBS / olgl / lutRS) from /fonts at runtime
+ * and falls back to this baked lutRS for any face whose load fails.  The other
+ * three faces are NOT baked in — they live only as fonts/*.wmf.
  *
- * Each face is a wm_font_t descriptor over a uint32 blob the WM hands to
- * the extended ObjBlitGlyphs firmware path (R5 bit 31).  This header must
- * be #included AFTER wm_font_t is defined (it is, in oriscwm.c).
+ * A wm_font_t descriptor over a uint32 blob the WM hands to the extended
+ * ObjBlitGlyphs path (R5 bit 31).  #included after wm_font_t is defined.
  *
- * Font assets are (c) 1989 Sun Microsystems and (c) 1985, 1986 Bigelow &
- * Holmes; Lucida is a B&H trademark.  See the project NOTICE.
+ * Font assets (c) 1989 Sun Microsystems and (c) 1985, 1986 Bigelow & Holmes;
+ * Lucida is a B&H trademark.  See the project NOTICE.
  */'
 
 OUT="ouroboros/wm_fonts.h"
 {
     echo "$BANNER"
     echo
-    $GEN --face luRS  --bdf "$OPENLOOK_BDF/75dpi/luRS12.bdf" \
-         --base 32 --count 95 --cell 12x16 --proportional
-    echo
-    $GEN --face luBS  --bdf "$OPENLOOK_BDF/75dpi/luBS12.bdf" \
-         --base 32 --count 95 --cell 12x16 --proportional
-    echo
     $GEN --face lutRS --bdf "$OPENLOOK_BDF/100dpi/lutRS10.bdf" \
          --base 32 --count 95 --cell 8x16
 } > "$OUT"
 echo "wrote $OUT"
-
-OLGL_BANNER='/* wm_fonts_olgl.h — GENERATED OPEN LOOK glyph font face.  DO NOT EDIT.
- *
- * Regenerate with:  sh scripts/gen_wm_fonts.sh
- *
- * The OPEN LOOK glyph font (pushpins, menu marks, default rings, check
- * boxes, 2D menu pins, resize corners, scrollbar arrows).  Auto-fit cell
- * (the scrollbar cable/elevator glyphs span the full 47x47 envelope).
- * Baked and committed so the chrome PRs that consume these glyphs can
- * #include it; oriscwm.c does not yet pull it in.
- *
- * Font assets (c) 1989 Sun Microsystems.  See the project NOTICE.
- */'
-
-OUT_OLGL="ouroboros/wm_fonts_olgl.h"
-{
-    echo "$OLGL_BANNER"
-    echo
-    $GEN --face olgl --bdf "$OPENLOOK_BDF/misc/olgl12.bdf" \
-         --base 19 --count 167
-} > "$OUT_OLGL"
-echo "wrote $OUT_OLGL"
 
 # On-disk .wmf font objects for dynamic font loading.  These are the SAME
 # blobs baked into the headers above, written as raw WMF1 bytes so the WM can

@@ -688,14 +688,12 @@ typedef struct {
 	                            * Baked initializers omit this (zero-filled). */
 } wm_font_t;
 
-/* The baked faces (font_luRS proportional title face, font_lutRS mono
- * body face).  Generated — see scripts/gen_wm_fonts.sh.  Included here,
- * after wm_font_t is defined, so the initializers resolve. */
+/* The single compiled-in FAILSAFE face: lutRS (monospace Lucida Typewriter).
+ * Generated — see scripts/gen_wm_fonts.sh.  All four faces (luRS / luBS / olgl
+ * / lutRS) load from /fonts at runtime; this baked lutRS is the fallback for
+ * any face whose load fails, so the WM always renders text.  Included here,
+ * after wm_font_t is defined, so the initializer resolves. */
 #include "wm_fonts.h"
-/* The OPEN LOOK glyph face (font_olgl) — UI marks (pushpins, the ▽ menu
- * mark, scrollbar arrows, …).  Same wm_font_t descriptor, baked from
- * olgl12.bdf; the title bar's window-menu button renders codepoint 22. */
-#include "wm_fonts_olgl.h"
 
 /* Phase B/C dynamic font table — runtime faces loaded from /fonts, indexed by
  * FONT_FACE_* (PROP=0 luRS, MONO=1 lutRS, GLYPH=2 olgl, BOLD=3 luBS).  Each
@@ -1227,9 +1225,6 @@ static unsigned int dyn_cache[WM_NDYNFONT][WM_FONT_HDR_BYTES / 4];
 static const char *const dyn_font_path[WM_NDYNFONT] = {
 	"/fonts/luRS.wmf", "/fonts/lutRS.wmf", "/fonts/olgl.wmf", "/fonts/luBS.wmf"
 };
-static const wm_font_t *const dyn_font_baked[WM_NDYNFONT] = {
-	&font_luRS, &font_lutRS, &font_olgl, &font_luBS
-};
 /* Object capacity per face — the read loop stops at EOF, so this only has to be
  * >= the .wmf size.  olgl (the 47x47 glyph envelope) is ~47 KB; the text faces
  * fit the default.  (hf_open discards the wire-reported file size, so we size
@@ -1348,57 +1343,65 @@ wm_font_cache_header(int id)
 	return 0;
 }
 
-/* Load one face from /fonts and untether it from its baked blob: load the
- * object, cache its width table, validate the cached widths against the baked
- * blob, then on success point font_dyn[id] at the cache (measure) + object
- * (render).  Any failure leaves font_dyn[id] as the verbatim baked copy
- * wm_init_dynamic_fonts seeded, so the face always renders. */
+/* Load one face from /fonts and build its descriptor ENTIRELY from the loaded
+ * file (no baked twin): stream the blob into the face's object, cache its WMF1
+ * header + width table, parse the header for the cell/base/count/flags +
+ * sanity-check the magic, then point font_dyn[id] at the cache (measure) +
+ * object (render).  Any failure leaves font_dyn[id] as the lutRS failsafe that
+ * wm_init_dynamic_fonts seeded — a face always renders, and the failure is
+ * reported (a future build will also raise a dialog). */
 static void
 wm_load_face(int id)
 {
-	int n, wc, wb;
-	wm_font_t probe;
+	int n, cell_w, cell_h, base, count, flags;
 	wm_font_t *f = &font_dyn[id];        /* register-computed; no la font_dyn+N */
+	const unsigned int *c = dyn_cache[id];
 	const char *name = dyn_font_path[id];
 
 	n = wm_font_load(id);
 	if (n <= 0) {
 		WM_PRINT("oriscwm: "); WM_PRINT(name);
-		WM_PRINT(" load failed — baked\n");
+		WM_PRINT(" load failed — lutRS failsafe\n");
 		return;
 	}
 	if (wm_font_cache_header(id) != 0) {
 		WM_PRINT("oriscwm: "); WM_PRINT(name);
-		WM_PRINT(" width fetch failed — baked\n");
+		WM_PRINT(" header fetch failed — lutRS failsafe\n");
 		return;
 	}
-	probe = *f;                                        /* baked copy + cache blob */
-	probe.blob = (const unsigned int *)dyn_cache[id];
-	wc = font_measure(&probe, (const unsigned char *)"Workspace", 9);
-	wb = font_measure(dyn_font_baked[id], (const unsigned char *)"Workspace", 9);
-	if (wc != wb) {
+	/* Parse the cached WMF1 header (big-endian words, as font_advance reads it):
+	 * c[0]=magic, c[1]=(cell_w<<16)|cell_h, c[2]=(base<<16)|count, c[3]=flags. */
+	cell_w = (int)((c[1] >> 16) & 0xFFFF);
+	cell_h = (int)( c[1]        & 0xFFFF);
+	base   = (int)((c[2] >> 16) & 0xFFFF);
+	count  = (int)( c[2]        & 0xFFFF);
+	flags  = (int)((c[3] >> 16) & 0xFFFF);
+	if (c[0] != 0x574D4631u || cell_w <= 0 || cell_h <= 0 || count <= 0) {
 		WM_PRINT("oriscwm: "); WM_PRINT(name);
-		WM_PRINT(" widths MISMATCH — baked\n");
+		WM_PRINT(" bad WMF1 header — lutRS failsafe\n");
 		return;
 	}
-	f->blob = (const unsigned int *)dyn_cache[id];
+	f->blob = c;
+	f->cell_w = cell_w; f->cell_h = cell_h;
+	f->base = base; f->n_glyphs = count; f->flags = flags;
 	f->obj_slot = WM_FONTOBJ_BASE + id * 8;
 	WM_PRINT("oriscwm: "); WM_PRINT(name);
 	WM_PRINT(" loaded ("); WM_PRINT_INT(n);
-	WM_PRINT(" B); widths OK — off disk\n");
+	WM_PRINT(" B); WMF1 "); WM_PRINT_INT(cell_w); WM_PRINT("x"); WM_PRINT_INT(cell_h);
+	WM_PRINT(" — off disk\n");
 }
 
-/* Boot: seed every face as its baked twin (universal fallback), then load the
- * chrome text faces from /fonts.  Phase C step 2 migrates luRS (menu items) +
- * luBS (window + menu titles); lutRS + olgl stay baked until their render
- * paths + per-file sizes (olgl is 47 KB) are handled.  Called once at boot. */
+/* Boot: seed every face with the lutRS failsafe (the one face still compiled
+ * in), then load all four from /fonts.  A face whose load fails renders in
+ * lutRS rather than crashing — the deliberate "keep one baked failsafe" policy
+ * that lets the other three blobs leave the binary. */
 static void
 wm_init_dynamic_fonts(void)
 {
 	int i;
-	for (i = 0; i < WM_NDYNFONT; i++) font_dyn[i] = *dyn_font_baked[i];
+	for (i = 0; i < WM_NDYNFONT; i++) font_dyn[i] = font_lutRS;
 	if (wm_hostfs_init() != 0) {
-		WM_PRINT("oriscwm: hostfsd unavailable — fonts stay baked\n");
+		WM_PRINT("oriscwm: hostfsd unavailable — chrome on the lutRS failsafe\n");
 		return;
 	}
 	wm_load_face(FONT_FACE_PROP);   /* luRS — menu items + client proportional */
