@@ -83,7 +83,7 @@ wait 2>/dev/null || true
 # is still baked in, as the load-failure failsafe.)
 if grep -q "/fonts/luRS.wmf loaded (3152 B); WMF1 12x16"  "$TMP/wm.out" && \
    grep -q "/fonts/luBS.wmf loaded (3152 B); WMF1 12x16"  "$TMP/wm.out" && \
-   grep -q "/fonts/olgl.wmf loaded (47280 B); WMF1 47x47" "$TMP/wm.out" && \
+   grep -q "/fonts/olgl.wmf loaded (56616 B); WMF1 47x47" "$TMP/wm.out" && \
    grep -q "/fonts/lutRS.wmf loaded (1632 B); WMF1 8x16"  "$TMP/wm.out"; then
     echo "PASS: WM loaded all four faces from /fonts (headers parsed)"
     exit 0

@@ -329,7 +329,7 @@
 #define WM_NDYNFONT                     8      /* + ids 4..7 for font_open() */
 #define FONT_NAME_MAX                   32     /* client font name; WM forms "/fonts/" + name + ".wmf" */
 #define WM_FONTOBJ_BYTES                8192   /* fits luRS/luBS/lutRS (≤3152 B); Phase C sizes per file for olgl (47 KB) */
-#define WM_FONT_HDR_BYTES               192    /* WMF1 header (16) + width table (≤167); covers all four faces */
+#define WM_FONT_HDR_BYTES               256    /* WMF1 header (16) + width table; covers olgl's count-200 (cp 19..218) */
 #define TAG_DATA                        0x4102
 
 /* === Glyph rendering ==================================================
@@ -426,8 +426,13 @@
  * (including border ring + title bar + content area).  Used by
  * alloc_window_fb, the compositor, and recompose_after_destroy
  * for "the window's full screen footprint." */
-#define USABLE_W_PX  ((N_COLS + 2 * BORDER_CELLS_X) * CELL_W)
-                                                          /* 656 */
+/* OPEN LOOK vertical scrollbar — a fixed column added to the RIGHT of the
+ * window FB (the content stays N_COLS wide, so clients are unaffected; the
+ * window just grows SCROLLBAR_W_PX wider).  16px = the ~14px elevator (olgl
+ * cp 54) + a hair of padding. */
+#define SCROLLBAR_W_PX  16
+#define USABLE_W_PX  ((N_COLS + 2 * BORDER_CELLS_X) * CELL_W + SCROLLBAR_W_PX)
+                                                          /* 656 + 16 = 672 */
 #define USABLE_H_PX  ((BORDER_CELLS_Y + TITLE_BAR_CELLS + N_ROWS \
                        + BORDER_CELLS_Y) * CELL_H)        /* 432 */
 
@@ -2556,6 +2561,65 @@ paint_window_face(void)
 	fill_rect_window(c_xy, c_wh, WM_BG_COLOR);
 }
 
+/* OPEN LOOK vertical scrollbar glyphs (olgl).  The elevator emboss is just TWO
+ * glyphs: cp 54 (WHITE highlight) and cp 55 (BG3 shadow) — and cp 55 already
+ * carries BOTH the up + down line arrows AND the third-divider lines, so there
+ * are no separate arrow glyphs (cp 56/59 are the pressed-state box fills, not
+ * plain arrows).  The middle third holds a recessed drag-box (194 UL / 195 LR)
+ * with the 3-layer dimple inside it (196 UL / 197 LR / 198 fill — the same
+ * emboss as the menu pushpin).  All bake LEFT-aligned in the 47px olgl cell, so
+ * they blit at sx directly (verified against fonts/olgl.wmf via a headless
+ * render).  cap_glyph blits one olgl glyph; forward-declared since it lives in
+ * the menu section below. */
+static void cap_glyph(int x, int y, const unsigned char *g, int fg);
+static const unsigned char sb_elev_hi[] = { 54, 0 };
+static const unsigned char sb_elev_lo[] = { 55, 0 };
+static const unsigned char sb_box_ul[]  = { 194, 0 };
+static const unsigned char sb_box_lr[]  = { 195, 0 };
+static const unsigned char sb_dimp_f[]  = { 198, 0 };
+static const unsigned char sb_dimp_ul[] = { 196, 0 };
+static const unsigned char sb_dimp_lr[] = { 197, 0 };
+
+/* Paint the OPEN LOOK vertical scrollbar in the window's right gutter (the
+ * SCROLLBAR_W_PX column right of the content).  Anchors + elevator are
+ * draw_bevel_box (RAISED gray-group bevels); the cable is a BG2 fill; the
+ * elevator emboss + arrows + drag dimple are olgl glyphs via cap_glyph.
+ * Stage A: the elevator sits at the top (a decorative position indicator);
+ * the functional offset/proportion arrives with the client scroll-state op.
+ * Targets the ACTIVE window FB — caller set_active_window's first. */
+static void
+paint_scrollbar(void)
+{
+	int sx   = CONTENT_X_OFF_PX + CELL_AREA_W_PX + 1;   /* just right of content */
+	int sw   = SCROLLBAR_W_PX - 2;                       /* 14px body */
+	int top  = CONTENT_Y_OFF_PX;
+	int bot  = CONTENT_Y_OFF_PX + CELL_AREA_H_PX;
+	int anch = 9;                                       /* subtle cable-end caps */
+	int cy0  = top + anch + 2, cy1 = bot - anch - 2;
+	int cable_x = sx + 4, cable_w = sw - 8;
+	int elev_y = cy0;                                   /* Stage A: at the start */
+	int dy   = elev_y + 15;                             /* drag-box → middle third */
+
+	draw_bevel_box(((sx & 0xFFFF) << 16) | (top & 0xFFFF),
+	               ((sw & 0xFFFF) << 16) | (anch & 0xFFFF), BEVEL_RAISED | BEVEL_FILL);
+	draw_bevel_box(((sx & 0xFFFF) << 16) | ((bot - anch) & 0xFFFF),
+	               ((sw & 0xFFFF) << 16) | (anch & 0xFFFF), BEVEL_RAISED | BEVEL_FILL);
+	if (cy1 > cy0)
+		fill_rect_window(((cable_x & 0xFFFF) << 16) | (cy0 & 0xFFFF),
+		                 ((cable_w & 0xFFFF) << 16) | ((cy1 - cy0) & 0xFFFF), WM_FACE_BG2);
+	/* elevator: BG1 face, then the olgl emboss (cp 54/55 carry the 3D edges, the
+	 * up + down arrows and the dividers) + the recessed drag-box & dimple. */
+	fill_rect_window(((sx & 0xFFFF) << 16) | (elev_y & 0xFFFF),
+	                 ((sw & 0xFFFF) << 16) | (47 & 0xFFFF), WM_FACE_BG1);
+	cap_glyph(sx, elev_y, sb_elev_hi, WM_FACE_WHITE);
+	cap_glyph(sx, elev_y, sb_elev_lo, WM_FACE_BG3);
+	cap_glyph(sx, dy, sb_box_ul,  WM_FACE_BG3);
+	cap_glyph(sx, dy, sb_box_lr,  WM_FACE_WHITE);
+	cap_glyph(sx, dy, sb_dimp_f,  WM_FACE_BG2);
+	cap_glyph(sx, dy, sb_dimp_ul, WM_OL_BLACK);
+	cap_glyph(sx, dy, sb_dimp_lr, WM_FACE_WHITE);
+}
+
 /* Phase 60 step 3 superseded subscribe_term_pointer (the
  * /sys/term/<N>/pointer subscribe) and walk_pointer_to_slot.  The
  * pointer events mailbox is now a TAG_INPUT_SINK allocated by
@@ -3352,6 +3416,7 @@ handle_new_window(int wtype)
 	 * recycled from a destroyed window. */
 	window_title_lens[wid - 1] = 0;
 	paint_title_bar();
+	paint_scrollbar();   /* OPEN LOOK vertical scrollbar in the right gutter */
 
 	/* Phase 60 step 13 — composite the full window onto the screen
 	 * so the (zero-filled = bg-colored) content area replaces
