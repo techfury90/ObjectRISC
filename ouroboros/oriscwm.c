@@ -317,11 +317,13 @@
  * the screen FB above the z-stack.  Free libc slot between the wait-set ref
  * (@1568, 8 bytes) and the OR-spill anchor (@1696 = TABLE_BYTES + 1568). */
 #define WM_MENU_OVERLAY_FB_SLOT_OFFSET  1576
-/* Phase B — holds the ref to a font object loaded from /fonts at runtime, so
- * the dynamic-face blit emitter can OREFLD it into O2.  Next free libc slot
- * after the menu overlay (@1576), still below the OR-spill anchor (@1696). */
-#define WM_FONTOBJ_SLOT_OFFSET          1584
-#define WM_FONTOBJ_BYTES                8192   /* fits luRS.wmf (3152 B); Phase C sizes per file (olgl is 47 KB) */
+/* Phase B/C — per-face slots for fonts loaded from /fonts at runtime, so the
+ * dynamic-face blit emitter can OREFLD each into O2.  Indexed by FONT_FACE_*
+ * (PROP=0, MONO=1, GLYPH=2, BOLD=3): slot = WM_FONTOBJ_BASE + id*8, i.e.
+ * 1584/1592/1600/1608.  All four fit below the OR-spill anchor (@1696). */
+#define WM_FONTOBJ_BASE                 1584
+#define WM_NDYNFONT                     4
+#define WM_FONTOBJ_BYTES                8192   /* fits luRS/luBS/lutRS (≤3152 B); Phase C sizes per file for olgl (47 KB) */
 #define WM_FONT_HDR_BYTES               192    /* WMF1 header (16) + width table (≤167); covers all four faces */
 #define TAG_DATA                        0x4102
 
@@ -695,15 +697,23 @@ typedef struct {
  * olgl12.bdf; the title bar's window-menu button renders codepoint 22. */
 #include "wm_fonts_olgl.h"
 
-/* Phase B dynamic font loading — a runtime copy of the luRS face whose
- * glyphs are blitted from an object loaded out of /fonts (proving the
- * O2-from-object emitter), rather than the compiled-in blob.  Filled by
- * wm_font_load() at boot; until then (and on load failure) it is a verbatim
- * copy of the baked font_luRS, so the menu renders identically either way.
- * It keeps the baked blob pointer for MEASURING (font_advance); only the
- * render path switches to the loaded object.  (Phase C adds a width-table
- * cache so the baked blob can be dropped, then migrates all four faces.) */
-static wm_font_t font_luRS_dyn;
+/* Phase B/C dynamic font table — runtime faces loaded from /fonts, indexed by
+ * FONT_FACE_* (PROP=0 luRS, MONO=1 lutRS, GLYPH=2 olgl, BOLD=3 luBS).  Each
+ * entry starts as a verbatim copy of its baked twin (the fallback for any load
+ * failure) and, once loaded, points blob at its cached width table (measure)
+ * and obj_slot at its loaded object (render) — referencing the baked blob
+ * nowhere.  Filled by wm_init_dynamic_fonts() at boot. */
+static wm_font_t font_dyn[WM_NDYNFONT];
+
+/* Accessor for a dynamic face by FONT_FACE_* id.  Going through a function
+ * (the id is a runtime arg) keeps pcc from folding a constant element/field
+ * offset into `la font_dyn+N`, which asmorisc rejects as a multi-token
+ * operand — the same trap arr[const].field hits elsewhere. */
+static const wm_font_t *
+dyn_face(int id)
+{
+	return &font_dyn[id];
+}
 
 /* FONT_MAGIC / flags / R5 shape bits — must match simorisc's extended
  * ObjBlitGlyphs path. */
@@ -1210,14 +1220,53 @@ wm_hostfs_init(void)
 	return hf_init();
 }
 
-/* Stream a /fonts/*.wmf blob into a freshly-ObjAlloc'd byte object parked at
- * WM_FONTOBJ_SLOT.  The slot RETAINS the object ref (the blit emitter OREFLDs
- * it into O2); obj_adopt_slot only aliases it into a handle for the read, and
- * obj_drop releases just that handle.  Returns bytes read (>0 = success). */
-static int
-wm_font_load(const char *path)
+/* Per-face dynamic state.  dyn_cache[id] holds the loaded face's WMF1 header +
+ * width table (so font_advance/measure read the loaded widths, not the baked
+ * blob); the loaded object itself lives in O12 slot WM_FONTOBJ_BASE + id*8. */
+static unsigned int dyn_cache[WM_NDYNFONT][WM_FONT_HDR_BYTES / 4];
+static const char *const dyn_font_path[WM_NDYNFONT] = {
+	"/fonts/luRS.wmf", "/fonts/lutRS.wmf", "/fonts/olgl.wmf", "/fonts/luBS.wmf"
+};
+static const wm_font_t *const dyn_font_baked[WM_NDYNFONT] = {
+	&font_luRS, &font_lutRS, &font_olgl, &font_luBS
+};
+
+/* Park the just-ObjAlloc'd object (O1) into face id's slot — immediate OREFST
+ * per id (pcc rejects computed offsets; the load_window_fb_to_o1 idiom). */
+static void
+font_slot_park_o1(int id)
 {
-	int fd = vfs_open(path, HF_O_RDONLY);
+	switch (id) {
+	case 0: asm volatile("orefst o1, 1584(o12)"); break;
+	case 1: asm volatile("orefst o1, 1592(o12)"); break;
+	case 2: asm volatile("orefst o1, 1600(o12)"); break;
+	case 3: asm volatile("orefst o1, 1608(o12)"); break;
+	default: break;
+	}
+}
+
+/* Load face id's blob into face id's slot — immediate OREFLD into O1 per id
+ * (used as ObjFetchBytes' source). */
+static void
+font_slot_load_o1(int id)
+{
+	switch (id) {
+	case 0: asm volatile("orefld o1, 1584(o12)"); break;
+	case 1: asm volatile("orefld o1, 1592(o12)"); break;
+	case 2: asm volatile("orefld o1, 1600(o12)"); break;
+	case 3: asm volatile("orefld o1, 1608(o12)"); break;
+	default: break;
+	}
+}
+
+/* Stream face id's /fonts/*.wmf blob into a freshly-ObjAlloc'd byte object
+ * parked at WM_FONTOBJ_BASE + id*8.  The slot RETAINS the ref (the blit emitter
+ * OREFLDs it into O2); obj_adopt_slot only aliases it into a handle for the
+ * read, and obj_drop releases just that handle.  Returns bytes read (>0). */
+static int
+wm_font_load(int id)
+{
+	int fd = vfs_open(dyn_font_path[id], HF_O_RDONLY);
 	if (fd < 0) return fd;
 
 	int status;
@@ -1225,19 +1274,18 @@ wm_font_load(const char *path)
 		"addiu r4, r0, %1\n"           /* size = WM_FONTOBJ_BYTES */
 		"addiu r5, r0, %2\n"           /* TAG_DATA (byte object) */
 		"addiu r6, r0, %3\n"           /* CAP_R|W|V|C (W: hostfsd writes it) */
-		"call  #0x100\n"               /* ObjAlloc → O1 */
+		"call  #0x100\n"               /* ObjAlloc → O1 (parked below) */
 		"nop\n"
-		"orefst o1, %4(o12)\n"         /* park ref for the blit emitter */
 		"addu  %0, r2, r0"
 		: "=r"(status)
 		: "i"(WM_FONTOBJ_BYTES), "i"(TAG_DATA),
-		  "i"(CAP_R | CAP_W | CAP_V | CAP_C),
-		  "i"(WM_FONTOBJ_SLOT_OFFSET)
+		  "i"(CAP_R | CAP_W | CAP_V | CAP_C)
 		: "r1", "r2", "r4", "r5", "r6"
 	);
 	if (status != 0) { vfs_close(fd); return -1; }
+	font_slot_park_o1(id);             /* O1 still holds the new object */
 
-	int h = obj_adopt_slot(WM_FONTOBJ_SLOT_OFFSET);
+	int h = obj_adopt_slot(WM_FONTOBJ_BASE + id * 8);
 	if (h < 0) { vfs_close(fd); return -1; }   /* OBJ_NULL */
 
 	unsigned int off = 0;
@@ -1254,95 +1302,99 @@ wm_font_load(const char *path)
 	return (int)off;
 }
 
-/* Phase C — the loaded face's WMF1 header + width table, cached in the WM's
- * DATA segment so font_advance/font_measure can read the proportional widths
- * WITHOUT the baked blob.  This is what untethers a loaded face from its
- * compiled-in twin: once it's populated, font_luRS_dyn.blob points here, not
- * at luRS_blob. */
-static unsigned int dyn_luRS_cache[WM_FONT_HDR_BYTES / 4];
-
-/* Copy the loaded font object's first WM_FONT_HDR_BYTES (header + width table)
- * into dyn_luRS_cache.  ObjFetchBytes can't write the DATA segment directly —
+/* Copy face id's loaded object's first WM_FONT_HDR_BYTES (header + width table)
+ * into dyn_cache[id].  ObjFetchBytes can't write the DATA segment directly —
  * the WM's O15 ref lacks ref-level CAP_W (its VA mapping is R|W, but the
  * primitive checks ref caps) — so fetch into the boot stack (O11, which has
  * CAP_W) then memcpy through the data mapping's W bit, exactly as
  * handle_set_title does for window titles.  Returns 0 on success. */
 static int
-wm_font_cache_header(void)
+wm_font_cache_header(int id)
 {
 	unsigned char fetch_buf[WM_FONT_HDR_BYTES];
 	int dst_off = (int)((unsigned int)fetch_buf - STACK_BOTTOM);
 	int n = WM_FONT_HDR_BYTES;
 	int fetch_status;
 	int i;
+	font_slot_load_o1(id);             /* O1 = face id's loaded object (source) */
 	asm volatile(
 		"addu  r8,  r0, r0\n"          /* src_off = 0 */
 		"addu  r9,  %1, r0\n"          /* dst_off (stack) */
 		"addu  r10, %2, r0\n"          /* count */
-		"orefld o1, %3(o12)\n"         /* O1 = loaded font object (CAP_R) */
 		"omov   o2, o11\n"             /* O2 = boot stack (dest, CAP_W) */
 		"addu  r4, r8,  r0\n"
 		"addu  r5, r9,  r0\n"
 		"addu  r6, r10, r0\n"
-		"call  #0x108\n"               /* ObjFetchBytes */
+		"call  #0x108\n"               /* ObjFetchBytes (O1 set above) */
 		"nop\n"
 		"addu  %0, r2, r0"
 		: "=r"(fetch_status)
-		: "r"(dst_off), "r"(n), "i"(WM_FONTOBJ_SLOT_OFFSET)
+		: "r"(dst_off), "r"(n)
 		: "r1", "r2", "r3", "r4", "r5", "r6", "r8", "r9", "r10"
 	);
 	if (fetch_status != 0) return fetch_status;
 	{
-		unsigned char *dst = (unsigned char *)dyn_luRS_cache;
+		unsigned char *dst = (unsigned char *)dyn_cache[id];
 		for (i = 0; i < n; i++) dst[i] = fetch_buf[i];   /* stack → data (W) */
 	}
 	return 0;
 }
 
-/* Boot: load luRS from /fonts and untether it from the baked blob.  Start as a
- * verbatim baked face (the fallback for any failure — no hostfsd, no /fonts,
- * fetch error, or a width-table that doesn't validate), then on full success
- * point the face at the loaded OBJECT (render) and the width-table CACHE
- * (measure) so nothing reads luRS_blob.  Called once at boot. */
+/* Load one face from /fonts and untether it from its baked blob: load the
+ * object, cache its width table, validate the cached widths against the baked
+ * blob, then on success point font_dyn[id] at the cache (measure) + object
+ * (render).  Any failure leaves font_dyn[id] as the verbatim baked copy
+ * wm_init_dynamic_fonts seeded, so the face always renders. */
 static void
-wm_init_dynamic_fonts(void)
+wm_load_face(int id)
 {
 	int n, wc, wb;
 	wm_font_t probe;
+	wm_font_t *f = &font_dyn[id];        /* register-computed; no la font_dyn+N */
+	const char *name = dyn_font_path[id];
 
-	font_luRS_dyn = font_luRS;
+	n = wm_font_load(id);
+	if (n <= 0) {
+		WM_PRINT("oriscwm: "); WM_PRINT(name);
+		WM_PRINT(" load failed — baked\n");
+		return;
+	}
+	if (wm_font_cache_header(id) != 0) {
+		WM_PRINT("oriscwm: "); WM_PRINT(name);
+		WM_PRINT(" width fetch failed — baked\n");
+		return;
+	}
+	probe = *f;                                        /* baked copy + cache blob */
+	probe.blob = (const unsigned int *)dyn_cache[id];
+	wc = font_measure(&probe, (const unsigned char *)"Workspace", 9);
+	wb = font_measure(dyn_font_baked[id], (const unsigned char *)"Workspace", 9);
+	if (wc != wb) {
+		WM_PRINT("oriscwm: "); WM_PRINT(name);
+		WM_PRINT(" widths MISMATCH — baked\n");
+		return;
+	}
+	f->blob = (const unsigned int *)dyn_cache[id];
+	f->obj_slot = WM_FONTOBJ_BASE + id * 8;
+	WM_PRINT("oriscwm: "); WM_PRINT(name);
+	WM_PRINT(" loaded ("); WM_PRINT_INT(n);
+	WM_PRINT(" B); widths OK — off disk\n");
+}
+
+/* Boot: seed every face as its baked twin (universal fallback), then load the
+ * chrome text faces from /fonts.  Phase C step 2 migrates luRS (menu items) +
+ * luBS (window + menu titles); lutRS + olgl stay baked until their render
+ * paths + per-file sizes (olgl is 47 KB) are handled.  Called once at boot. */
+static void
+wm_init_dynamic_fonts(void)
+{
+	int i;
+	for (i = 0; i < WM_NDYNFONT; i++) font_dyn[i] = *dyn_font_baked[i];
 	if (wm_hostfs_init() != 0) {
 		WM_PRINT("oriscwm: hostfsd unavailable — fonts stay baked\n");
 		return;
 	}
-	n = wm_font_load("/fonts/luRS.wmf");
-	if (n <= 0) {
-		WM_PRINT("oriscwm: /fonts/luRS.wmf load failed (");
-		WM_PRINT_INT(n);
-		WM_PRINT(") — using baked luRS\n");
-		return;
-	}
-	if (wm_font_cache_header() != 0) {
-		WM_PRINT("oriscwm: luRS width-table fetch failed — using baked luRS\n");
-		return;
-	}
-	/* Validate the cached widths against the baked blob before trusting it. */
-	probe = font_luRS_dyn;
-	probe.blob = (const unsigned int *)dyn_luRS_cache;
-	wc = font_measure(&probe, (const unsigned char *)"Workspace", 9);
-	wb = font_measure(&font_luRS, (const unsigned char *)"Workspace", 9);
-	if (wc != wb) {
-		WM_PRINT("oriscwm: luRS cached widths MISMATCH (");
-		WM_PRINT_INT(wc); WM_PRINT(" vs "); WM_PRINT_INT(wb);
-		WM_PRINT(") — using baked luRS\n");
-		return;
-	}
-	/* Fully off disk: measure from the cache, render from the object. */
-	font_luRS_dyn.blob = (const unsigned int *)dyn_luRS_cache;
-	font_luRS_dyn.obj_slot = WM_FONTOBJ_SLOT_OFFSET;
-	WM_PRINT("oriscwm: luRS loaded from /fonts (");
-	WM_PRINT_INT(n);
-	WM_PRINT(" B); widths OK (cache==baked) — menu fully off disk\n");
+	wm_load_face(FONT_FACE_PROP);   /* luRS — menu items */
+	wm_load_face(FONT_FACE_BOLD);   /* luBS — window + menu titles */
 }
 
 /* Phase 60 step 11 — per-wid window FB slot dispatch.  Mirrors the
@@ -2114,23 +2166,32 @@ blit_glyphs_screenfb(int packed_xy, int packed_shape, int font_off, int text_off
 	);
 }
 
-/* Phase B — EXTENDED glyph blit into the ACTIVE window FB for a font loaded
+/* Phase B/C — EXTENDED glyph blit into the ACTIVE window FB for a font loaded
  * from /fonts at runtime.  Identical to blit_glyphs_winfb except O2 is the
- * loaded font object (OREFLD'd from WM_FONTOBJ_SLOT) instead of O15, and
- * font_off is 0 (the WMF1 blob is at offset 0 of its own object).  O3 (text)
- * is still O15 — chrome strings live in boot data.  This is the one render-
- * path change dynamic fonts need; everything else is identical to the baked
- * path, so a loaded face renders pixel-for-pixel like its compiled-in twin. */
+ * loaded font object (OREFLD'd from the face's per-face slot) instead of O15,
+ * and font_off is 0 (the WMF1 blob is at offset 0 of its own object).  O3
+ * (text) is still O15 — chrome strings live in boot data.  This is the one
+ * render-path change dynamic fonts need; everything else is identical to the
+ * baked path, so a loaded face renders pixel-for-pixel like its compiled-in
+ * twin.  `slot` selects which loaded face (immediate OREFLD per slot — pcc
+ * rejects computed offsets); O2 set by the switch persists into the blit asm
+ * (no C between the two volatile blocks). */
 static void
-blit_glyphs_winfb_dyn(int packed_xy, int packed_shape, int text_off)
+blit_glyphs_winfb_dyn(int packed_xy, int packed_shape, int text_off, int slot)
 {
+	switch (slot) {
+	case 1584: asm volatile("orefld o2, 1584(o12)"); break;
+	case 1592: asm volatile("orefld o2, 1592(o12)"); break;
+	case 1600: asm volatile("orefld o2, 1600(o12)"); break;
+	case 1608: asm volatile("orefld o2, 1608(o12)"); break;
+	default: return;
+	}
 	asm volatile(
 		"addu   r8,  %0, r0\n"
 		"addu   r9,  %1, r0\n"
 		"addu   r11, %2, r0\n"
 		"orefld o1, %3(o12)\n"      /* O1 = active window FB */
-		"orefld o2, %4(o12)\n"      /* O2 = loaded font object */
-		"omov   o3, o15\n"          /* O3 = boot data (text) */
+		"omov   o3, o15\n"          /* O3 = boot data (text); O2 = font (above) */
 		"addu   r4, r8,  r0\n"
 		"addu   r5, r9,  r0\n"
 		"addu   r6, r0,  r0\n"      /* font_off = 0 (blob at object start) */
@@ -2139,7 +2200,7 @@ blit_glyphs_winfb_dyn(int packed_xy, int packed_shape, int text_off)
 		"nop"
 		:
 		: "r"(packed_xy), "r"(packed_shape), "r"(text_off),
-		  "i"(WM_ACTIVE_FB_SLOT_OFFSET), "i"(WM_FONTOBJ_SLOT_OFFSET)
+		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
 		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
 		  "r8", "r9", "r11"
 	);
@@ -2169,7 +2230,8 @@ win_draw_string(const wm_font_t *font, int packed_xy, int packed_shape,
 	int text_off = (int)((unsigned int)text - DATA_VA);
 	if (font->obj_slot) {
 		/* Font loaded from /fonts — blit from its object (O2), not O15. */
-		blit_glyphs_winfb_dyn(packed_xy, packed_shape, text_off);
+		blit_glyphs_winfb_dyn(packed_xy, packed_shape, text_off,
+		                      font->obj_slot);
 		return;
 	}
 	int font_off = (int)((unsigned int)font->blob - DATA_VA);
@@ -2294,7 +2356,7 @@ paint_title_bar(void)
 		int n0 = window_title_lens[active_wid - 1];
 		int title_px = 0, n = 0;
 		while (n < n0) {
-			int adv = font_advance(&font_luBS, title[n]);
+			int adv = font_advance(dyn_face(FONT_FACE_BOLD), title[n]);
 			if (title_px + adv > span_w) break;
 			title_px += adv;
 			n++;
@@ -2306,8 +2368,8 @@ paint_title_bar(void)
 			int text_bg = focused ? WM_TITLE_STRIPE_FACE : WM_TITLE_BG;
 			int packed_shape = font_shape(n, WM_TITLE_TEXT_FG, text_bg, 1);
 			/* Bold Lucida Sans — OPEN LOOK title bars are bold, same as the
-			 * menu title (font_luBS, 12x16 like luRS so geometry is unchanged). */
-			win_draw_string(&font_luBS, packed_xy, packed_shape, title);
+			 * menu title; routed through the /fonts-loaded luBS (font_dyn). */
+			win_draw_string(dyn_face(FONT_FACE_BOLD), packed_xy, packed_shape, title);
 		}
 	}
 
@@ -5501,7 +5563,7 @@ menu_width_px(void)
 	int max = 0;
 	int i;
 	for (i = 0; i < DESKTOP_MENU_N; i++) {
-		int w = font_measure(&font_luRS_dyn,
+		int w = font_measure(dyn_face(FONT_FACE_PROP),
 		                     (const unsigned char *)desktop_menu_labels[i],
 		                     desktop_menu_label_lens[i]);
 		if (w > max) max = w;
@@ -5511,7 +5573,7 @@ menu_width_px(void)
 	 * title's last-glyph ink (the trailing 'e' of "Workspace") clears the
 	 * divider (font_measure counts advances, which run a hair short of ink). */
 	int title = MENU_PP_LEFT + MENU_PP_W + 4 + 3
-	          + font_measure(&font_luBS,
+	          + font_measure(dyn_face(FONT_FACE_BOLD),
 	                         (const unsigned char *)menu_title, MENU_TITLE_LEN);
 	int inner = items > title ? items : title;
 	return 2 * MENU_BORDER_PX + inner;
@@ -5609,13 +5671,13 @@ menu_paint_item(int item_idx)
 	const char *label = desktop_menu_labels[item_idx];
 	int label_len     = desktop_menu_label_lens[item_idx];
 	int text_x = item_x + MENU_TEXT_MARGIN_PX;
-	int text_y = item_y + (MENU_ITEM_H_PX - font_luRS_dyn.cell_h) / 2;
+	int text_y = item_y + (MENU_ITEM_H_PX - dyn_face(FONT_FACE_PROP)->cell_h) / 2;
 	int packed_xy = ((text_x & 0xFFFF) << 16) | (text_y & 0xFFFF);
 	int packed_shape = font_shape(label_len, WM_OL_BLACK, WM_FACE_BG1, 1);
-	/* Phase B — render the item labels from the /fonts-loaded luRS (font_luRS_dyn
-	 * == baked luRS until the load succeeds, then renders from the loaded
-	 * object).  This is the one caller routed through the dynamic face. */
-	win_draw_string(&font_luRS_dyn, packed_xy, packed_shape,
+	/* Phase C — render the item labels from the /fonts-loaded luRS
+	 * (font_dyn[FONT_FACE_PROP] == baked luRS until the load succeeds, then
+	 * measures from the cache + renders from the loaded object). */
+	win_draw_string(dyn_face(FONT_FACE_PROP), packed_xy, packed_shape,
 	                   (const unsigned char *)label);
 }
 
@@ -5646,13 +5708,14 @@ menu_draw_title(void)
 {
 	menu_draw_pushpin();
 	int tx0 = menu_x_px + MENU_PP_LEFT + MENU_PP_W + 4;
-	int tw  = font_measure(&font_luBS,
+	int tw  = font_measure(dyn_face(FONT_FACE_BOLD),
 	                       (const unsigned char *)menu_title, MENU_TITLE_LEN);
 	int right = menu_x_px + menu_w_px - MENU_BORDER_PX;
 	int tx = tx0 + (right - tx0 - tw) / 2;
-	int ty = menu_y_px + MENU_BORDER_PX + (MENU_TITLE_PX - font_luBS.cell_h) / 2;
+	int ty = menu_y_px + MENU_BORDER_PX
+	       + (MENU_TITLE_PX - dyn_face(FONT_FACE_BOLD)->cell_h) / 2;
 	int pxy = ((tx & 0xFFFF) << 16) | (ty & 0xFFFF);
-	win_draw_string(&font_luBS, pxy,
+	win_draw_string(dyn_face(FONT_FACE_BOLD), pxy,
 	                   font_shape(MENU_TITLE_LEN, WM_OL_BLACK, WM_FACE_BG1, 1),
 	                   (const unsigned char *)menu_title);
 	/* text-ledge separator: inset 3px, just below the title row. */
