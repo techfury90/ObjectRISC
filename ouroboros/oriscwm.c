@@ -882,6 +882,12 @@ static int  menu_pinned;          /* pushpin IN (menu kept open) vs OUT */
 static int  menu_x_px, menu_y_px;  /* top-left in SCREEN PIXEL coords */
 static int  menu_w_px, menu_h_px;
 static int  menu_highlighted;     /* -1 = none, else 0..N-1 */
+/* Drag state for moving a PINNED menu by its title row (mirrors the window
+ * drag: an outline follows the cursor, the menu jumps to it on button-up). */
+static int  menu_drag_active;
+static int  menu_drag_start_x, menu_drag_start_y;  /* cursor at grab */
+static int  menu_drag_win_x,   menu_drag_win_y;    /* menu pos at grab */
+static int  menu_drag_out_x,   menu_drag_out_y;    /* current outline pos */
 
 /* The owner task ref and subscriber notify_cap live in OPR slots
  * (WM_OWNER_BASE_OFFSET + id*8 and WM_SUBSCRIBE_BASE_OFFSET + id*8)
@@ -1434,12 +1440,17 @@ do_blit_copy_active_to_screen(int packed_src_xy, int packed_dst_xy,
  * compositing the remaining z-stack. */
 static void fill_rect_packed(int packed_xy, int packed_wh, int color);
 
+/* Forward decl: the composite_screen_rect wrapper re-blits a pinned desktop
+ * menu after any window composites over it (the menu lives on the screen FB
+ * above the z-order, so it needs explicit stay-on-top). */
+static void menu_draw(void);
+
 /* Composite an arbitrary screen rect by walking z-order bottom-to-
  * top: each window's intersection with the rect is blitted from its
  * FB.  Used by composite_window_region (for paint-after-write) and
  * recompose_after_destroy (for vacated-pixel cleanup). */
 static void
-composite_screen_rect(int sx, int sy, int w, int h)
+composite_screen_rect_impl(int sx, int sy, int w, int h)
 {
 	int sxe = sx + w;
 	int sye = sy + h;
@@ -1505,6 +1516,22 @@ composite_screen_rect(int sx, int sy, int w, int h)
 		int packed_wh  = ((rw & 0xFFFF) << 16) | (rh & 0xFFFF);
 		do_blit_copy_active_to_screen(packed_src, packed_dst, packed_wh);
 	}
+}
+
+/* Stay-on-top wrapper: composite, then re-blit a pinned desktop menu if the
+ * rect overlapped it — a window (or the drag outline's erase) just painted
+ * over the menu, which lives on the screen FB above the z-order.  Keeping it
+ * unconditional also keeps the menu's frame intact while its move-outline is
+ * dragged across it.  menu_draw() paints straight to the screen FB (no
+ * composite_screen_rect), so there's no recursion. */
+static void
+composite_screen_rect(int sx, int sy, int w, int h)
+{
+	composite_screen_rect_impl(sx, sy, w, h);
+	if (menu_active && menu_pinned
+	    && sx < menu_x_px + menu_w_px && sx + w > menu_x_px
+	    && sy < menu_y_px + menu_h_px && sy + h > menu_y_px)
+		menu_draw();
 }
 
 static void
@@ -5013,10 +5040,8 @@ topmost_window_at(int px, int py)
  * re-composite the affected screen rect so any windows beneath
  * the outline come back unscathed. */
 static void
-draw_outline(int x, int y)
+draw_outline(int x, int y, int w, int h)
 {
-	int w = USABLE_W_PX;
-	int h = USABLE_H_PX;
 	int color = WM_OUTLINE_COLOR;
 	/* Top strip. */
 	fill_rect_packed(((x & 0xFFFF) << 16) | (y & 0xFFFF),
@@ -5048,10 +5073,8 @@ erase_screen_rect(int sx, int sy, int w, int h)
 }
 
 static void
-erase_outline(int x, int y)
+erase_outline(int x, int y, int w, int h)
 {
-	int w = USABLE_W_PX;
-	int h = USABLE_H_PX;
 	erase_screen_rect(x, y, w, OUTLINE_PX);                   /* top */
 	erase_screen_rect(x, y + h - OUTLINE_PX, w, OUTLINE_PX);  /* bot */
 	erase_screen_rect(x, y, OUTLINE_PX, h);                   /* left */
@@ -5147,8 +5170,10 @@ menu_width_px(void)
 		if (w > max) max = w;
 	}
 	int items = max + 2 * MENU_TEXT_MARGIN_PX;
-	/* The title row must also fit: pushpin + a gap + the bold title. */
-	int title = MENU_PP_LEFT + MENU_PP_W + 4
+	/* The title row must also fit: pushpin + gap + the bold title + 3px so the
+	 * title's last-glyph ink (the trailing 'e' of "Workspace") clears the
+	 * divider (font_measure counts advances, which run a hair short of ink). */
+	int title = MENU_PP_LEFT + MENU_PP_W + 4 + 3
 	          + font_measure(&font_luBS,
 	                         (const unsigned char *)menu_title, MENU_TITLE_LEN);
 	int inner = items > title ? items : title;
@@ -5337,6 +5362,20 @@ menu_hit_pushpin(int px, int py)
 	return px >= x && px < x + MENU_PP_W && py >= y && py < y + MENU_PP_H;
 }
 
+/* True if (px, py) is on the title row (the drag handle), excluding the
+ * pushpin — pressing here on a pinned menu starts a move. */
+static int
+menu_hit_title(int px, int py)
+{
+	if (!menu_active) return 0;
+	int ty0 = menu_y_px + MENU_BORDER_PX;
+	int ty1 = ty0 + MENU_TITLE_PX;
+	if (py < ty0 || py >= ty1) return 0;
+	if (px < menu_x_px + MENU_BORDER_PX
+	 || px >= menu_x_px + menu_w_px - MENU_BORDER_PX) return 0;
+	return !menu_hit_pushpin(px, py);
+}
+
 static void
 desktop_menu_show(int px, int py)
 {
@@ -5448,6 +5487,43 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 	int px = (packed_xy >> 16) & 0xFFFF;
 	int py = packed_xy & 0xFFFF;
 
+	/* A pinned menu being dragged by its title takes priority (mirrors the
+	 * window drag below): the outline follows the cursor; the menu jumps to
+	 * it on button-up. */
+	if (menu_drag_active) {
+		if (evt_type == PTR_EVT_MOTION) {
+			int nx = menu_drag_win_x + (px - menu_drag_start_x);
+			int ny = menu_drag_win_y + (py - menu_drag_start_y);
+			int max_x = FB_W - menu_w_px, max_y = FB_H - menu_h_px;
+			if (nx < 0) nx = 0;
+			if (ny < 0) ny = 0;
+			if (nx > max_x) nx = max_x;
+			if (ny > max_y) ny = max_y;
+			if (nx == menu_drag_out_x && ny == menu_drag_out_y) return 1;
+			erase_outline(menu_drag_out_x, menu_drag_out_y, menu_w_px, menu_h_px);
+			draw_outline(nx, ny, menu_w_px, menu_h_px);
+			menu_drag_out_x = nx;
+			menu_drag_out_y = ny;
+			return 1;
+		}
+		if (evt_type == PTR_EVT_UP && button == PTR_BTN_LEFT) {
+			erase_outline(menu_drag_out_x, menu_drag_out_y, menu_w_px, menu_h_px);
+			if (menu_drag_out_x != menu_x_px || menu_drag_out_y != menu_y_px) {
+				/* Move: erase the menu at its old spot (recompose the windows
+				 * behind) and redraw at the new one.  Set the new position
+				 * FIRST so the stay-on-top hook keys off the new rect. */
+				int ox = menu_x_px, oy = menu_y_px;
+				menu_x_px = menu_drag_out_x;
+				menu_y_px = menu_drag_out_y;
+				recompose_after_destroy(ox, oy, menu_w_px, menu_h_px);
+				menu_draw();
+			}
+			menu_drag_active = 0;
+			return 1;
+		}
+		return 1;   /* swallow other events mid-drag */
+	}
+
 	/* Desktop menu.  TRANSIENT (unpinned) = modal: the WM owns the cursor and
 	 * any off-menu click dismisses.  PINNED = non-modal (OPEN LOOK): off-menu
 	 * events fall through to the normal window handling below and the menu
@@ -5474,14 +5550,32 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 					return 1;
 				}
 				int hit = menu_hit_item(px, py);
-				if (hit >= 0)          desktop_menu_select(hit);
-				else if (!menu_pinned) desktop_menu_dismiss();
+				if (hit >= 0) { desktop_menu_select(hit); return 1; }
+				/* Pinned + press on the title row → start dragging the menu. */
+				if (menu_pinned && menu_hit_title(px, py)) {
+					menu_drag_active  = 1;
+					menu_drag_start_x = px;
+					menu_drag_start_y = py;
+					menu_drag_win_x   = menu_x_px;
+					menu_drag_win_y   = menu_y_px;
+					menu_drag_out_x   = menu_x_px;
+					menu_drag_out_y   = menu_y_px;
+					draw_outline(menu_x_px, menu_y_px, menu_w_px, menu_h_px);
+					return 1;
+				}
+				if (!menu_pinned) desktop_menu_dismiss();
 				return 1;
 			}
 			/* PTR_EVT_UP / other while owning the cursor: swallow. */
 			return 1;
 		}
-		/* pinned + off-menu: fall through to normal window handling. */
+		/* Pinned + off-menu: clear any stale item highlight (the pointer has
+		 * left the menu), then fall through to the normal window handling. */
+		if (evt_type == PTR_EVT_MOTION && menu_highlighted >= 0) {
+			int old = menu_highlighted;
+			menu_highlighted = -1;
+			menu_paint_item(old);
+		}
 	}
 
 	/* Right-click (or middle-click) on empty desktop summons the
@@ -5518,8 +5612,8 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 		if (ny > max_y) ny = max_y;
 		if (nx == drag_outline_x && ny == drag_outline_y)
 			return 1;
-		erase_outline(drag_outline_x, drag_outline_y);
-		draw_outline(nx, ny);
+		erase_outline(drag_outline_x, drag_outline_y, USABLE_W_PX, USABLE_H_PX);
+		draw_outline(nx, ny, USABLE_W_PX, USABLE_H_PX);
 		drag_outline_x = nx;
 		drag_outline_y = ny;
 		return 1;
@@ -5547,7 +5641,7 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 			drag_window_y  = window_pos_y[t - 1];
 			drag_outline_x = drag_window_x;
 			drag_outline_y = drag_window_y;
-			draw_outline(drag_outline_x, drag_outline_y);
+			draw_outline(drag_outline_x, drag_outline_y, USABLE_W_PX, USABLE_H_PX);
 			return 1;
 		}
 		/* Click in a non-title region: raise but let the
@@ -5557,7 +5651,7 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 
 	if (evt_type == PTR_EVT_UP) {
 		if (drag_active && button == PTR_BTN_LEFT) {
-			erase_outline(drag_outline_x, drag_outline_y);
+			erase_outline(drag_outline_x, drag_outline_y, USABLE_W_PX, USABLE_H_PX);
 			int idx = drag_wid - 1;
 			if (idx >= 0 && idx < MAX_WINDOWS
 			    && (drag_outline_x != window_pos_x[idx]
