@@ -864,8 +864,21 @@ static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
 #define MENU_BORDER_PX       2    /* item inset from the menu frame (olgx B) */
 #define MENU_TEXT_MARGIN_PX  9    /* text left/right margin (olgx endcap_width) */
 #define MENU_ITEM_H_PX       20   /* per-item row height (luRS cell 16 + pad) */
+/* Title row: a pinnable OPEN LOOK menu (olwm "Workspace" menu) carries a bold
+ * title + pushpin above an engraved olgx text-ledge separator. */
+#define MENU_TITLE_PX        18   /* title-row height (olgx pushpin_height*3/2) */
+#define MENU_LEDGE_PX        2    /* text-ledge separator (olgx 2px raised box) */
+#define MENU_PP_W            26   /* pushpin-out sprite width (olgl 26x12)      */
+#define MENU_PP_H            12   /* pushpin-out sprite height                  */
+#define MENU_PP_LEFT         13   /* pushpin x within the menu (olgx pp_w/2)    */
+#define MENU_PP_TOP          3    /* pushpin y within the title row             */
+/* Item area starts below the border + title row + ledge. */
+#define MENU_CONTENT_Y_OFF   (MENU_BORDER_PX + MENU_TITLE_PX + MENU_LEDGE_PX)
+static const char         menu_title[]   = "Workspace";
+#define MENU_TITLE_LEN       9
 
 static int  menu_active;           /* non-zero while desktop menu showing */
+static int  menu_pinned;          /* pushpin IN (menu kept open) vs OUT */
 static int  menu_x_px, menu_y_px;  /* top-left in SCREEN PIXEL coords */
 static int  menu_w_px, menu_h_px;
 static int  menu_highlighted;     /* -1 = none, else 0..N-1 */
@@ -5133,7 +5146,13 @@ menu_width_px(void)
 		                     desktop_menu_label_lens[i]);
 		if (w > max) max = w;
 	}
-	return 2 * MENU_BORDER_PX + max + 2 * MENU_TEXT_MARGIN_PX;
+	int items = max + 2 * MENU_TEXT_MARGIN_PX;
+	/* The title row must also fit: pushpin + a gap + the bold title. */
+	int title = MENU_PP_LEFT + MENU_PP_W + 4
+	          + font_measure(&font_luBS,
+	                         (const unsigned char *)menu_title, MENU_TITLE_LEN);
+	int inner = items > title ? items : title;
+	return 2 * MENU_BORDER_PX + inner;
 }
 
 /* OPEN LOOK menu-item capsule endcaps (olgx olgx_draw_button, recessed look).
@@ -5151,6 +5170,15 @@ static const unsigned char cap_l_fill[] = { 26, 0 };   /* left  body      → BG
 static const unsigned char cap_r_top[]  = { 28, 0 };   /* right upper arc → BG3   */
 static const unsigned char cap_r_bot[]  = { 27, 0 };   /* right lower arc → WHITE */
 static const unsigned char cap_r_fill[] = { 29, 0 };   /* right body      → BG2   */
+/* Pushpin glyphs (olgl), 3-layer emboss like everything: top→WHITE, bottom→BG3,
+ * middle→BG2.  OUT (enc 100-102) = sideways pin (transient); IN (103-105) =
+ * head-on pin (pinned/retained). */
+static const unsigned char pp_out_top[] = { 100, 0 };
+static const unsigned char pp_out_bot[] = { 101, 0 };
+static const unsigned char pp_out_mid[] = { 102, 0 };
+static const unsigned char pp_in_top[]  = { 103, 0 };
+static const unsigned char pp_in_bot[]  = { 104, 0 };
+static const unsigned char pp_in_mid[]  = { 105, 0 };
 
 /* One olgl capsule glyph at screen pixel (x, y) in colour fg, transparent. */
 static void
@@ -5203,7 +5231,7 @@ menu_paint_item(int item_idx)
 {
 	if (item_idx < 0 || item_idx >= DESKTOP_MENU_N) return;
 	int item_x = menu_x_px + MENU_BORDER_PX;
-	int item_y = menu_y_px + MENU_BORDER_PX + item_idx * MENU_ITEM_H_PX;
+	int item_y = menu_y_px + MENU_CONTENT_Y_OFF + item_idx * MENU_ITEM_H_PX;
 	int item_w = menu_w_px - 2 * MENU_BORDER_PX;
 	int item_xy = ((item_x & 0xFFFF) << 16) | (item_y & 0xFFFF);
 	int item_wh = ((item_w & 0xFFFF) << 16) | (MENU_ITEM_H_PX & 0xFFFF);
@@ -5224,7 +5252,54 @@ menu_paint_item(int item_idx)
 	                   (const unsigned char *)label);
 }
 
-/* Paint the whole menu: BG1 plate, 1px raised bevel frame, then all items. */
+/* Draw the pushpin (OUT or IN per menu_pinned) as a 3-layer emboss at its slot
+ * in the title row — middle=BG2 fill, top=WHITE highlight, bottom=BG3 shadow. */
+static void
+menu_draw_pushpin(void)
+{
+	int x = menu_x_px + MENU_PP_LEFT;
+	int y = menu_y_px + MENU_BORDER_PX + MENU_PP_TOP;
+	/* Clear the full OUT-sized slot (26x13) to BG1 first.  The IN sprite is
+	 * only 13px wide, so a bare redraw on OUT->IN would leave the OUT pin's
+	 * right half on screen. */
+	fill_rect_packed(((x & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((MENU_PP_W & 0xFFFF) << 16) | ((MENU_PP_H + 1) & 0xFFFF),
+	                 WM_FACE_BG1);
+	cap_glyph(x, y, menu_pinned ? pp_in_mid : pp_out_mid, WM_FACE_BG2);
+	cap_glyph(x, y, menu_pinned ? pp_in_top : pp_out_top, WM_FACE_WHITE);
+	cap_glyph(x, y, menu_pinned ? pp_in_bot : pp_out_bot, WM_FACE_BG3);
+}
+
+/* Title row: pushpin + bold "Workspace" centred in the space right of the pin,
+ * then an olgx text-ledge (a 2px raised box: WHITE top row + BG3 bottom row)
+ * separating it from the items. */
+static void
+menu_draw_title(void)
+{
+	menu_draw_pushpin();
+	int tx0 = menu_x_px + MENU_PP_LEFT + MENU_PP_W + 4;
+	int tw  = font_measure(&font_luBS,
+	                       (const unsigned char *)menu_title, MENU_TITLE_LEN);
+	int right = menu_x_px + menu_w_px - MENU_BORDER_PX;
+	int tx = tx0 + (right - tx0 - tw) / 2;
+	int ty = menu_y_px + MENU_BORDER_PX + (MENU_TITLE_PX - font_luBS.cell_h) / 2;
+	int pxy = ((tx & 0xFFFF) << 16) | (ty & 0xFFFF);
+	screen_draw_string(&font_luBS, pxy,
+	                   font_shape(MENU_TITLE_LEN, WM_OL_BLACK, WM_FACE_BG1, 1),
+	                   (const unsigned char *)menu_title);
+	/* text-ledge separator: inset 3px, just below the title row. */
+	int lx = menu_x_px + MENU_BORDER_PX + 3;
+	int lw = menu_w_px - 2 * MENU_BORDER_PX - 6;
+	int ly = menu_y_px + MENU_BORDER_PX + MENU_TITLE_PX;
+	if (lw > 0) {
+		fill_rect_packed(((lx & 0xFFFF) << 16) | (ly & 0xFFFF),
+		                 ((lw & 0xFFFF) << 16) | 1, WM_FACE_WHITE);
+		fill_rect_packed(((lx & 0xFFFF) << 16) | ((ly + 1) & 0xFFFF),
+		                 ((lw & 0xFFFF) << 16) | 1, WM_FACE_BG3);
+	}
+}
+
+/* Paint the whole menu: BG1 plate, raised bevel frame, title row, then items. */
 static void
 menu_draw(void)
 {
@@ -5232,6 +5307,7 @@ menu_draw(void)
 	int wh = ((menu_w_px & 0xFFFF) << 16) | (menu_h_px & 0xFFFF);
 	fill_rect_packed(xy, wh, WM_FACE_BG1);              /* plate face */
 	draw_bevel_box_screen(xy, wh, BEVEL_RAISED);        /* WHITE NW / BG3 SE */
+	menu_draw_title();
 	int i;
 	for (i = 0; i < DESKTOP_MENU_N; i++) menu_paint_item(i);
 }
@@ -5244,11 +5320,21 @@ menu_hit_item(int px, int py)
 	if (!menu_active) return -1;
 	if (px < menu_x_px + MENU_BORDER_PX
 	 || px >= menu_x_px + menu_w_px - MENU_BORDER_PX) return -1;
-	int rel = py - (menu_y_px + MENU_BORDER_PX);
+	int rel = py - (menu_y_px + MENU_CONTENT_Y_OFF);   /* below title + ledge */
 	if (rel < 0) return -1;
 	int item = rel / MENU_ITEM_H_PX;
 	if (item < 0 || item >= DESKTOP_MENU_N) return -1;
 	return item;
+}
+
+/* True if (px, py) is on the title-row pushpin (its sprite box). */
+static int
+menu_hit_pushpin(int px, int py)
+{
+	if (!menu_active) return 0;
+	int x = menu_x_px + MENU_PP_LEFT;
+	int y = menu_y_px + MENU_BORDER_PX + MENU_PP_TOP;
+	return px >= x && px < x + MENU_PP_W && py >= y && py < y + MENU_PP_H;
 }
 
 static void
@@ -5256,7 +5342,8 @@ desktop_menu_show(int px, int py)
 {
 	if (menu_active) return;
 	menu_w_px = menu_width_px();
-	menu_h_px = 2 * MENU_BORDER_PX + DESKTOP_MENU_N * MENU_ITEM_H_PX;
+	menu_h_px = MENU_CONTENT_Y_OFF + DESKTOP_MENU_N * MENU_ITEM_H_PX
+	          + MENU_BORDER_PX;
 	/* Anchor at the click, clamped so the menu fits fully on screen. */
 	int x = px, y = py;
 	if (x + menu_w_px > FB_W) x = FB_W - menu_w_px;
@@ -5266,6 +5353,7 @@ desktop_menu_show(int px, int py)
 	menu_x_px = x;
 	menu_y_px = y;
 	menu_highlighted = -1;
+	menu_pinned = 0;
 	menu_active = 1;
 	menu_draw();
 }
@@ -5307,7 +5395,14 @@ desktop_menu_select(int item_idx)
 		return;
 	}
 	const char *path = desktop_menu_spawn_paths[item_idx];
-	desktop_menu_dismiss();
+	/* Pinned = keep the menu open for repeated launches (just drop the
+	 * selected item's highlight); transient = close on select. */
+	if (menu_pinned) {
+		menu_highlighted = -1;
+		menu_paint_item(item_idx);
+	} else {
+		desktop_menu_dismiss();
+	}
 	if (path == (const char *)0) return;
 
 	int rc = sup_walk_to_slot();
@@ -5353,25 +5448,40 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 	int px = (packed_xy >> 16) & 0xFFFF;
 	int py = packed_xy & 0xFFFF;
 
-	/* Modal desktop menu: while up, the WM owns the cursor.
-	 * MOTION updates hover; LEFT DOWN inside menu = select +
-	 * dismiss + spawn; LEFT DOWN outside = cancel + dismiss;
-	 * other buttons / RIGHT clicks are swallowed silently so a
-	 * second right-click doesn't open a second menu. */
+	/* Desktop menu.  TRANSIENT (unpinned) = modal: the WM owns the cursor and
+	 * any off-menu click dismisses.  PINNED = non-modal (OPEN LOOK): off-menu
+	 * events fall through to the normal window handling below and the menu
+	 * persists; only the pushpin (IN->OUT) or Esc closes it. */
 	if (menu_active) {
-		if (evt_type == PTR_EVT_MOTION) {
-			desktop_menu_update_highlight(px, py);
+		int on_menu = px >= menu_x_px && px < menu_x_px + menu_w_px
+		           && py >= menu_y_px && py < menu_y_px + menu_h_px;
+		if (!menu_pinned || on_menu) {
+			if (evt_type == PTR_EVT_MOTION) {
+				desktop_menu_update_highlight(px, py);
+				return 1;
+			}
+			if (evt_type == PTR_EVT_DOWN) {
+				if (button != PTR_BTN_LEFT) return 1;
+				if (menu_hit_pushpin(px, py)) {
+					/* Toggle the pin.  OUT->IN keeps the menu open (repaint
+					 * the pushpin head-on); IN->OUT unpins and dismisses. */
+					if (menu_pinned) {
+						desktop_menu_dismiss();
+					} else {
+						menu_pinned = 1;
+						menu_draw_pushpin();
+					}
+					return 1;
+				}
+				int hit = menu_hit_item(px, py);
+				if (hit >= 0)          desktop_menu_select(hit);
+				else if (!menu_pinned) desktop_menu_dismiss();
+				return 1;
+			}
+			/* PTR_EVT_UP / other while owning the cursor: swallow. */
 			return 1;
 		}
-		if (evt_type == PTR_EVT_DOWN) {
-			if (button != PTR_BTN_LEFT) return 1;
-			int hit = menu_hit_item(px, py);
-			if (hit >= 0) desktop_menu_select(hit);
-			else          desktop_menu_dismiss();
-			return 1;
-		}
-		/* PTR_EVT_UP and anything else: swallow while modal. */
-		return 1;
+		/* pinned + off-menu: fall through to normal window handling. */
 	}
 
 	/* Right-click (or middle-click) on empty desktop summons the
@@ -5690,10 +5800,12 @@ poll_keyboard_events(void)
 	);
 	if (_wm_kbd_evt_poll_status != 0) return;
 
-	/* Modal menu: ESC dismisses; anything else gets swallowed. */
+	/* Menu keyboard: ESC always dismisses (escape hatch).  A TRANSIENT menu is
+	 * modal — swallow every other key; a PINNED menu is non-modal — let other
+	 * keys fall through to the focused window. */
 	if (menu_active) {
-		if (code == TK_ESCAPE) desktop_menu_dismiss();
-		return;
+		if (code == TK_ESCAPE) { desktop_menu_dismiss(); return; }
+		if (!menu_pinned) return;
 	}
 
 	/* Forward to focused window's subscriber, if any. */
