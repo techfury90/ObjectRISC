@@ -5136,10 +5136,68 @@ menu_width_px(void)
 	return 2 * MENU_BORDER_PX + max + 2 * MENU_TEXT_MARGIN_PX;
 }
 
+/* OPEN LOOK menu-item capsule endcaps (olgx olgx_draw_button, recessed look).
+ * The rounded caps are olgl button glyphs blitted in 3 colour passes; the
+ * middle is a plain BG2 fill with a 1px BG3 top edge + 1px WHITE bottom edge
+ * (olgx's middle glyphs are exactly those 1px edge runs over a fill column, so
+ * flat rects are pixel-faithful).  9px endcaps, item height MENU_ITEM_H_PX.
+ *   olgl enc 24/25/26 = left  upper-arc / lower-arc / body
+ *   olgl enc 28/27/29 = right upper-arc / lower-arc / body
+ * Verified headlessly against the real ObjBlitGlyphs (scratch menu_capsule). */
+#define MENU_ENDCAP_PX 9
+static const unsigned char cap_l_top[]  = { 24, 0 };   /* left  upper arc → BG3   */
+static const unsigned char cap_l_bot[]  = { 25, 0 };   /* left  lower arc → WHITE */
+static const unsigned char cap_l_fill[] = { 26, 0 };   /* left  body      → BG2   */
+static const unsigned char cap_r_top[]  = { 28, 0 };   /* right upper arc → BG3   */
+static const unsigned char cap_r_bot[]  = { 27, 0 };   /* right lower arc → WHITE */
+static const unsigned char cap_r_fill[] = { 29, 0 };   /* right body      → BG2   */
+
+/* One olgl capsule glyph at screen pixel (x, y) in colour fg, transparent. */
+static void
+cap_glyph(int x, int y, const unsigned char *g, int fg)
+{
+	int xy = ((x & 0xFFFF) << 16) | (y & 0xFFFF);
+	screen_draw_string(&font_olgl, xy, font_shape(1, fg, WM_FACE_BG2, 1), g);
+}
+
+/* Recessed (OLGX_INVOKED) menu-item CAPSULE on the screen FB: BG2 body, BG3
+ * shadow on the top edge + upper rounded caps, WHITE highlight on the bottom
+ * edge + lower rounded caps.  The corners outside the stadium keep the BG1
+ * plate (caller fills BG1 first). */
+static void
+draw_recessed_capsule(int x, int y, int w)
+{
+	int mx = x + MENU_ENDCAP_PX;
+	int mw = w - 2 * MENU_ENDCAP_PX;
+	int rx = x + w - MENU_ENDCAP_PX;
+	/* The endcap glyphs' WHITE lower arc bottoms at row H-2 (the body fills
+	 * H-1 only at the cap/middle junction), so the middle bottom highlight
+	 * line sits at H-2 to meet the arcs — not H-1, which hangs 1px low. */
+	int yb = y + MENU_ITEM_H_PX - 2;
+	/* fill pass: BG2 body + filled end caps */
+	if (mw > 0)
+		fill_rect_packed(((mx & 0xFFFF) << 16) | (y & 0xFFFF),
+		                 ((mw & 0xFFFF) << 16) | (MENU_ITEM_H_PX & 0xFFFF),
+		                 WM_FACE_BG2);
+	cap_glyph(x,  y, cap_l_fill, WM_FACE_BG2);
+	cap_glyph(rx, y, cap_r_fill, WM_FACE_BG2);
+	/* top pass: BG3 shadow (1px top edge + upper rounded caps) */
+	if (mw > 0)
+		fill_rect_packed(((mx & 0xFFFF) << 16) | (y & 0xFFFF),
+		                 ((mw & 0xFFFF) << 16) | 1, WM_FACE_BG3);
+	cap_glyph(x,  y, cap_l_top, WM_FACE_BG3);
+	cap_glyph(rx, y, cap_r_top, WM_FACE_BG3);
+	/* bottom pass: WHITE highlight (1px bottom edge + lower rounded caps) */
+	if (mw > 0)
+		fill_rect_packed(((mx & 0xFFFF) << 16) | (yb & 0xFFFF),
+		                 ((mw & 0xFFFF) << 16) | 1, WM_FACE_WHITE);
+	cap_glyph(x,  y, cap_l_bot, WM_FACE_WHITE);
+	cap_glyph(rx, y, cap_r_bot, WM_FACE_WHITE);
+}
+
 /* Paint one item.  Normal = transparent black label on the flat BG1 plate;
- * highlighted = recessed BG2 capsule (draw_bevel_box_screen sans RAISED —
- * the olgx OLGX_INVOKED look) + the same label.  Label is vertically centred
- * in the row. */
+ * highlighted = the recessed OPEN LOOK capsule (rounded endcaps) + the same
+ * label.  Label is vertically centred in the row. */
 static void
 menu_paint_item(int item_idx)
 {
@@ -5150,10 +5208,11 @@ menu_paint_item(int item_idx)
 	int item_xy = ((item_x & 0xFFFF) << 16) | (item_y & 0xFFFF);
 	int item_wh = ((item_w & 0xFFFF) << 16) | (MENU_ITEM_H_PX & 0xFFFF);
 
+	/* Flat plate first (also erases a prior capsule's rounded corners back to
+	 * BG1); overlay the recessed capsule when highlighted. */
+	fill_rect_packed(item_xy, item_wh, WM_FACE_BG1);
 	if (item_idx == menu_highlighted)
-		draw_bevel_box_screen(item_xy, item_wh, BEVEL_FILL);   /* recessed */
-	else
-		fill_rect_packed(item_xy, item_wh, WM_FACE_BG1);       /* flat plate */
+		draw_recessed_capsule(item_x, item_y, item_w);
 
 	const char *label = desktop_menu_labels[item_idx];
 	int label_len     = desktop_menu_label_lens[item_idx];
