@@ -1230,6 +1230,13 @@ static const char *const dyn_font_path[WM_NDYNFONT] = {
 static const wm_font_t *const dyn_font_baked[WM_NDYNFONT] = {
 	&font_luRS, &font_lutRS, &font_olgl, &font_luBS
 };
+/* Object capacity per face — the read loop stops at EOF, so this only has to be
+ * >= the .wmf size.  olgl (the 47x47 glyph envelope) is ~47 KB; the text faces
+ * fit the default.  (hf_open discards the wire-reported file size, so we size
+ * by face rather than querying it — fine while /fonts is a fixed asset set.) */
+static const unsigned int dyn_font_objsize[WM_NDYNFONT] = {
+	WM_FONTOBJ_BYTES, WM_FONTOBJ_BYTES, 0x10000, WM_FONTOBJ_BYTES
+};
 
 /* Park the just-ObjAlloc'd object (O1) into face id's slot — immediate OREFST
  * per id (pcc rejects computed offsets; the load_window_fb_to_o1 idiom). */
@@ -1266,19 +1273,20 @@ font_slot_load_o1(int id)
 static int
 wm_font_load(int id)
 {
+	int objsize = (int)dyn_font_objsize[id];
 	int fd = vfs_open(dyn_font_path[id], HF_O_RDONLY);
 	if (fd < 0) return fd;
 
 	int status;
 	asm volatile(
-		"addiu r4, r0, %1\n"           /* size = WM_FONTOBJ_BYTES */
+		"addu  r4, %1, r0\n"           /* size = dyn_font_objsize[id] (runtime) */
 		"addiu r5, r0, %2\n"           /* TAG_DATA (byte object) */
 		"addiu r6, r0, %3\n"           /* CAP_R|W|V|C (W: hostfsd writes it) */
 		"call  #0x100\n"               /* ObjAlloc → O1 (parked below) */
 		"nop\n"
 		"addu  %0, r2, r0"
 		: "=r"(status)
-		: "i"(WM_FONTOBJ_BYTES), "i"(TAG_DATA),
+		: "r"(objsize), "i"(TAG_DATA),
 		  "i"(CAP_R | CAP_W | CAP_V | CAP_C)
 		: "r1", "r2", "r4", "r5", "r6"
 	);
@@ -1290,7 +1298,7 @@ wm_font_load(int id)
 
 	unsigned int off = 0;
 	for (;;) {
-		unsigned int want = WM_FONTOBJ_BYTES - off;
+		unsigned int want = (unsigned int)objsize - off;
 		if (want == 0) break;
 		if (want > 0x10000) want = 0x10000;     /* ORX_READ_CHUNK */
 		int got = hf_read_obj(fd, h, (int)off, (int)want);
@@ -1395,6 +1403,7 @@ wm_init_dynamic_fonts(void)
 	}
 	wm_load_face(FONT_FACE_PROP);   /* luRS — menu items */
 	wm_load_face(FONT_FACE_BOLD);   /* luBS — window + menu titles */
+	wm_load_face(FONT_FACE_GLYPH);  /* olgl — pushpins, ▽ menu marks, capsule caps */
 }
 
 /* Phase 60 step 11 — per-wid window FB slot dispatch.  Mirrors the
@@ -2293,9 +2302,9 @@ paint_menu_button(void)
 	int gx = bx + (MENU_BTN_W - OL_MENU_MARK_W) / 2;
 	int gy = by + (TITLE_INNER_PX - OL_MENU_MARK_H) / 2;
 	int gxy = ((gx & 0xFFFF) << 16) | (gy & 0xFFFF);
-	win_draw_string(&font_olgl, gxy, font_shape(1, WM_FACE_BG3,   WM_TITLE_BG, 1), mm_ul_str);
-	win_draw_string(&font_olgl, gxy, font_shape(1, WM_FACE_WHITE, WM_TITLE_BG, 1), mm_lr_str);
-	win_draw_string(&font_olgl, gxy, font_shape(1, WM_FACE_BG2,   WM_TITLE_BG, 1), mm_fill_str);
+	win_draw_string(dyn_face(FONT_FACE_GLYPH), gxy, font_shape(1, WM_FACE_BG3,   WM_TITLE_BG, 1), mm_ul_str);
+	win_draw_string(dyn_face(FONT_FACE_GLYPH), gxy, font_shape(1, WM_FACE_WHITE, WM_TITLE_BG, 1), mm_lr_str);
+	win_draw_string(dyn_face(FONT_FACE_GLYPH), gxy, font_shape(1, WM_FACE_BG2,   WM_TITLE_BG, 1), mm_fill_str);
 }
 
 /* Phase 60 step 8 / OPEN LOOK olwm rework — paint the title bar at the top
@@ -5610,7 +5619,7 @@ static void
 cap_glyph(int x, int y, const unsigned char *g, int fg)
 {
 	int xy = ((x & 0xFFFF) << 16) | (y & 0xFFFF);
-	win_draw_string(&font_olgl, xy, font_shape(1, fg, WM_FACE_BG2, 1), g);
+	win_draw_string(dyn_face(FONT_FACE_GLYPH), xy, font_shape(1, fg, WM_FACE_BG2, 1), g);
 }
 
 /* Recessed (OLGX_INVOKED) menu-item CAPSULE in the overlay FB: BG2 body, BG3
