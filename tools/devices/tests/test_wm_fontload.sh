@@ -7,10 +7,16 @@
 # through the MOUNT, ObjAllocs a byte object, and streams the WMF1 blob in
 # with hf_read_obj. Success is the WM's console line reporting the load.
 #
-# This exercises the whole dynamic-font LOAD path end-to-end (the render is
-# framebuffer/Tk-only, eyeballed on `make boot`). It is also the guard that
-# the WM↔hostfsd plumbing (O8/DIR_SLOT, O10 discovery, the obj_adopt_slot
-# case for the font slot) keeps working as Phase C migrates more faces.
+# It also caches the WMF1 header + width table into the data segment (via the
+# ObjFetchBytes-through-stack bounce) and self-checks that the cached widths
+# match the baked blob — proving font_advance reads the LOADED widths, so the
+# menu measures + renders with no reference to the compiled-in blob.
+#
+# This exercises the whole dynamic-font LOAD + width-cache path end-to-end (the
+# render is framebuffer/Tk-only, eyeballed on `make boot`). It is also the guard
+# that the WM↔hostfsd plumbing (O8/DIR_SLOT, O10 discovery, the obj_adopt_slot
+# case for the font slot, the ObjFetchBytes cache) keeps working as Phase C
+# migrates more faces.
 #
 # Architecture under test:
 #   - oriscbar (crossbar)
@@ -64,18 +70,19 @@ python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
     "$TMP/oriscwm.orx" > "$TMP/wm.out" 2>&1 &
 WM=$!
 for _ in $(seq 200); do
-    grep -q "luRS loaded from /fonts\|load failed\|hostfsd unavailable" "$TMP/wm.out" 2>/dev/null && break
+    grep -q "widths OK\|MISMATCH\|load failed\|hostfsd unavailable\|fetch failed" "$TMP/wm.out" 2>/dev/null && break
     sleep 0.05
 done
 
 kill -TERM $WM $TERMP $HF $DIR $BAR 2>/dev/null || true
 wait 2>/dev/null || true
 
-if grep -q "oriscwm: luRS loaded from /fonts (3152 B)" "$TMP/wm.out"; then
-    echo "PASS: WM loaded luRS.wmf from /fonts (3152 B)"
+# Success = loaded (3152 B) AND the cached width table validated against baked.
+if grep -q "luRS loaded from /fonts (3152 B); widths OK (cache==baked)" "$TMP/wm.out"; then
+    echo "PASS: WM loaded luRS.wmf from /fonts (3152 B), cached widths == baked"
     exit 0
 fi
-echo "FAIL: WM did not load luRS from /fonts"
+echo "FAIL: WM did not load + cache luRS from /fonts"
 echo "--- wm.out (oriscwm lines) ---"; grep -iE "oriscwm:|font" "$TMP/wm.out" || true
 echo "--- dir.out (tail) ---"; tail -5 "$TMP/dir.out" || true
 echo "--- hf.out (tail) ---"; tail -5 "$TMP/hf.out" || true
