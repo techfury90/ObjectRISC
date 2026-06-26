@@ -1401,9 +1401,10 @@ wm_init_dynamic_fonts(void)
 		WM_PRINT("oriscwm: hostfsd unavailable — fonts stay baked\n");
 		return;
 	}
-	wm_load_face(FONT_FACE_PROP);   /* luRS — menu items */
+	wm_load_face(FONT_FACE_PROP);   /* luRS — menu items + client proportional */
 	wm_load_face(FONT_FACE_BOLD);   /* luBS — window + menu titles */
 	wm_load_face(FONT_FACE_GLYPH);  /* olgl — pushpins, ▽ menu marks, capsule caps */
+	wm_load_face(FONT_FACE_MONO);   /* lutRS — client monospace body text */
 }
 
 /* Phase 60 step 11 — per-wid window FB slot dispatch.  Mirrors the
@@ -5045,15 +5046,17 @@ vec_unpack_lo(int packed)
  * drains vector ops one at a time, so a single shared byte is race-free. */
 static unsigned char wm_text_scratch[9];   /* up to 8 batched glyphs + slack */
 
-/* Map a client font-face id (FONT_FACE_* in liborisc.h) to a baked face.
- * Out-of-range falls back to the proportional Lucida face. */
+/* Map a client font-face id (FONT_FACE_* in liborisc.h) to a dynamic-table
+ * face.  FONT_FACE_* are exactly the table indices (PROP=0, MONO=1, GLYPH=2,
+ * BOLD=3), so client text gets the same /fonts-loaded faces as the WM chrome
+ * (each falls back to its baked twin if its load failed).  win_draw_string's
+ * dyn path blits from the face's object; the client text is in wm_text_scratch
+ * (O15), which the dyn emitter's O3 already expects.  Out-of-range → luRS. */
 static const wm_font_t *
 text_face_lookup(int id)
 {
-	if (id == FONT_FACE_MONO)  return &font_lutRS;
-	if (id == FONT_FACE_GLYPH) return &font_olgl;
-	if (id == FONT_FACE_BOLD)  return &font_luBS;
-	return &font_luRS;
+	if (id < 0 || id >= WM_NDYNFONT) id = FONT_FACE_PROP;
+	return dyn_face(id);
 }
 
 static void
