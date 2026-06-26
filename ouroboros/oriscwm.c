@@ -4412,7 +4412,7 @@ vec_unpack_lo(int packed)
 /* Scratch byte for client glyph rendering — lives in boot DATA (O15) so
  * win_draw_string can reach it the same way window_titles does.  The WM
  * drains vector ops one at a time, so a single shared byte is race-free. */
-static unsigned char wm_text_scratch[2];
+static unsigned char wm_text_scratch[9];   /* up to 8 batched glyphs + slack */
 
 /* Map a client font-face id (FONT_FACE_* in liborisc.h) to a baked face.
  * Out-of-range falls back to the proportional Lucida face. */
@@ -4480,6 +4480,35 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		 * vector queue (and gives the Markdown viewer a fast path). */
 		composite_window_region(ax, ay, adv > 0 ? adv : face->cell_w,
 		                        face->cell_h);
+		return;
+	}
+	if (op == VEC_OP_TEXT_RUN) {
+		const wm_font_t *face = text_face_lookup(window_text_face[slot]);
+		/* Unpack up to 8 codepoints (MSB-first from the two payload words); a
+		 * 0 byte terminates the run (the client packs text, never NUL). */
+		wm_text_scratch[0] = (packed1 >> 24) & 0xFF;
+		wm_text_scratch[1] = (packed1 >> 16) & 0xFF;
+		wm_text_scratch[2] = (packed1 >>  8) & 0xFF;
+		wm_text_scratch[3] =  packed1        & 0xFF;
+		wm_text_scratch[4] = (packed2 >> 24) & 0xFF;
+		wm_text_scratch[5] = (packed2 >> 16) & 0xFF;
+		wm_text_scratch[6] = (packed2 >>  8) & 0xFF;
+		wm_text_scratch[7] =  packed2        & 0xFF;
+		int n = 0;
+		while (n < 8 && wm_text_scratch[n] != 0) n++;
+		if (n == 0) return;
+		int w  = font_measure(face, wm_text_scratch, n);
+		int ax = window_text_x[slot] + CONTENT_X_OFF_PX;
+		int ay = window_text_y[slot] + CONTENT_Y_OFF_PX;
+		int pxy = ((ax & 0xFFFF) << 16) | (ay & 0xFFFF);
+		/* ONE firmware call renders the whole batch (the firmware advances the
+		 * pen per glyph from the width table) and ONE composite covers the
+		 * batch's box — ~8x fewer SENDs / blits / composites than per-char. */
+		win_draw_string(face, pxy,
+		                font_shape(n, cur_vec_color, WM_BG_COLOR, 1),
+		                wm_text_scratch);
+		window_text_x[slot] += w;
+		composite_window_region(ax, ay, w > 0 ? w : face->cell_w, face->cell_h);
 		return;
 	}
 

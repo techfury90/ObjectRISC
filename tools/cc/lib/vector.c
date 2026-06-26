@@ -156,7 +156,21 @@ vec_text(int face, int x, int y, const char *s)
 {
 	if (vec_text_move(face, x, y) != 0)
 		return -1;
-	while (*s)
-		vec_text_char((unsigned char)*s++);
+	/* Batch up to 8 codepoints per SEND (MSB-first into two payload words),
+	 * ~8x fewer cross-CPU round-trips than one VEC_OP_TEXT_CHAR per glyph.
+	 * A partial last batch leaves trailing 0 bytes, which the WM reads as the
+	 * run terminator (text has no embedded NUL). */
+	while (*s) {
+		unsigned int w0 = 0, w1 = 0;
+		int n = 0;
+		while (n < 8 && *s) {
+			unsigned int b = (unsigned char)*s++;
+			if (n < 4) w0 |= b << (8 * (3 - n));
+			else       w1 |= b << (8 * (3 - (n - 4)));
+			n++;
+		}
+		if (_vec_send(VEC_OP_TEXT_RUN, (int)w0, (int)w1) != 0)
+			return -1;
+	}
 	return 0;
 }
