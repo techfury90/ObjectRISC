@@ -834,23 +834,28 @@ static int           window_title_lens[MAX_WINDOWS];
  * buffers with parallel offset arrays because the .word LABEL
  * path resolved to `DATA_BASE + offset_in_obj` at assemble time,
  * ignoring this .oro's actual placement in the linked image. */
-#define DESKTOP_MENU_N 5
+#define DESKTOP_MENU_N 6
 static const char *const desktop_menu_labels[DESKTOP_MENU_N] = {
 	"Shell",
 	"Edit",
 	"Mouse Paint",
 	"Menu Demo",
 	"Font Demo",
+	"Shut Down",
 };
 static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
-	5, 4, 11, 9, 9,
+	5, 4, 11, 9, 9, 9,
 };
+/* "Shut Down" has no spawn path — it runs an action (sup_shutdown, exactly
+ * what the shell's `exit` does), special-cased in desktop_menu_select. */
+#define MENU_SHUTDOWN_IDX (DESKTOP_MENU_N - 1)
 static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
 	"/programs/shell.orx",
 	"/programs/edit.orx",
 	"/programs/mouse_paint.orx",
 	"/programs/menudemo.orx",
 	"/programs/font_demo.orx",
+	(const char *)0,         /* Shut Down — action, not a spawn */
 };
 /* No "Cancel" item — an OPEN LOOK menu dismisses by clicking off it (the
  * pointer-up-outside path already calls desktop_menu_dismiss). */
@@ -1960,7 +1965,7 @@ paint_title_bar(void)
 		int n0 = window_title_lens[active_wid - 1];
 		int title_px = 0, n = 0;
 		while (n < n0) {
-			int adv = font_advance(&font_luRS, title[n]);
+			int adv = font_advance(&font_luBS, title[n]);
 			if (title_px + adv > span_w) break;
 			title_px += adv;
 			n++;
@@ -1971,7 +1976,9 @@ paint_title_bar(void)
 			              | (TITLE_TEXT_Y_OFF_PX & 0xFFFF);
 			int text_bg = focused ? WM_TITLE_STRIPE_FACE : WM_TITLE_BG;
 			int packed_shape = font_shape(n, WM_TITLE_TEXT_FG, text_bg, 1);
-			win_draw_string(&font_luRS, packed_xy, packed_shape, title);
+			/* Bold Lucida Sans — OPEN LOOK title bars are bold, same as the
+			 * menu title (font_luBS, 12x16 like luRS so geometry is unchanged). */
+			win_draw_string(&font_luBS, packed_xy, packed_shape, title);
 		}
 	}
 
@@ -4645,6 +4652,7 @@ text_face_lookup(int id)
 {
 	if (id == FONT_FACE_MONO)  return &font_lutRS;
 	if (id == FONT_FACE_GLYPH) return &font_olgl;
+	if (id == FONT_FACE_BOLD)  return &font_luBS;
 	return &font_luRS;
 }
 
@@ -4681,7 +4689,7 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		window_text_x[slot]    = vec_unpack_hi(packed1);
 		window_text_y[slot]    = vec_unpack_lo(packed1);
 		int f = packed2;
-		if (f < 0 || f > FONT_FACE_GLYPH) f = FONT_FACE_PROP;
+		if (f < 0 || f > FONT_FACE_BOLD) f = FONT_FACE_PROP;   /* BOLD is the max id */
 		window_text_face[slot] = (unsigned char)f;
 		return;
 	}
@@ -5431,6 +5439,16 @@ desktop_menu_select(int item_idx)
 {
 	if (item_idx < 0 || item_idx >= DESKTOP_MENU_N) {
 		desktop_menu_dismiss();
+		return;
+	}
+	if (item_idx == MENU_SHUTDOWN_IDX) {
+		/* System shutdown — always dismiss (even when pinned), then do exactly
+		 * what the shell's `exit` does: walk to the supervisor + fire the op=2
+		 * halt SEND (BOOT_PARENT_SLOT == SUP_SLOT == 544, so sup_shutdown finds
+		 * the cap sup_walk_to_slot just parked). */
+		desktop_menu_dismiss();
+		if (sup_walk_to_slot() == 0) sup_shutdown();
+		wm_restore_boot_or();
 		return;
 	}
 	const char *path = desktop_menu_spawn_paths[item_idx];

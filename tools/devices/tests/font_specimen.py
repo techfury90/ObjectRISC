@@ -55,15 +55,17 @@ class FakeCPU:
 def main():
     # The three faces, baked exactly as scripts/gen_wm_fonts.sh does.
     luRS,  _ = face_blob(f"{BDF}/75dpi/luRS12.bdf",   32, 95, (12, 16), True)
+    luBS,  _ = face_blob(f"{BDF}/75dpi/luBS12.bdf",   32, 95, (12, 16), True)
     lutRS, _ = face_blob(f"{BDF}/100dpi/lutRS10.bdf", 32, 95, (8, 16),  False)
     olgl,  _ = face_blob(f"{BDF}/misc/olgl12.bdf",    19, 167, (47, 47), False)
 
-    F_LURS, F_LUTRS, F_OLGL, F_TEXT = 2, 3, 4, 5
-    W, H = 680, 196
+    F_LURS, F_LUBS, F_LUTRS, F_OLGL, F_TEXT = 2, 3, 4, 5, 6
+    W, H = 680, 244
     fb = bytearray([PAPER] * W * H)
     descs = [None,
              _desc(fb, type_tag=sim.TAG_FRAMEBUFFER, fb_w=W, fb_h=H),
              _desc(bytearray(luRS)),
+             _desc(bytearray(luBS)),
              _desc(bytearray(lutRS)),
              _desc(bytearray(olgl)),
              _desc(bytearray(b""))]   # F_TEXT, rebound per blit
@@ -98,12 +100,16 @@ def main():
     text(F_LURS, 16, 56,
          "The quick brown fox jumps over the lazy dog 0123456789", INK)
 
-    text(F_LURS, 8, 86, "Lucida Typewriter (lutRS, monospace):", LABEL)
-    text(F_LUTRS, 16, 104, "$ ls -la *.orx | grep ouroboros", INK)
+    text(F_LURS, 8, 84, "Lucida Sans Bold (luBS, proportional):", LABEL)
+    text(F_LUBS, 16, 102,
+         "The quick brown fox jumps over the lazy dog 0123456789", INK)
 
-    text(F_LURS, 8, 134, "OPEN LOOK glyphs (olgl):", LABEL)
+    text(F_LURS, 8, 130, "Lucida Typewriter (lutRS, monospace):", LABEL)
+    text(F_LUTRS, 16, 148, "$ ls -la *.orx | grep ouroboros", INK)
+
+    text(F_LURS, 8, 176, "OPEN LOOK glyphs (olgl):", LABEL)
     for i, cp in enumerate((19, 20, 21, 22, 23, 47)):
-        text(F_OLGL, 16 + i * 28, 152, bytes([cp]), INK)
+        text(F_OLGL, 16 + i * 28, 194, bytes([cp]), INK)
 
     lut = sim._build_palette_lut()
     rgb = b"".join(lut[bb] for bb in fb)
