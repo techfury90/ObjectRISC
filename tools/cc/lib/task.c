@@ -346,6 +346,26 @@ task_init(void)
 	} else {
 		my_terminal_idx = -1;
 	}
+
+	/* Preemption as a system default. Every task that runs libc
+	 * startup self-installs the cause-0x01 timer handler, so a
+	 * CPU-bound co-resident task can't starve the others whether or
+	 * not it cooperates — the complement to direct-handoff (#143),
+	 * which gives a just-woken I/O-bound task the CPU next. The
+	 * install must be per-task (the trap vector points at this
+	 * program's OWN preempt_timer_handler VA, so the supervisor
+	 * can't arm it for a child) — hence task_init, the universal
+	 * libc entry, not supervisor.c.
+	 *
+	 * Cheap and safe: COMPARE fires on COUNT (retired cycles), and a
+	 * BLOCKED task doesn't advance COUNT — so the event-driven
+	 * daemons (WM on its solo CPU, dir, hostfsd, the supervisor's
+	 * infinite spawn-wait) effectively never hit it; it only fires
+	 * for genuinely CPU-bound tasks, exactly the fairness target.
+	 * Preemption is between-instructions and the context switch
+	 * saves the full GPR/OREG file, so OREF spill anchors stay
+	 * consistent (no mid-op hazard). */
+	task_install_preempt_timer(DEFAULT_PREEMPT_QUANTUM);
 }
 
 /* Phase 51: getter / setter for the libc-managed terminal_idx slot.

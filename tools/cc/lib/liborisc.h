@@ -489,7 +489,16 @@ unsigned int task_active_mask(void);               /* in-use slot bitmap */
 /* Install a generic timer-interrupt handler that yields to the
  * next runnable task every `quantum` cycles. Lets the caller stay
  * responsive even when a child task is CPU-bound. Caller must be
- * supervisor-mode (uses InstallTrapHandler #0x520). */
+ * supervisor-mode (uses InstallTrapHandler #0x520).
+ *
+ * As of the preemption-by-default change this is installed
+ * automatically by task_init() with DEFAULT_PREEMPT_QUANTUM, so
+ * every task the supervisor spawns is preemptible out of the box.
+ * It remains public for callers that want a different quantum
+ * (re-install overwrites the cause-0x01 vector + COMPARE). The
+ * quantum sets only the FIRST interval; preempt_handler.s hardcodes
+ * its own re-arm value (kept equal to DEFAULT_PREEMPT_QUANTUM). */
+#define DEFAULT_PREEMPT_QUANTUM 5000
 void task_install_preempt_timer(unsigned int quantum);
 
 /* ---- orx.c — load and run a .orx executable as a child task ----- *
