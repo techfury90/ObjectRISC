@@ -834,17 +834,16 @@ static int           window_title_lens[MAX_WINDOWS];
  * buffers with parallel offset arrays because the .word LABEL
  * path resolved to `DATA_BASE + offset_in_obj` at assemble time,
  * ignoring this .oro's actual placement in the linked image. */
-#define DESKTOP_MENU_N 6
+#define DESKTOP_MENU_N 5
 static const char *const desktop_menu_labels[DESKTOP_MENU_N] = {
 	"Shell",
 	"Edit",
 	"Mouse Paint",
 	"Menu Demo",
 	"Font Demo",
-	"Cancel",
 };
 static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
-	5, 4, 11, 9, 9, 6,
+	5, 4, 11, 9, 9,
 };
 static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
 	"/programs/shell.orx",
@@ -852,21 +851,23 @@ static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
 	"/programs/mouse_paint.orx",
 	"/programs/menudemo.orx",
 	"/programs/font_demo.orx",
-	(const char *)0,         /* Cancel — dismiss, no spawn */
 };
+/* No "Cancel" item — an OPEN LOOK menu dismisses by clicking off it (the
+ * pointer-up-outside path already calls desktop_menu_dismiss). */
 
-/* Menu chrome: padding around each item in cells.  Width = max label
- * cells + 2 padding.  Height = N items × 1 row.  Cell-aligned so the
- * ObjBlitGlyphs cell-coord math stays clean. */
-#define MENU_PAD_CELLS_X    1
-#define MENU_BG_COLOR       1     /* light gray (matches title bar bg) */
-#define MENU_FG_COLOR       0     /* dark navy (text over gray)        */
-#define MENU_HI_BG_COLOR    8     /* bright white when hovered         */
-#define MENU_HI_FG_COLOR    0     /* dark navy text over hilite        */
+/* OPEN LOOK menu chrome (olgx / XView om_render geometry, pixel-precise).
+ * The menu is a flat BG1 plate with a 1px raised bevel; items are
+ * proportional luRS text with NO resting box and zero inter-item gap; the
+ * highlighted item is a recessed BG2 capsule (the olgx OLGX_INVOKED look —
+ * BG3 top-left, WHITE bottom-right).  See the olgx spec: button_height,
+ * endcap_width(=text margin), WALKMENU_BORDER. */
+#define MENU_BORDER_PX       2    /* item inset from the menu frame (olgx B) */
+#define MENU_TEXT_MARGIN_PX  9    /* text left/right margin (olgx endcap_width) */
+#define MENU_ITEM_H_PX       20   /* per-item row height (luRS cell 16 + pad) */
 
 static int  menu_active;           /* non-zero while desktop menu showing */
-static int  menu_x_cell, menu_y_cell;  /* top-left in CELL coords */
-static int  menu_w_cells, menu_h_cells;
+static int  menu_x_px, menu_y_px;  /* top-left in SCREEN PIXEL coords */
+static int  menu_w_px, menu_h_px;
 static int  menu_highlighted;     /* -1 = none, else 0..N-1 */
 
 /* The owner task ref and subscriber notify_cap live in OPR slots
@@ -1676,6 +1677,38 @@ draw_bevel_box(int packed_xy, int packed_wh, int packed_mode)
 	                 ((e & 0xFFFF) << 16) | (h & 0xFFFF), lo);
 }
 
+/* SCREEN-FB twin of draw_bevel_box (fills go through fill_rect_packed, the
+ * screen-FB filler, not fill_rect_window).  Used by the desktop menu, which
+ * paints straight onto the screen FB above all windows.  Identical olgx
+ * edge-assignment: RAISED = WHITE top-left / BG3 bottom-right over a BG1
+ * face; RECESSED (no RAISED bit) = BG3 top-left / WHITE bottom-right over a
+ * BG2 face — the OPEN LOOK selected-item look. */
+static void
+draw_bevel_box_screen(int packed_xy, int packed_wh, int packed_mode)
+{
+	int x = (packed_xy >> 16) & 0xFFFF;
+	int y =  packed_xy        & 0xFFFF;
+	int w = (packed_wh >> 16) & 0xFFFF;
+	int h =  packed_wh        & 0xFFFF;
+	int e = BEVEL_EDGE_PX;
+	int raised = packed_mode & BEVEL_RAISED;
+	int hi = raised ? WM_FACE_WHITE : WM_FACE_BG3;    /* top-left edge */
+	int lo = raised ? WM_FACE_BG3   : WM_FACE_WHITE;  /* bottom-right edge */
+
+	if (packed_mode & BEVEL_FILL) {
+		int face = raised ? WM_FACE_BG1 : WM_FACE_BG2;
+		fill_rect_packed(packed_xy, packed_wh, face);
+	}
+	fill_rect_packed(((x & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((w & 0xFFFF) << 16) | (e & 0xFFFF), hi);
+	fill_rect_packed(((x & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((e & 0xFFFF) << 16) | (h & 0xFFFF), hi);
+	fill_rect_packed(((x & 0xFFFF) << 16) | ((y + h - e) & 0xFFFF),
+	                 ((w & 0xFFFF) << 16) | (e & 0xFFFF), lo);
+	fill_rect_packed((((x + w - e) & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((e & 0xFFFF) << 16) | (h & 0xFFFF), lo);
+}
+
 /* === Centralized glyph-blit emitters ================================
  *
  * One ObjBlitGlyphs (#0x10C) firmware call, fully described by
@@ -1782,6 +1815,20 @@ screen_blit_glyph_row(int packed_xy, const unsigned char *text,
 	if (((packed_shape >> 16) & 0xFFFF) == 0) return;
 	int text_off = (int)((unsigned int)text - DATA_VA);
 	int font_off = (int)((unsigned int)&font_8x16[0][0] - DATA_VA);
+	blit_glyphs_screenfb(packed_xy, packed_shape, font_off, text_off);
+}
+
+/* EXTENDED proportional string blit into the SCREEN FB — screen-FB twin of
+ * win_draw_string (font-manager face, absolute-pixel, per-glyph advance).
+ * Used by the desktop menu for proportional luRS labels.  Text must live in
+ * boot data (O15); the menu's string literals do. */
+static void
+screen_draw_string(const wm_font_t *font, int packed_xy, int packed_shape,
+                   const unsigned char *text)
+{
+	if (((packed_shape >> 16) & 0x3FFF) == 0) return;
+	int text_off = (int)((unsigned int)text - DATA_VA);
+	int font_off = (int)((unsigned int)font->blob - DATA_VA);
 	blit_glyphs_screenfb(packed_xy, packed_shape, font_off, text_off);
 }
 
@@ -5072,82 +5119,96 @@ sup_walk_to_slot(void)
 	return 0;
 }
 
-/* Desktop menu helpers.  All coords below are in CELL units except
- * where suffixed _px / when explicitly noted.  Menu position is
- * cell-aligned so ObjBlitGlyphs's cell-coord math works directly. */
+/* Desktop menu helpers — OPEN LOOK pop-up, pixel-precise on the screen FB.
+ * A flat BG1 plate with a 1px raised bevel; proportional luRS items with the
+ * highlighted one shown as a recessed BG2 capsule. */
 static int
-menu_width_cells(void)
+menu_width_px(void)
 {
 	int max = 0;
 	int i;
 	for (i = 0; i < DESKTOP_MENU_N; i++) {
-		int n = desktop_menu_label_lens[i];
-		if (n > max) max = n;
+		int w = font_measure(&font_luRS,
+		                     (const unsigned char *)desktop_menu_labels[i],
+		                     desktop_menu_label_lens[i]);
+		if (w > max) max = w;
 	}
-	return max + 2 * MENU_PAD_CELLS_X;
+	return 2 * MENU_BORDER_PX + max + 2 * MENU_TEXT_MARGIN_PX;
 }
 
+/* Paint one item.  Normal = transparent black label on the flat BG1 plate;
+ * highlighted = recessed BG2 capsule (draw_bevel_box_screen sans RAISED —
+ * the olgx OLGX_INVOKED look) + the same label.  Label is vertically centred
+ * in the row. */
 static void
 menu_paint_item(int item_idx)
 {
 	if (item_idx < 0 || item_idx >= DESKTOP_MENU_N) return;
-	int row_cell_y = menu_y_cell + item_idx;
-	int is_hi = (item_idx == menu_highlighted);
-	int bg    = is_hi ? MENU_HI_BG_COLOR : MENU_BG_COLOR;
-	int fg    = is_hi ? MENU_HI_FG_COLOR : MENU_FG_COLOR;
+	int item_x = menu_x_px + MENU_BORDER_PX;
+	int item_y = menu_y_px + MENU_BORDER_PX + item_idx * MENU_ITEM_H_PX;
+	int item_w = menu_w_px - 2 * MENU_BORDER_PX;
+	int item_xy = ((item_x & 0xFFFF) << 16) | (item_y & 0xFFFF);
+	int item_wh = ((item_w & 0xFFFF) << 16) | (MENU_ITEM_H_PX & 0xFFFF);
 
-	/* Fill the row bg first (covers hilite change). */
-	int xy = ((menu_x_cell * CELL_W) & 0xFFFF) << 16;
-	xy |= (row_cell_y * CELL_H) & 0xFFFF;
-	int wh = ((menu_w_cells * CELL_W) & 0xFFFF) << 16;
-	wh |= CELL_H & 0xFFFF;
-	fill_rect_packed(xy, wh, bg);
+	if (item_idx == menu_highlighted)
+		draw_bevel_box_screen(item_xy, item_wh, BEVEL_FILL);   /* recessed */
+	else
+		fill_rect_packed(item_xy, item_wh, WM_FACE_BG1);       /* flat plate */
 
-	/* Then the label glyphs, indented by MENU_PAD_CELLS_X. */
 	const char *label = desktop_menu_labels[item_idx];
 	int label_len     = desktop_menu_label_lens[item_idx];
-	int glyph_cx      = menu_x_cell + MENU_PAD_CELLS_X;
-	int packed_xy_g   = ((glyph_cx & 0xFFFF) << 16) | (row_cell_y & 0xFFFF);
-	int packed_shape  = ((label_len & 0xFFFF) << 16)
-	                  | ((fg & 0xFF) << 8) | (bg & 0xFF);
-	screen_blit_glyph_row(packed_xy_g, (const unsigned char *)label,
-	                      packed_shape);
+	int text_x = item_x + MENU_TEXT_MARGIN_PX;
+	int text_y = item_y + (MENU_ITEM_H_PX - font_luRS.cell_h) / 2;
+	int packed_xy = ((text_x & 0xFFFF) << 16) | (text_y & 0xFFFF);
+	int packed_shape = font_shape(label_len, WM_OL_BLACK, WM_FACE_BG1, 1);
+	screen_draw_string(&font_luRS, packed_xy, packed_shape,
+	                   (const unsigned char *)label);
 }
 
-/* True if a cell coord falls inside the active menu rect. */
+/* Paint the whole menu: BG1 plate, 1px raised bevel frame, then all items. */
+static void
+menu_draw(void)
+{
+	int xy = ((menu_x_px & 0xFFFF) << 16) | (menu_y_px & 0xFFFF);
+	int wh = ((menu_w_px & 0xFFFF) << 16) | (menu_h_px & 0xFFFF);
+	fill_rect_packed(xy, wh, WM_FACE_BG1);              /* plate face */
+	draw_bevel_box_screen(xy, wh, BEVEL_RAISED);        /* WHITE NW / BG3 SE */
+	int i;
+	for (i = 0; i < DESKTOP_MENU_N; i++) menu_paint_item(i);
+}
+
+/* Item index under screen pixel (px, py), or -1 if outside the item area
+ * (the inner rect, inset MENU_BORDER_PX from the frame). */
 static int
-menu_hit_cell(int cx, int cy)
+menu_hit_item(int px, int py)
 {
 	if (!menu_active) return -1;
-	if (cx < menu_x_cell || cx >= menu_x_cell + menu_w_cells)
-		return -1;
-	if (cy < menu_y_cell || cy >= menu_y_cell + menu_h_cells)
-		return -1;
-	return cy - menu_y_cell;
+	if (px < menu_x_px + MENU_BORDER_PX
+	 || px >= menu_x_px + menu_w_px - MENU_BORDER_PX) return -1;
+	int rel = py - (menu_y_px + MENU_BORDER_PX);
+	if (rel < 0) return -1;
+	int item = rel / MENU_ITEM_H_PX;
+	if (item < 0 || item >= DESKTOP_MENU_N) return -1;
+	return item;
 }
 
 static void
 desktop_menu_show(int px, int py)
 {
 	if (menu_active) return;
-	menu_w_cells = menu_width_cells();
-	menu_h_cells = DESKTOP_MENU_N;
-	int cx = px / CELL_W;
-	int cy = py / CELL_H;
-	/* Clamp so the menu fits fully on screen. */
-	int max_cx = (FB_W / CELL_W) - menu_w_cells;
-	int max_cy = (FB_H / CELL_H) - menu_h_cells;
-	if (cx < 0) cx = 0;
-	if (cy < 0) cy = 0;
-	if (cx > max_cx) cx = max_cx;
-	if (cy > max_cy) cy = max_cy;
-	menu_x_cell = cx;
-	menu_y_cell = cy;
+	menu_w_px = menu_width_px();
+	menu_h_px = 2 * MENU_BORDER_PX + DESKTOP_MENU_N * MENU_ITEM_H_PX;
+	/* Anchor at the click, clamped so the menu fits fully on screen. */
+	int x = px, y = py;
+	if (x + menu_w_px > FB_W) x = FB_W - menu_w_px;
+	if (y + menu_h_px > FB_H) y = FB_H - menu_h_px;
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+	menu_x_px = x;
+	menu_y_px = y;
 	menu_highlighted = -1;
 	menu_active = 1;
-
-	int i;
-	for (i = 0; i < DESKTOP_MENU_N; i++) menu_paint_item(i);
+	menu_draw();
 }
 
 /* Erase the menu by bg-filling + recomposing the rect from the
@@ -5156,24 +5217,18 @@ static void
 desktop_menu_dismiss(void)
 {
 	if (!menu_active) return;
-	int sx = menu_x_cell * CELL_W;
-	int sy = menu_y_cell * CELL_H;
-	int sw = menu_w_cells * CELL_W;
-	int sh = menu_h_cells * CELL_H;
+	int sx = menu_x_px, sy = menu_y_px, sw = menu_w_px, sh = menu_h_px;
 	menu_active = 0;
 	menu_highlighted = -1;
 	recompose_after_destroy(sx, sy, sw, sh);
 }
 
-/* Update hover highlight based on the new cursor position.  Two
- * paints worst case: erase old, paint new (each is one row +
- * glyphs). */
+/* Update hover highlight from the new cursor position.  Worst case two item
+ * repaints: erase old (back to flat plate), draw new (recessed capsule). */
 static void
 desktop_menu_update_highlight(int px, int py)
 {
-	int cx = px / CELL_W;
-	int cy = py / CELL_H;
-	int new_hi = menu_hit_cell(cx, cy);
+	int new_hi = menu_hit_item(px, py);
 	if (new_hi == menu_highlighted) return;
 	int old_hi = menu_highlighted;
 	menu_highlighted = new_hi;
@@ -5251,9 +5306,7 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 		}
 		if (evt_type == PTR_EVT_DOWN) {
 			if (button != PTR_BTN_LEFT) return 1;
-			int cx = px / CELL_W;
-			int cy = py / CELL_H;
-			int hit = menu_hit_cell(cx, cy);
+			int hit = menu_hit_item(px, py);
 			if (hit >= 0) desktop_menu_select(hit);
 			else          desktop_menu_dismiss();
 			return 1;
