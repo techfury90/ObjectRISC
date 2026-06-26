@@ -2561,16 +2561,21 @@ paint_window_face(void)
 	fill_rect_window(c_xy, c_wh, WM_BG_COLOR);
 }
 
-/* OPEN LOOK vertical scrollbar glyphs (olgl): the elevator emboss (cp 54 WHITE
- * highlight / 55 BG3 shadow, full-height), the line-back/forward arrows (56/59),
- * and the drag dimple (196 UL / 197 LR / 198 fill — the same 3-layer emboss as
- * the menu pushpin).  cap_glyph blits one olgl glyph; forward-declared since it
- * lives in the menu section below. */
+/* OPEN LOOK vertical scrollbar glyphs (olgl).  The elevator emboss is just TWO
+ * glyphs: cp 54 (WHITE highlight) and cp 55 (BG3 shadow) — and cp 55 already
+ * carries BOTH the up + down line arrows AND the third-divider lines, so there
+ * are no separate arrow glyphs (cp 56/59 are the pressed-state box fills, not
+ * plain arrows).  The middle third holds a recessed drag-box (194 UL / 195 LR)
+ * with the 3-layer dimple inside it (196 UL / 197 LR / 198 fill — the same
+ * emboss as the menu pushpin).  All bake LEFT-aligned in the 47px olgl cell, so
+ * they blit at sx directly (verified against fonts/olgl.wmf via a headless
+ * render).  cap_glyph blits one olgl glyph; forward-declared since it lives in
+ * the menu section below. */
 static void cap_glyph(int x, int y, const unsigned char *g, int fg);
 static const unsigned char sb_elev_hi[] = { 54, 0 };
 static const unsigned char sb_elev_lo[] = { 55, 0 };
-static const unsigned char sb_arrow_up[] = { 56, 0 };
-static const unsigned char sb_arrow_dn[] = { 59, 0 };
+static const unsigned char sb_box_ul[]  = { 194, 0 };
+static const unsigned char sb_box_lr[]  = { 195, 0 };
 static const unsigned char sb_dimp_f[]  = { 198, 0 };
 static const unsigned char sb_dimp_ul[] = { 196, 0 };
 static const unsigned char sb_dimp_lr[] = { 197, 0 };
@@ -2589,10 +2594,11 @@ paint_scrollbar(void)
 	int sw   = SCROLLBAR_W_PX - 2;                       /* 14px body */
 	int top  = CONTENT_Y_OFF_PX;
 	int bot  = CONTENT_Y_OFF_PX + CELL_AREA_H_PX;
-	int anch = 14;
+	int anch = 9;                                       /* subtle cable-end caps */
 	int cy0  = top + anch + 2, cy1 = bot - anch - 2;
 	int cable_x = sx + 4, cable_w = sw - 8;
 	int elev_y = cy0;                                   /* Stage A: at the start */
+	int dy   = elev_y + 15;                             /* drag-box → middle third */
 
 	draw_bevel_box(((sx & 0xFFFF) << 16) | (top & 0xFFFF),
 	               ((sw & 0xFFFF) << 16) | (anch & 0xFFFF), BEVEL_RAISED | BEVEL_FILL);
@@ -2601,16 +2607,17 @@ paint_scrollbar(void)
 	if (cy1 > cy0)
 		fill_rect_window(((cable_x & 0xFFFF) << 16) | (cy0 & 0xFFFF),
 		                 ((cable_w & 0xFFFF) << 16) | ((cy1 - cy0) & 0xFFFF), WM_FACE_BG2);
-	/* elevator: BG1 face, then the olgl emboss + arrows + dimple over it */
+	/* elevator: BG1 face, then the olgl emboss (cp 54/55 carry the 3D edges, the
+	 * up + down arrows and the dividers) + the recessed drag-box & dimple. */
 	fill_rect_window(((sx & 0xFFFF) << 16) | (elev_y & 0xFFFF),
 	                 ((sw & 0xFFFF) << 16) | (47 & 0xFFFF), WM_FACE_BG1);
 	cap_glyph(sx, elev_y, sb_elev_hi, WM_FACE_WHITE);
 	cap_glyph(sx, elev_y, sb_elev_lo, WM_FACE_BG3);
-	cap_glyph(sx, elev_y, sb_arrow_up, WM_FACE_BG2);
-	cap_glyph(sx, elev_y, sb_arrow_dn, WM_FACE_BG2);
-	cap_glyph(sx, elev_y + 18, sb_dimp_f,  WM_FACE_BG2);
-	cap_glyph(sx, elev_y + 18, sb_dimp_ul, WM_OL_BLACK);
-	cap_glyph(sx, elev_y + 18, sb_dimp_lr, WM_FACE_WHITE);
+	cap_glyph(sx, dy, sb_box_ul,  WM_FACE_BG3);
+	cap_glyph(sx, dy, sb_box_lr,  WM_FACE_WHITE);
+	cap_glyph(sx, dy, sb_dimp_f,  WM_FACE_BG2);
+	cap_glyph(sx, dy, sb_dimp_ul, WM_OL_BLACK);
+	cap_glyph(sx, dy, sb_dimp_lr, WM_FACE_WHITE);
 }
 
 /* Phase 60 step 3 superseded subscribe_term_pointer (the
