@@ -225,6 +225,8 @@ int  menu_run(int col, int row, const char *items, int n);
 #define VEC_OP_SET_COLOR    0x06
 #define VEC_OP_TEXT_MOVE    0x07   /* set text pen: packed1=(x<<16)|y, packed2=face id */
 #define VEC_OP_TEXT_CHAR    0x08   /* draw one glyph at the pen in the pen color, advance */
+#define VEC_OP_TEXT_RUN     0x09   /* draw up to 8 packed chars at the pen (MSB-first,
+                                    * 0 byte ends the run); the batched vec_text fast path */
 
 /* Font faces for vec_text* (face ids must match oriscwm's text_face_lookup):
  * the WM owns the baked Lucida + OPEN LOOK faces and advances the pen per
