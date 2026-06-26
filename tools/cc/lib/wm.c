@@ -61,6 +61,7 @@
 #define WM_OP_SUBSCRIBE_EVENTS   4
 #define WM_OP_QUERY_GEOMETRY     5
 #define WM_OP_SET_TITLE          6
+#define WM_OP_FONT_OPEN          7
 
 /* WM error codes — also surface in liborisc.h. Mirrored locally for
  * the no-WM fallback short-circuit. */
@@ -80,6 +81,9 @@
 /* wm_set_title hard cap. Must match oriscwm.c's MAX_TITLE_LEN (= N_COLS;
  * Phase 60 step 14 dropped N_COLS to 80). */
 #define WM_MAX_TITLE_LEN          80
+
+/* font_open name cap — must match oriscwm.c's FONT_NAME_MAX. */
+#define WM_FONT_NAME_MAX          32
 
 /* Mailbox caps: R|W|S|V|C (== 0x5b) — same as the other clients' service
  * mailboxes. */
@@ -354,6 +358,35 @@ wm_set_title(int wid, const char *title)
 	if (wm_send_recv(OBJ_SRC_STACK, WM_OP_SET_TITLE, wid, packed, rep) != 0)
 		return -1;
 	return rep[0];
+}
+
+/* font_open: ask the WM to load /fonts/<name>.wmf and return a face id usable
+ * as the `face` arg to vec_text / vec_text_move.  The four built-in faces
+ * resolve to ids 0..3; any other name loads into a fresh WM slot and returns a
+ * new id (>=4).  Re-opening an already-loaded name returns its existing id.
+ * Returns a face id >=0, or a negative WM error (e.g. -2 if /fonts/<name>.wmf
+ * doesn't exist, -7 if the WM's dynamic-font table is full).  Same stack-copy +
+ * blocking-reply shape as wm_set_title — the name reaches the WM via O2. */
+int
+font_open(const char *name)
+{
+	int rc = wm_ensure();
+	if (rc != 0) return rc;
+
+	char buf[WM_FONT_NAME_MAX];
+	int len = 0;
+	while (len < WM_FONT_NAME_MAX && name[len] != '\0') {
+		buf[len] = name[len];
+		len++;
+	}
+	if (len == 0 || len >= WM_FONT_NAME_MAX) return -1;   /* empty / too long */
+	int stack_off = (int)((unsigned int)buf - STACK_BOTTOM);
+	int packed = ((len & 0xFFFF) << 16) | (stack_off & 0xFFFF);
+
+	int rep[4];
+	if (wm_send_recv(OBJ_SRC_STACK, WM_OP_FONT_OPEN, 0, packed, rep) != 0)
+		return -1;
+	return rep[0];   /* R3 = id (>=0) or -errno */
 }
 
 /* OP_SUBSCRIBE_EVENTS. Milestone-2 stub with no callers; events don't

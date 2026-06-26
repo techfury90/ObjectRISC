@@ -223,9 +223,9 @@ obj_adopt_dir_result(void)
  *   - the .orx loader (orx.c): 128 = its freshly-ObjAlloc'd code object,
  *     136 = the data object — adopted so hf_read_obj can stream a whole
  *     section straight into them.
- *   - oriscwm (1584/1592/1600/1608 WM_FONTOBJ_BASE + id*8): per-face font
+ *   - oriscwm (1584..1640 = WM_FONTOBJ_BASE + id*8, ids 0..7): per-face font
  *     objects ObjAlloc'd to receive a /fonts/*.wmf blob via hf_read_obj —
- *     same pattern as the orx sections.
+ *     same pattern as the orx sections.  Ids 4..7 are font_open()'d fonts.
  * `off` must be one of the slot offsets below (OREFLD takes an
  * immediate). OBJ_NULL if the slot is null or the table is full. */
 obj_t
@@ -247,6 +247,10 @@ obj_adopt_slot(int off)
 	case 1592: asm volatile("orefld o1, 1592(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
 	case 1600: asm volatile("orefld o1, 1600(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
 	case 1608: asm volatile("orefld o1, 1608(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
+	case 1616: asm volatile("orefld o1, 1616(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
+	case 1624: asm volatile("orefld o1, 1624(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
+	case 1632: asm volatile("orefld o1, 1632(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
+	case 1640: asm volatile("orefld o1, 1640(o12)\n oisn %0, o1" : "=r"(isn) : : "r1"); break;
 	default:  return OBJ_NULL;
 	}
 	if (isn)
