@@ -1756,7 +1756,25 @@ class System:
                         break
             if ready:
                 task.state = TASK_STATE_RUNNABLE
-                cpu.runnable.append(task)
+                # Direct-handoff: a task that just had its IPC condition
+                # satisfied (a reply/SEND landed) goes to the FRONT of the
+                # round-robin queue, not the back, so it resumes on this
+                # CPU's very next schedule instead of after a full lap.
+                # The sender has effectively handed off to it. This is the
+                # last interactive-latency lever: a foreground task doing
+                # serial RPCs (`help`, `ps`) used to wait ~one round-robin
+                # lap PER reply when other tasks were runnable; front-insert
+                # collapses that to next-schedule. Still cooperative — only
+                # the queue ORDER changes; the current task keeps running
+                # until it yields/blocks (no preemption).
+                #
+                # Fairness: Ouroboros's real wake pattern is a single task
+                # waiting on a single reply, so front-insert is the desired,
+                # benign behavior. If a genuine wake-storm ever caused
+                # starvation, fall back to insert-just-ahead-of-current or a
+                # bounded boost; absolute-front is kept for simplicity until
+                # a test forces otherwise.
+                cpu.runnable.insert(0, task)
 
     def _try_unblock(self, cpu: CPU) -> bool:
         """Resume a blocked CPU if its wait condition is now satisfied.
