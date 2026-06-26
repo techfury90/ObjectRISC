@@ -744,12 +744,31 @@ static unsigned char window_vec_color[MAX_WINDOWS]; /* current pen palette idx *
 static int           window_text_x[MAX_WINDOWS];
 static int           window_text_y[MAX_WINDOWS];
 static unsigned char window_text_face[MAX_WINDOWS];
-/* Per-window "content drawn since last composite" flag.  Vector ops draw into
- * the window FB and set this instead of compositing; poll_window_vectors
- * composites ONCE after draining a window's burst — so a page of text is one
- * screen update, not one per op (and the stack behind an overlapping window
- * flashes at most once per burst, not per op). */
-static unsigned char window_vec_dirty[MAX_WINDOWS];
+/* Per-window deferred-composite state — a single DIRTY BOUNDING BOX shared by
+ * EVERY paint surface (console strips, grid strips, console scroll, and all the
+ * vector ops).  Paint ops draw into the window FB and union the rect they
+ * touched into this bbox (mark_window_dirty) instead of compositing inline; the
+ * draining poller blits only that bbox once per burst (composite_window_dirty).
+ *
+ * Two wins in one mechanism:
+ *   - TIME-coalesced: a page of text (vec_text, or a console flood like `help`
+ *     / `ls`) is a single screen update, not one composite per op (and the
+ *     stack behind an overlapping window flashes at most once per burst).
+ *   - SPACE-coalesced: the composite is sized to what actually changed — typing
+ *     one character repaints one 8x16 cell, a small vector update repaints its
+ *     rect, not the whole ~640x384 content area.  A scroll legitimately dirties
+ *     the whole content area, so paging `help` still costs one content-area
+ *     blit per burst; localized edits cost only their cells.  Late-80s-blitter
+ *     manners.
+ *
+ * Coords are window-FB pixels (0,0 = window top-left incl. border); the bbox is
+ * [x0,x1) x [y0,y1), and x1 <= x0 means empty.  All four pollers run in
+ * sequence (consoles, grids, vectors, rasters), each compositing + clearing the
+ * bbox at its own burst end, so sharing one bbox is race-free. */
+static int window_dirty_x0[MAX_WINDOWS];
+static int window_dirty_y0[MAX_WINDOWS];
+static int window_dirty_x1[MAX_WINDOWS];
+static int window_dirty_y1[MAX_WINDOWS];
 
 /* Phase 60 step 11 — per-wid screen position + z-order.  The window
  * FB at WM_WINDOW_FB_BASE+(wid-1)*8 composites onto the screen FB
@@ -1527,6 +1546,56 @@ composite_content_area(void)
 {
 	composite_window_region(CONTENT_X_OFF_PX, CONTENT_Y_OFF_PX,
 	                        CELL_AREA_W_PX, CELL_AREA_H_PX);
+}
+
+/* Dirty-region tracking, shared by the console/grid and vector paint paths.
+ * mark_window_dirty unions a just-painted rect (window-FB pixel coords) into
+ * window `slot`'s dirty bbox; composite_window_dirty (called by the draining
+ * poller) blits exactly that bbox to the screen and resets it.  Coalesces a
+ * burst into ONE composite sized to what actually changed — one cell for a
+ * keystroke, its rect for a small vector update, the content area for a scroll
+ * — instead of always repainting the whole content area. */
+static void
+mark_window_dirty(int slot, int x, int y, int w, int h)
+{
+	if (slot < 0 || slot >= MAX_WINDOWS) return;
+	if (w <= 0 || h <= 0)                return;
+	int x1 = x + w;
+	int y1 = y + h;
+	/* Clamp to the window FB.  A glyph at the content's right edge or an
+	 * over-large vector rect can paint past the cell area (the firmware clips
+	 * to the FB, not the content), and negative client coords arrive sign-
+	 * extended; clamping keeps the bbox a valid in-window rect to composite. */
+	if (x  < 0)            x  = 0;
+	if (y  < 0)            y  = 0;
+	if (x1 > USABLE_W_PX)  x1 = USABLE_W_PX;
+	if (y1 > USABLE_H_PX)  y1 = USABLE_H_PX;
+	if (x1 <= x || y1 <= y) return;   /* fully off-window */
+	if (window_dirty_x1[slot] <= window_dirty_x0[slot]) {   /* was empty */
+		window_dirty_x0[slot] = x;  window_dirty_y0[slot] = y;
+		window_dirty_x1[slot] = x1; window_dirty_y1[slot] = y1;
+		return;
+	}
+	if (x  < window_dirty_x0[slot]) window_dirty_x0[slot] = x;
+	if (y  < window_dirty_y0[slot]) window_dirty_y0[slot] = y;
+	if (x1 > window_dirty_x1[slot]) window_dirty_x1[slot] = x1;
+	if (y1 > window_dirty_y1[slot]) window_dirty_y1[slot] = y1;
+}
+
+/* Composite window `wid`'s pending dirty bbox (if any) and clear it.  Caller
+ * passes wid; we set it active so composite_window_region targets it. */
+static void
+composite_window_dirty(int wid)
+{
+	int slot = wid - 1;
+	if (slot < 0 || slot >= MAX_WINDOWS)             return;
+	if (window_dirty_x1[slot] <= window_dirty_x0[slot]) return;   /* empty */
+	set_active_window(wid);
+	composite_window_region(window_dirty_x0[slot], window_dirty_y0[slot],
+	                        window_dirty_x1[slot] - window_dirty_x0[slot],
+	                        window_dirty_y1[slot] - window_dirty_y0[slot]);
+	window_dirty_x0[slot] = 0; window_dirty_x1[slot] = 0;
+	window_dirty_y0[slot] = 0; window_dirty_y1[slot] = 0;
 }
 
 /* fill_rect_packed targets the screen FB (paint_window_chrome's
@@ -3966,12 +4035,16 @@ flush_strip(const unsigned char *glyphs, int n_glyphs,
 		  "r8", "r9", "r10", "r11"
 	);
 
-	/* Composite the just-painted strip onto the screen FB so the
-	 * change is visible.  Strip pixel rect in window-local coords:
-	 * (fb_col*CELL_W, fb_row*CELL_H) → (n_glyphs*CELL_W, CELL_H).
-	 * fb_col / fb_row already include the border + title offsets. */
-	composite_window_region(fb_col * CELL_W, fb_row * CELL_H,
-	                        n_glyphs * CELL_W, CELL_H);
+	/* Strip painted into the window FB; union its rect into the window's
+	 * dirty bbox and defer the screen composite to the draining poller's
+	 * burst end — so a console flood (`help`, `ls`, a build log) is one
+	 * screen update, and a lone keystroke recomposites just its cell.  The
+	 * strip rect in window-FB pixels: (fb_col*CELL_W, fb_row*CELL_H) sized
+	 * (n_glyphs*CELL_W, CELL_H).  active_wid is the window render_buffer /
+	 * forward_grid_write set before calling us. */
+	mark_window_dirty(active_wid - 1,
+	                  fb_col * CELL_W, fb_row * CELL_H,
+	                  n_glyphs * CELL_W, CELL_H);
 }
 
 /* Phase 60 step 6 — shift the inner cell area up by one cell row
@@ -4014,9 +4087,13 @@ fb_scroll_up_one_cell(void)
 		: "r1", "r2", "r4", "r5", "r6",
 		  "r8", "r9", "r10"
 	);
-	/* Only the cell-content area changed; border + title stay put. */
-	composite_window_region(CONTENT_X_OFF_PX, CONTENT_Y_OFF_PX,
-	                        CELL_AREA_W_PX, CELL_AREA_H_PX);
+	/* A scroll shifts the WHOLE cell-content area, so mark the entire
+	 * content rect dirty (border + title stay put).  Deferred to the
+	 * poller's burst end — paging through `help` thus repaints the content
+	 * area once per burst, not once per scrolled line. */
+	mark_window_dirty(active_wid - 1,
+	                  CONTENT_X_OFF_PX, CONTENT_Y_OFF_PX,
+	                  CELL_AREA_W_PX, CELL_AREA_H_PX);
 }
 
 /* Hoist `*row` back into [0, N_ROWS) by scrolling the inner cell
@@ -4376,6 +4453,13 @@ poll_window_consoles(void)
 			set_active_window(wid);
 			forward_console_write(wid, offset, count);
 		}
+
+		/* Composite ONCE for the whole drained burst — and only the dirty
+		 * bbox the strips/scrolls actually touched.  A flood of per-line
+		 * console writes (`help`, `ls`, a build log) is a single screen
+		 * update instead of one composite per strip/scroll; a lone keystroke
+		 * blits just its cell instead of the whole content area. */
+		composite_window_dirty(wid);
 	}
 }
 
@@ -4426,6 +4510,10 @@ poll_window_grids(void)
 			set_active_window(wid);
 			forward_grid_write(g_offset, g_count, g_col, g_row);
 		}
+
+		/* One composite per drained grid burst, sized to the dirty bbox —
+		 * same dirty-region coalescing as poll_window_consoles. */
+		composite_window_dirty(wid);
 	}
 }
 
@@ -4492,15 +4580,16 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		return;
 	}
 	if (op == VEC_OP_CLEAR) {
-		/* Repaint the cell-content area to bg via ObjFillRect on
-		 * the window FB; the composite is deferred to the drain end
-		 * (window_vec_dirty).  Border + title bar stay put. */
+		/* Repaint the cell-content area to bg via ObjFillRect on the window
+		 * FB; the composite is deferred to the drain end.  Border + title bar
+		 * stay put, so the dirty rect is exactly the content area. */
 		int xy = ((CONTENT_X_OFF_PX & 0xFFFF) << 16)
 		       | (CONTENT_Y_OFF_PX & 0xFFFF);
 		int wh = ((CELL_AREA_W_PX & 0xFFFF) << 16)
 		       | (CELL_AREA_H_PX & 0xFFFF);
 		fill_rect_window(xy, wh, WM_BG_COLOR);
-		window_vec_dirty[slot] = 1;
+		mark_window_dirty(slot, CONTENT_X_OFF_PX, CONTENT_Y_OFF_PX,
+		                  CELL_AREA_W_PX, CELL_AREA_H_PX);
 		return;
 	}
 
@@ -4527,7 +4616,10 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		                font_shape(1, cur_vec_color, WM_BG_COLOR, 1),
 		                wm_text_scratch);
 		window_text_x[slot] += adv;
-		window_vec_dirty[slot] = 1;   /* composite deferred to the drain end */
+		/* Dirty just the glyph cell (composite deferred to the drain end).
+		 * Width = face->cell_w (the max glyph box) so a proportional glyph
+		 * whose ink runs past its advance is still fully covered. */
+		mark_window_dirty(slot, ax, ay, face->cell_w, face->cell_h);
 		return;
 	}
 	if (op == VEC_OP_TEXT_RUN) {
@@ -4556,31 +4648,46 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		                font_shape(n, cur_vec_color, WM_BG_COLOR, 1),
 		                wm_text_scratch);
 		window_text_x[slot] += w;
-		window_vec_dirty[slot] = 1;
+		/* Dirty the run's pixel span (ax .. ax+w), + one cell so the final
+		 * proportional glyph's ink overhang is covered.  mark clamps to the
+		 * window FB. */
+		mark_window_dirty(slot, ax, ay, w + face->cell_w, face->cell_h);
 		return;
 	}
 
-	int painted = 0;
+	/* Painted ops use content-relative coords (fb_blit_row adds the content
+	 * origin), so each marks its rect translated by CONTENT_*_OFF. */
 	if (op == VEC_OP_LINE) {
 		int x1 = vec_unpack_hi(packed1);
 		int y1 = vec_unpack_lo(packed1);
 		int x2 = vec_unpack_hi(packed2);
 		int y2 = vec_unpack_lo(packed2);
 		draw_line(x1, y1, x2, y2);
-		painted = 1;
+		int minx = x1 < x2 ? x1 : x2;
+		int miny = y1 < y2 ? y1 : y2;
+		int lw   = (x1 < x2 ? x2 - x1 : x1 - x2) + 1;   /* incl. both endpoints */
+		int lh   = (y1 < y2 ? y2 - y1 : y1 - y2) + 1;
+		mark_window_dirty(slot, minx + CONTENT_X_OFF_PX,
+		                  miny + CONTENT_Y_OFF_PX, lw, lh);
 	} else {
 		int x = vec_unpack_hi(packed1);
 		int y = vec_unpack_lo(packed1);
 		int w = vec_unpack_hi(packed2);
 		int h = vec_unpack_lo(packed2);
+		int painted = 0;
 		if      (op == VEC_OP_RECT_FILL)    { draw_rect_fill(x, y, w, h);    painted = 1; }
 		else if (op == VEC_OP_RECT_OUTLINE) { draw_rect_outline(x, y, w, h); painted = 1; }
 		else if (op == VEC_OP_OVAL_FILL)    { draw_oval_fill(x, y, w, h);    painted = 1; }
 		else if (op == VEC_OP_OVAL_OUTLINE) { draw_oval_outline(x, y, w, h); painted = 1; }
 		/* Unknown op: drop silently — clients see no error since
 		 * vector SENDs are fire-and-forget anyway. */
+		if (painted)
+			/* 1px margin: draw_oval_* fills 2*r+1 px, so the ellipse can
+			 * touch one pixel past the (x,y,w,h) box; the margin keeps that
+			 * edge in the composited rect.  mark clamps to the FB. */
+			mark_window_dirty(slot, x + CONTENT_X_OFF_PX - 1,
+			                  y + CONTENT_Y_OFF_PX - 1, w + 2, h + 2);
 	}
-	if (painted) window_vec_dirty[slot] = 1;
 }
 
 /* See poll_window_grids — same status-via-global trick, capped at 4
@@ -4623,18 +4730,13 @@ poll_window_vectors(void)
 			forward_vector_write(wid, op, packed1, packed2);
 		}
 
-		/* Composite ONCE for the whole drained burst.  forward_vector_write
-		 * only marks window_vec_dirty now, so a vec_text page (or any run of
-		 * ops) is a single screen update instead of one composite per op —
-		 * that per-op compositing was both the residual specimen latency AND
-		 * the intermittent navy/black flash (each composite re-blit the
-		 * window stack bottom-to-top, briefly showing the window behind). */
-		int vslot = wid - 1;
-		if (window_vec_dirty[vslot]) {
-			set_active_window(wid);
-			composite_content_area();
-			window_vec_dirty[vslot] = 0;
-		}
+		/* Composite ONCE for the whole drained burst, sized to the dirty
+		 * bbox the ops actually touched.  Per-op compositing was both the
+		 * residual specimen latency AND the intermittent navy/black flash
+		 * (each composite re-blit the window stack bottom-to-top, briefly
+		 * showing the window behind); now a vec_text page is one screen
+		 * update, and a small vector edit blits only its rect. */
+		composite_window_dirty(wid);
 	}
 }
 
