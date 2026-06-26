@@ -39,32 +39,29 @@ should_quit(int code)
 	return code == 'q' || code == 'Q' || code == TK_ESCAPE;
 }
 
-/* Draw the specimen.  task_yield between lines lets the WM drain this
- * window's vector queue (one glyph SEND per char) so a full page of text
- * never backs up the depth-64 queue. */
+/* Draw the specimen.  The whole page is sent as one burst of vector ops — the
+ * WM drains a batch per wake (WM_DRAIN_MAX) and vec_text packs ~8 glyphs per
+ * SEND, so the ~50 ops stay well under the depth-64 queue.  No pacing needed
+ * (the per-line task_yields are gone — they only forced extra WM wakes). */
 static void
 draw_specimen(void)
 {
 	vec_set_color(COL_PAPER); vec_rect_fill(0, 0, CONTENT_W, CONTENT_H);
-	task_yield();
 
 	vec_set_color(COL_INK);
 	vec_text(FONT_FACE_PROP, 8, 6, "Object RISC -- OPEN LOOK Font Specimen");
 	vec_set_color(COL_RULE);  vec_line(8, 26, CONTENT_W - 9, 26);
-	task_yield();
 
 	vec_set_color(COL_LABEL);
 	vec_text(FONT_FACE_PROP, 8, 38, "Lucida Sans (luRS, proportional):");
 	vec_set_color(COL_INK);
 	vec_text(FONT_FACE_PROP, 16, 56,
 	         "The quick brown fox jumps over the lazy dog 0123456789");
-	task_yield();
 
 	vec_set_color(COL_LABEL);
 	vec_text(FONT_FACE_PROP, 8, 86, "Lucida Typewriter (lutRS, monospace):");
 	vec_set_color(COL_INK);
 	vec_text(FONT_FACE_MONO, 16, 104, "$ ls -la *.orx | grep ouroboros");
-	task_yield();
 
 	vec_set_color(COL_LABEL);
 	vec_text(FONT_FACE_PROP, 8, 134, "OPEN LOOK glyphs (olgl):");
@@ -73,7 +70,6 @@ draw_specimen(void)
 		vec_text_move(FONT_FACE_GLYPH, 16 + i * 28, 152);
 		vec_text_char(OLGL_ROW[i]);
 	}
-	task_yield();
 
 	vec_set_color(COL_LABEL);
 	vec_text(FONT_FACE_PROP, 8, 182, "(press q or Esc to close)");

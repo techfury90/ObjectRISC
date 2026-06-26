@@ -4292,6 +4292,14 @@ forward_grid_write(int offset, int count, int col, int row)
  * instant any console queue receives a SEND), so per-window writes
  * now have no timeout floor — just the natural turn-around of the
  * producing program. */
+
+/* Per-pass per-window DRAIN CAP.  Each poll-sweep drains up to this many
+ * queued SENDs for a window before moving on, instead of one op per main-loop
+ * pass — so a burst (e.g. a page of vec_text) is serviced in a couple of wakes
+ * rather than paying the WaitAnyQueue-rebuild + full poll-sweep overhead once
+ * per op.  The cap bounds how long a flood on one surface can hold off input. */
+#define WM_DRAIN_MAX 32
+
 static void
 poll_window_consoles(void)
 {
@@ -4299,24 +4307,25 @@ poll_window_consoles(void)
 	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
 		if (window_type[wid - 1] != WIN_TYPE_CONSOLE) continue;
 
-		/* Load full per-window CONSOLE cap into O1 and poll with
-		 * timeout=0.  Status ERR_OK (0) means we got a SEND;
-		 * forward it.  Anything else (typically ETIMEOUT) means
-		 * the queue is empty — move on. */
-		load_console_to_o1(wid);
-		int status, offset, count;
-		asm volatile(
-			"addiu r4, r0, 0\n"        /* timeout = 0 (non-blocking) */
-			"call  #0x204\n"           /* ReceiveQueuePoll */
-			"nop\n"
-			"addu  %0, r2, r0\n"
-			"addu  %1, r3, r0\n"
-			"addu  %2, r4, r0"
-			: "=r"(status), "=r"(offset), "=r"(count)
-			:
-			: "r1", "r2", "r3", "r4", "r5", "r6"
-		);
-		if (status == 0) {
+		/* Drain up to WM_DRAIN_MAX queued SENDs for this window per pass.
+		 * Status ERR_OK (0) = got a SEND; anything else (typically
+		 * ETIMEOUT) = empty, stop draining this window. */
+		int drained;
+		for (drained = 0; drained < WM_DRAIN_MAX; drained++) {
+			load_console_to_o1(wid);
+			int status, offset, count;
+			asm volatile(
+				"addiu r4, r0, 0\n"        /* timeout = 0 (non-blocking) */
+				"call  #0x204\n"           /* ReceiveQueuePoll */
+				"nop\n"
+				"addu  %0, r2, r0\n"
+				"addu  %1, r3, r0\n"
+				"addu  %2, r4, r0"
+				: "=r"(status), "=r"(offset), "=r"(count)
+				:
+				: "r1", "r2", "r3", "r4", "r5", "r6"
+			);
+			if (status != 0) break;   /* queue empty */
 			/* O2 (source) and O3 (reply_cap) survive the call —
 			 * pcc-orisc treats OPRs as scratch but our asm reloads
 			 * them from the stash slots inside forward_console_write. */
@@ -4343,34 +4352,33 @@ poll_window_grids(void)
 	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
 		if (window_type[wid - 1] != WIN_TYPE_CONSOLE) continue;
 
-		load_grid_to_o1(wid);
-		/* Poll the per-window queue.  We need five values out
-		 * (status + offset + count + col + row); pcc-orisc's
-		 * codegen caps single-asm register outputs at 4.
-		 * Workaround: capture R3..R6 (offset, count, col, row)
-		 * via the asm's regular output operands, and stash R2
-		 * (status) to a file-scope global from inside the same
-		 * asm.  Using a global instead of a stack-local
-		 * sidesteps any pcc bug with stack-spill addressing
-		 * mid-asm; the global is fine since we only use it
-		 * synchronously across this one call. */
-		int g_offset, g_count, g_col, g_row;
-		asm volatile(
-			"addiu r4, r0, 0\n"
-			"call  #0x204\n"           /* ReceiveQueuePoll */
-			"nop\n"
-			"la    r1, _wm_grid_poll_status\n"
-			"sw    r2, 0(r1)\n"
-			"addu  %0, r3, r0\n"
-			"addu  %1, r4, r0\n"
-			"addu  %2, r5, r0\n"
-			"addu  %3, r6, r0"
-			: "=r"(g_offset), "=r"(g_count),
-			  "=r"(g_col),    "=r"(g_row)
-			:
-			: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
-		);
-		if (_wm_grid_poll_status == 0) {
+		/* Drain up to WM_DRAIN_MAX queued SENDs for this window per pass.
+		 * We need five values out (status + offset + count + col + row);
+		 * pcc-orisc's codegen caps single-asm register outputs at 4, so
+		 * capture R3..R6 via output operands and stash R2 (status) to a
+		 * file-scope global from inside the same asm (a stack-local would
+		 * trip a pcc spill-addressing bug mid-asm; the global is fine, used
+		 * synchronously across this one call). */
+		int drained;
+		for (drained = 0; drained < WM_DRAIN_MAX; drained++) {
+			load_grid_to_o1(wid);
+			int g_offset, g_count, g_col, g_row;
+			asm volatile(
+				"addiu r4, r0, 0\n"
+				"call  #0x204\n"           /* ReceiveQueuePoll */
+				"nop\n"
+				"la    r1, _wm_grid_poll_status\n"
+				"sw    r2, 0(r1)\n"
+				"addu  %0, r3, r0\n"
+				"addu  %1, r4, r0\n"
+				"addu  %2, r5, r0\n"
+				"addu  %3, r6, r0"
+				: "=r"(g_offset), "=r"(g_count),
+				  "=r"(g_col),    "=r"(g_row)
+				:
+				: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+			);
+			if (_wm_grid_poll_status != 0) break;   /* queue empty */
 			set_active_window(wid);
 			forward_grid_write(g_offset, g_count, g_col, g_row);
 		}
@@ -4549,22 +4557,28 @@ poll_window_vectors(void)
 	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
 		if (window_type[wid - 1] != WIN_TYPE_CONSOLE) continue;
 
-		load_vector_to_o1(wid);
-		int op, packed1, packed2;
-		asm volatile(
-			"addiu r4, r0, 0\n"
-			"call  #0x204\n"           /* ReceiveQueuePoll */
-			"nop\n"
-			"la    r1, _wm_vector_poll_status\n"
-			"sw    r2, 0(r1)\n"
-			"addu  %0, r3, r0\n"
-			"addu  %1, r4, r0\n"
-			"addu  %2, r5, r0"
-			: "=r"(op), "=r"(packed1), "=r"(packed2)
-			:
-			: "r1", "r2", "r3", "r4", "r5", "memory"
-		);
-		if (_wm_vector_poll_status == 0) {
+		/* Drain up to WM_DRAIN_MAX queued ops per pass — a vec_text page
+		 * arrives as a burst of TEXT_RUNs, and one-per-pass made each pay
+		 * the full main-loop overhead (the font-specimen "draw one block
+		 * per pass" symptom). */
+		int drained;
+		for (drained = 0; drained < WM_DRAIN_MAX; drained++) {
+			load_vector_to_o1(wid);
+			int op, packed1, packed2;
+			asm volatile(
+				"addiu r4, r0, 0\n"
+				"call  #0x204\n"           /* ReceiveQueuePoll */
+				"nop\n"
+				"la    r1, _wm_vector_poll_status\n"
+				"sw    r2, 0(r1)\n"
+				"addu  %0, r3, r0\n"
+				"addu  %1, r4, r0\n"
+				"addu  %2, r5, r0"
+				: "=r"(op), "=r"(packed1), "=r"(packed2)
+				:
+				: "r1", "r2", "r3", "r4", "r5", "memory"
+			);
+			if (_wm_vector_poll_status != 0) break;   /* queue empty */
 			set_active_window(wid);
 			forward_vector_write(wid, op, packed1, packed2);
 		}
@@ -4682,24 +4696,27 @@ poll_window_rasters(void)
 	for (wid = 1; wid <= MAX_WINDOWS; wid++) {
 		if (window_type[wid - 1] != WIN_TYPE_CONSOLE) continue;
 
-		load_raster_to_o1(wid);
-		int op, packed1, packed2, byte_off;
-		asm volatile(
-			"addiu r4, r0, 0\n"
-			"call  #0x204\n"
-			"nop\n"
-			"la    r1, _wm_raster_poll_status\n"
-			"sw    r2, 0(r1)\n"
-			"addu  %0, r3, r0\n"
-			"addu  %1, r4, r0\n"
-			"addu  %2, r5, r0\n"
-			"addu  %3, r6, r0"
-			: "=r"(op), "=r"(packed1),
-			  "=r"(packed2), "=r"(byte_off)
-			:
-			: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
-		);
-		if (_wm_raster_poll_status == 0) {
+		/* Drain up to WM_DRAIN_MAX queued blits for this window per pass. */
+		int drained;
+		for (drained = 0; drained < WM_DRAIN_MAX; drained++) {
+			load_raster_to_o1(wid);
+			int op, packed1, packed2, byte_off;
+			asm volatile(
+				"addiu r4, r0, 0\n"
+				"call  #0x204\n"
+				"nop\n"
+				"la    r1, _wm_raster_poll_status\n"
+				"sw    r2, 0(r1)\n"
+				"addu  %0, r3, r0\n"
+				"addu  %1, r4, r0\n"
+				"addu  %2, r5, r0\n"
+				"addu  %3, r6, r0"
+				: "=r"(op), "=r"(packed1),
+				  "=r"(packed2), "=r"(byte_off)
+				:
+				: "r1", "r2", "r3", "r4", "r5", "r6", "memory"
+			);
+			if (_wm_raster_poll_status != 0) break;   /* queue empty */
 			set_active_window(wid);
 			forward_raster_write(op, packed1, packed2, byte_off);
 		}
