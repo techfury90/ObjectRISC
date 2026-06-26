@@ -101,6 +101,7 @@
 #define WM_OP_SUBSCRIBE_EVENTS   4
 #define WM_OP_QUERY_GEOMETRY     5
 #define WM_OP_SET_TITLE          6
+#define WM_OP_FONT_OPEN          7
 
 #define WIN_TYPE_CONSOLE   1
 #define WIN_TYPE_GRAPHICAL 2
@@ -318,11 +319,15 @@
  * (@1568, 8 bytes) and the OR-spill anchor (@1696 = TABLE_BYTES + 1568). */
 #define WM_MENU_OVERLAY_FB_SLOT_OFFSET  1576
 /* Phase B/C — per-face slots for fonts loaded from /fonts at runtime, so the
- * dynamic-face blit emitter can OREFLD each into O2.  Indexed by FONT_FACE_*
- * (PROP=0, MONO=1, GLYPH=2, BOLD=3): slot = WM_FONTOBJ_BASE + id*8, i.e.
- * 1584/1592/1600/1608.  All four fit below the OR-spill anchor (@1696). */
+ * dynamic-face blit emitter can OREFLD each into O2.  Indexed by face id: the
+ * four built-ins are FONT_FACE_* (PROP=0, MONO=1, GLYPH=2, BOLD=3); font_open()
+ * assigns ids 4..WM_NDYNFONT-1 to client-named fonts.  slot = WM_FONTOBJ_BASE +
+ * id*8 → 1584..1640.  All eight fit in the free O12 gap below the OR-spill
+ * anchor (@1696); id 13 (@1688) is the hard ceiling without growing the alloc. */
 #define WM_FONTOBJ_BASE                 1584
-#define WM_NDYNFONT                     4
+#define WM_NBUILTIN_FONT                4      /* ids 0..3, loaded at boot */
+#define WM_NDYNFONT                     8      /* + ids 4..7 for font_open() */
+#define FONT_NAME_MAX                   32     /* client font name; WM forms "/fonts/" + name + ".wmf" */
 #define WM_FONTOBJ_BYTES                8192   /* fits luRS/luBS/lutRS (≤3152 B); Phase C sizes per file for olgl (47 KB) */
 #define WM_FONT_HDR_BYTES               192    /* WMF1 header (16) + width table (≤167); covers all four faces */
 #define TAG_DATA                        0x4102
@@ -1222,16 +1227,34 @@ wm_hostfs_init(void)
  * width table (so font_advance/measure read the loaded widths, not the baked
  * blob); the loaded object itself lives in O12 slot WM_FONTOBJ_BASE + id*8. */
 static unsigned int dyn_cache[WM_NDYNFONT][WM_FONT_HDR_BYTES / 4];
-static const char *const dyn_font_path[WM_NDYNFONT] = {
+/* Path per face id.  Built-in ids 0..3 are the const strings; font_open() fills
+ * ids 4..7 by pointing these at dyn_path_store[] entries it composes — so the
+ * array is mutable POINTERS to const strings.  Unset dynamic entries are NULL
+ * (never loaded; those faces stay on the lutRS failsafe). */
+static const char *dyn_font_path[WM_NDYNFONT] = {
 	"/fonts/luRS.wmf", "/fonts/lutRS.wmf", "/fonts/olgl.wmf", "/fonts/luBS.wmf"
 };
 /* Object capacity per face — the read loop stops at EOF, so this only has to be
  * >= the .wmf size.  olgl (the 47x47 glyph envelope) is ~47 KB; the text faces
- * fit the default.  (hf_open discards the wire-reported file size, so we size
- * by face rather than querying it — fine while /fonts is a fixed asset set.) */
+ * fit the default.  font_open'd fonts (4..7) get 64 KB headroom (ObjAlloc'd
+ * lazily, only when opened).  (hf_open discards the wire-reported file size, so
+ * we size by face rather than querying it.) */
 static const unsigned int dyn_font_objsize[WM_NDYNFONT] = {
-	WM_FONTOBJ_BYTES, WM_FONTOBJ_BYTES, 0x10000, WM_FONTOBJ_BYTES
+	WM_FONTOBJ_BYTES, WM_FONTOBJ_BYTES, 0x10000, WM_FONTOBJ_BYTES,
+	0x10000, 0x10000, 0x10000, 0x10000
 };
+
+/* font_open() bookkeeping for the dynamic ids (WM_NBUILTIN_FONT..WM_NDYNFONT-1).
+ * dyn_n_loaded counts used slots (starts past the built-ins); dyn_path_store
+ * holds each dynamic slot's composed "/fonts/<name>.wmf" (dyn_font_path[id]
+ * points at it); dyn_loaded_name remembers the open's name for the idempotent
+ * re-open check; dyn_builtin_name maps the four baked names back to ids 0..3. */
+static const char *const dyn_builtin_name[WM_NBUILTIN_FONT] = {
+	"luRS", "lutRS", "olgl", "luBS"
+};
+static char dyn_path_store[WM_NDYNFONT][FONT_NAME_MAX + 12];
+static char dyn_loaded_name[WM_NDYNFONT][FONT_NAME_MAX];
+static int  dyn_n_loaded = WM_NBUILTIN_FONT;
 
 /* Park the just-ObjAlloc'd object (O1) into face id's slot — immediate OREFST
  * per id (pcc rejects computed offsets; the load_window_fb_to_o1 idiom). */
@@ -1243,6 +1266,10 @@ font_slot_park_o1(int id)
 	case 1: asm volatile("orefst o1, 1592(o12)"); break;
 	case 2: asm volatile("orefst o1, 1600(o12)"); break;
 	case 3: asm volatile("orefst o1, 1608(o12)"); break;
+	case 4: asm volatile("orefst o1, 1616(o12)"); break;
+	case 5: asm volatile("orefst o1, 1624(o12)"); break;
+	case 6: asm volatile("orefst o1, 1632(o12)"); break;
+	case 7: asm volatile("orefst o1, 1640(o12)"); break;
 	default: break;
 	}
 }
@@ -1257,6 +1284,10 @@ font_slot_load_o1(int id)
 	case 1: asm volatile("orefld o1, 1592(o12)"); break;
 	case 2: asm volatile("orefld o1, 1600(o12)"); break;
 	case 3: asm volatile("orefld o1, 1608(o12)"); break;
+	case 4: asm volatile("orefld o1, 1616(o12)"); break;
+	case 5: asm volatile("orefld o1, 1624(o12)"); break;
+	case 6: asm volatile("orefld o1, 1632(o12)"); break;
+	case 7: asm volatile("orefld o1, 1640(o12)"); break;
 	default: break;
 	}
 }
@@ -2197,6 +2228,10 @@ blit_glyphs_winfb_dyn(int packed_xy, int packed_shape, int text_off, int slot)
 	case 1592: asm volatile("orefld o2, 1592(o12)"); break;
 	case 1600: asm volatile("orefld o2, 1600(o12)"); break;
 	case 1608: asm volatile("orefld o2, 1608(o12)"); break;
+	case 1616: asm volatile("orefld o2, 1616(o12)"); break;
+	case 1624: asm volatile("orefld o2, 1624(o12)"); break;
+	case 1632: asm volatile("orefld o2, 1632(o12)"); break;
+	case 1640: asm volatile("orefld o2, 1640(o12)"); break;
 	default: return;
 	}
 	asm volatile(
@@ -3830,6 +3865,99 @@ handle_set_title(int wid, int packed_len_off)
 	wm_reply(0, 0, 0, 0);
 }
 
+/* Compare a fetched (NUL-terminated) font name against a known name. */
+static int
+font_name_eq(const unsigned char *a, const char *b)
+{
+	int i = 0;
+	while (a[i] && b[i]) {
+		if (a[i] != (unsigned char)b[i]) return 0;
+		i++;
+	}
+	return a[i] == 0 && b[i] == 0;
+}
+
+/* WM_OP_FONT_OPEN — load /fonts/<name>.wmf and reply a face id the client can
+ * pass to vec_text.  Wire shape: R6 = packed (len:high16, src_off:low16); O2 =
+ * the caller's name bytes (OBJ_SRC_STACK).  Reply R3 = id (>=0) or -errno.
+ *   - the four built-ins resolve to their fixed ids 0..3;
+ *   - an already-open name returns its existing id (idempotent);
+ *   - a new name loads into the next free slot (4..WM_NDYNFONT-1) and returns
+ *     the new id; a failed load (missing file / bad header) replies E_NOENT
+ *     WITHOUT burning the slot. */
+static void
+handle_font_open(int packed_len_off)
+{
+	int len     = (packed_len_off >> 16) & 0xFFFF;
+	int src_off = packed_len_off & 0xFFFF;
+	int i, id, k, j;
+	unsigned char name[FONT_NAME_MAX];
+
+	if (len <= 0 || len >= FONT_NAME_MAX) { wm_reply(E_INVAL, 0, 0, 0); return; }
+
+	/* Stash the caller's source ref before any asm clobbers O2, then fetch the
+	 * name into a stack buffer (O15 lacks ref-level CAP_W) — handle_set_title's
+	 * trick. */
+	asm volatile("orefst o2, %0(o12)" :: "i"(WM_FORWARD_SRC_SLOT_OFFSET));
+	{
+		unsigned char fetch_buf[FONT_NAME_MAX];
+		int dst_off = (int)((unsigned int)fetch_buf - STACK_BOTTOM);
+		int fetch_status;
+		asm volatile(
+			"addu  r8, %1, r0\n"
+			"addu  r9, %2, r0\n"
+			"addu  r10, %3, r0\n"
+			"orefld o1, %4(o12)\n"      /* O1 = caller's source */
+			"omov   o2, o11\n"          /* O2 = boot stack (dest) */
+			"addu  r4, r8,  r0\n"
+			"addu  r5, r9,  r0\n"
+			"addu  r6, r10, r0\n"
+			"call  #0x108\n"            /* ObjFetchBytes */
+			"nop\n"
+			"addu  %0, r2, r0"
+			: "=r"(fetch_status)
+			: "r"(src_off), "r"(dst_off), "r"(len),
+			  "i"(WM_FORWARD_SRC_SLOT_OFFSET)
+			: "r1", "r2", "r3", "r4", "r5", "r6", "r8", "r9", "r10"
+		);
+		if (fetch_status != 0) { wm_reply(E_IO, 0, 0, 0); return; }
+		for (i = 0; i < len; i++) name[i] = fetch_buf[i];
+	}
+	name[len] = 0;
+
+	/* Built-in face → fixed id 0..3. */
+	for (i = 0; i < WM_NBUILTIN_FONT; i++)
+		if (font_name_eq(name, dyn_builtin_name[i])) { wm_reply(i, 0, 0, 0); return; }
+	/* Already font_open'd → existing id (idempotent — no second ObjAlloc). */
+	for (i = WM_NBUILTIN_FONT; i < dyn_n_loaded; i++)
+		if (font_name_eq(name, dyn_loaded_name[i])) { wm_reply(i, 0, 0, 0); return; }
+	/* New font — claim the next free slot. */
+	if (dyn_n_loaded >= WM_NDYNFONT) { wm_reply(E_NOSPC, 0, 0, 0); return; }
+	id = dyn_n_loaded;
+
+	/* Compose "/fonts/<name>.wmf" into the slot's path store. */
+	k = 0;
+	{ const char *pre = "/fonts/"; for (j = 0; pre[j]; j++) dyn_path_store[id][k++] = pre[j]; }
+	for (j = 0; j < len; j++) dyn_path_store[id][k++] = (char)name[j];
+	{ const char *suf = ".wmf";    for (j = 0; suf[j]; j++) dyn_path_store[id][k++] = suf[j]; }
+	dyn_path_store[id][k] = 0;
+	dyn_font_path[id] = dyn_path_store[id];
+	for (i = 0; i < len; i++) dyn_loaded_name[id][i] = (char)name[i];
+	dyn_loaded_name[id][len] = 0;
+
+	wm_load_face(id);
+	if (dyn_face(id)->obj_slot == 0) {
+		/* Load failed (missing file / bad header).  dyn_n_loaded is NOT bumped,
+		 * so this slot stays free — the next font_open reuses it and overwrites
+		 * the stale path/name, which are never scanned (scan is < dyn_n_loaded). */
+		wm_reply(E_NOENT, 0, 0, 0);
+		return;
+	}
+	dyn_n_loaded++;
+	WM_PRINT("oriscwm: font_open → id "); WM_PRINT_INT(id); WM_PRINT("\n");
+	wm_reply(id, 0, 0, 0);
+}
+
 /* WM_OP_QUERY_GEOMETRY — read back a window's pixel + cell extents.
  *   R5 = wid (or 0 to use the first live window — the typical
  *           leader-spawn shell that didn't open its own window
@@ -5095,7 +5223,7 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		window_text_x[slot]    = vec_unpack_hi(packed1);
 		window_text_y[slot]    = vec_unpack_lo(packed1);
 		int f = packed2;
-		if (f < 0 || f > FONT_FACE_BOLD) f = FONT_FACE_PROP;   /* BOLD is the max id */
+		if (f < 0 || f >= WM_NDYNFONT) f = FONT_FACE_PROP;   /* incl. font_open ids 4..7 */
 		window_text_face[slot] = (unsigned char)f;
 		return;
 	}
@@ -6593,6 +6721,8 @@ main(void)
 				handle_query_geometry(wid_or_zero);
 			} else if (op == WM_OP_SET_TITLE) {
 				handle_set_title(wid_or_zero, arg);
+			} else if (op == WM_OP_FONT_OPEN) {
+				handle_font_open(arg);   /* arg = packed name len:src_off */
 			} else {
 				wm_reply(E_INVAL, 0, 0, 0);
 			}

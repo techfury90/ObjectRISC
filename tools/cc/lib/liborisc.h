@@ -236,6 +236,13 @@ int  menu_run(int col, int row, const char *items, int n);
 #define FONT_FACE_GLYPH  2   /* OPEN LOOK glyph font (olgl) — UI marks            */
 #define FONT_FACE_BOLD   3   /* bold proportional Lucida Sans (luBS) — emphasis   */
 
+/* font_open: load /fonts/<name>.wmf in the WM and get a face id for vec_text.
+ * The four built-ins resolve to FONT_FACE_PROP/MONO/GLYPH/BOLD (0..3); any
+ * other name loads into a fresh slot and returns id >= 4 (re-open returns the
+ * same id).  Returns the id (>= 0), or a negative WM error (-2 = no such font,
+ * -7 = the WM's font table is full). */
+int  font_open(const char *name);
+
 int  vec_init_from_dir_result(void);                 /* adopt DIR_RESULT_SLOT cap into the VECTOR handle */
 int  vec_line(int x1, int y1, int x2, int y2);
 int  vec_rect_fill(int x, int y, int w, int h);
