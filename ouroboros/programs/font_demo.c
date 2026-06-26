@@ -1,10 +1,11 @@
 /*
  * font_demo.c — OPEN LOOK font specimen (desktop-menu launchable).
  *
- * Draws, AS A REAL CLIENT PROGRAM, samples of all three baked WM faces
+ * Draws, AS A REAL CLIENT PROGRAM, samples of all four baked WM faces
  * through the client font service (VEC_OP_TEXT_* / vec_text):
  *
  *   - Lucida Sans        (FONT_FACE_PROP,  luRS)  — proportional headings
+ *   - Lucida Sans Bold   (FONT_FACE_BOLD,  luBS)  — bold emphasis / titles
  *   - Lucida Typewriter  (FONT_FACE_MONO,  lutRS) — monospace body
  *   - OPEN LOOK glyphs    (FONT_FACE_GLYPH, olgl)  — pushpins / menu marks
  *
@@ -59,20 +60,26 @@ draw_specimen(void)
 	         "The quick brown fox jumps over the lazy dog 0123456789");
 
 	vec_set_color(COL_LABEL);
-	vec_text(FONT_FACE_PROP, 8, 86, "Lucida Typewriter (lutRS, monospace):");
+	vec_text(FONT_FACE_PROP, 8, 84, "Lucida Sans Bold (luBS, proportional):");
 	vec_set_color(COL_INK);
-	vec_text(FONT_FACE_MONO, 16, 104, "$ ls -la *.orx | grep ouroboros");
+	vec_text(FONT_FACE_BOLD, 16, 102,
+	         "The quick brown fox jumps over the lazy dog 0123456789");
 
 	vec_set_color(COL_LABEL);
-	vec_text(FONT_FACE_PROP, 8, 134, "OPEN LOOK glyphs (olgl):");
+	vec_text(FONT_FACE_PROP, 8, 130, "Lucida Typewriter (lutRS, monospace):");
+	vec_set_color(COL_INK);
+	vec_text(FONT_FACE_MONO, 16, 148, "$ ls -la *.orx | grep ouroboros");
+
+	vec_set_color(COL_LABEL);
+	vec_text(FONT_FACE_PROP, 8, 176, "OPEN LOOK glyphs (olgl):");
 	vec_set_color(COL_INK);
 	for (int i = 0; i < (int)sizeof(OLGL_ROW); i++) {
-		vec_text_move(FONT_FACE_GLYPH, 16 + i * 28, 152);
+		vec_text_move(FONT_FACE_GLYPH, 16 + i * 28, 194);
 		vec_text_char(OLGL_ROW[i]);
 	}
 
 	vec_set_color(COL_LABEL);
-	vec_text(FONT_FACE_PROP, 8, 182, "(press q or Esc to close)");
+	vec_text(FONT_FACE_PROP, 8, 224, "(press q or Esc to close)");
 }
 
 int

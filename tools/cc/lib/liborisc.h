@@ -234,6 +234,7 @@ int  menu_run(int col, int row, const char *items, int n);
 #define FONT_FACE_PROP   0   /* proportional Lucida Sans (luRS) — titles/headings */
 #define FONT_FACE_MONO   1   /* monospace Lucida Typewriter (lutRS) — body text   */
 #define FONT_FACE_GLYPH  2   /* OPEN LOOK glyph font (olgl) — UI marks            */
+#define FONT_FACE_BOLD   3   /* bold proportional Lucida Sans (luBS) — emphasis   */
 
 int  vec_init_from_dir_result(void);                 /* adopt DIR_RESULT_SLOT cap into the VECTOR handle */
 int  vec_line(int x1, int y1, int x2, int y2);

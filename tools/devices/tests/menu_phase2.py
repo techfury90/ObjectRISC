@@ -37,7 +37,7 @@ luBS, ib = face_blob(f"{BDF}/75dpi/luBS12.bdf", 32, 95, (12,16), True)   # bold,
 olgl, _ = face_blob(f"{BDF}/misc/olgl12.bdf", 19, 167, (47,47), False)
 print("luBS cell", ib["cell_w"], "x", ib["cell_h"])
 F_RS, F_BS, F_OLGL, F_TEXT = 2, 3, 4, 5
-W, H = 170, 150
+W, H = 170, 180
 fb = bytearray([BLUE]*W*H)
 descs = [None, D(fb, sim.TAG_FRAMEBUFFER, W, H), D(bytearray(luRS)), D(bytearray(luBS)), D(bytearray(olgl)), D(bytearray(b""))]
 def cpu(): c=C(descs); c.set_opr(1, R(1, sim.CAP_R|sim.CAP_W)); return c
@@ -75,7 +75,7 @@ TITLE = "Workspace"
 B, TMARGIN = 2, 3
 PP_W, PP_LEFT, PP_TOP, TITLE_ROW_H = 26, 13, 3, 18
 title_w = measure(luBS_bytes, ib, TITLE)
-labels = ["Shell", "Edit", "Mouse Paint", "Menu Demo", "Font Demo"]
+labels = ["Shell", "Edit", "Mouse Paint", "Menu Demo", "Font Demo", "Shut Down"]
 maxlabel = max(measure(luRS_bytes, None, s) for s in labels)
 inner = max(maxlabel + 2*ENDCAP, PP_LEFT + PP_W + 4 + 3 + title_w)
 mw = 2*B + inner

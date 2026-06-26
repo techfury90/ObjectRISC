@@ -64,6 +64,7 @@ main(void)
 
 	if (vec_set_color(14)) { fail("set_color", 0); return 5; }
 	if (vec_text(FONT_FACE_PROP, 8, 8,  "luRS proportional")) { fail("luRS", 0);  return 6; }
+	if (vec_text(FONT_FACE_BOLD, 8, 18, "luBS bold"))         { fail("luBS", 0);  return 10; }
 	if (vec_text(FONT_FACE_MONO, 8, 28, "lutRS mono"))        { fail("lutRS", 0); return 7; }
 	for (i = 0; i < (int)sizeof(OLGL_ROW); i++)
 		if (vec_text_move(FONT_FACE_GLYPH, 8 + i * 24, 48) ||
