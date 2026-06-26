@@ -5259,6 +5259,12 @@ menu_draw_pushpin(void)
 {
 	int x = menu_x_px + MENU_PP_LEFT;
 	int y = menu_y_px + MENU_BORDER_PX + MENU_PP_TOP;
+	/* Clear the full OUT-sized slot (26x13) to BG1 first.  The IN sprite is
+	 * only 13px wide, so a bare redraw on OUT->IN would leave the OUT pin's
+	 * right half on screen. */
+	fill_rect_packed(((x & 0xFFFF) << 16) | (y & 0xFFFF),
+	                 ((MENU_PP_W & 0xFFFF) << 16) | ((MENU_PP_H + 1) & 0xFFFF),
+	                 WM_FACE_BG1);
 	cap_glyph(x, y, menu_pinned ? pp_in_mid : pp_out_mid, WM_FACE_BG2);
 	cap_glyph(x, y, menu_pinned ? pp_in_top : pp_out_top, WM_FACE_WHITE);
 	cap_glyph(x, y, menu_pinned ? pp_in_bot : pp_out_bot, WM_FACE_BG3);
@@ -5442,36 +5448,40 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 	int px = (packed_xy >> 16) & 0xFFFF;
 	int py = packed_xy & 0xFFFF;
 
-	/* Modal desktop menu: while up, the WM owns the cursor.
-	 * MOTION updates hover; LEFT DOWN inside menu = select +
-	 * dismiss + spawn; LEFT DOWN outside = cancel + dismiss;
-	 * other buttons / RIGHT clicks are swallowed silently so a
-	 * second right-click doesn't open a second menu. */
+	/* Desktop menu.  TRANSIENT (unpinned) = modal: the WM owns the cursor and
+	 * any off-menu click dismisses.  PINNED = non-modal (OPEN LOOK): off-menu
+	 * events fall through to the normal window handling below and the menu
+	 * persists; only the pushpin (IN->OUT) or Esc closes it. */
 	if (menu_active) {
-		if (evt_type == PTR_EVT_MOTION) {
-			desktop_menu_update_highlight(px, py);
-			return 1;
-		}
-		if (evt_type == PTR_EVT_DOWN) {
-			if (button != PTR_BTN_LEFT) return 1;
-			if (menu_hit_pushpin(px, py)) {
-				/* Toggle the pin.  OUT->IN keeps the menu open (repaint
-				 * the pushpin head-on); IN->OUT unpins and dismisses. */
-				if (menu_pinned) {
-					desktop_menu_dismiss();
-				} else {
-					menu_pinned = 1;
-					menu_draw_pushpin();
-				}
+		int on_menu = px >= menu_x_px && px < menu_x_px + menu_w_px
+		           && py >= menu_y_px && py < menu_y_px + menu_h_px;
+		if (!menu_pinned || on_menu) {
+			if (evt_type == PTR_EVT_MOTION) {
+				desktop_menu_update_highlight(px, py);
 				return 1;
 			}
-			int hit = menu_hit_item(px, py);
-			if (hit >= 0) desktop_menu_select(hit);
-			else          desktop_menu_dismiss();
+			if (evt_type == PTR_EVT_DOWN) {
+				if (button != PTR_BTN_LEFT) return 1;
+				if (menu_hit_pushpin(px, py)) {
+					/* Toggle the pin.  OUT->IN keeps the menu open (repaint
+					 * the pushpin head-on); IN->OUT unpins and dismisses. */
+					if (menu_pinned) {
+						desktop_menu_dismiss();
+					} else {
+						menu_pinned = 1;
+						menu_draw_pushpin();
+					}
+					return 1;
+				}
+				int hit = menu_hit_item(px, py);
+				if (hit >= 0)          desktop_menu_select(hit);
+				else if (!menu_pinned) desktop_menu_dismiss();
+				return 1;
+			}
+			/* PTR_EVT_UP / other while owning the cursor: swallow. */
 			return 1;
 		}
-		/* PTR_EVT_UP and anything else: swallow while modal. */
-		return 1;
+		/* pinned + off-menu: fall through to normal window handling. */
 	}
 
 	/* Right-click (or middle-click) on empty desktop summons the
@@ -5790,10 +5800,12 @@ poll_keyboard_events(void)
 	);
 	if (_wm_kbd_evt_poll_status != 0) return;
 
-	/* Modal menu: ESC dismisses; anything else gets swallowed. */
+	/* Menu keyboard: ESC always dismisses (escape hatch).  A TRANSIENT menu is
+	 * modal — swallow every other key; a PINNED menu is non-modal — let other
+	 * keys fall through to the focused window. */
 	if (menu_active) {
-		if (code == TK_ESCAPE) desktop_menu_dismiss();
-		return;
+		if (code == TK_ESCAPE) { desktop_menu_dismiss(); return; }
+		if (!menu_pinned) return;
 	}
 
 	/* Forward to focused window's subscriber, if any. */
