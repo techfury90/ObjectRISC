@@ -72,8 +72,13 @@ $GEN --out "$FONTS_DIR/luBS.wmf"  --bdf "$OPENLOOK_BDF/75dpi/luBS12.bdf" \
      --base 32 --count 95 --cell 12x16 --proportional
 $GEN --out "$FONTS_DIR/lutRS.wmf" --bdf "$OPENLOOK_BDF/100dpi/lutRS10.bdf" \
      --base 32 --count 95 --cell 8x16
+# count 200 (codepoints 19..218) so the scrollbar dimple/box glyphs (cp 194-198)
+# + the horizontal-scrollbar twins (cp 200/201) are included, not just 19..185.
+# Force --cell 47x47 (the original count-167 auto-fit) so the existing chrome
+# glyphs (19..185) stay byte-identical; an unused taller glyph in 186..218 is
+# clipped (the scrollbar glyphs all fit 47x47, verified by the headless render).
 $GEN --out "$FONTS_DIR/olgl.wmf"  --bdf "$OPENLOOK_BDF/misc/olgl12.bdf" \
-     --base 19 --count 167
+     --base 19 --count 200 --cell 47x47
 # luBI (Lucida Bold Italic) is NOT a built-in WM face — it's the demo font for
 # font_open(): a client can load it by name at runtime (test_wm_fontopen).
 $GEN --out "$FONTS_DIR/luBI.wmf"  --bdf "$OPENLOOK_BDF/75dpi/lubI12.bdf" \
