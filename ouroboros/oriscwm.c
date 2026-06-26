@@ -317,6 +317,11 @@
  * the screen FB above the z-stack.  Free libc slot between the wait-set ref
  * (@1568, 8 bytes) and the OR-spill anchor (@1696 = TABLE_BYTES + 1568). */
 #define WM_MENU_OVERLAY_FB_SLOT_OFFSET  1576
+/* Phase B — holds the ref to a font object loaded from /fonts at runtime, so
+ * the dynamic-face blit emitter can OREFLD it into O2.  Next free libc slot
+ * after the menu overlay (@1576), still below the OR-spill anchor (@1696). */
+#define WM_FONTOBJ_SLOT_OFFSET          1584
+#define WM_FONTOBJ_BYTES                8192   /* fits luRS.wmf (3152 B); Phase C sizes per file (olgl is 47 KB) */
 #define TAG_DATA                        0x4102
 
 /* === Glyph rendering ==================================================
@@ -672,6 +677,12 @@ typedef struct {
 	int base;                  /* first codepoint */
 	int n_glyphs;
 	int flags;                 /* bit0 = proportional */
+	int obj_slot;              /* 0 = baked: blit reads the blob from O15
+	                            * (font_off = blob - DATA_VA).  Nonzero = a
+	                            * font loaded from /fonts at runtime: the O12
+	                            * byte-offset of the loaded object, which the
+	                            * blit emitter OREFLDs into O2 (font_off = 0).
+	                            * Baked initializers omit this (zero-filled). */
 } wm_font_t;
 
 /* The baked faces (font_luRS proportional title face, font_lutRS mono
@@ -682,6 +693,16 @@ typedef struct {
  * mark, scrollbar arrows, …).  Same wm_font_t descriptor, baked from
  * olgl12.bdf; the title bar's window-menu button renders codepoint 22. */
 #include "wm_fonts_olgl.h"
+
+/* Phase B dynamic font loading — a runtime copy of the luRS face whose
+ * glyphs are blitted from an object loaded out of /fonts (proving the
+ * O2-from-object emitter), rather than the compiled-in blob.  Filled by
+ * wm_font_load() at boot; until then (and on load failure) it is a verbatim
+ * copy of the baked font_luRS, so the menu renders identically either way.
+ * It keeps the baked blob pointer for MEASURING (font_advance); only the
+ * render path switches to the loaded object.  (Phase C adds a width-table
+ * cache so the baked blob can be dropped, then migrates all four faces.) */
+static wm_font_t font_luRS_dyn;
 
 /* FONT_MAGIC / flags / R5 shape bits — must match simorisc's extended
  * ObjBlitGlyphs path. */
@@ -1158,6 +1179,103 @@ alloc_menu_overlay_fb(void)
 		: "r1", "r2", "r4", "r5", "r6", "r7"
 	);
 	return status;
+}
+
+/* === Phase B — dynamic font loading ================================
+ *
+ * Discover hostfsd + pull /fonts/luRS.wmf into a WM-owned object so the menu
+ * can render from a font loaded off disk instead of the compiled-in blob.
+ * The WM's boot wires only the directory (O8 → DIR_SLOT); hostfsd is found at
+ * runtime by walking /sys/hostfsd/0 (the supervisor's idiom).  dir_walk reads
+ * DIR_SLOT (584), not O8, so hf_init's O8 mailbox mirror doesn't collide with
+ * directory access. */
+
+/* obj.h handle helpers — liborisc.h is obj.h-agnostic (it declares hf_read_obj's
+ * handle as a bare int), so declare the two we need the same way.  A handle is
+ * an int; obj.h's OBJ_NULL is -1. */
+extern int  obj_adopt_slot(int off);
+extern void obj_drop(int h);
+
+static int
+wm_hostfs_init(void)
+{
+	int kind;
+	char rem[64];
+	if (dir_walk("/sys/hostfsd/0", &kind, rem, sizeof(rem)) != 0)
+		return -1;
+	/* dir_walk parked the resolved ref in DIR_RESULT_SLOT (616); promote it
+	 * to O10 where hf_init's obj_adopt_o10 looks for the hostfsd service. */
+	asm volatile("orefld o10, 616(o12)");
+	return hf_init();
+}
+
+/* Stream a /fonts/*.wmf blob into a freshly-ObjAlloc'd byte object parked at
+ * WM_FONTOBJ_SLOT.  The slot RETAINS the object ref (the blit emitter OREFLDs
+ * it into O2); obj_adopt_slot only aliases it into a handle for the read, and
+ * obj_drop releases just that handle.  Returns bytes read (>0 = success). */
+static int
+wm_font_load(const char *path)
+{
+	int fd = vfs_open(path, HF_O_RDONLY);
+	if (fd < 0) return fd;
+
+	int status;
+	asm volatile(
+		"addiu r4, r0, %1\n"           /* size = WM_FONTOBJ_BYTES */
+		"addiu r5, r0, %2\n"           /* TAG_DATA (byte object) */
+		"addiu r6, r0, %3\n"           /* CAP_R|W|V|C (W: hostfsd writes it) */
+		"call  #0x100\n"               /* ObjAlloc → O1 */
+		"nop\n"
+		"orefst o1, %4(o12)\n"         /* park ref for the blit emitter */
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(WM_FONTOBJ_BYTES), "i"(TAG_DATA),
+		  "i"(CAP_R | CAP_W | CAP_V | CAP_C),
+		  "i"(WM_FONTOBJ_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6"
+	);
+	if (status != 0) { vfs_close(fd); return -1; }
+
+	int h = obj_adopt_slot(WM_FONTOBJ_SLOT_OFFSET);
+	if (h < 0) { vfs_close(fd); return -1; }   /* OBJ_NULL */
+
+	unsigned int off = 0;
+	for (;;) {
+		unsigned int want = WM_FONTOBJ_BYTES - off;
+		if (want == 0) break;
+		if (want > 0x10000) want = 0x10000;     /* ORX_READ_CHUNK */
+		int got = hf_read_obj(fd, h, (int)off, (int)want);
+		if (got <= 0) break;                     /* EOF or error */
+		off += (unsigned int)got;
+	}
+	obj_drop(h);                                 /* slot keeps the ref */
+	vfs_close(fd);
+	return (int)off;
+}
+
+/* Copy the baked luRS descriptor (font_advance/measure reads its blob), then
+ * try to load luRS from /fonts.  On success flip the dynamic face to render
+ * from the loaded object; on any failure it stays a verbatim baked face, so
+ * the menu renders identically either way.  Called once at boot. */
+static void
+wm_init_dynamic_fonts(void)
+{
+	font_luRS_dyn = font_luRS;
+	if (wm_hostfs_init() != 0) {
+		WM_PRINT("oriscwm: hostfsd unavailable — fonts stay baked\n");
+		return;
+	}
+	int n = wm_font_load("/fonts/luRS.wmf");
+	if (n > 0) {
+		font_luRS_dyn.obj_slot = WM_FONTOBJ_SLOT_OFFSET;
+		WM_PRINT("oriscwm: luRS loaded from /fonts (");
+		WM_PRINT_INT(n);
+		WM_PRINT(" B) — menu renders from disk\n");
+	} else {
+		WM_PRINT("oriscwm: /fonts/luRS.wmf load failed (");
+		WM_PRINT_INT(n);
+		WM_PRINT(") — using baked luRS\n");
+	}
 }
 
 /* Phase 60 step 11 — per-wid window FB slot dispatch.  Mirrors the
@@ -1929,6 +2047,37 @@ blit_glyphs_screenfb(int packed_xy, int packed_shape, int font_off, int text_off
 	);
 }
 
+/* Phase B — EXTENDED glyph blit into the ACTIVE window FB for a font loaded
+ * from /fonts at runtime.  Identical to blit_glyphs_winfb except O2 is the
+ * loaded font object (OREFLD'd from WM_FONTOBJ_SLOT) instead of O15, and
+ * font_off is 0 (the WMF1 blob is at offset 0 of its own object).  O3 (text)
+ * is still O15 — chrome strings live in boot data.  This is the one render-
+ * path change dynamic fonts need; everything else is identical to the baked
+ * path, so a loaded face renders pixel-for-pixel like its compiled-in twin. */
+static void
+blit_glyphs_winfb_dyn(int packed_xy, int packed_shape, int text_off)
+{
+	asm volatile(
+		"addu   r8,  %0, r0\n"
+		"addu   r9,  %1, r0\n"
+		"addu   r11, %2, r0\n"
+		"orefld o1, %3(o12)\n"      /* O1 = active window FB */
+		"orefld o2, %4(o12)\n"      /* O2 = loaded font object */
+		"omov   o3, o15\n"          /* O3 = boot data (text) */
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r0,  r0\n"      /* font_off = 0 (blob at object start) */
+		"addu   r7, r11, r0\n"
+		"call   #0x10C\n"           /* ObjBlitGlyphs */
+		"nop"
+		:
+		: "r"(packed_xy), "r"(packed_shape), "r"(text_off),
+		  "i"(WM_ACTIVE_FB_SLOT_OFFSET), "i"(WM_FONTOBJ_SLOT_OFFSET)
+		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+		  "r8", "r9", "r11"
+	);
+}
+
 /* Window-menu mark text — the three olgl ▽ menu-mark layers (UL/LR/fill), each
  * a single byte in boot data so win_draw_string can reach it via O15.  Rendered
  * through the EXTENDED font-manager path with font_olgl (not the legacy cell
@@ -1951,6 +2100,11 @@ win_draw_string(const wm_font_t *font, int packed_xy, int packed_shape,
 {
 	if (((packed_shape >> 16) & 0x3FFF) == 0) return;
 	int text_off = (int)((unsigned int)text - DATA_VA);
+	if (font->obj_slot) {
+		/* Font loaded from /fonts — blit from its object (O2), not O15. */
+		blit_glyphs_winfb_dyn(packed_xy, packed_shape, text_off);
+		return;
+	}
 	int font_off = (int)((unsigned int)font->blob - DATA_VA);
 	blit_glyphs_winfb(packed_xy, packed_shape, font_off, text_off);
 }
@@ -5391,7 +5545,10 @@ menu_paint_item(int item_idx)
 	int text_y = item_y + (MENU_ITEM_H_PX - font_luRS.cell_h) / 2;
 	int packed_xy = ((text_x & 0xFFFF) << 16) | (text_y & 0xFFFF);
 	int packed_shape = font_shape(label_len, WM_OL_BLACK, WM_FACE_BG1, 1);
-	win_draw_string(&font_luRS, packed_xy, packed_shape,
+	/* Phase B — render the item labels from the /fonts-loaded luRS (font_luRS_dyn
+	 * == baked luRS until the load succeeds, then renders from the loaded
+	 * object).  This is the one caller routed through the dynamic face. */
+	win_draw_string(&font_luRS_dyn, packed_xy, packed_shape,
 	                   (const unsigned char *)label);
 }
 
@@ -6151,6 +6308,11 @@ main(void)
 		WM_PRINT("\n");
 		return 1;
 	}
+
+	/* Phase B — load luRS from /fonts now that DIR_SLOT is up (after
+	 * self_register, before the slow per-surface setup).  Non-fatal: on any
+	 * failure the dynamic face falls back to the baked blob. */
+	wm_init_dynamic_fonts();
 
 	/* Phase 60 step 3 — nothing under /sys/term/<N>/* anymore.
 	 * Keyboard, pointer, framebuffer are all local: keyboard +
