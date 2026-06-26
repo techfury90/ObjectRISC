@@ -69,20 +69,23 @@ python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
     --service "0=0@0" --service "0=0@0" --service "0=0@0" --service "18=1@9" \
     "$TMP/oriscwm.orx" > "$TMP/wm.out" 2>&1 &
 WM=$!
+# luBS loads second; wait for it (or any failure) so both faces are settled.
 for _ in $(seq 200); do
-    grep -q "widths OK\|MISMATCH\|load failed\|hostfsd unavailable\|fetch failed" "$TMP/wm.out" 2>/dev/null && break
+    grep -q "luBS.wmf loaded\|MISMATCH\|load failed\|hostfsd unavailable\|fetch failed" "$TMP/wm.out" 2>/dev/null && break
     sleep 0.05
 done
 
 kill -TERM $WM $TERMP $HF $DIR $BAR 2>/dev/null || true
 wait 2>/dev/null || true
 
-# Success = loaded (3152 B) AND the cached width table validated against baked.
-if grep -q "luRS loaded from /fonts (3152 B); widths OK (cache==baked)" "$TMP/wm.out"; then
-    echo "PASS: WM loaded luRS.wmf from /fonts (3152 B), cached widths == baked"
+# Success = BOTH chrome faces (luRS menu, luBS titles) loaded (3152 B) and their
+# cached width tables validated against the baked blobs.
+if grep -q "/fonts/luRS.wmf loaded (3152 B); widths OK" "$TMP/wm.out" && \
+   grep -q "/fonts/luBS.wmf loaded (3152 B); widths OK" "$TMP/wm.out"; then
+    echo "PASS: WM loaded + cache-validated luRS + luBS from /fonts"
     exit 0
 fi
-echo "FAIL: WM did not load + cache luRS from /fonts"
+echo "FAIL: WM did not load + cache luRS + luBS from /fonts"
 echo "--- wm.out (oriscwm lines) ---"; grep -iE "oriscwm:|font" "$TMP/wm.out" || true
 echo "--- dir.out (tail) ---"; tail -5 "$TMP/dir.out" || true
 echo "--- hf.out (tail) ---"; tail -5 "$TMP/hf.out" || true
