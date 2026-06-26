@@ -312,6 +312,11 @@
 #define WM_WAITSET_SLOT_OFFSET          1568
 #define WM_WAITSET_BYTES                552       /* 69 slots × 8 bytes */
 #define WM_WAITSET_COUNT                69
+/* Phase 2c — the desktop menu is a composited surface: it draws into this
+ * offscreen screen-sized FB and composite_menu_overlay blits its rect onto
+ * the screen FB above the z-stack.  Free libc slot between the wait-set ref
+ * (@1568, 8 bytes) and the OR-spill anchor (@1696 = TABLE_BYTES + 1568). */
+#define WM_MENU_OVERLAY_FB_SLOT_OFFSET  1576
 #define TAG_DATA                        0x4102
 
 /* === Glyph rendering ==================================================
@@ -1128,6 +1133,33 @@ alloc_local_framebuffer(void)
 	return status;
 }
 
+/* Phase 2c step 1 — the desktop menu's offscreen backing FB.  Screen-sized
+ * (so the menu draws at its absolute screen position straight into it) and
+ * OFFSCREEN (flag 1 = no display mirror; it reaches the screen only via the
+ * composite_menu_overlay blit, on top of the window z-stack).  Allocated once
+ * at boot, like the window FBs.  Promoting the menu to a composited surface is
+ * what frees the move-outline drag from fighting a live menu re-draw. */
+static int
+alloc_menu_overlay_fb(void)
+{
+	int status;
+	asm volatile(
+		"addiu r4, r0, %1\n"           /* width  = FB_W */
+		"addiu r5, r0, %2\n"           /* height = FB_H */
+		"addiu r6, r0, 3\n"            /* CAP_R | CAP_W */
+		"addiu r7, r0, 1\n"            /* FB_FLAG_OFFSCREEN (no display mirror) */
+		"call  #0x10A\n"               /* ObjAllocFramebuffer */
+		"nop\n"
+		"orefst o1, %3(o12)\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "i"(FB_W), "i"(FB_H),
+		  "i"(WM_MENU_OVERLAY_FB_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6", "r7"
+	);
+	return status;
+}
+
 /* Phase 60 step 11 — per-wid window FB slot dispatch.  Mirrors the
  * load_console_to_o1 / stash_console_o1 pattern: pcc-orisc rejects
  * computed-offset OREFLD/OREFST so each wid has its own case with a
@@ -1445,10 +1477,88 @@ do_blit_copy_active_to_screen(int packed_src_xy, int packed_dst_xy,
  * compositing the remaining z-stack. */
 static void fill_rect_packed(int packed_xy, int packed_wh, int color);
 
-/* Forward decl: the composite_screen_rect wrapper re-blits a pinned desktop
- * menu after any window composites over it (the menu lives on the screen FB
- * above the z-order, so it needs explicit stay-on-top). */
-static void menu_draw(void);
+/* === Desktop menu compositing surface (Phase 2c) =====================
+ *
+ * The desktop menu draws into an offscreen screen-sized overlay FB at its
+ * absolute screen position (the menu_draw path sets ACTIVE = the overlay and
+ * uses the window-FB primitives), and composite_menu_overlay blits the menu's
+ * rect from that overlay onto the screen FB on top of the window z-stack.
+ *
+ * This replaces the old "menu_draw straight onto the screen FB + stay-on-top
+ * re-draw" model.  Restoring the menu after any window/outline composite is
+ * now a single cheap FB blit (not a full re-draw), so the move-outline drag no
+ * longer fights a live menu re-paint — the surface promotion the menu wanted. */
+
+/* Blit overlay → screen, reading the overlay slot DIRECTLY as the source so
+ * WM_ACTIVE_FB is left untouched (callers compositing window content rely on
+ * it staying put).  Twin of do_blit_copy_active_to_screen with O2 from the
+ * menu-overlay slot instead of ACTIVE. */
+static void
+do_blit_overlay_to_screen(int packed_src_xy, int packed_dst_xy, int packed_wh)
+{
+	asm volatile(
+		"addu   r8,  %0, r0\n"
+		"addu   r9,  %1, r0\n"
+		"addu   r10, %2, r0\n"
+		"orefld o1, %3(o12)\n"          /* O1 = screen FB (dst) */
+		"orefld o2, %4(o12)\n"          /* O2 = menu overlay FB (source) */
+		"addu   r4, r8,  r0\n"
+		"addu   r5, r9,  r0\n"
+		"addu   r6, r10, r0\n"
+		"call   #0x10F\n"               /* ObjBlitCopy */
+		"nop"
+		:
+		: "r"(packed_src_xy), "r"(packed_dst_xy), "r"(packed_wh),
+		  "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET),
+		  "i"(WM_MENU_OVERLAY_FB_SLOT_OFFSET)
+		: "r1", "r2", "r4", "r5", "r6",
+		  "r8", "r9", "r10"
+	);
+}
+
+/* Point ACTIVE at the menu overlay FB — the menu draw functions target the
+ * active FB, so this redirects their fills/glyphs into the overlay. */
+static void
+set_active_to_menu_overlay(void)
+{
+	asm volatile(
+		"orefld o1, %0(o12)\n"
+		"orefst o1, %1(o12)"
+		:: "i"(WM_MENU_OVERLAY_FB_SLOT_OFFSET),
+		   "i"(WM_ACTIVE_FB_SLOT_OFFSET)
+		: "r1"
+	);
+}
+
+/* Composite the part of screen rect [sx,sy,w,h] that overlaps the menu from
+ * the overlay FB onto the screen.  Overlay is screen-sized and the menu drawn
+ * at absolute coords, so src == dst.  Caller guarantees the menu is painted
+ * into the overlay (menu_draw / menu_paint_item ran). */
+static void
+composite_menu_overlay(int sx, int sy, int w, int h)
+{
+	int mx = menu_x_px, my = menu_y_px;
+	int mxe = mx + menu_w_px, mye = my + menu_h_px;
+	int ix  = sx > mx ? sx : mx;
+	int iy  = sy > my ? sy : my;
+	int ixe = (sx + w) < mxe ? (sx + w) : mxe;
+	int iye = (sy + h) < mye ? (sy + h) : mye;
+	if (ixe <= ix || iye <= iy) return;
+	int p   = ((ix & 0xFFFF) << 16) | (iy & 0xFFFF);
+	int pwh = (((ixe - ix) & 0xFFFF) << 16) | ((iye - iy) & 0xFFFF);
+	do_blit_overlay_to_screen(p, p, pwh);
+}
+
+/* Composite a single menu item row (its screen rect) from the overlay — used
+ * after a hover-highlight or pinned-select repaints one item. */
+static void
+composite_menu_item(int idx)
+{
+	int ix = menu_x_px + MENU_BORDER_PX;
+	int iy = menu_y_px + MENU_CONTENT_Y_OFF + idx * MENU_ITEM_H_PX;
+	int iw = menu_w_px - 2 * MENU_BORDER_PX;
+	composite_menu_overlay(ix, iy, iw, MENU_ITEM_H_PX);
+}
 
 /* Composite an arbitrary screen rect by walking z-order bottom-to-
  * top: each window's intersection with the rect is blitted from its
@@ -1523,20 +1633,18 @@ composite_screen_rect_impl(int sx, int sy, int w, int h)
 	}
 }
 
-/* Stay-on-top wrapper: composite, then re-blit a pinned desktop menu if the
- * rect overlapped it — a window (or the drag outline's erase) just painted
- * over the menu, which lives on the screen FB above the z-order.  Keeping it
- * unconditional also keeps the menu's frame intact while its move-outline is
- * dragged across it.  menu_draw() paints straight to the screen FB (no
- * composite_screen_rect), so there's no recursion. */
+/* Stay-on-top wrapper: composite the window z-stack, then re-blit any active
+ * desktop menu's overlapping rect from its overlay FB — the menu is a surface
+ * above the z-order, so a window (or the drag outline's erase) painting here
+ * must be overpainted by the menu.  composite_menu_overlay self-clips to the
+ * menu rect (a cheap no-op when they don't overlap) and reads the overlay FB
+ * directly, so there's no re-draw and no recursion. */
 static void
 composite_screen_rect(int sx, int sy, int w, int h)
 {
 	composite_screen_rect_impl(sx, sy, w, h);
-	if (menu_active && menu_pinned
-	    && sx < menu_x_px + menu_w_px && sx + w > menu_x_px
-	    && sy < menu_y_px + menu_h_px && sy + h > menu_y_px)
-		menu_draw();
+	if (menu_active)
+		composite_menu_overlay(sx, sy, w, h);
 }
 
 static void
@@ -5213,18 +5321,19 @@ static const unsigned char pp_in_top[]  = { 103, 0 };
 static const unsigned char pp_in_bot[]  = { 104, 0 };
 static const unsigned char pp_in_mid[]  = { 105, 0 };
 
-/* One olgl capsule glyph at screen pixel (x, y) in colour fg, transparent. */
+/* One olgl capsule glyph at screen pixel (x, y) in colour fg, transparent.
+ * Targets the active FB — the menu draw path points that at the overlay. */
 static void
 cap_glyph(int x, int y, const unsigned char *g, int fg)
 {
 	int xy = ((x & 0xFFFF) << 16) | (y & 0xFFFF);
-	screen_draw_string(&font_olgl, xy, font_shape(1, fg, WM_FACE_BG2, 1), g);
+	win_draw_string(&font_olgl, xy, font_shape(1, fg, WM_FACE_BG2, 1), g);
 }
 
-/* Recessed (OLGX_INVOKED) menu-item CAPSULE on the screen FB: BG2 body, BG3
+/* Recessed (OLGX_INVOKED) menu-item CAPSULE in the overlay FB: BG2 body, BG3
  * shadow on the top edge + upper rounded caps, WHITE highlight on the bottom
  * edge + lower rounded caps.  The corners outside the stadium keep the BG1
- * plate (caller fills BG1 first). */
+ * plate (caller fills BG1 first).  Active FB = the menu overlay. */
 static void
 draw_recessed_capsule(int x, int y, int w)
 {
@@ -5237,20 +5346,20 @@ draw_recessed_capsule(int x, int y, int w)
 	int yb = y + MENU_ITEM_H_PX - 2;
 	/* fill pass: BG2 body + filled end caps */
 	if (mw > 0)
-		fill_rect_packed(((mx & 0xFFFF) << 16) | (y & 0xFFFF),
+		fill_rect_window(((mx & 0xFFFF) << 16) | (y & 0xFFFF),
 		                 ((mw & 0xFFFF) << 16) | (MENU_ITEM_H_PX & 0xFFFF),
 		                 WM_FACE_BG2);
 	cap_glyph(x,  y, cap_l_fill, WM_FACE_BG2);
 	cap_glyph(rx, y, cap_r_fill, WM_FACE_BG2);
 	/* top pass: BG3 shadow (1px top edge + upper rounded caps) */
 	if (mw > 0)
-		fill_rect_packed(((mx & 0xFFFF) << 16) | (y & 0xFFFF),
+		fill_rect_window(((mx & 0xFFFF) << 16) | (y & 0xFFFF),
 		                 ((mw & 0xFFFF) << 16) | 1, WM_FACE_BG3);
 	cap_glyph(x,  y, cap_l_top, WM_FACE_BG3);
 	cap_glyph(rx, y, cap_r_top, WM_FACE_BG3);
 	/* bottom pass: WHITE highlight (1px bottom edge + lower rounded caps) */
 	if (mw > 0)
-		fill_rect_packed(((mx & 0xFFFF) << 16) | (yb & 0xFFFF),
+		fill_rect_window(((mx & 0xFFFF) << 16) | (yb & 0xFFFF),
 		                 ((mw & 0xFFFF) << 16) | 1, WM_FACE_WHITE);
 	cap_glyph(x,  y, cap_l_bot, WM_FACE_WHITE);
 	cap_glyph(rx, y, cap_r_bot, WM_FACE_WHITE);
@@ -5263,6 +5372,7 @@ static void
 menu_paint_item(int item_idx)
 {
 	if (item_idx < 0 || item_idx >= DESKTOP_MENU_N) return;
+	set_active_to_menu_overlay();
 	int item_x = menu_x_px + MENU_BORDER_PX;
 	int item_y = menu_y_px + MENU_CONTENT_Y_OFF + item_idx * MENU_ITEM_H_PX;
 	int item_w = menu_w_px - 2 * MENU_BORDER_PX;
@@ -5271,7 +5381,7 @@ menu_paint_item(int item_idx)
 
 	/* Flat plate first (also erases a prior capsule's rounded corners back to
 	 * BG1); overlay the recessed capsule when highlighted. */
-	fill_rect_packed(item_xy, item_wh, WM_FACE_BG1);
+	fill_rect_window(item_xy, item_wh, WM_FACE_BG1);
 	if (item_idx == menu_highlighted)
 		draw_recessed_capsule(item_x, item_y, item_w);
 
@@ -5281,7 +5391,7 @@ menu_paint_item(int item_idx)
 	int text_y = item_y + (MENU_ITEM_H_PX - font_luRS.cell_h) / 2;
 	int packed_xy = ((text_x & 0xFFFF) << 16) | (text_y & 0xFFFF);
 	int packed_shape = font_shape(label_len, WM_OL_BLACK, WM_FACE_BG1, 1);
-	screen_draw_string(&font_luRS, packed_xy, packed_shape,
+	win_draw_string(&font_luRS, packed_xy, packed_shape,
 	                   (const unsigned char *)label);
 }
 
@@ -5290,12 +5400,13 @@ menu_paint_item(int item_idx)
 static void
 menu_draw_pushpin(void)
 {
+	set_active_to_menu_overlay();
 	int x = menu_x_px + MENU_PP_LEFT;
 	int y = menu_y_px + MENU_BORDER_PX + MENU_PP_TOP;
 	/* Clear the full OUT-sized slot (26x13) to BG1 first.  The IN sprite is
 	 * only 13px wide, so a bare redraw on OUT->IN would leave the OUT pin's
 	 * right half on screen. */
-	fill_rect_packed(((x & 0xFFFF) << 16) | (y & 0xFFFF),
+	fill_rect_window(((x & 0xFFFF) << 16) | (y & 0xFFFF),
 	                 ((MENU_PP_W & 0xFFFF) << 16) | ((MENU_PP_H + 1) & 0xFFFF),
 	                 WM_FACE_BG1);
 	cap_glyph(x, y, menu_pinned ? pp_in_mid : pp_out_mid, WM_FACE_BG2);
@@ -5317,7 +5428,7 @@ menu_draw_title(void)
 	int tx = tx0 + (right - tx0 - tw) / 2;
 	int ty = menu_y_px + MENU_BORDER_PX + (MENU_TITLE_PX - font_luBS.cell_h) / 2;
 	int pxy = ((tx & 0xFFFF) << 16) | (ty & 0xFFFF);
-	screen_draw_string(&font_luBS, pxy,
+	win_draw_string(&font_luBS, pxy,
 	                   font_shape(MENU_TITLE_LEN, WM_OL_BLACK, WM_FACE_BG1, 1),
 	                   (const unsigned char *)menu_title);
 	/* text-ledge separator: inset 3px, just below the title row. */
@@ -5325,21 +5436,25 @@ menu_draw_title(void)
 	int lw = menu_w_px - 2 * MENU_BORDER_PX - 6;
 	int ly = menu_y_px + MENU_BORDER_PX + MENU_TITLE_PX;
 	if (lw > 0) {
-		fill_rect_packed(((lx & 0xFFFF) << 16) | (ly & 0xFFFF),
+		fill_rect_window(((lx & 0xFFFF) << 16) | (ly & 0xFFFF),
 		                 ((lw & 0xFFFF) << 16) | 1, WM_FACE_WHITE);
-		fill_rect_packed(((lx & 0xFFFF) << 16) | ((ly + 1) & 0xFFFF),
+		fill_rect_window(((lx & 0xFFFF) << 16) | ((ly + 1) & 0xFFFF),
 		                 ((lw & 0xFFFF) << 16) | 1, WM_FACE_BG3);
 	}
 }
 
-/* Paint the whole menu: BG1 plate, raised bevel frame, title row, then items. */
+/* Paint the whole menu into the overlay FB: BG1 plate, raised bevel frame,
+ * title row, then items.  Draws only — the caller composites the menu's rect
+ * to the screen (desktop_menu_show / the drag-move path / the stay-on-top
+ * wrapper, all via composite_menu_overlay). */
 static void
 menu_draw(void)
 {
+	set_active_to_menu_overlay();
 	int xy = ((menu_x_px & 0xFFFF) << 16) | (menu_y_px & 0xFFFF);
 	int wh = ((menu_w_px & 0xFFFF) << 16) | (menu_h_px & 0xFFFF);
-	fill_rect_packed(xy, wh, WM_FACE_BG1);              /* plate face */
-	draw_bevel_box_screen(xy, wh, BEVEL_RAISED);        /* WHITE NW / BG3 SE */
+	fill_rect_window(xy, wh, WM_FACE_BG1);              /* plate face */
+	draw_bevel_box(xy, wh, BEVEL_RAISED);               /* WHITE NW / BG3 SE */
 	menu_draw_title();
 	int i;
 	for (i = 0; i < DESKTOP_MENU_N; i++) menu_paint_item(i);
@@ -5402,7 +5517,8 @@ desktop_menu_show(int px, int py)
 	menu_highlighted = -1;
 	menu_pinned = 0;
 	menu_active = 1;
-	menu_draw();
+	menu_draw();                /* paint into the overlay FB */
+	composite_menu_overlay(menu_x_px, menu_y_px, menu_w_px, menu_h_px);
 }
 
 /* Erase the menu by bg-filling + recomposing the rect from the
@@ -5426,8 +5542,8 @@ desktop_menu_update_highlight(int px, int py)
 	if (new_hi == menu_highlighted) return;
 	int old_hi = menu_highlighted;
 	menu_highlighted = new_hi;
-	if (old_hi >= 0) menu_paint_item(old_hi);
-	if (new_hi >= 0) menu_paint_item(new_hi);
+	if (old_hi >= 0) { menu_paint_item(old_hi); composite_menu_item(old_hi); }
+	if (new_hi >= 0) { menu_paint_item(new_hi); composite_menu_item(new_hi); }
 }
 
 /* User clicked an item — dismiss menu, then sup_spawn the program
@@ -5457,6 +5573,7 @@ desktop_menu_select(int item_idx)
 	if (menu_pinned) {
 		menu_highlighted = -1;
 		menu_paint_item(item_idx);
+		composite_menu_item(item_idx);
 	} else {
 		desktop_menu_dismiss();
 	}
@@ -5527,14 +5644,18 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 		if (evt_type == PTR_EVT_UP && button == PTR_BTN_LEFT) {
 			erase_outline(menu_drag_out_x, menu_drag_out_y, menu_w_px, menu_h_px);
 			if (menu_drag_out_x != menu_x_px || menu_drag_out_y != menu_y_px) {
-				/* Move: erase the menu at its old spot (recompose the windows
-				 * behind) and redraw at the new one.  Set the new position
-				 * FIRST so the stay-on-top hook keys off the new rect. */
+				/* Move: set the new position FIRST so the overlay paints + the
+				 * stay-on-top hook key off the new rect, repaint the overlay at
+				 * the new spot, erase the old screen rect (windows show through;
+				 * the new-menu∩old overlap re-blits via the wrapper), then
+				 * composite the full new menu onto the screen. */
 				int ox = menu_x_px, oy = menu_y_px;
 				menu_x_px = menu_drag_out_x;
 				menu_y_px = menu_drag_out_y;
-				recompose_after_destroy(ox, oy, menu_w_px, menu_h_px);
 				menu_draw();
+				recompose_after_destroy(ox, oy, menu_w_px, menu_h_px);
+				composite_menu_overlay(menu_x_px, menu_y_px,
+				                       menu_w_px, menu_h_px);
 			}
 			menu_drag_active = 0;
 			return 1;
@@ -5564,6 +5685,10 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 					} else {
 						menu_pinned = 1;
 						menu_draw_pushpin();
+						composite_menu_overlay(
+						    menu_x_px + MENU_PP_LEFT,
+						    menu_y_px + MENU_BORDER_PX + MENU_PP_TOP,
+						    MENU_PP_W, MENU_PP_H + 1);
 					}
 					return 1;
 				}
@@ -5593,6 +5718,7 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 			int old = menu_highlighted;
 			menu_highlighted = -1;
 			menu_paint_item(old);
+			composite_menu_item(old);
 		}
 	}
 
@@ -6040,6 +6166,11 @@ main(void)
 		WM_PRINT("x");
 		WM_PRINT_INT(FB_H);
 		WM_PRINT(")\n");
+		/* Offscreen backing FB for the composited desktop menu surface.
+		 * Non-fatal on failure — desktop_menu_show checks the slot and
+		 * simply won't pop a menu rather than scribbling on a null FB. */
+		if (alloc_menu_overlay_fb() != 0)
+			WM_PRINT("oriscwm: menu overlay FB alloc failed\n");
 		paint_window_chrome();
 	} else {
 		WM_PRINT("oriscwm: ObjAllocFramebuffer failed: ");
