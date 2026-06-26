@@ -460,11 +460,12 @@
  * palette PR — matched to the real OpenWindows 3 shot,
  * docs/images/openwindows_ipx.png).
  *
- * The terminal body keeps its existing colors (WM_BG/FG) so the cell
- * grid is untouched; only the chrome (workspace, frame, title) moves to
- * the OPEN LOOK indices. */
-#define WM_BG_COLOR        0    /* terminal-body / window-content bg (navy) */
-#define WM_FG_COLOR        1    /* terminal-body text (light gray) */
+ * Window content (the terminal body and app panes) is OPEN LOOK black-on-
+ * white: White #f5f5f5 paper, black ink — matching the OpenWindows panes
+ * and the font specimen.  The chrome (workspace, frame, title) uses the
+ * gray indices below. */
+#define WM_BG_COLOR        11   /* window-content / pane bg — White #f5f5f5 */
+#define WM_FG_COLOR        14   /* window-content text — black #000000 */
 #define WM_WORKSPACE_COLOR 9    /* desktop background — OPEN LOOK blue #40a0c0 */
 #define WM_FACE_BG1        10   /* window face / unfocused title — BG1 #cccccc */
 #define WM_FACE_WHITE      11   /* olgx button highlight / pane — White #f5f5f5 */
@@ -475,10 +476,6 @@
                                  * palette slot) */
 #define WM_OL_BLACK        14   /* text / window border / separator #000000 */
 #define WM_BORDER_COLOR    WM_OL_BLACK  /* flat 2px black olwm window frame */
-/* Title bar uses inverse-video: bar bg = fg-gray, text = bg-navy.
- * (Vestigial — paint_title_bar uses the WM_TITLE_* indices below.) */
-#define WM_TITLE_BAR_BG WM_FG_COLOR
-#define WM_TITLE_BAR_FG WM_BG_COLOR
 
 /* Focus indicator — olwm's drawHeaderBar3D / drawHeaderNoFocus3D model
  * (winframe.c:1005-1024), replacing the old pure-white focused bar.
