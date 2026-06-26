@@ -55,6 +55,9 @@ OUT="ouroboros/wm_fonts.h"
     $GEN --face luRS  --bdf "$OPENLOOK_BDF/75dpi/luRS12.bdf" \
          --base 32 --count 95 --cell 12x16 --proportional
     echo
+    $GEN --face luBS  --bdf "$OPENLOOK_BDF/75dpi/luBS12.bdf" \
+         --base 32 --count 95 --cell 12x16 --proportional
+    echo
     $GEN --face lutRS --bdf "$OPENLOOK_BDF/100dpi/lutRS10.bdf" \
          --base 32 --count 95 --cell 8x16
 } > "$OUT"
