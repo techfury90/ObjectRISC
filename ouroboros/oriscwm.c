@@ -1413,6 +1413,44 @@ composite_screen_rect(int sx, int sy, int w, int h)
 {
 	int sxe = sx + w;
 	int sye = sy + h;
+	/* Occlusion fast path.  If the TOPMOST window fully covers this rect,
+	 * it is the only thing visible here — blit it alone and skip the rest
+	 * of the stack.  This is the common case (a focused window compositing
+	 * its own content area while it scrolls / prints) and it fixes two
+	 * things at once:
+	 *   (1) the "a window behind flashes into the foreground for a frame
+	 *       while the shell scrolls" artifact — the bottom-to-top loop
+	 *       below blits every intersecting window, so a lower window is
+	 *       painted first and only then overpainted by the top one; if the
+	 *       host display worker repaints in between, that lower window
+	 *       shows through.  Blitting only the top window removes the
+	 *       transient entirely.
+	 *   (2) the redundant cost of blitting fully-occluded windows on every
+	 *       strip / scroll composite when windows overlap.
+	 * Topmost = window_z[count-1] (focused, on top); nothing is above it,
+	 * so if it contains the whole rect the result is exact.  Any other
+	 * shape (rect spans multiple windows, vacated-pixel cleanup after a
+	 * destroy) falls through to the general bottom-to-top composite. */
+	if (window_z_count > 0) {
+		int top = window_z[window_z_count - 1];
+		if (top >= 1 && top <= MAX_WINDOWS) {
+			int tx = window_pos_x[top - 1];
+			int ty = window_pos_y[top - 1];
+			if (sx >= tx && sy >= ty
+			    && sxe <= tx + USABLE_W_PX
+			    && sye <= ty + USABLE_H_PX) {
+				load_window_fb_to_o1(top);
+				asm volatile("orefst o1, %0(o12)"
+				             :: "i"(WM_ACTIVE_FB_SLOT_OFFSET));
+				int psrc = (((sx - tx) & 0xFFFF) << 16)
+				         | ((sy - ty) & 0xFFFF);
+				int pdst = ((sx & 0xFFFF) << 16) | (sy & 0xFFFF);
+				int pwh  = ((w  & 0xFFFF) << 16) | (h  & 0xFFFF);
+				do_blit_copy_active_to_screen(psrc, pdst, pwh);
+				return;
+			}
+		}
+	}
 	int z;
 	for (z = 0; z < window_z_count; z++) {
 		int t = window_z[z];
