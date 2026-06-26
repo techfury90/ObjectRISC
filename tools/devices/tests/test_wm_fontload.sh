@@ -71,24 +71,24 @@ python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
 WM=$!
 # lutRS loads last; wait for it (or any failure) so all four faces are settled.
 for _ in $(seq 240); do
-    grep -q "lutRS.wmf loaded\|MISMATCH\|load failed\|hostfsd unavailable\|fetch failed" "$TMP/wm.out" 2>/dev/null && break
+    grep -q "lutRS.wmf loaded\|failsafe\|bad WMF1" "$TMP/wm.out" 2>/dev/null && break
     sleep 0.05
 done
 
 kill -TERM $WM $TERMP $HF $DIR $BAR 2>/dev/null || true
 wait 2>/dev/null || true
 
-# Success = all FOUR faces loaded + cache-validated: luRS (menu items + client
-# proportional), luBS (titles), olgl (pushpins/marks, 47 KB), lutRS (client
-# mono).  text_face_lookup now routes client text through these too.
-if grep -q "/fonts/luRS.wmf loaded (3152 B); widths OK"  "$TMP/wm.out" && \
-   grep -q "/fonts/luBS.wmf loaded (3152 B); widths OK"  "$TMP/wm.out" && \
-   grep -q "/fonts/olgl.wmf loaded (47280 B); widths OK" "$TMP/wm.out" && \
-   grep -q "/fonts/lutRS.wmf loaded (1632 B); widths OK" "$TMP/wm.out"; then
-    echo "PASS: WM loaded + cache-validated all four faces from /fonts"
+# Success = all FOUR faces loaded off /fonts with their WMF1 header parsed to
+# the right cell size — luRS/luBS 12x16, lutRS 8x16, olgl 47x47.  (Only lutRS
+# is still baked in, as the load-failure failsafe.)
+if grep -q "/fonts/luRS.wmf loaded (3152 B); WMF1 12x16"  "$TMP/wm.out" && \
+   grep -q "/fonts/luBS.wmf loaded (3152 B); WMF1 12x16"  "$TMP/wm.out" && \
+   grep -q "/fonts/olgl.wmf loaded (47280 B); WMF1 47x47" "$TMP/wm.out" && \
+   grep -q "/fonts/lutRS.wmf loaded (1632 B); WMF1 8x16"  "$TMP/wm.out"; then
+    echo "PASS: WM loaded all four faces from /fonts (headers parsed)"
     exit 0
 fi
-echo "FAIL: WM did not load + cache all four faces from /fonts"
+echo "FAIL: WM did not load all four faces from /fonts"
 echo "--- wm.out (oriscwm lines) ---"; grep -iE "oriscwm:|font" "$TMP/wm.out" || true
 echo "--- dir.out (tail) ---"; tail -5 "$TMP/dir.out" || true
 echo "--- hf.out (tail) ---"; tail -5 "$TMP/hf.out" || true
