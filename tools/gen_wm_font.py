@@ -260,6 +260,13 @@ def main():
     ap.add_argument("--proportional", action="store_true",
                     help="Mark the face proportional (advance from width "
                          "table).  Omit for a monospace face.")
+    ap.add_argument("--out",
+                    help="Write the raw WMF1 blob (the on-disk .wmf font "
+                         "object) to this file instead of emitting C.  The "
+                         "bytes are byte-identical to the baked face's blob, "
+                         "so the WM loads the same face at runtime that it "
+                         "would compile in.  Requires --bdf; uses the same "
+                         "--base/--count/--cell/--proportional.")
     ap.add_argument("--font",
                     help="Path to a TTF/TTC/OTF font file.  Mutually "
                          "exclusive with --preset.")
@@ -278,6 +285,26 @@ def main():
                          f"{CELL_W}x{CELL_H} cell — no ImageMagick, no TTF "
                          "rasterization.  Mutually exclusive with --font/--preset.")
     args = ap.parse_args()
+
+    if args.out:
+        if not args.bdf:
+            ap.error("--out requires --bdf")
+        cell = None
+        if args.cell:
+            try:
+                cw, chh = (int(v) for v in args.cell.lower().split("x"))
+            except ValueError:
+                ap.error("--cell must look like WxH, e.g. 12x16")
+            cell = (cw, chh)
+        blob, info = face_blob(args.bdf, args.base, args.count, cell,
+                               args.proportional)
+        Path(args.out).write_bytes(blob)
+        sys.stderr.write(
+            f"wrote {args.out}  ({len(blob)} bytes; cell "
+            f"{info['cell_w']}x{info['cell_h']}, base {args.base}, "
+            f"{args.count} glyphs, "
+            f"{'proportional' if args.proportional else 'mono'})\n")
+        return
 
     if args.face:
         if not args.bdf:

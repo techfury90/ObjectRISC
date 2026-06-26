@@ -84,3 +84,20 @@ OUT_OLGL="ouroboros/wm_fonts_olgl.h"
          --base 19 --count 167
 } > "$OUT_OLGL"
 echo "wrote $OUT_OLGL"
+
+# On-disk .wmf font objects for dynamic font loading.  These are the SAME
+# blobs baked into the headers above, written as raw WMF1 bytes so the WM can
+# load a face from /fonts at runtime (served by hostfsd, jailed to the repo
+# root) instead of compiling it in.  Committed (like the headers) because they
+# can't be rebuilt without the OpenLook BDF sources, which aren't in the repo.
+FONTS_DIR="fonts"
+mkdir -p "$FONTS_DIR"
+$GEN --out "$FONTS_DIR/luRS.wmf"  --bdf "$OPENLOOK_BDF/75dpi/luRS12.bdf" \
+     --base 32 --count 95 --cell 12x16 --proportional
+$GEN --out "$FONTS_DIR/luBS.wmf"  --bdf "$OPENLOOK_BDF/75dpi/luBS12.bdf" \
+     --base 32 --count 95 --cell 12x16 --proportional
+$GEN --out "$FONTS_DIR/lutRS.wmf" --bdf "$OPENLOOK_BDF/100dpi/lutRS10.bdf" \
+     --base 32 --count 95 --cell 8x16
+$GEN --out "$FONTS_DIR/olgl.wmf"  --bdf "$OPENLOOK_BDF/misc/olgl12.bdf" \
+     --base 19 --count 167
+echo "wrote $FONTS_DIR/{luRS,luBS,lutRS,olgl}.wmf"
