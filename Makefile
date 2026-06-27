@@ -56,6 +56,7 @@ SHELL_BUILD_BANNER ?= "Object RISC Shell"
 SHELL_ORX          := $(BUILD)/programs/shell.orx
 SUPERVISOR_ORX     := $(BUILD)/supervisor.orx
 ORISCWM_ORX        := $(BUILD)/oriscwm.orx
+TERMFW_ORX         := $(BUILD)/termfw.orx
 
 # --- ouroboros programs ----------------------------------------------
 
@@ -64,9 +65,9 @@ PROGRAM_ORXS := $(patsubst ouroboros/programs/%.c,$(BUILD)/programs/%.orx,$(PROG
 
 # --- top-level targets ------------------------------------------------
 
-.PHONY: all boot clean lib programs shell supervisor oriscwm help
+.PHONY: all boot clean lib programs shell supervisor oriscwm termfw help
 
-all: $(LIBORISC) $(SHELL_ORX) $(SUPERVISOR_ORX) $(ORISCWM_ORX) $(PROGRAM_ORXS)
+all: $(LIBORISC) $(SHELL_ORX) $(SUPERVISOR_ORX) $(ORISCWM_ORX) $(TERMFW_ORX) $(PROGRAM_ORXS)
 
 lib: $(LIBORISC)
 
@@ -75,6 +76,8 @@ shell: $(SHELL_ORX)
 supervisor: $(SUPERVISOR_ORX)
 
 oriscwm: $(ORISCWM_ORX)
+
+termfw: $(TERMFW_ORX)
 
 programs: $(PROGRAM_ORXS)
 
@@ -155,6 +158,18 @@ $(BUILD)/oriscwm.oro: ouroboros/oriscwm.c | $(BUILD)
 
 $(ORISCWM_ORX): $(BUILD)/oriscwm.oro $(RUNTIME) $(LIBORISC) | $(BUILD)
 	$(ORLD) -o $@ $(RUNTIME) $(BUILD)/oriscwm.oro $(LIBORISC)
+
+# termfw — Object RISC terminal firmware boot image (.orx).  M1: framebuffer
+# self-test + Lucida Typewriter splash; standalone (no supervisor/WM/dir).  In
+# ouroboros/ (not programs/) because it #includes wm_fonts.h from the same dir.
+
+$(BUILD)/termfw.oro: ouroboros/termfw.c | $(BUILD)
+	$(CPP)  $(CFLAGS) $< > $(@:.oro=.i)
+	$(CCOM) < $(@:.oro=.i) > $(@:.oro=.s)
+	$(ASMORISC) -r $(@:.oro=.s) -o $@
+
+$(TERMFW_ORX): $(BUILD)/termfw.oro $(RUNTIME) $(LIBORISC) | $(BUILD)
+	$(ORLD) -o $@ $(RUNTIME) $(BUILD)/termfw.oro $(LIBORISC)
 
 # Programs — uniform c→oro→orx pipeline.
 
