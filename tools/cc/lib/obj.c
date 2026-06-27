@@ -718,6 +718,81 @@ obj_recv_full(obj_t h, int out[4])
 	return 0;
 }
 
+/* === WaitAnyQueue (#0x206) — block on a SET of queues at once ============
+ *
+ * A client that reacts to more than one event source (e.g. the Markdown viewer
+ * waiting on the keyboard AND the WM's scrollbar pushes) builds a "wait set": an
+ * OBJSTORE whose slots hold the queue refs to watch.  #0x206 blocks until ANY
+ * listed queue is non-empty (or an optional µs timeout elapses); the caller then
+ * drains whichever queues have data with obj_poll.  Mirrors the WM's own
+ * event-driven main loop. */
+
+/* Store O1 (a queue ref) into slot `slot` of the wait-set OBJSTORE in O2.  The
+ * orefst offset must be an immediate, so it's an inline switch. */
+static void
+obj__waitset_slot(int slot)
+{
+	switch (slot) {
+	case 0: asm volatile("orefst o1, 0(o2)");  break;
+	case 1: asm volatile("orefst o1, 8(o2)");  break;
+	case 2: asm volatile("orefst o1, 16(o2)"); break;
+	case 3: asm volatile("orefst o1, 24(o2)"); break;
+	case 4: asm volatile("orefst o1, 32(o2)"); break;
+	case 5: asm volatile("orefst o1, 40(o2)"); break;
+	case 6: asm volatile("orefst o1, 48(o2)"); break;
+	case 7: asm volatile("orefst o1, 56(o2)"); break;
+	}
+}
+
+/* Build a wait set over n queue handles (n <= 8).  Returns an OBJSTORE handle to
+ * pass to obj_waitset_wait, or OBJ_NULL.  obj__load_o1 only touches O1, so O2
+ * (the store) survives the fill loop. */
+obj_t
+obj_waitset_new(const obj_t *handles, int n)
+{
+	int i;
+	obj_t sh;
+	if (n <= 0 || n > 8)
+		return OBJ_NULL;
+	sh = obj_alloc_store((unsigned)(n * 8), OBJ_TAG_DATA, OBJ_CAP_R | OBJ_CAP_W);
+	if (sh < 0)
+		return OBJ_NULL;
+	obj__load_o2(sh);                 /* O2 = the wait-set store */
+	for (i = 0; i < n; i++) {
+		obj__load_o1(handles[i]);     /* O1 = queue i's ref (O2 preserved) */
+		obj__waitset_slot(i);         /* store[i] = O1 */
+	}
+	asm volatile("omov o2, o11\n omov o3, o15");   /* restore boot ORs */
+	return sh;
+}
+
+/* Block until any queue in wait set `sh` (n slots) is ready, or `timeout_us`
+ * microseconds elapse (0 = block forever).  Returns 0 if a queue is ready, or a
+ * negative status (e.g. timeout).  After it returns, drain the ready queue(s)
+ * with obj_poll. */
+static int obj__waitset_status;
+
+int
+obj_waitset_wait(obj_t sh, int n, int timeout_us)
+{
+	if (sh < 0)
+		return -1;
+	obj__load_o2(sh);                 /* O2 = the wait-set store */
+	asm volatile(
+		"addu  r5, %0, r0\n"          /* R5 = slot count */
+		"addu  r6, %1, r0\n"          /* R6 = timeout µs (0 = infinite) */
+		"call  #0x206\n"              /* WaitAnyQueue */
+		"nop\n"
+		"la    r1, obj__waitset_status\n"
+		"sw    r2, 0(r1)"
+		:
+		: "r"(n), "r"(timeout_us)
+		: "r1", "r2", "r5", "r6", "memory"
+	);
+	asm volatile("omov o2, o11\n omov o3, o15");   /* restore boot ORs */
+	return obj__waitset_status;
+}
+
 int
 obj_recv_cap(obj_t h, int *out_word)
 {

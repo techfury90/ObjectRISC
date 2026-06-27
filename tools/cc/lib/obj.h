@@ -205,6 +205,14 @@ int   obj_poll(obj_t h, int out[4]);
  * error. */
 int   obj_recv_full(obj_t h, int out[4]);
 
+/* WaitAnyQueue (#0x206): block on a SET of queues at once.  obj_waitset_new
+ * builds an OBJSTORE over n queue handles (n <= 8); obj_waitset_wait blocks
+ * until any is ready (or timeout_us elapses, 0 = forever) and returns 0 on
+ * ready / negative on timeout, after which the caller drains the ready queues
+ * with obj_poll.  Lets a client be event-driven over multiple sources. */
+obj_t obj_waitset_new(const obj_t *handles, int n);
+int   obj_waitset_wait(obj_t sh, int n, int timeout_us);
+
 /* OR-receive: block on `h`'s queue for a reply that carries a CAPABILITY
  * in its O2 register (the resolved-surface replies wm_bind_surface and
  * dir_lookup return), OREFST that cap into a fresh handle slot, and
