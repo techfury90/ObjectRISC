@@ -160,6 +160,23 @@ Wire protocol (request: program SENDs to oriscdir at (pid, idx 1)):
                      their notifications silently dropped by the
                      wire layer.
 
+  OP_UNREGISTER = 7  Remove a previously-registered LEAF (the inverse
+                     of OP_REGISTER). Used when a co-resident terminal
+                     ends its session and tears down its supervisor /
+                     WM entries so peers stop resolving them. The op is
+                     idempotent: unregistering a path that's already
+                     gone replies OK. If the target leaf still has
+                     children it is demoted to a plain DIR (its
+                     subtree is preserved); otherwise it's removed and
+                     any now-empty ancestor DIRs are pruned. Only LEAF
+                     nodes are unregisterable — pointing at a DIR or
+                     MOUNT replies E_NOTDIR.
+
+                          O2 = path bytes ref
+                          O3 = reply_cap
+                          R5 = path length (bytes)
+                     Reply: R3 = 0 OK, negative on error.
+
 All responses are SEND_DELIVERs aimed at the caller-supplied
 reply_cap; the result lands in the receiver's R3..R5 / O2 (after
 queue-dispatch overlay shifts caller's R4..R7 → R3..R6 and the
@@ -229,6 +246,12 @@ OP_SUBSCRIBE    = 6     # Phase 54: subscribe to changes under a path.
                         # re-walks, reacts. The supervisor uses this to
                         # eliminate the periodic /sys/term polling that
                         # Phase 52 introduced.
+OP_UNREGISTER   = 7     # Remove a registered LEAF (inverse of REGISTER).
+                        # Used by co-resident End Session teardown to
+                        # deregister a terminal's supervisor / WM entries.
+                        # Idempotent (missing path → OK). Demotes to DIR
+                        # if the leaf has children; otherwise removes it
+                        # and prunes now-empty ancestor dirs.
 
 # ---- Node-kind codes (returned in R4 of OP_WALK responses) ---------------
 
@@ -614,6 +637,8 @@ class OriscDir:
             self._do_list(pr, path_bytes)
         elif pr.op == OP_SUBSCRIBE:
             self._do_subscribe(pr, path_bytes)
+        elif pr.op == OP_UNREGISTER:
+            self._do_unregister(pr, path_bytes)
         else:
             self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
 
@@ -752,6 +777,45 @@ class OriscDir:
         new_node = Node(name=last, parent=node, leaf_ref=ref_to_register)
         node.children[last] = new_node
         self._log(f"register {path!r} → 0x{ref_to_register:016x}")
+        self._after_tree_mutation(comps)
+        self._reply(pr.reply_cap, 0, 0, 0, 0)
+
+    def _do_unregister(self, pr: PendingRequest, path_bytes: bytes) -> None:
+        """Remove a registered LEAF (inverse of _do_register). The op
+        is idempotent — unregistering a path that's already gone replies
+        OK. A leaf that still has children is demoted to a plain DIR so
+        its subtree survives; an otherwise-empty leaf is deleted and any
+        now-empty ancestor DIRs are pruned. Only LEAFs may be
+        unregistered (a DIR/MOUNT target → E_NOTDIR)."""
+        try:
+            path = path_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        comps = normalize_path(path)
+        if comps is None or not comps:
+            return self._reply(pr.reply_cap, E_INVAL, 0, 0, 0)
+        parent = self._walk_internal(comps[:-1])
+        last = comps[-1]
+        if parent is None or parent.kind() != KIND_DIR \
+                or last not in parent.children:
+            # Already gone (or never existed) — idempotent success.
+            return self._reply(pr.reply_cap, 0, 0, 0, 0)
+        target = parent.children[last]
+        if target.kind() != KIND_LEAF:
+            # Only registered leaves are unregisterable.
+            return self._reply(pr.reply_cap, E_NOTDIR, 0, 0, 0)
+        if target.children:
+            # Subtree below — keep it, just drop the leaf ref (→ DIR).
+            target.leaf_ref = 0
+        else:
+            del parent.children[last]
+            # Prune now-empty ancestor DIRs up toward the root.
+            node = parent
+            while node is not self.root and not node.children \
+                    and not node.leaf_ref and not node.mount_ref:
+                node.parent.children.pop(node.name, None)
+                node = node.parent
+        self._log(f"unregister {path!r}")
         self._after_tree_mutation(comps)
         self._reply(pr.reply_cap, 0, 0, 0, 0)
 
