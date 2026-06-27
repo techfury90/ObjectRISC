@@ -1908,6 +1908,17 @@ main(void)
 			 * Phase 48 detail: login.orx may be parked in task_wait on
 			 * the shell; killing the task table deterministically here
 			 * keeps it clean before we return. */
+			/* Deregister this CPU's supervisor entry FIRST so peers'
+			 * pick_next_cpu / relay_spawn_request stop dispatching to a
+			 * halting CPU.  dir_unregister clobbers O1-O4, but that's
+			 * fine here — the cascade-kill below (task_active_mask +
+			 * task_kill) loads everything it needs from the task table,
+			 * not from inherited ORs. */
+			{
+				char unreg_path[PEER_PATH_BUF_SIZE];
+				render_peer_path(procid, unreg_path);
+				dir_unregister(unreg_path);
+			}
 			unsigned int mask = task_active_mask();
 			int t;
 			for (t = 0; t < TASK_MAX_CONCURRENT; t++) {

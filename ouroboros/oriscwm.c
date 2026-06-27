@@ -908,13 +908,14 @@ static const char *const desktop_menu_labels[DESKTOP_MENU_N] = {
 	"Menu Demo",
 	"Font Demo",
 	"Markdown Viewer",
-	"Shut Down",
+	"End Session",
 };
 static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
-	5, 4, 11, 9, 9, 15, 9,
+	5, 4, 11, 9, 9, 15, 11,
 };
-/* "Shut Down" has no spawn path — it runs an action (sup_shutdown, exactly
- * what the shell's `exit` does), special-cased in desktop_menu_select. */
+/* "End Session" has no spawn path — it runs an action (deregister this
+ * terminal + sup_shutdown, exactly what the shell's `exit` does),
+ * special-cased in desktop_menu_select. */
 #define MENU_SHUTDOWN_IDX (DESKTOP_MENU_N - 1)
 static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
 	"/programs/shell.orx",
@@ -923,7 +924,7 @@ static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
 	"/programs/menudemo.orx",
 	"/programs/font_demo.orx",
 	"/programs/mdview.orx",
-	(const char *)0,         /* Shut Down — action, not a spawn */
+	(const char *)0,         /* End Session — action, not a spawn */
 };
 /* No "Cancel" item — an OPEN LOOK menu dismisses by clicking off it (the
  * pointer-up-outside path already calls desktop_menu_dismiss). */
@@ -1041,6 +1042,7 @@ static char path_keyboard[40];
  * doesn't walk it. */
 static char path_pointer[40];
 static char path_self_register[40];  /* /sys/wm/<N>/0 */
+static char path_supervisor[40];     /* /sys/cpu/<N>/supervisor (local CPU) */
 
 static int
 wm_append_decimal(int n, char *buf, int p)
@@ -6163,10 +6165,21 @@ sup_walk_to_slot(void)
 {
 	if (sup_walked) return 0;
 
-	const char path[] = "/sys/cpu/0/supervisor";
+	/* Route to the LOCAL supervisor: co-resident terminals run their own
+	 * supervisor at /sys/cpu/<my_term_idx>/supervisor (my_term_idx ==
+	 * this terminal's procid co-resident); the legacy separate-CPU WM
+	 * has no local supervisor and uses cpu0's.  Build the path from the
+	 * live wm_coresident/my_term_idx state (both fully set by the time
+	 * the menu fires) into the file-scope buffer. */
+	int sup_cpu = wm_coresident ? my_term_idx : 0;
+	int p = wm_append_str("/sys/cpu/", path_supervisor, 0);
+	p = wm_append_decimal(sup_cpu, path_supervisor, p);
+	p = wm_append_str("/supervisor", path_supervisor, p);
+	path_supervisor[p] = '\0';
+
 	int kind;
 	char rem[16];
-	int rc = dir_walk(path, &kind, rem, sizeof(rem));
+	int rc = dir_walk(path_supervisor, &kind, rem, sizeof(rem));
 	if (rc != 0) return rc;
 	if (kind != DIR_KIND_LEAF) return -1;
 	asm volatile(
@@ -6471,11 +6484,16 @@ desktop_menu_select(int item_idx)
 		return;
 	}
 	if (item_idx == MENU_SHUTDOWN_IDX) {
-		/* System shutdown — always dismiss (even when pinned), then do exactly
-		 * what the shell's `exit` does: walk to the supervisor + fire the op=2
-		 * halt SEND (BOOT_PARENT_SLOT == SUP_SLOT == 544, so sup_shutdown finds
-		 * the cap sup_walk_to_slot just parked). */
+		/* End Session — close THIS terminal cleanly.  Always dismiss (even
+		 * when pinned), then: (1) deregister our own /sys/wm/<idx>/0 entry so
+		 * clients stop resolving this WM, (2) do exactly what the shell's
+		 * `exit` does — walk to the LOCAL supervisor + fire the op=2 halt SEND
+		 * (BOOT_PARENT_SLOT == SUP_SLOT == 544, so sup_shutdown finds the cap
+		 * sup_walk_to_slot just parked).  dir_unregister clobbers O1-O4, but
+		 * sup_walk_to_slot / sup_shutdown re-establish what they need, then
+		 * wm_restore_boot_or restores the boot ORs before any task_exit. */
 		desktop_menu_dismiss();
+		dir_unregister(path_self_register);
 		if (sup_walk_to_slot() == 0) sup_shutdown();
 		wm_restore_boot_or();
 		/* Co-resident (no terminal): the WM is sysinit's child, not the

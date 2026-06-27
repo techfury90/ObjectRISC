@@ -695,6 +695,14 @@ int dir_walk(const char *path, int *kind_out,
  * EEXISTS if the path already has a non-empty node. */
 int dir_register(const char *path);
 
+/* Unregister the leaf at `path` (inverse of dir_register). Idempotent
+ * — returns 0 if `path` is already gone. A leaf with children is
+ * demoted to a plain DIR (subtree preserved); an otherwise-empty leaf
+ * is removed and now-empty ancestor dirs are pruned. Returns 0 on
+ * success, negative on error (E_NOTDIR if `path` is a DIR/MOUNT). No
+ * ref-to-register needed, so no O1 setup. */
+int dir_unregister(const char *path);
+
 /* Mount: register the service ref currently in O1 at `path`, with
  * `prefix` as the root within the mounted service (passed back to
  * walk callers as part of their remainder). */

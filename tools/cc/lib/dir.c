@@ -47,6 +47,9 @@
 #define DIR_OP_SUBSCRIBE 6   /* Phase 54 — register a notify_cap for
                               * mutations under a path. See oriscdir
                               * docstring for the wire details. */
+#define DIR_OP_UNREGISTER 7  /* Remove a registered leaf (inverse of
+                              * REGISTER). Used by co-resident End
+                              * Session teardown. Idempotent. */
 
 /* Supervisor's get-dir-ref op (handled by supervisor.c — Phase
  * 45f). Shells and other supervisor-spawned programs SEND op=4
@@ -316,6 +319,52 @@ dir_register(const char *path)
 	obj_drop(dir_h);               /* handles alias raw slots / caller's */
 	obj_drop(reply_h);             /* ref — drop, never free */
 	obj_drop(ref_h);
+
+	if (prc != 0) return -6;
+	return out[0];                 /* reply R3 = status */
+}
+
+/* dir_unregister — remove the leaf at `path` (inverse of
+ * dir_register). Unlike register/mount there's no ref-to-register, so
+ * no O1 to stash and no DIR_INPUT_REF_SLOT / ref_h. We just bridge the
+ * dir-service and reply-mailbox caps out of their raw slots, build the
+ * path-bytes request object, and SEND op=UNREGISTER. The reply doubles
+ * as the barrier (the daemon ObjFetchBytes the path before replying),
+ * so it's safe to free the path object afterward — no async race. */
+int
+dir_unregister(const char *path)
+{
+	int rc = dir_init();
+	if (rc != 0) return rc;
+	rc = dir_reply_mailbox_init();
+	if (rc != 0) return rc;
+
+	int len = dir_strlen(path);
+	if (len <= 0 || len >= DIR_PATH_BUF_SIZE) return -1;
+	if (obj_init() != 0) return -6;
+
+	obj_t dir_h   = obj_adopt_slot(DIR_SLOT_OFFSET);
+	obj_t reply_h = obj_adopt_slot(REPLY_MB_SLOT_OFFSET);
+	obj_t path_h  = obj_make_bytes(path, len,
+	                               CAP_R | CAP_W | CAP_V | CAP_C);
+	if (dir_h < 0 || reply_h < 0 || path_h < 0) {
+		if (path_h >= 0) obj_free(path_h);
+		obj_drop(dir_h); obj_drop(reply_h);
+		return -6;
+	}
+
+	/* SEND: O2 = path bytes, O3 = reply mailbox cap, O4 = null
+	 * (no ref to register); R5 = path length. */
+	obj_send_3or(dir_h, path_h, reply_h, OBJ_NULL,
+	             DIR_OP_UNREGISTER, len, 0, 0);
+
+	int out[4];
+	int prc = obj_recv_full(reply_h, out);
+	_dir_restore_or();
+
+	obj_free(path_h);              /* bytes object — daemon done with it */
+	obj_drop(dir_h);               /* handles alias raw slots / caller's */
+	obj_drop(reply_h);             /* ref — drop, never free */
 
 	if (prc != 0) return -6;
 	return out[0];                 /* reply R3 = status */
