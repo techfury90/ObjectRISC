@@ -6,10 +6,11 @@ Spawns:
     2. zero or more device processes (currently: oriscterm)
     3. one or more simorisc CPU processes connected to the crossbar
 
-Waits for the "leader" CPU (default: pid 0) to exit, then signals every
-other process to shut down. Forwards each process's stdout/stderr to
-this script's stdout/stderr with a small per-source prefix so it's
-clear what came from where.
+Waits for the FIRST CPU to exit, then signals every other process to shut
+down — there is no designated leader; any CPU's exit (e.g. a terminal's
+"Shut Down") ends the session. Forwards each process's stdout/stderr to
+this script's stdout/stderr with a small per-source prefix so it's clear
+what came from where.
 
 Typical usage (the hello-world-on-terminal demo):
 
