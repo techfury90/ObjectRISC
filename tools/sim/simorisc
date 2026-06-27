@@ -348,17 +348,22 @@ class BlockedOnQueueSet(BlockedSignal):
     is empty. The scheduler holds the CPU at the CALL until ANY listed
     queue receives a message, then returns ERR_OK and advances PC — a
     pure readiness wait, no message delivery (mirror of BlockedOnQueue
-    but for a set, and it never pops). Infinite block: there is no
-    timeout, so _try_unblock_queue_set only ever advances the PC once a
-    queue is genuinely non-empty.
+    but for a set, and it never pops). `deadline` (absolute wall-clock
+    time.time() seconds, or None) optionally bounds the wait: once
+    time.time() >= deadline with no queue ready, _try_unblock_queue_set
+    resumes the CALL with ERR_ETIMEOUT instead of ERR_OK. The bound is
+    WALL-CLOCK, not scheduler ticks (unlike BlockedOnQueue), so it fires
+    correctly even while the WM is parked and other tasks run, and a
+    requested microsecond delay maps straight to real time.
 
     `descriptor_indices` is the set of local descriptor indices resolved
     (and validated) at primitive-entry time. The WM owns every queue in
     the set (home == self) and is single-threaded while blocked, so the
     set can't be mutated under us; the wake/unblock checks still re-probe
     each descriptor defensively before reading its queue."""
-    def __init__(self, descriptor_indices):
+    def __init__(self, descriptor_indices, deadline=None):
         self.descriptor_indices = descriptor_indices
+        self.deadline = deadline
 
 
 class BlockedOnResponse(BlockedSignal):
@@ -1747,7 +1752,7 @@ class System:
                 # (infinite timeout); user code that needs strict
                 # timeout semantics should stay current.
             elif isinstance(b, BlockedOnQueueSet):
-                # Ready as soon as ANY queue in the set is non-empty.
+                # Ready as soon as ANY queue in the set is non-empty...
                 for idx in b.descriptor_indices:
                     if 0 < idx < len(cpu.descriptors) \
                             and cpu.descriptors[idx] is not None \
@@ -1755,6 +1760,12 @@ class System:
                             and len(cpu.descriptors[idx].queue) > 0:
                         ready = True
                         break
+                # ...or the optional wall-clock timeout has expired (the
+                # actual ERR_ETIMEOUT/PC-advance lands in _try_unblock_queue_set
+                # once this task is current again).
+                if not ready and b.deadline is not None \
+                        and time.time() >= b.deadline:
+                    ready = True
             if ready:
                 task.state = TASK_STATE_RUNNABLE
                 # Direct-handoff: a task that just had its IPC condition
@@ -1834,8 +1845,9 @@ class System:
         """Resume a WaitAnyQueue once ANY listed queue is non-empty.
         Pure readiness: we DON'T pop the message (the caller drains it
         with its own ReceiveQueuePoll) — we just set R2 = ERR_OK and
-        advance past the CALL. Infinite wait, so returning False simply
-        keeps the CPU parked until a queue fills (no timeout to tick)."""
+        advance past the CALL. With a finite b.deadline, an expired
+        wall-clock deadline resumes with ERR_ETIMEOUT instead; otherwise
+        returning False keeps the CPU parked until a queue fills."""
         for idx in b.descriptor_indices:
             if 0 < idx < len(cpu.descriptors) \
                     and cpu.descriptors[idx] is not None \
@@ -1847,7 +1859,14 @@ class System:
                 cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
                 cpu.blocked_on = None
                 return True
-        return False   # nothing ready yet — stay blocked (no timeout)
+        if b.deadline is not None and time.time() >= b.deadline:
+            cpu.set_gpr(2, ERR_ETIMEOUT)
+            cpu.set_gpr(3, 0)
+            cpu.pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.next_pc = (cpu.pc + 4) & 0xFFFFFFFF
+            cpu.blocked_on = None
+            return True
+        return False   # nothing ready yet — stay blocked
 
     def _try_unblock_response(self, cpu: CPU, b: 'BlockedOnResponse') -> bool:
         """Look for a response packet matching this CPU's outstanding
@@ -4474,6 +4493,11 @@ def primitive_WaitAnyQueue(cpu: CPU) -> None:
           references (one 8-byte slot each, OREFST layout). Must carry
           R (we read it like an OREFLD source).
       R5: number of references to read from the list (count).
+      R6: optional timeout in MICROSECONDS — 0 means infinite block (the
+          historic behaviour); >0 resumes the CALL with ERR_ETIMEOUT if no
+          listed queue becomes ready within that wall-clock span. Lets the
+          WM idle-block yet still wake for a timer (e.g. scrollbar auto-repeat)
+          without busy-polling.
 
     The queue set is dynamic and larger than the O-registers (a window
     manager has a per-window queue that comes and goes), so it's passed
@@ -4487,12 +4511,12 @@ def primitive_WaitAnyQueue(cpu: CPU) -> None:
 
     Returns:
       R2: ERR_OK once a listed queue is non-empty (immediately if one
-          already is); ERR_* if the list object itself is unusable.
-      R3: 0 (no payload — this is a readiness wait, not a dequeue).
-
-    Infinite block, no timeout."""
-    listref = cpu.get_opr(2)
-    count   = cpu.get_gpr(5) & 0xFFFFFFFF
+          already is); ERR_ETIMEOUT if the R6 timeout expired first; ERR_*
+          if the list object itself is unusable.
+      R3: 0 (no payload — this is a readiness wait, not a dequeue)."""
+    listref    = cpu.get_opr(2)
+    count      = cpu.get_gpr(5) & 0xFFFFFFFF
+    timeout_us = cpu.get_gpr(6) & 0xFFFFFFFF
 
     # Validate the list object itself (mirror ReceiveQueuePoll's target
     # checks, but require R since we read its slots like OREFLD does).
@@ -4543,9 +4567,11 @@ def primitive_WaitAnyQueue(cpu: CPU) -> None:
 
     # Otherwise park. The scheduler resumes us the instant any listed
     # queue receives a message (cross-CPU: poll_incoming appends to the
-    # home queue, then _try_unblock_queue_set advances past this CALL).
+    # home queue, then _try_unblock_queue_set advances past this CALL), or
+    # at the optional wall-clock deadline (ERR_ETIMEOUT).
     cpu.set_gpr(3, 0)
-    raise BlockedOnQueueSet(descriptor_indices=indices)
+    deadline = None if timeout_us == 0 else time.time() + (timeout_us / 1_000_000.0)
+    raise BlockedOnQueueSet(descriptor_indices=indices, deadline=deadline)
 
 
 def primitive_InstallTrapHandler(cpu: CPU) -> None:
