@@ -266,12 +266,12 @@ main(void)
 	 * derives from it.  (Validated via the M2 spike.)  The banner stays up
 	 * meanwhile — the supervisor draws nothing until the WM comes up (M3). */
 
-	/* Drop our framebuffer from O5 BEFORE spawning.  A child inherits the
-	 * parent's O5, and a non-null O5 makes the supervisor think it has a console
-	 * terminal — it then SENDs to the framebuffer (which lacks the S cap) and
-	 * traps.  At M2 the supervisor has no terminal (the FB→WM handoff is M3); the
-	 * banner stays on screen regardless, since the FB object itself persists. */
-	asm volatile("onull o5");
+	/* M3: forward our framebuffer to the supervisor via ORX_SLOT_CHILD_O5.  The
+	 * supervisor detects the non-null O5 as "co-resident", carries it (its
+	 * console-SEND/login path is guarded off so it never SENDs to the FB), and
+	 * relays it down through sysinit to the WM, which adopts it = one seamless
+	 * window (no second display). */
+	asm volatile("orefst o5, 632(o12)");   /* ORX_SLOT_CHILD_O5 = framebuffer */
 
 	/* Promote the boot directory into DIR_SLOT (for our own dir_walks) AND
 	 * forward it into ORX_SLOT_CHILD_O8 so the supervisor task harvests
@@ -310,9 +310,15 @@ main(void)
 	{
 		task_t sup = orx_spawn("/programs/supervisor.orx", "", "/");
 		if (sup < 0) { WP("FAIL: supervisor load\n"); return 5; }
+		WP("termfw: system software running\n");
+		/* Block (yielding) until the supervisor exits -- e.g. a WM "Shut Down"
+		 * -> sup_shutdown -> the supervisor winds down and returns.  Then we fall
+		 * out of main so the CPU halts and oriscrun tears the boot down, rather
+		 * than idle-yielding forever (which left the simulator running after a
+		 * shutdown). */
+		task_wait(sup);
 	}
-	WP("termfw: system software running\n");
-	for (;;)
-		task_yield();               /* firmware idles; supervisor is co-resident */
+	WP("termfw: system software halted\n");
+	return 0;
 #endif
 }

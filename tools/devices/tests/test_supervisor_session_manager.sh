@@ -217,17 +217,23 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# --- two CPUs, each wired to a different terminal -------------------
+# --- two CPUs, each walking /sys/term/<procid>/* for its console ----
+# Console/keyboard/grid come from WALKING /sys/term/<procid>/* (fake_terminal
+# self-registers them) — the modern walk-don't-wire convention that boot.sh and
+# wm_boot use.  O5 MUST be a null pad at boot so the supervisor's M3 co-residency
+# detector (non-null O5 = a forwarded framebuffer) classifies these as legacy
+# (login -> shell), not co-resident.  fake_terminal 16 = instance 0 (CPU 0),
+# fake_terminal 19 = instance 1 (CPU 1).
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "18=1@9" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
 
 python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
-    --service "19=1@9" --service "19=2@9" \
-    --service "19=3@9" --service "18=1@9" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu1.out" 2>"$TMP/cpu1.err" &
 CPU1=$!

@@ -1196,6 +1196,24 @@ alloc_local_framebuffer(void)
 	return status;
 }
 
+/* M3 co-residency — if the boot chain (firmware → supervisor → sysinit)
+ * forwarded its display-backed framebuffer into our O5, ADOPT it: stash the ref
+ * into WM_SURF_FRAMEBUFFER_SLOT_OFFSET and report success.  Drawing into the
+ * firmware's existing FB object is what makes splash → desktop ONE seamless Tk
+ * window — allocating our own display-backed FB would open a second window.
+ * Returns 0 if adopted, -1 if O5 is null (no inherited FB; caller allocs its
+ * own, the separate-CPU path). */
+static int
+adopt_inherited_framebuffer(void)
+{
+	int o5_null;
+	asm volatile("oisn %0, o5" : "=r"(o5_null));
+	if (o5_null)
+		return -1;
+	asm volatile("orefst o5, %0(o12)" :: "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET));
+	return 0;
+}
+
 /* Phase 2c step 1 — the desktop menu's offscreen backing FB.  Screen-sized
  * (so the menu draws at its absolute screen position straight into it) and
  * OFFSCREEN (flag 1 = no display mirror; it reaches the screen only via the
@@ -6459,6 +6477,16 @@ desktop_menu_select(int item_idx)
 		desktop_menu_dismiss();
 		if (sup_walk_to_slot() == 0) sup_shutdown();
 		wm_restore_boot_or();
+		/* Co-resident (no terminal): the WM is sysinit's child, not the
+		 * supervisor's, so the supervisor's op=2 cascade-kill never reaches
+		 * us — we'd survive its halt and keep pid 0 alive, so the sim would
+		 * never stop.  Exit now (mirroring the shell's `exit`: sup_shutdown
+		 * THEN TaskExit).  The supervisor still reaps sysinit + every
+		 * sup_spawn'd app; with us gone too, pid 0 drains and oriscrun's
+		 * --leader 0 tears the process group down.  The legacy separate-CPU
+		 * WM (my_terminal_idx >= 0) keeps its old behaviour. */
+		if (task_my_terminal_idx() < 0)
+			task_exit(0);
 		return;
 	}
 	const char *path = desktop_menu_spawn_paths[item_idx];
@@ -7062,6 +7090,9 @@ main(void)
 		WM_PRINT("\n");
 		return 1;
 	}
+	WM_PRINT("oriscwm: self-registered at ");
+	WM_PRINT(path_self_register);
+	WM_PRINT("\n");
 
 	/* Phase B — load luRS from /fonts now that DIR_SLOT is up (after
 	 * self_register, before the slow per-surface setup).  Non-fatal: on any
@@ -7075,13 +7106,29 @@ main(void)
 	 * queues), framebuffer via #0x10A ObjAllocFramebuffer.
 	 * forward_console_write replies to the client's reply_cap
 	 * directly — no underlying CONSOLE service to forward to. */
-	status = alloc_local_framebuffer();
+	/* M3 co-residency: adopt the firmware's inherited framebuffer (O5) if the
+	 * boot chain forwarded one; otherwise allocate our own (separate-CPU path).
+	 * Adopting reuses the firmware's FB object = the same Tk window. */
+	if (adopt_inherited_framebuffer() == 0) {
+		WM_PRINT("oriscwm: adopted inherited framebuffer (O5) — co-resident\n");
+		/* Co-resident: there is no /sys/term terminal device — the WM owns
+		 * the display directly and mediates each app's console via
+		 * wm_open_session.  Declare "no terminal" so our sup_spawn sends
+		 * term_hint=0; otherwise handle_spawn_request dir-walks a
+		 * nonexistent /sys/term/<N>/{console,keyboard,grid} and wedges. */
+		task_set_my_terminal_idx(-1);
+		status = 0;
+	} else {
+		status = alloc_local_framebuffer();
+		if (status == 0) {
+			WM_PRINT("oriscwm: framebuffer allocated locally (");
+			WM_PRINT_INT(FB_W);
+			WM_PRINT("x");
+			WM_PRINT_INT(FB_H);
+			WM_PRINT(")\n");
+		}
+	}
 	if (status == 0) {
-		WM_PRINT("oriscwm: framebuffer allocated locally (");
-		WM_PRINT_INT(FB_W);
-		WM_PRINT("x");
-		WM_PRINT_INT(FB_H);
-		WM_PRINT(")\n");
 		/* Offscreen backing FB for the composited desktop menu surface.
 		 * Non-fatal on failure — desktop_menu_show checks the slot and
 		 * simply won't pop a menu rather than scribbling on a null FB. */

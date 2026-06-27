@@ -36,6 +36,7 @@ python3 tools/ld/orld -o "$TMP/termfw.orx" "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/
 # /programs (jail): the supervisor boot image + what it spawns at boot.
 cp build/supervisor.orx       "$TMP/jail/programs/supervisor.orx"
 cp build/programs/sysinit.orx "$TMP/jail/programs/sysinit.orx"
+cp build/oriscwm.orx          "$TMP/jail/programs/oriscwm.orx"
 cp build/programs/shell.orx   "$TMP/jail/programs/shell.orx"
 cp build/programs/login.orx   "$TMP/jail/programs/login.orx" 2>/dev/null || true
 
@@ -51,9 +52,12 @@ HF=$!; for _ in $(seq 50); do grep -q "hostfsd READY" "$TMP/hf.out" 2>/dev/null 
 # Terminal CPU: pid 0, O8 = directory (18=1@9).  Runs termfw, which hands off to
 # the co-resident supervisor.  Bounded by an alarm — the firmware idle-yields
 # forever once the supervisor is up.
+# Pass "--display tk" as $1 to watch the splash -> empty Workspace desktop come
+# up live in ONE window (the WM paints into the firmware's framebuffer).
+DISPLAY_ARG="${1:-}"
 perl -e 'alarm shift; exec @ARGV' 30 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
     --service "0=0@0" --service "0=0@0" --service "0=0@0" --service "18=1@9" --service "0=0@0" --service "0=0@0" \
-    "$TMP/termfw.orx" > "$TMP/cpu0.out" 2>&1 || true
+    $DISPLAY_ARG "$TMP/termfw.orx" > "$TMP/cpu0.out" 2>&1 || true
 
 kill -KILL $HF $DIR $BAR 2>/dev/null || true
 wait 2>/dev/null || true
@@ -61,10 +65,14 @@ wait 2>/dev/null || true
 echo "--- terminal CPU (termfw -> co-resident supervisor) ---"
 cat "$TMP/cpu0.out"
 
-grep -q "termfw: self-test PASS"          "$TMP/cpu0.out" || { echo "FAIL: no splash PASS" >&2; exit 1; }
-grep -q "termfw: system software running" "$TMP/cpu0.out" || { echo "FAIL: firmware never handed off" >&2; exit 1; }
-grep -q "supervisor: booting"             "$TMP/cpu0.out" || { echo "FAIL: supervisor didn't boot co-resident" >&2; exit 1; }
-grep -q "sysinit: online"                 "$TMP/cpu0.out" || { echo "FAIL: co-resident spawn service didn't run sysinit" >&2; exit 1; }
-if grep -q "FAIL:" "$TMP/cpu0.out"; then echo "FAIL: termfw reported a failure" >&2; exit 1; fi
+grep -q "termfw: self-test PASS"            "$TMP/cpu0.out" || { echo "FAIL: no splash PASS" >&2; exit 1; }
+grep -q "termfw: system software running"   "$TMP/cpu0.out" || { echo "FAIL: firmware never handed off" >&2; exit 1; }
+grep -q "supervisor: booting"               "$TMP/cpu0.out" || { echo "FAIL: supervisor didn't boot co-resident" >&2; exit 1; }
+grep -q "sysinit: window manager launched"  "$TMP/cpu0.out" || { echo "FAIL: sysinit didn't launch the WM" >&2; exit 1; }
+grep -q "adopted inherited framebuffer"     "$TMP/cpu0.out" || { echo "FAIL: WM didn't adopt the inherited framebuffer" >&2; exit 1; }
+grep -q "oriscwm: self-registered"          "$TMP/cpu0.out" || { echo "FAIL: WM didn't self-register" >&2; exit 1; }
+grep -q "sysinit: online"                   "$TMP/cpu0.out" && { echo "FAIL: sysinit fell back to the legacy stub (args/guard wrong)" >&2; exit 1; }
+grep -q "allocated locally"                 "$TMP/cpu0.out" && { echo "FAIL: WM opened its own framebuffer (FB forward broke)" >&2; exit 1; }
+grep -qiE "trap|capability-violation"       "$TMP/cpu0.out" && { echo "FAIL: trap occurred" >&2; exit 1; }
 
 echo "PASS"

@@ -27,12 +27,13 @@
 # single-CPU test harnesses still launch shell.orx directly (no
 # supervisor in O8 → sup_spawn falls back to orx_spawn).
 #
-# Spawned processes by `make boot`:
+# Spawned processes by `make boot` (co-resident terminal):
 #   - oriscbar  (crossbar)
-#   - oriscterm (Tk terminal, pid 16)
-#   - hostfsd   (host FS access, pid 17, jailed to repo root)
 #   - oriscdir  (directory daemon, pid 18)
-#   - 2 supervisor CPUs (pid 0 = leader with shell; pid 1 = worker)
+#   - hostfsd   (host FS access, pid 17, jailed to repo root; serves
+#               /programs + /fonts)
+#   - 1 CPU (pid 0) running termfw.orx -> supervisor -> sysinit -> window
+#     manager, all co-resident.  Apps launch from the WM's right-click menu.
 #
 # The shell announces itself with the current real-world date minus
 # 40 years (alternate-history conceit) — computed here, passed via
@@ -66,6 +67,12 @@ BANNER="Object RISC Shell ($PAST)"
 touch ouroboros/shell.c
 make -s shell SHELL_BUILD_BANNER="\"$BANNER\""
 make -s all
+
+# The co-resident chain spawns its system images from /programs (firmware ->
+# /programs/supervisor.orx; sysinit -> /programs/oriscwm.orx).  They build into
+# build/ (where the device tests consume them); mirror them into the /programs
+# view the WM-menu apps already use.
+cp -f build/supervisor.orx build/oriscwm.orx build/programs/
 
 # The hostfsd jail expects programs at /programs/. We keep build
 # artefacts under build/, so symlink the built programs in.
@@ -103,30 +110,22 @@ fi
 #   O9     = pad (supervisor allocates its own spawn mailbox here).
 #   O10    = null pad. Walked from /sys/hostfsd/0 by the supervisor.
 #
-# CPU 0 → terminal instance 0 → /sys/term/0/* → oriscterm pid 16
-# CPU 1 → terminal instance 1 → /sys/term/1/* → oriscterm pid 19
-# (the per-procid path means each CPU's walk lands on its own
-# terminal without any per-CPU configuration on the supervisor.)
-#
-# CPUs 2 + 3 = oriscwm instances (Phase 59 / WM γ.15: one per
-# terminal; Phase 60 step 3 promoted them into "terminal firmware").
-# Each WM owns its terminal's display + keyboard + pointer locally
-# via simorisc's --display tk + ObjAllocFramebuffer / ObjAllocInputSink
-# primitives — no oriscterm process in the loop anymore.  WMs
-# register at /sys/wm/<N>/0; supervisors discover their own
-# terminal's WM via wm_init (walks /sys/wm/<my_term>/0).  init-r4=N+1
-# tells the WM its terminal index.
-#
-# If a WM crashes / fails to register, the matching supervisor's
-# wm_init returns negative — there's no fallback display anymore,
-# so the system effectively halts on that terminal.  Acceptable: the
-# WM is now load-bearing rather than the always-on-but-optional
-# luxury it was pre-Phase-60.
+# Co-resident terminal: instead of separate WM CPUs that supervisors
+# discover over the wire, ONE CPU (pid 0) runs termfw.orx, which boots a
+# framebuffer + splash and orx_spawns the supervisor as a same-CPU task;
+# the supervisor spawns sysinit, which launches oriscwm -- all co-resident.
+# The WM ADOPTS the firmware's framebuffer (signalled by a non-null O5 at
+# the supervisor's boot, vs the null pad above) instead of allocating its
+# own, and owns local keyboard/pointer sinks fed by simorisc's Tk worker --
+# so the splash dissolves straight into the desktop in ONE window.  The WM
+# registers at /sys/wm/0/0; apps launch from its right-click menu.  The
+# legacy separate-CPU topology still works (guarded by the same null/non-
+# null O5 split) and lives in the device tests (test_wm_boot.sh).
+# Display: a Tk window by default; set OROS_NODISPLAY=1 for a headless boot.
+DISPLAY_OPT=",display=tk"
+[ -n "${OROS_NODISPLAY:-}" ] && DISPLAY_OPT=""
 exec python3 tools/oriscrun \
     --directory pid=18 \
     --hostfsd "pid=17,instance=0,root=$ROOT" \
-    --cpu "pid=2:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=1,display=tk" \
-    --cpu "pid=3:program=$ROOT/build/oriscwm.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,init-r4=2,display=tk" \
-    --cpu "pid=0:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
-    --cpu "pid=1:program=$ROOT/build/supervisor.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0" \
+    --cpu "pid=0:program=$ROOT/build/termfw.orx,service=0=0@0,service=0=0@0,service=0=0@0,service=18=1@9,service=0=0@0,service=0=0@0$DISPLAY_OPT" \
     --leader 0 --leader-timeout 600
