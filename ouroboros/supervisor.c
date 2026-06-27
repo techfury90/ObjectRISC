@@ -270,6 +270,15 @@ install_child_o8_override(void)
  * for ObjFetchBytes and as a sanity cap on incoming `len`. */
 #define SPAWN_REQ_MAX     256
 
+/* .orx header flags word lives at offset 0x0C (CONTRACT.md §1).  Bit 0
+ * (ORX_FLAG_LOCAL_OK) — must match tools/ld/orld's ORX_FLAG_LOCAL_OK —
+ * means "this program MAY run on the launching terminal's CPU" (P2b
+ * execution-locality opt-in).  The supervisor peeks it at spawn
+ * placement; clear (the default) routes the app to a compute CPU.
+ * ORX_HDR_PEEK is the fixed 32-byte header we read to inspect flags. */
+#define ORX_FLAG_LOCAL_OK 0x1
+#define ORX_HDR_PEEK      32
+
 /* Phase 45e — replaced map_spawn_request / unmap_spawn_request /
  * copy_cstr_from with a single ObjFetchBytes call. The new
  * primitive (#0x108) copies bytes between two object refs and
@@ -1415,6 +1424,51 @@ handle_list_tasks_request(void)
 	if (reply_status == 0) list_free_reply();
 }
 
+/* P2b: peek the .orx header at `path` and return 1 iff its flags word
+ * (offset 0x0C) has ORX_FLAG_LOCAL_OK set.  Mirrors orx_spawn's header
+ * read (vfs_open + 32-byte read + magic check) but only inspects flags.
+ * Best-effort: any open/read/magic failure returns 0 (default = compute)
+ * and the upcoming orx_spawn surfaces the real error. */
+static int
+program_is_local_ok(const char *path)
+{
+	int fd = vfs_open(path, HF_O_RDONLY);
+	if (fd < 0) return 0;
+	unsigned char hdr[ORX_HDR_PEEK];
+	int n = vfs_read(fd, (char *)hdr, ORX_HDR_PEEK);
+	vfs_close(fd);
+	if (n != ORX_HDR_PEEK) return 0;
+	if (hdr[0] != 'O' || hdr[1] != 'R' || hdr[2] != 'I' ||
+	    hdr[3] != 'S' || hdr[4] != 'C') return 0;
+	unsigned int flags = ((unsigned int)hdr[0x0C] << 24)
+	                   | ((unsigned int)hdr[0x0D] << 16)
+	                   | ((unsigned int)hdr[0x0E] << 8)
+	                   |  (unsigned int)hdr[0x0F];
+	return (flags & ORX_FLAG_LOCAL_OK) ? 1 : 0;
+}
+
+/* P2b: is the program named by the pending spawn request flagged
+ * LOCAL_OK?  The request bytes ref is parked in RELAY_BYTES_SLOT (O2
+ * stashed at the top of handle_spawn_request); load it, ObjFetchBytes
+ * the payload, take the first NUL-terminated field (the path), and peek
+ * its header.  Self-contained: it reads from the slot (left intact) and
+ * clobbers only OPRs the caller restores from slots anyway, so it can
+ * run before the placement decision without disturbing the relay /
+ * local-spawn OR dance. */
+static int
+request_is_local_ok(int len)
+{
+	if (len <= 0 || len > SPAWN_REQ_MAX) return 0;
+	asm volatile("orefld o2, %0(o12)"
+	             :: "i"(RELAY_BYTES_SLOT_OFFSET) : "r1");
+	unsigned char buf[SPAWN_REQ_MAX];
+	if (read_spawn_request(buf, len) != 0) return 0;
+	char path[128];
+	const char *p = (const char *)buf;
+	copy_cstr_from(&p, path, sizeof(path));
+	return program_is_local_ok(path);
+}
+
 /* Service one spawn request that just landed on our queue. The
  * dequeue has filled:
  *   R3 = op          (1 = spawn)
@@ -1494,7 +1548,14 @@ handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 	 * literal target_pid == self_procid also stays local (handled
 	 * by the explicit-relay branch above missing on equality). */
 	if (target_pid == TARGET_PID_ANY) {
-		int picked = pick_next_cpu(self_procid);
+		/* P2b: a co-resident terminal keeps a LOCAL_OK program on its own
+		 * CPU (the launching terminal) instead of round-robining it to a
+		 * compute CPU — the per-program execution-locality opt-in.  Every
+		 * other case (not a terminal, or program not LOCAL_OK) defaults to
+		 * the compute CPUs via pick_next_cpu.  The && short-circuits, so
+		 * compute supervisors never pay the header peek. */
+		int local_ok = sup_coresident && request_is_local_ok(len);
+		int picked = local_ok ? self_procid : pick_next_cpu(self_procid);
 		if (picked != self_procid) {
 			asm volatile(
 				"orefld o2, %0(o12)\n"

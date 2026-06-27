@@ -21,7 +21,7 @@ architecture's endianness convention from Volume I).
 |--------|------|------------------------------------------------------|
 | `0x00` | 8    | Magic: ASCII bytes `O R I S C` followed by three NULs (`0x4F 0x52 0x49 0x53 0x43 0x00 0x00 0x00`) |
 | `0x08` | 4    | Format version, currently `1`                        |
-| `0x0C` | 4    | Flags, currently `0`                                 |
+| `0x0C` | 4    | Flags (bitfield, see below); `0` if none set          |
 | `0x10` | 4    | Entry offset within the text section, in bytes       |
 | `0x14` | 4    | Text section size, in bytes                          |
 | `0x18` | 4    | Data section size, in bytes (may be zero)            |
@@ -32,6 +32,17 @@ architecture's endianness convention from Volume I).
 Total file size is `0x20 + T + D`. The header is exactly 32 bytes.
 Text size must be a multiple of 4. Data size has no alignment
 requirement.
+
+**Flags (`0x0C`).** A big-endian bitfield. Defined bits:
+
+| Bit | Name | Meaning |
+|-----|------|---------|
+| `0` (`0x1`) | `LOCAL_OK` | The program MAY run on the launching terminal's CPU instead of the default compute CPU — the execution-locality opt-in. The supervisor reads this at spawn placement; set it with `orld --local-ok`. |
+
+All other bits are reserved and must be `0`. The constant lives in both
+`tools/ld/orld` (`ORX_FLAG_LOCAL_OK`, the writer) and
+`ouroboros/supervisor.c` (`ORX_FLAG_LOCAL_OK`, the reader) — there is no
+shared definition, so keep these and this table in sync.
 
 The assembler produces this format. The simulator consumes it. A
 loader that finds a magic mismatch, an unsupported version, or a
