@@ -62,6 +62,7 @@
 #define WM_OP_QUERY_GEOMETRY     5
 #define WM_OP_SET_TITLE          6
 #define WM_OP_FONT_OPEN          7
+#define WM_OP_MEASURE_TEXT       8
 
 /* WM error codes — also surface in liborisc.h. Mirrored locally for
  * the no-WM fallback short-circuit. */
@@ -84,6 +85,9 @@
 
 /* font_open name cap — must match oriscwm.c's FONT_NAME_MAX. */
 #define WM_FONT_NAME_MAX          32
+
+/* wm_measure_text run cap — must match oriscwm.c's WM_MEASURE_MAX. */
+#define WM_MEASURE_MAX            128
 
 /* Mailbox caps: R|W|S|V|C (== 0x5b) — same as the other clients' service
  * mailboxes. */
@@ -387,6 +391,34 @@ font_open(const char *name)
 	if (wm_send_recv(OBJ_SRC_STACK, WM_OP_FONT_OPEN, 0, packed, rep) != 0)
 		return -1;
 	return rep[0];   /* R3 = id (>=0) or -errno */
+}
+
+/* wm_measure_text: ask the WM for the pixel width of `s` in face `face` (a
+ * FONT_FACE_* id or a font_open id).  Lets a client lay out / wrap PROPORTIONAL
+ * text, which it can't measure itself — only the WM holds the width tables.
+ * Same stack-copy + blocking-reply shape as font_open.  Returns the width in px
+ * (>=0), or a negative WM error. */
+int
+wm_measure_text(int face, const char *s)
+{
+	int rc = wm_ensure();
+	if (rc != 0) return rc;
+
+	char buf[WM_MEASURE_MAX];
+	int len = 0;
+	while (len < WM_MEASURE_MAX && s[len] != '\0') {
+		buf[len] = s[len];
+		len++;
+	}
+	if (len >= WM_MEASURE_MAX) return -1;   /* too long to measure in one call */
+	if (len == 0) return 0;                  /* empty run = 0 px */
+	int stack_off = (int)((unsigned int)buf - STACK_BOTTOM);
+	int packed = ((len & 0xFFFF) << 16) | (stack_off & 0xFFFF);
+
+	int rep[4];
+	if (wm_send_recv(OBJ_SRC_STACK, WM_OP_MEASURE_TEXT, face, packed, rep) != 0)
+		return -1;
+	return rep[0];   /* R3 = width in px (>=0) or -errno */
 }
 
 /* OP_SUBSCRIBE_EVENTS. Milestone-2 stub with no callers; events don't
