@@ -849,6 +849,18 @@ static int           drag_start_x, drag_start_y;
 static int           drag_window_x, drag_window_y;
 static int           drag_outline_x, drag_outline_y;
 
+/* OPEN LOOK scrollbar interaction state.  window_sb_elev[wid-1] is the
+ * elevator's top in window-LOCAL px, clamped to [SB_ELEV_MIN, SB_ELEV_MAX].
+ * The sb_drag_* trio mirrors the window-move drag above (grab the elevator,
+ * keep the grab point under the pointer).  Decorative for now — the WM keeps
+ * no scrollback, so moving the elevator scrolls nothing; a client (the
+ * Markdown viewer) will eventually drive + read this. */
+static int           window_sb_elev[MAX_WINDOWS];
+static int           sb_drag_active;
+static int           sb_drag_wid;
+static int           sb_drag_grab_off;   /* py(screen) − elevator-top(screen) at grab */
+static int           sb_arrow_dir;       /* 0=none, 1=up / 2=down line-arrow pressed (selected look) */
+
 /* Phase 60 step 8 / step 22 — per-window title bar text storage.
  * Was a single shared buffer through step 21; step 22 added title-bar
  * repaints on focus change (set_focus / refocus_to_topmost), which
@@ -2561,6 +2573,35 @@ paint_window_face(void)
 	fill_rect_window(c_xy, c_wh, WM_BG_COLOR);
 }
 
+/* Scrollbar geometry (window-LOCAL px) — one source of truth shared by
+ * paint_scrollbar, point_in_scrollbar and the elevator drag. */
+#define SB_X        (CONTENT_X_OFF_PX + CELL_AREA_W_PX + 1)   /* 649 — just right of content */
+#define SB_BODY_W   (SCROLLBAR_W_PX - 2)                       /* 14 — elevator/anchor width */
+#define SB_TOP      CONTENT_Y_OFF_PX                           /* 32 — track top */
+#define SB_BOT      (CONTENT_Y_OFF_PX + CELL_AREA_H_PX)        /* 416 — track bottom */
+#define SB_ANCH     6                                          /* short cable-end cap (Sun ref ≈6px) */
+#define SB_CABLE_OFF 6                                         /* cable x within the body (centred-ish) */
+#define SB_CABLE_W   3                                         /* thin dark cable (Sun ref ≈3px) */
+#define SB_CY0      (SB_TOP + SB_ANCH + 2)                     /* 40 — cable top (elevator min) */
+#define SB_CY1      (SB_BOT - SB_ANCH - 2)                     /* 408 — cable bottom */
+#define SB_ELEV_H   47                                         /* fixed elevator height */
+#define SB_ELEV_MIN SB_CY0                                     /* 40 */
+#define SB_ELEV_MAX (SB_CY1 - SB_ELEV_H)                       /* 361 */
+#define SB_PAGE     (SB_ELEV_H + 8)                            /* cable page step ≈ one elevator */
+#define SB_THIRD    (SB_ELEV_H / 3)                            /* 15 — elevator third (line/drag/line) */
+#define SB_LINE     6                                          /* line step (decorative; no scrollback) */
+
+/* point_in_scrollbar region codes.  The elevator splits into thirds: top =
+ * line-up arrow, middle = drag, bottom = line-down arrow (OPEN LOOK). */
+#define SB_HIT_NONE 0
+#define SB_HIT_ELEV 1   /* elevator MIDDLE third → drag */
+#define SB_HIT_UP   2   /* cable above the elevator → page up */
+#define SB_HIT_DOWN 3   /* cable below the elevator → page down */
+#define SB_HIT_TOP  4   /* top anchor → to start */
+#define SB_HIT_BOT  5   /* bottom anchor → to end */
+#define SB_HIT_LINEUP   6   /* elevator TOP third → line up */
+#define SB_HIT_LINEDOWN 7   /* elevator BOTTOM third → line down */
+
 /* OPEN LOOK vertical scrollbar glyphs (olgl).  The elevator emboss is just TWO
  * glyphs: cp 54 (WHITE highlight) and cp 55 (BG3 shadow) — and cp 55 already
  * carries BOTH the up + down line arrows AND the third-divider lines, so there
@@ -2584,40 +2625,49 @@ static const unsigned char sb_dimp_lr[] = { 197, 0 };
  * SCROLLBAR_W_PX column right of the content).  Anchors + elevator are
  * draw_bevel_box (RAISED gray-group bevels); the cable is a BG2 fill; the
  * elevator emboss + arrows + drag dimple are olgl glyphs via cap_glyph.
- * Stage A: the elevator sits at the top (a decorative position indicator);
- * the functional offset/proportion arrives with the client scroll-state op.
- * Targets the ACTIVE window FB — caller set_active_window's first. */
+ * The elevator position is window_sb_elev[active_wid-1] (the drag/page model);
+ * the whole track is erased to the window face first so a moved elevator leaves
+ * no ghost.  Targets the ACTIVE window FB — caller set_active_window's first. */
 static void
 paint_scrollbar(void)
 {
-	int sx   = CONTENT_X_OFF_PX + CELL_AREA_W_PX + 1;   /* just right of content */
-	int sw   = SCROLLBAR_W_PX - 2;                       /* 14px body */
-	int top  = CONTENT_Y_OFF_PX;
-	int bot  = CONTENT_Y_OFF_PX + CELL_AREA_H_PX;
-	int anch = 9;                                       /* subtle cable-end caps */
-	int cy0  = top + anch + 2, cy1 = bot - anch - 2;
-	int cable_x = sx + 4, cable_w = sw - 8;
-	int elev_y = cy0;                                   /* Stage A: at the start */
-	int dy   = elev_y + 15;                             /* drag-box → middle third */
+	int elev_y   = window_sb_elev[active_wid - 1];
+	int selected = (sb_drag_active && sb_drag_wid == active_wid);
+	int arrow    = (sb_arrow_dir && sb_drag_wid == active_wid) ? sb_arrow_dir : 0;
 
-	draw_bevel_box(((sx & 0xFFFF) << 16) | (top & 0xFFFF),
-	               ((sw & 0xFFFF) << 16) | (anch & 0xFFFF), BEVEL_RAISED | BEVEL_FILL);
-	draw_bevel_box(((sx & 0xFFFF) << 16) | ((bot - anch) & 0xFFFF),
-	               ((sw & 0xFFFF) << 16) | (anch & 0xFFFF), BEVEL_RAISED | BEVEL_FILL);
-	if (cy1 > cy0)
-		fill_rect_window(((cable_x & 0xFFFF) << 16) | (cy0 & 0xFFFF),
-		                 ((cable_w & 0xFFFF) << 16) | ((cy1 - cy0) & 0xFFFF), WM_FACE_BG2);
-	/* elevator: BG1 face, then the olgl emboss (cp 54/55 carry the 3D edges, the
-	 * up + down arrows and the dividers) + the recessed drag-box & dimple. */
-	fill_rect_window(((sx & 0xFFFF) << 16) | (elev_y & 0xFFFF),
-	                 ((sw & 0xFFFF) << 16) | (47 & 0xFFFF), WM_FACE_BG1);
-	cap_glyph(sx, elev_y, sb_elev_hi, WM_FACE_WHITE);
-	cap_glyph(sx, elev_y, sb_elev_lo, WM_FACE_BG3);
-	cap_glyph(sx, dy, sb_box_ul,  WM_FACE_BG3);
-	cap_glyph(sx, dy, sb_box_lr,  WM_FACE_WHITE);
-	cap_glyph(sx, dy, sb_dimp_f,  WM_FACE_BG2);
-	cap_glyph(sx, dy, sb_dimp_ul, WM_OL_BLACK);
-	cap_glyph(sx, dy, sb_dimp_lr, WM_FACE_WHITE);
+	/* erase the whole travel column to the window face, then the thin DARK
+	 * cable, then the elevator over it — the elevator (14) is wider than the
+	 * cable (3), so only a full-width erase clears its old footprint. */
+	fill_rect_window(((SB_X & 0xFFFF) << 16) | (SB_CY0 & 0xFFFF),
+	                 ((SB_BODY_W & 0xFFFF) << 16) | ((SB_CY1 - SB_CY0) & 0xFFFF), WM_FACE_BG1);
+	draw_bevel_box(((SB_X & 0xFFFF) << 16) | (SB_TOP & 0xFFFF),
+	               ((SB_BODY_W & 0xFFFF) << 16) | (SB_ANCH & 0xFFFF), BEVEL_RAISED | BEVEL_FILL);
+	draw_bevel_box(((SB_X & 0xFFFF) << 16) | ((SB_BOT - SB_ANCH) & 0xFFFF),
+	               ((SB_BODY_W & 0xFFFF) << 16) | (SB_ANCH & 0xFFFF), BEVEL_RAISED | BEVEL_FILL);
+	fill_rect_window((((SB_X + SB_CABLE_OFF) & 0xFFFF) << 16) | (SB_CY0 & 0xFFFF),
+	                 ((SB_CABLE_W & 0xFFFF) << 16) | ((SB_CY1 - SB_CY0) & 0xFFFF), WM_FACE_BG3);
+	/* elevator: BG1 face + the olgl emboss (cp 54/55 = 3D edges + up/down arrows
+	 * + the two dividers → the 3-box look).  The recessed drag-box + dimple are
+	 * the SELECTED (being-dragged) indicator — unselected leaves the middle box
+	 * empty, as the Sun original does. */
+	fill_rect_window(((SB_X & 0xFFFF) << 16) | (elev_y & 0xFFFF),
+	                 ((SB_BODY_W & 0xFFFF) << 16) | (SB_ELEV_H & 0xFFFF), WM_FACE_BG1);
+	cap_glyph(SB_X, elev_y, sb_elev_hi, WM_FACE_WHITE);
+	cap_glyph(SB_X, elev_y, sb_elev_lo, WM_FACE_BG3);
+	if (selected) {
+		/* drag: recessed box + dimple in the MIDDLE third */
+		int dy = elev_y + SB_THIRD;
+		cap_glyph(SB_X, dy, sb_box_ul,  WM_FACE_BG3);
+		cap_glyph(SB_X, dy, sb_box_lr,  WM_FACE_WHITE);
+		cap_glyph(SB_X, dy, sb_dimp_f,  WM_FACE_BG2);
+		cap_glyph(SB_X, dy, sb_dimp_ul, WM_OL_BLACK);
+		cap_glyph(SB_X, dy, sb_dimp_lr, WM_FACE_WHITE);
+	} else if (arrow) {
+		/* line-arrow pressed: recessed box on its third (the arrow shows in it) */
+		int dy = (arrow == 1) ? elev_y : elev_y + 2 * SB_THIRD;
+		cap_glyph(SB_X, dy, sb_box_ul, WM_FACE_BG3);
+		cap_glyph(SB_X, dy, sb_box_lr, WM_FACE_WHITE);
+	}
 }
 
 /* Phase 60 step 3 superseded subscribe_term_pointer (the
@@ -3415,6 +3465,7 @@ handle_new_window(int wtype)
 	 * to fill it in.  Reset this wid's title slot in case the id was
 	 * recycled from a destroyed window. */
 	window_title_lens[wid - 1] = 0;
+	window_sb_elev[wid - 1] = SB_ELEV_MIN;   /* elevator starts at the top */
 	paint_title_bar();
 	paint_scrollbar();   /* OPEN LOOK vertical scrollbar in the right gutter */
 
@@ -5721,6 +5772,82 @@ point_in_menu_button(int wid, int px, int py)
 	return (px >= bx_lo && px < bx_hi && py >= by_lo && py < by_hi);
 }
 
+/* Which region of wid's scrollbar is under (px,py) (screen px)?  The elevator
+ * is the drag zone; the cable above/below it pages; the anchors jump to the
+ * ends.  Returns SB_HIT_* or SB_HIT_NONE. */
+static int
+point_in_scrollbar(int wid, int px, int py)
+{
+	int lx = px - window_pos_x[wid - 1];           /* window-local */
+	int ly = py - window_pos_y[wid - 1];
+	int elev_y = window_sb_elev[wid - 1];
+	if (lx < SB_X || lx >= SB_X + SB_BODY_W) return SB_HIT_NONE;
+	if (ly < SB_TOP || ly >= SB_BOT)         return SB_HIT_NONE;
+	if (ly < SB_TOP + SB_ANCH)               return SB_HIT_TOP;
+	if (ly >= SB_BOT - SB_ANCH)              return SB_HIT_BOT;
+	if (ly >= elev_y && ly < elev_y + SB_ELEV_H) {
+		if (ly < elev_y + SB_THIRD)      return SB_HIT_LINEUP;
+		if (ly < elev_y + 2 * SB_THIRD)  return SB_HIT_ELEV;
+		return SB_HIT_LINEDOWN;
+	}
+	return (ly < elev_y) ? SB_HIT_UP : SB_HIT_DOWN;
+}
+
+/* Repaint just wid's scrollbar column and composite it to screen (the elevator
+ * moved).  Leaves active_wid = wid, like the other chrome repaints. */
+static void
+sb_repaint(int wid)
+{
+	set_active_window(wid);
+	paint_scrollbar();
+	composite_window_region(SB_X, SB_TOP, SCROLLBAR_W_PX, SB_BOT - SB_TOP);
+}
+
+/* A SELECT-press on wid's scrollbar region `hit`: grab the elevator (middle
+ * third → drag), line-step on the arrow thirds, page on the cable, or jump to
+ * an end on an anchor.  The arrow thirds also light their box (selected look)
+ * until release. */
+static void
+sb_press(int wid, int hit, int px, int py)
+{
+	int elev = window_sb_elev[wid - 1];
+	if (hit == SB_HIT_ELEV) {
+		sb_drag_active   = 1;
+		sb_drag_wid      = wid;
+		sb_drag_grab_off = py - (window_pos_y[wid - 1] + elev);
+		sb_repaint(wid);   /* show the selected (dimple) look on grab */
+		return;
+	}
+	if      (hit == SB_HIT_LINEUP)   { elev -= SB_LINE; sb_drag_wid = wid; sb_arrow_dir = 1; }
+	else if (hit == SB_HIT_LINEDOWN) { elev += SB_LINE; sb_drag_wid = wid; sb_arrow_dir = 2; }
+	else if (hit == SB_HIT_TOP)  elev = SB_ELEV_MIN;
+	else if (hit == SB_HIT_BOT)  elev = SB_ELEV_MAX;
+	else if (hit == SB_HIT_UP)   elev -= SB_PAGE;
+	else if (hit == SB_HIT_DOWN) elev += SB_PAGE;
+	if (elev < SB_ELEV_MIN) elev = SB_ELEV_MIN;
+	if (elev > SB_ELEV_MAX) elev = SB_ELEV_MAX;
+	/* always repaint — the arrow press must show its selected box even when the
+	 * elevator is already pinned to the travel limit. */
+	window_sb_elev[wid - 1] = elev;
+	sb_repaint(wid);
+}
+
+/* Elevator drag motion: keep the grab point under the pointer, clamped to the
+ * cable travel.  Repaints only on an actual move. */
+static void
+sb_motion(int px, int py)
+{
+	int wid = sb_drag_wid;
+	int elev;
+	if (wid < 1 || wid > MAX_WINDOWS) { sb_drag_active = 0; return; }
+	elev = (py - sb_drag_grab_off) - window_pos_y[wid - 1];
+	if (elev < SB_ELEV_MIN) elev = SB_ELEV_MIN;
+	if (elev > SB_ELEV_MAX) elev = SB_ELEV_MAX;
+	if (elev == window_sb_elev[wid - 1]) return;
+	window_sb_elev[wid - 1] = elev;
+	sb_repaint(wid);
+}
+
 /* Phase 60 step 19 — lazy supervisor cap acquisition.  WM boots with
  * O8 = oriscdir cap (parked into BOOT_PARENT_SLOT_OFFSET / SUP_SLOT
  * at task_init).  The desktop menu wants to use libc's sup_spawn,
@@ -6233,6 +6360,7 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 	}
 
 	if (evt_type == PTR_EVT_MOTION) {
+		if (sb_drag_active) { sb_motion(px, py); return 1; }
 		if (!drag_active) return 0;
 		if (drag_wid < 1 || drag_wid > MAX_WINDOWS) {
 			drag_active = 0;
@@ -6283,12 +6411,23 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 			draw_outline(drag_outline_x, drag_outline_y, USABLE_W_PX, USABLE_H_PX);
 			return 1;
 		}
+		int sbhit = point_in_scrollbar(t, px, py);
+		if (sbhit != SB_HIT_NONE) {
+			sb_press(t, sbhit, px, py);
+			return 1;
+		}
 		/* Click in a non-title region: raise but let the
 		 * subscriber see the click. */
 		return 0;
 	}
 
 	if (evt_type == PTR_EVT_UP) {
+		if ((sb_drag_active || sb_arrow_dir) && button == PTR_BTN_LEFT) {
+			sb_drag_active = 0;
+			sb_arrow_dir   = 0;
+			sb_repaint(sb_drag_wid);   /* clear the selected look on release */
+			return 1;
+		}
 		if (drag_active && button == PTR_BTN_LEFT) {
 			erase_outline(drag_outline_x, drag_outline_y, USABLE_W_PX, USABLE_H_PX);
 			int idx = drag_wid - 1;
