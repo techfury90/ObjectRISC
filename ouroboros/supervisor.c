@@ -1828,6 +1828,19 @@ main(void)
 	int procid    = read_procid();
 	int is_leader = (procid == 0);
 
+	/* M3 co-residency detector.  termfw forwards its display-backed framebuffer
+	 * into our O5; every legacy boot leaves O5 a NULL pad at boot and walks
+	 * /sys/term for a console (boot.sh, wm_boot, and session_manager all follow
+	 * this walk-don't-wire convention).  So a non-null O5 at boot = the
+	 * framebuffer = co-resident.  OISN is the ONLY O5 probe that's safe here:
+	 * otag/ohome TRAP on a remote ref, and a wired console lives on another pid —
+	 * but the null/non-null split is all we need given the convention.  When
+	 * co-resident, sysinit is the WM launcher and we skip the /sys/term walks +
+	 * the login spawn. */
+	int coresident;
+	asm volatile("oisn %0, o5" : "=r"(coresident));
+	coresident = !coresident;   /* OISN sets 1 when O5 is null */
+
 	/* Phase 51: declare our terminal_idx (procid in the current
 	 * model) so children spawned via orx_spawn inherit it through
 	 * the R5 → child.R4 → _orisc_init_r4 chain, and so any future
@@ -1880,20 +1893,25 @@ main(void)
 	{
 		char path[PEER_PATH_BUF_SIZE];
 
-		render_term_path(procid, "console", path);
-		if (sup_walk_for_opr(path) == 0)
-			asm volatile("orefld o5, %0(o12)"
-			             :: "i"(DIR_RESULT_SLOT_OFFSET));
+		/* M3: skip the /sys/term console/keyboard/grid walks when co-resident —
+		 * the WM (launched by sysinit) owns the terminal, and walking the console
+		 * into O5 would overwrite the framebuffer cap termfw forwarded there. */
+		if (!coresident) {
+			render_term_path(procid, "console", path);
+			if (sup_walk_for_opr(path) == 0)
+				asm volatile("orefld o5, %0(o12)"
+				             :: "i"(DIR_RESULT_SLOT_OFFSET));
 
-		render_term_path(procid, "keyboard", path);
-		if (sup_walk_for_opr(path) == 0)
-			asm volatile("orefld o6, %0(o12)"
-			             :: "i"(DIR_RESULT_SLOT_OFFSET));
+			render_term_path(procid, "keyboard", path);
+			if (sup_walk_for_opr(path) == 0)
+				asm volatile("orefld o6, %0(o12)"
+				             :: "i"(DIR_RESULT_SLOT_OFFSET));
 
-		render_term_path(procid, "grid", path);
-		if (sup_walk_for_opr(path) == 0)
-			asm volatile("orefld o7, %0(o12)"
-			             :: "i"(DIR_RESULT_SLOT_OFFSET));
+			render_term_path(procid, "grid", path);
+			if (sup_walk_for_opr(path) == 0)
+				asm volatile("orefld o7, %0(o12)"
+				             :: "i"(DIR_RESULT_SLOT_OFFSET));
+		}
 
 		if (sup_walk_for_opr("/sys/hostfsd/0") == 0)
 			asm volatile("orefld o10, %0(o12)"
@@ -2047,7 +2065,29 @@ main(void)
 	 * late-boot setup work that's CPU-local (i.e., something a
 	 * directory mutation can't express). */
 	if (is_leader) {
-		task_t sysinit = sup_spawn_named(SYSINIT_PATH, "", "/");
+		/* M3: when co-resident, sysinit is the WM launcher.  Hand it O8=directory
+		 * (so it can orx_spawn the WM) + O5=framebuffer (to forward to the WM),
+		 * and signal the launcher role via args="wm".  Restore the spawn-mailbox
+		 * child-O8 + clear child-O5 afterward so later spawns are unaffected. */
+		const char *si_args = "";
+		if (coresident) {
+			asm volatile(
+				"orefld o1, %0(o12)\n"   /* DIR_SLOT (directory) */
+				"orefst o1, %1(o12)\n"   /* -> ORX_SLOT_CHILD_O8 (was spawn-mailbox) */
+				"orefst o5, %2(o12)"     /* O5 (framebuffer) -> ORX_SLOT_CHILD_O5 */
+				:
+				: "i"(DIR_SLOT_OFFSET),
+				  "i"(ORX_SLOT_CHILD_O8_OFFSET),
+				  "i"(ORX_SLOT_CHILD_O5_OFFSET)
+				: "r1");
+			si_args = "wm";
+		}
+		task_t sysinit = sup_spawn_named(SYSINIT_PATH, si_args, "/");
+		if (coresident) {
+			install_child_o8_override();   /* restore spawn-mailbox child-O8 */
+			asm volatile("onull o1\n orefst o1, %0(o12)"
+			             :: "i"(ORX_SLOT_CHILD_O5_OFFSET) : "r1");
+		}
 		if (sysinit < 0) {
 			SUP_PRINT("supervisor: failed to spawn sysinit: ");
 			SUP_PRINT_INT((int)sysinit);
@@ -2089,7 +2129,7 @@ main(void)
 	 * become shell hosts. In a single-terminal config (existing test
 	 * harnesses that wire term to procid 0 only, null pads for procid
 	 * 1) that collapses to the prior behaviour. */
-	if (has_terminal) {
+	if (has_terminal && !coresident) {
 		/* Phase 47: workers race the leader's /programs mount (now
 		 * done by sysinit.orx — see the leader-only block above).
 		 * If we try to spawn login before /programs is mounted in

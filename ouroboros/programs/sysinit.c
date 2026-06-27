@@ -33,6 +33,18 @@ main(void)
 
 	task_init();
 
+	/* Act as the launcher only when the supervisor invoked us with args="wm"
+	 * (the co-resident boot).  In the legacy separate-CPU boot we're spawned with
+	 * empty args and stay the historical one-shot "online" stub — no WM launch,
+	 * no directory cap to misuse. */
+	{
+		const char *a = program_args();
+		if (!(a[0] == 'w' && a[1] == 'm' && a[2] == '\0')) {
+			SP("sysinit: online\n");
+			return 0;
+		}
+	}
+
 	/* Stash the inherited framebuffer (O5) into ORX_SLOT_CHILD_O5 NOW, before
 	 * any later step could clobber the passthrough OPR — we relay it to the WM.
 	 * If no FB was forwarded (O5 null), this forwards null and the WM falls back
