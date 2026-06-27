@@ -592,6 +592,63 @@ relay_spawn_request(int len, int target_pid, int term_hint_plus_one)
 	return 0;
 }
 
+/* Highest procid we scan when iterating CPUs (round-robin pick + the
+ * P2c cull broadcast). */
+#define MAX_PROCID 16
+
+/* P2c: fire-and-forget SEND a cull (op=3) for `origin` (= terminal idx
+ * + 1) to the peer supervisor whose mailbox sub-cap is already in O1
+ * (loaded by the caller from DIR_RESULT_SLOT).  No payload, no reply —
+ * the async-SEND buffer-lifetime race can't apply (nothing to fetch).
+ * Mirrors relay_spawn_request's SEND: op in R4, origin in R7 (the +1
+ * register shift lands them in the receiver's R3/R6 = op/term_hint).
+ * O2..O4 are nulled so the message carries no stale object refs. */
+static void
+send_cull_to_o1(int origin)
+{
+	asm volatile(
+		"onull  o2\n"
+		"onull  o3\n"
+		"onull  o4\n"
+		"addiu  r4, r0, 3\n"        /* op = SUP_OP_CULL_TERM */
+		"addiu  r5, r0, 0\n"
+		"addiu  r6, r0, 0\n"
+		"addu   r7, %0, r0\n"       /* origin = terminal idx + 1 (rides term_hint) */
+		"send   o1\n"
+		:
+		: "r"(origin)
+		: "r4", "r5", "r6", "r7"
+	);
+}
+
+/* P2c: broadcast a cull for `origin` to every peer supervisor.  Walks
+ * /sys/cpu/<N>/supervisor for each candidate (skipping self — our own
+ * tasks die in the op=2 cascade-kill) with a single non-retrying
+ * dir_walk and fire-and-forget SENDs op=3.  Called from the End Session
+ * (op=2) path on a co-resident terminal so the apps it round-robined
+ * onto compute CPUs don't outlive it.  Fire-and-forget over the crossbar
+ * survives our subsequent halt: once SENT, delivery is independent of
+ * this CPU.  Sending to a peer that's also a terminal is harmless (it
+ * has no tasks tagged with our origin). */
+static void
+broadcast_cull_to_peers(int origin, int self_procid)
+{
+	if (origin <= 0) return;
+	int i;
+	for (i = 0; i < MAX_PROCID; i++) {
+		if (i == self_procid) continue;
+		char path[PEER_PATH_BUF_SIZE];
+		render_peer_path(i, path);
+		int kind;
+		char rem[16];
+		int rc = dir_walk(path, &kind, rem, sizeof(rem));
+		if (rc < 0 || kind != DIR_KIND_LEAF) continue;
+		asm volatile("orefld o1, %0(o12)"
+		             :: "i"(DIR_RESULT_SLOT_OFFSET) : "r1");
+		send_cull_to_o1(origin);
+	}
+}
+
 /* Phase 51: round-robin counter, one per supervisor. Initialised in
  * main() to (procid + 1) so the first relay from this supervisor
  * lands on the next live CPU (typically a peer, not self), giving
@@ -608,7 +665,6 @@ relay_spawn_request(int len, int target_pid, int term_hint_plus_one)
  * /sys/term/<N>/* to inject the requester's terminal into the
  * child's OPRs. (R7 == 0 → no info → stay local; preserves the
  * Phase-49 contract.) */
-#define MAX_PROCID 16
 static int next_cpu_counter;
 
 /* Set at boot when this supervisor is co-resident with a WM on the same CPU
@@ -629,6 +685,12 @@ static int sup_coresident;
 #define TASK_NAME_MAX 24
 #define TASK_NAME_SLOTS 16
 static char task_names[TASK_NAME_SLOTS * TASK_NAME_MAX];
+
+/* P2c: per-task originating-terminal tag, indexed by libc task_t in
+ * lockstep with task_names.  Stores term_hint (the terminal's idx + 1;
+ * 0 = no terminal), so a terminal's End Session can cull exactly the
+ * apps it round-robined onto a compute CPU.  Zero-init = untagged. */
+static int task_term_origin[TASK_NAME_SLOTS];
 
 /* Find the last '/' in `path` and return the byte after it (i.e.,
  * basename). For "/programs/shell.orx" returns "shell.orx"; for
@@ -1024,7 +1086,31 @@ reap_exited_tasks(void)
 		if (info.state != TASK_STATE_EXITED) continue;
 		(void)orx_unload((task_t)t);
 		task_names[t * TASK_NAME_MAX] = '\0';
+		task_term_origin[t] = 0;
 	}
+}
+
+
+/* P2c: cull every live child task tagged with `origin` (= the
+ * originating terminal's idx + 1, the same value stashed at spawn from
+ * term_hint).  Used by op=3 when a peer terminal ends its session and
+ * asks us to reap the apps it round-robined onto this CPU.  Mirrors the
+ * op=2 cascade-kill but filtered by origin, then reaps so the freed
+ * slots are immediately reusable.  Returns the number killed. */
+static int
+cull_tasks_for_terminal(int origin)
+{
+	if (origin <= 0) return 0;
+	unsigned int mask = task_active_mask();
+	int t, n = 0;
+	for (t = 0; t < TASK_NAME_SLOTS; t++) {
+		if (!(mask & (1u << t))) continue;
+		if (task_term_origin[t] != origin) continue;
+		(void)task_kill((task_t)t, 137);
+		n++;
+	}
+	if (n) reap_exited_tasks();
+	return n;
 }
 
 
@@ -1053,6 +1139,7 @@ reap_exited_tasks(void)
  * The shell adds a "CPU N:" header when printing. */
 
 #define SUP_OP_LIST_TASKS  5
+#define SUP_OP_CULL_TERM   3   /* P2c: cull tasks by originating terminal */
 #define LIST_REPLY_VA      0x00600000   /* matches sup_pack_request's
                                          * scratch VA — only one
                                          * MapObject lives there at a
@@ -1482,6 +1569,9 @@ handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 
 	task_t t = sup_spawn_named(path, args, cwd);
 	int status = (t < 0) ? (int)t : 0;
+	/* P2c: tag the child with its originating terminal so End Session
+	 * can cull it.  term_hint is already idx+1 (0 = no terminal). */
+	if (t >= 0 && t < TASK_NAME_SLOTS) task_term_origin[t] = term_hint;
 
 	/* Always clear the per-spawn overrides after orx_spawn so a
 	 * subsequent local spawn (no hint) doesn't pick up stale
@@ -1957,6 +2047,12 @@ main(void)
 			 * fine here — the cascade-kill below (task_active_mask +
 			 * task_kill) loads everything it needs from the task table,
 			 * not from inherited ORs. */
+			/* P2c: if we're a terminal (co-resident), cull the apps we
+			 * round-robined onto the compute CPUs before we halt — they
+			 * are orphaned otherwise.  Fire-and-forget op=3 to every
+			 * peer; our own local tasks die in the cascade-kill below. */
+			if (sup_coresident)
+				broadcast_cull_to_peers(task_my_terminal_idx() + 1, procid);
 			{
 				char unreg_path[PEER_PATH_BUF_SIZE];
 				render_peer_path(procid, unreg_path);
@@ -1974,6 +2070,11 @@ main(void)
 			 * halts, so no relay to a peer is needed. */
 			SUP_PRINT(shell_done);
 			return 0;
+		} else if (op == SUP_OP_CULL_TERM) {
+			/* P2c: a peer terminal ended its session and is asking us to
+			 * reap the apps it round-robined onto this CPU.  The origin
+			 * (= terminal idx+1) rides in term_hint.  Fire-and-forget. */
+			cull_tasks_for_terminal(term_hint);
 		} else if (op == 4) {
 			/* SUP_OP_GET_DIR (Phase 45g): a child program's dir.c
 			 * is asking us for the directory mailbox so it can
