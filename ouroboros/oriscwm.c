@@ -4391,15 +4391,18 @@ wm_block_until_ready(void)
 		::: "memory");
 
 	/* Block until any listed queue is non-empty.  O2 already holds the
-	 * wait-set list; R5 = the fixed count. */
+	 * wait-set list; R5 = the fixed count; R6 = 0 → infinite block (the
+	 * historic behaviour — #0x206 now reads R6 as an optional µs timeout,
+	 * which scrollbar auto-repeat will use, so we MUST pin it to 0 here). */
 	asm volatile(
 		"addiu r5, r0, %1\n"           /* count */
+		"addiu r6, r0, 0\n"            /* timeout = 0 → infinite */
 		"call  #0x206\n"               /* WaitAnyQueue */
 		"nop\n"
 		"addu  %0, r2, r0"
 		: "=r"(status)
 		: "i"(WM_WAITSET_COUNT)
-		: "r1", "r2", "r5"
+		: "r1", "r2", "r5", "r6"
 	);
 
 	/* We clobbered O2 (the wait-set list) to make the call; restore the

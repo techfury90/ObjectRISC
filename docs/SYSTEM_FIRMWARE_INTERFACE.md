@@ -944,6 +944,10 @@ object types and the in-framebuffer rendering operations on them.
 >   slots hold packed queue references (one per 8-byte slot). Must carry
 >   `R`.
 > - `R5`: number of references in the set.
+> - `R6`: optional timeout in microseconds — `0` = unbounded (default);
+>   `>0` resumes with `ETIMEOUT` if no queue becomes ready within that
+>   wall-clock span. Backward-compatible (callers leaving `R6 = 0` keep
+>   the original semantics).
 >
 > Each reference is validated as in `ReceiveQueuePoll` (`V` cap, home ==
 > the calling processor, attached receive queue). An entry that fails
@@ -951,8 +955,9 @@ object types and the in-framebuffer rendering operations on them.
 > rebuild the set freely as queues come and go.
 >
 > Returns: `R2`: status (`OK` once any listed queue is non-empty;
-> errors only for a malformed list object). `R3`: `0`. No message is
-> delivered. The wait is unbounded (no timeout).
+> `ETIMEOUT` if a finite `R6` elapsed first; errors only for a malformed
+> list object). `R3`: `0`. No message is delivered. With `R6 = 0` the wait
+> is unbounded; with `R6 > 0` it carries a wall-clock deadline.
 
 **`0x210  ProcessorList`** — *Restartable.*
 

@@ -483,6 +483,11 @@ Inputs:
 - `O2` = an `OBJSTORE` object whose first `R5` 8-byte slots hold packed
   64-bit queue references (the `OREFST` layout). Must carry `R`.
 - `R5` = the number of references to read (count).
+- `R6` = optional timeout in **microseconds** — `0` = infinite block (the
+  default and the historic behaviour); `>0` resumes the `CALL` with
+  `ETIMEOUT` if no listed queue becomes ready within that span. Lets the
+  WM idle-block yet still wake for a timer (e.g. scrollbar auto-repeat)
+  without reviving the old busy-poll floor.
 
 Each listed reference is validated exactly like `ReceiveQueuePoll`'s
 `O1` target — `V` cap, home == the calling CPU, live descriptor,
@@ -495,15 +500,22 @@ itself) is still an error.
 
 Returns:
 - `R2` = `OK` once at least one listed queue is non-empty (immediately
-  if one already is); `EFAULT` / `EPERM` / `EREMOTE` / `ESTALE` /
-  `EINVAL` if the list object itself is unusable.
+  if one already is); `ETIMEOUT` if a finite `R6` timeout expired first;
+  `EFAULT` / `EPERM` / `EREMOTE` / `ESTALE` / `EINVAL` if the list object
+  itself is unusable.
 - `R3` = `0`. No payload is delivered — this is a readiness signal, not
   a dequeue; registers and object registers are otherwise untouched.
 
-The block is **infinite** (no timeout): the CPU parks at the `CALL`
+With `R6 = 0` the block is **infinite**: the CPU parks at the `CALL`
 until a queue fills, then advances. The wake works cross-CPU — when a
 remote `SEND` lands on a listed home queue via the crossbar, the
-scheduler resumes the parked caller the same tick.
+scheduler resumes the parked caller the same tick. With `R6 > 0` the wait
+additionally carries a **wall-clock deadline** (real microseconds, not
+scheduler ticks — so it fires even while the caller is parked and other
+CPUs run); once that span elapses with no queue ready, the `CALL` resumes
+with `ETIMEOUT`, within the scheduler's ~1 ms idle re-poll. `R6` is a
+backward-compatible extension: existing callers that leave it `0` keep
+the original infinite-block semantics.
 
 **Numbering.** `0x206` is the first free hole in the Communication group
 (§6) after `ReceiveQueuePoll`; `0x205` is reserved by Volume VI for
