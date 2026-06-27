@@ -2060,34 +2060,29 @@ main(void)
 	 * back to direct hf_open, same as the pre-Phase-55 dir_mount-
 	 * failed path did.
 	 *
-	 * Sysinit still spawns here as a one-shot "system setup" hook;
-	 * it currently doesn't do much, but the slot is available for
-	 * late-boot setup work that's CPU-local (i.e., something a
-	 * directory mutation can't express). */
-	if (is_leader) {
-		/* M3: when co-resident, sysinit is the WM launcher.  Hand it O8=directory
-		 * (so it can orx_spawn the WM) + O5=framebuffer (to forward to the WM),
-		 * and signal the launcher role via args="wm".  Restore the spawn-mailbox
-		 * child-O8 + clear child-O5 afterward so later spawns are unaffected. */
-		const char *si_args = "";
-		if (coresident) {
-			asm volatile(
-				"orefld o1, %0(o12)\n"   /* DIR_SLOT (directory) */
-				"orefst o1, %1(o12)\n"   /* -> ORX_SLOT_CHILD_O8 (was spawn-mailbox) */
-				"orefst o5, %2(o12)"     /* O5 (framebuffer) -> ORX_SLOT_CHILD_O5 */
-				:
-				: "i"(DIR_SLOT_OFFSET),
-				  "i"(ORX_SLOT_CHILD_O8_OFFSET),
-				  "i"(ORX_SLOT_CHILD_O5_OFFSET)
-				: "r1");
-			si_args = "wm";
-		}
-		task_t sysinit = sup_spawn_named(SYSINIT_PATH, si_args, "/");
-		if (coresident) {
-			install_child_o8_override();   /* restore spawn-mailbox child-O8 */
-			asm volatile("onull o1\n orefst o1, %0(o12)"
-			             :: "i"(ORX_SLOT_CHILD_O5_OFFSET) : "r1");
-		}
+	 * Co-resident CPUs spawn sysinit as their WM launcher (below).  The old
+	 * leader/worker split that gated this is gone — every supervisor is a
+	 * peer, distinguished only by whether it drives a display.  So EVERY
+	 * terminal CPU launches its own WM, not just procid 0. */
+	if (coresident) {
+		/* Co-resident: sysinit is the WM launcher.  Hand it O8=directory (so
+		 * it can orx_spawn the WM) + O5=framebuffer (to forward to the WM),
+		 * and signal the launcher role via args="wm".  Restore the spawn-
+		 * mailbox child-O8 + clear child-O5 afterward so later spawns are
+		 * unaffected. */
+		asm volatile(
+			"orefld o1, %0(o12)\n"   /* DIR_SLOT (directory) */
+			"orefst o1, %1(o12)\n"   /* -> ORX_SLOT_CHILD_O8 (was spawn-mailbox) */
+			"orefst o5, %2(o12)"     /* O5 (framebuffer) -> ORX_SLOT_CHILD_O5 */
+			:
+			: "i"(DIR_SLOT_OFFSET),
+			  "i"(ORX_SLOT_CHILD_O8_OFFSET),
+			  "i"(ORX_SLOT_CHILD_O5_OFFSET)
+			: "r1");
+		task_t sysinit = sup_spawn_named(SYSINIT_PATH, "wm", "/");
+		install_child_o8_override();   /* restore spawn-mailbox child-O8 */
+		asm volatile("onull o1\n orefst o1, %0(o12)"
+		             :: "i"(ORX_SLOT_CHILD_O5_OFFSET) : "r1");
 		if (sysinit < 0) {
 			SUP_PRINT("supervisor: failed to spawn sysinit: ");
 			SUP_PRINT_INT((int)sysinit);
