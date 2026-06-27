@@ -1,18 +1,23 @@
 /*
  * mdview.c — the Ouroboros Markdown viewer (the north-star GUI app).
  *
- * Phase 3a: scrolling.  The document is parsed ONCE at load into a display list
- * of positioned items (text lines word-wrapped against a local glyph-width table
- * bulk-fetched via WM_OP_FONT_WIDTHS, plus rules / code panels / bullet discs),
- * each carrying its content-space y.  The
- * viewer owns a scroll OFFSET; render() draws only the items visible in the
- * window at that offset (cheap cull, no re-wrap), so keyboard scrolling
- * (arrows / page / space / Home / End) is smooth.  Reporting the offset to the
- * scrollbar (proportional elevator) and letting the scrollbar drive it are the
- * next steps (3b / 3c).
+ * The document is parsed into a display list of positioned items (text lines,
+ * rules, code panels, bullet discs), each carrying its content-space y.  Text
+ * items reference the source by (offset,len) into doc[] — NO copy — and words
+ * are word-wrapped against a local glyph-width table bulk-fetched once via
+ * WM_OP_FONT_WIDTHS, each measured a single time (layout is one linear pass).
+ * Layout is VIEWPORT-FIRST: layout_upto() lays out just the first screen, paints
+ * it, then finishes the tail — the reader sees text as soon as the visible
+ * region is ready.  The viewer owns a scroll OFFSET; render() culls to the
+ * visible items and slices each line's span out of doc[] at draw time.
+ *
+ * Scrolling: keyboard (arrows / page / space / Home / End) AND the WM's OPEN
+ * LOOK scrollbar drive the offset — the viewer blocks on keyboard + pointer at
+ * once (obj_waitset_*) and reports its scroll state back so the cable car tracks
+ * (wm_set_scroll), while scrollbar pushes (PTR_EVT_SCROLL) move the content.
  *
  * Shell/menu-spawned (edit/font_demo shape): wm_open_session + term_init +
- * hf_init, build the layout, draw, then loop on keys.
+ * hf_init, lay out the first screen, draw, then loop on input.
  */
 
 #include "liborisc.h"
@@ -34,11 +39,15 @@
 #define DOC_PATH    "/docs/welcome.md"
 #define DOC_MAX     8192
 
-/* Display list: the parsed document as positioned draw items (content-space y). */
+/* Display list: the parsed document as positioned draw items (content-space y).
+ * Text items reference the source by (offset,len) into doc[] — NO copy; render
+ * slices the span out at draw time, for visible items only.  Words are measured
+ * once at layout (their widths feed the wrap), so layout is one pass over the
+ * text with no per-word re-summing and no line copies. */
 #define MAX_ITEMS   128
-#define TEXT_CAP    128   /* must exceed the ~95-char window wrap width + margin */
-#define I_TEXT      0    /* face,x,y,text — a wrapped text line          */
-#define I_CODE      1    /* x,y,text — a code line (mono on a panel)     */
+#define LINE_CAP    256   /* render scratch for one display line's span */
+#define I_TEXT      0    /* face,x,y,off,len — a wrapped text line       */
+#define I_CODE      1    /* x,y,off,len — a code line (mono on a panel)  */
 #define I_RULE      2    /* y — an H1 hairline rule                      */
 #define I_DISC      3    /* x,y — a bullet disc                          */
 
@@ -49,7 +58,8 @@ static int  it_kind[MAX_ITEMS];
 static int  it_face[MAX_ITEMS];
 static int  it_x[MAX_ITEMS];
 static int  it_y[MAX_ITEMS];            /* content-space top y */
-static char it_text[MAX_ITEMS][TEXT_CAP];
+static int  it_off[MAX_ITEMS];          /* byte offset into doc[] (I_TEXT/I_CODE) */
+static int  it_len[MAX_ITEMS];          /* byte length (0 for I_RULE/I_DISC) */
 static int  n_items;
 static int  total_px;                   /* full content height */
 
@@ -74,7 +84,8 @@ load_doc(const char *path)
 	int fd = hf_open(path, HF_O_RDONLY);
 	if (fd < 0) return fd;
 
-	char chunk[256];
+	char chunk[4096];   /* one host read()/round-trip per 4 KB (vs 256 B) — a
+	                     * whole welcome.md-sized doc loads in a single read */
 	int n;
 	doc_len = 0;
 	while ((n = hf_read(fd, chunk, sizeof(chunk))) > 0) {
@@ -87,18 +98,18 @@ load_doc(const char *path)
 	return 0;
 }
 
-/* Append one display-list item. */
+/* Append one display-list item.  Text items carry a (off,len) slice of doc[]
+ * (off/len = 0 for the textless rule/disc); no string is copied. */
 static void
-emit(int kind, int face, int x, int y, const char *text)
+emit(int kind, int face, int x, int y, int off, int len)
 {
 	if (n_items >= MAX_ITEMS) return;
 	it_kind[n_items] = kind;
 	it_face[n_items] = face;
 	it_x[n_items]    = x;
 	it_y[n_items]    = y;
-	int i = 0;
-	if (text) while (text[i] && i < TEXT_CAP - 1) { it_text[n_items][i] = text[i]; i++; }
-	it_text[n_items][i] = 0;
+	it_off[n_items]  = off;
+	it_len[n_items]  = len;
 	n_items++;
 }
 
@@ -145,17 +156,18 @@ prewarm_widths(int face)
 	}
 }
 
-/* Greedy word-wrap `text` in `face` into I_TEXT items at content-y `y`, breaking
- * so each line measures <= max_w (text_width — locally summed from the cache).
- * Returns the y past the last line. */
+/* Greedy word-wrap `text` (a span of doc[]) in `face` into I_TEXT items at
+ * content-y `y`.  Words are contiguous in the source, so a wrapped line is just
+ * the doc[] slice from its first word to its last — tracked as (line_off,
+ * line_end), never copied.  Each word is measured ONCE and the running line
+ * width is kept, so layout is one linear pass.  Returns the y past the last line. */
 static int
 wrap_emit(int face, const char *text, int x, int y, int max_w)
 {
-	char line[TEXT_CAP], cand[TEXT_CAP];
-	int  ll = 0;
+	int  space_w  = text_width(face, " ", 1);   /* measured once (cached) */
+	int  line_off = -1, line_end = 0, line_w = 0;
 	const char *p = text;
 
-	line[0] = 0;
 	while (*p) {
 		while (*p == ' ') p++;
 		if (!*p) break;
@@ -163,46 +175,57 @@ wrap_emit(int face, const char *text, int x, int y, int max_w)
 		while (*p && *p != ' ') p++;
 		int wl = (int)(p - ws);
 
-		int cl = 0, i;
-		for (i = 0; i < ll; i++) cand[cl++] = line[i];
-		if (ll > 0 && cl < TEXT_CAP - 1) cand[cl++] = ' ';
-		for (i = 0; i < wl && cl < TEXT_CAP - 1; i++) cand[cl++] = ws[i];
-		cand[cl] = 0;
+		int word_w = text_width(face, ws, wl);
+		int sep    = (line_off >= 0) ? space_w : 0;
 
-		int w = text_width(face, cand, cl);
-		if (w >= 0 && w <= max_w) {
-			for (i = 0; i <= cl; i++) line[i] = cand[i];
-			ll = cl;
-		} else {
-			if (ll > 0) { emit(I_TEXT, face, x, y, line); y += LH; }
-			ll = 0;
-			for (i = 0; i < wl && ll < TEXT_CAP - 1; i++) line[ll++] = ws[i];
-			line[ll] = 0;
+		if (line_off >= 0 && line_w + sep + word_w > max_w) {
+			emit(I_TEXT, face, x, y, line_off, line_end - line_off); y += LH;
+			line_off = -1; line_w = 0; sep = 0;
 		}
+		if (line_off < 0) line_off = (int)(ws - doc);   /* line starts at this word */
+		line_end = (int)(p - doc);                      /* ...and now ends after it */
+		line_w  += sep + word_w;
 	}
-	if (ll > 0) { emit(I_TEXT, face, x, y, line); y += LH; }
+	if (line_off >= 0) { emit(I_TEXT, face, x, y, line_off, line_end - line_off); y += LH; }
 	return y;
 }
 
-/* Parse doc[] into the display list (once), and set total_px. */
-static void
-build_layout(void)
-{
-	n_items = 0;
-	int y = 6;
-	int in_code = 0;
-	char *p = doc;
+/* Resumable layout state for viewport-first layout: lay out only as far as the
+ * first paint needs, then finish the rest.  lay_p is the resume cursor. */
+static char *lay_p;
+static int   lay_y;
+static int   lay_incode;
+static int   lay_done;
 
-	while (*p) {
-		/* Split the next line IN PLACE: NUL-terminate at the newline so a full
-		 * (possibly very long) paragraph reaches wrap_emit uncopied — there is no
-		 * fixed line buffer to overflow.  doc[] is parsed once and unused after. */
+static void
+layout_reset(void)
+{
+	n_items    = 0;
+	lay_y      = 6;
+	lay_incode = 0;
+	lay_p      = doc;
+	lay_done   = 0;
+	total_px   = lay_y;
+}
+
+/* Lay out more of the document until content-y reaches `target_y` (or the doc
+ * ends), resuming from the previous call.  Splits each source line IN PLACE
+ * (NUL-terminating at the newline) and appends (offset,len) display items; words
+ * are measured once by wrap_emit.  Maintains lay_done + the running total_px. */
+static void
+layout_upto(int target_y)
+{
+	char *p = lay_p;
+	int y = lay_y, in_code = lay_incode;
+
+	while (*p && y < target_y) {
 		char *ln = p;
 		while (*p && *p != '\n') p++;
+		int linelen = (int)(p - ln);
 		if (*p == '\n') { *p = 0; p++; }
 
 		if (ln[0] == '`' && ln[1] == '`' && ln[2] == '`') { in_code = !in_code; continue; }
-		if (in_code) { emit(I_CODE, FONT_FACE_MONO, MARGIN_X, y, ln); y += LH; continue; }
+		if (in_code) { emit(I_CODE, FONT_FACE_MONO, MARGIN_X, y, (int)(ln - doc), linelen); y += LH; continue; }
 		if (ln[0] == 0) { y += 8; continue; }
 
 		if (ln[0] == '#') {
@@ -211,20 +234,25 @@ build_layout(void)
 			const char *h = ln + lv;
 			while (*h == ' ') h++;
 			y = wrap_emit(FONT_FACE_BOLD, h, MARGIN_X, y, TEXT_W);
-			if (lv == 1) { emit(I_RULE, 0, MARGIN_X, y, ""); y += 8; }
+			if (lv == 1) { emit(I_RULE, 0, MARGIN_X, y, 0, 0); y += 8; }
 			else         { y += 4; }
 			continue;
 		}
 
 		if ((ln[0] == '-' || ln[0] == '*') && ln[1] == ' ') {
-			emit(I_DISC, 0, MARGIN_X, y, "");
+			emit(I_DISC, 0, MARGIN_X, y, 0, 0);
 			y = wrap_emit(FONT_FACE_PROP, ln + 2, MARGIN_X + BULLET_IND, y, TEXT_W - BULLET_IND);
 			continue;
 		}
 
 		y = wrap_emit(FONT_FACE_PROP, ln, MARGIN_X, y, TEXT_W);
 	}
-	total_px = y;
+
+	lay_p      = p;
+	lay_y      = y;
+	lay_incode = in_code;
+	if (!*p) lay_done = 1;
+	total_px   = y;
 }
 
 /* Draw the items visible at scroll `offset` (a cheap cull — no re-wrap). */
@@ -234,19 +262,28 @@ render(int offset)
 	vec_set_color(COL_PAPER);
 	vec_rect_fill(0, 0, CONTENT_W, CONTENT_H);
 
+	char buf[LINE_CAP];
 	int i;
 	for (i = 0; i < n_items; i++) {
 		int sy = it_y[i] - offset;
 		if (sy + LH <= 0 || sy >= CONTENT_H) continue;   /* off-screen */
 		int k = it_kind[i];
-		if (k == I_TEXT) {
-			vec_set_color(COL_INK);
-			vec_text(it_face[i], it_x[i], sy, it_text[i]);
-		} else if (k == I_CODE) {
-			vec_set_color(COL_CODEBG);
-			vec_rect_fill(MARGIN_X, sy - 2, TEXT_W, LH);
-			vec_set_color(COL_INK);
-			vec_text(FONT_FACE_MONO, it_x[i] + 4, sy, it_text[i]);
+		if (k == I_TEXT || k == I_CODE) {
+			/* slice this line's doc[] span into a NUL-terminated draw buffer */
+			int len = it_len[i];
+			if (len > LINE_CAP - 1) len = LINE_CAP - 1;
+			int j;
+			for (j = 0; j < len; j++) buf[j] = doc[it_off[i] + j];
+			buf[len] = 0;
+			if (k == I_TEXT) {
+				vec_set_color(COL_INK);
+				vec_text(it_face[i], it_x[i], sy, buf);
+			} else {
+				vec_set_color(COL_CODEBG);
+				vec_rect_fill(MARGIN_X, sy - 2, TEXT_W, LH);
+				vec_set_color(COL_INK);
+				vec_text(FONT_FACE_MONO, it_x[i] + 4, sy, buf);
+			}
 		} else if (k == I_RULE) {
 			vec_set_color(COL_RULE);
 			vec_line(it_x[i], sy, CONTENT_W - MARGIN_X - 1, sy);
@@ -305,12 +342,20 @@ main(void)
 	prewarm_widths(FONT_FACE_PROP);
 	prewarm_widths(FONT_FACE_BOLD);
 	prewarm_widths(FONT_FACE_MONO);
-	build_layout();
-	int maxoff = total_px - CONTENT_H;
-	if (maxoff < 0) maxoff = 0;
+	/* Viewport-first: lay out just the first screen, paint it, THEN finish the
+	 * tail — the reader sees text as soon as the visible region is ready instead
+	 * of after the whole document is wrapped.  (A big-doc mode would background-
+	 * fill the tail on idle via the WaitAnyQueue timeout rather than finishing it
+	 * synchronously here.) */
+	layout_reset();
+	layout_upto(CONTENT_H + LH);
 	int offset = 0;
 	render(offset);
-	wm_set_scroll(wid, total_px, offset);   /* park the cable car at the top */
+	wm_set_scroll(wid, total_px, offset);
+	layout_upto(0x7fffffff);                /* finish the tail; total_px now exact */
+	int maxoff = total_px - CONTENT_H;
+	if (maxoff < 0) maxoff = 0;
+	wm_set_scroll(wid, total_px, offset);   /* refresh the cable car for full height */
 
 	/* Bind a pointer surface + subscribe so the WM can PUSH scrollbar-driven
 	 * scrolls (PTR_EVT_SCROLL) to us.  Best-effort: the keyboard still scrolls
