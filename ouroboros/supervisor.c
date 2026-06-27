@@ -460,6 +460,22 @@ render_wm_leader_path(int n, const char *suffix, char *buf)
 	return p;
 }
 
+/* Render "/sys/wm/<n>/0" into buf — the path a WM self-registers at on
+ * boot.  Its existence marks CPU n as a terminal (running a window
+ * manager) rather than a pure compute CPU.  Returns byte length. */
+static int
+render_wm_self_path(int n, char *buf)
+{
+	const char prefix[] = "/sys/wm/";
+	const char suffix[] = "/0";
+	int i, p = 0;
+	for (i = 0; prefix[i]; i++) buf[p++] = prefix[i];
+	p = append_decimal(n, buf, p);
+	for (i = 0; suffix[i]; i++) buf[p++] = suffix[i];
+	buf[p] = '\0';
+	return p;
+}
+
 /* Phase 47: walk a path in oriscdir; if it resolves to a LEAF, the
  * resolved ref is in DIR_RESULT_SLOT (offset 616) per dir_walk's
  * contract. Returns 0 on a successful LEAF resolution, -6 when no
@@ -581,8 +597,9 @@ relay_spawn_request(int len, int target_pid, int term_hint_plus_one)
  * lands on the next live CPU (typically a peer, not self), giving
  * an even initial spread on a multi-CPU boot. The pick_next_cpu
  * helper iterates through live /sys/cpu/<N>/supervisor entries
- * starting from this counter and advances. Per-supervisor (no shared
- * state); under steady load with N supervisors the global
+ * starting from this counter and advances, SKIPPING terminal CPUs
+ * (cpu_is_terminal — apps default to the compute CPUs). Per-supervisor
+ * (no shared state); under steady load with N supervisors the global
  * distribution stays roughly fair.
  *
  * Round-robin is gated on `term_hint > 0` in handle_spawn_request: a
@@ -658,6 +675,24 @@ sup_spawn_named(const char *path, const char *args, const char *cwd)
 	return t;
 }
 
+/* P2 execution-locality policy: does CPU n run a window manager — i.e.
+ * is it a terminal?  A live WM self-registers at /sys/wm/<n>/0, so a
+ * single dir_walk that resolves to a LEAF means "terminal".  NO retry
+ * (unlike sup_walk_for_opr): a compute CPU legitimately has no such
+ * entry, and a 5x NOT_FOUND retry would stall the round-robin on every
+ * compute candidate.  dir_walk clobbers O1..O4, but pick_next_cpu's
+ * callers already stash/restore around it (see handle_spawn_request). */
+static int
+cpu_is_terminal(int n)
+{
+	char path[PEER_PATH_BUF_SIZE];
+	render_wm_self_path(n, path);
+	int kind;
+	char rem[16];
+	int rc = dir_walk(path, &kind, rem, sizeof(rem));
+	return (rc == 0 && kind == DIR_KIND_LEAF) ? 1 : 0;
+}
+
 static int
 pick_next_cpu(int self_procid)
 {
@@ -674,6 +709,14 @@ pick_next_cpu(int self_procid)
 		char path[PEER_PATH_BUF_SIZE];
 		render_peer_path(candidate, path);
 		if (sup_walk_for_opr(path) == 0) {
+			/* P2: skip terminal CPUs so apps default to the compute
+			 * CPUs.  A terminal runs only tasks initiated from it
+			 * interactively; a future per-program locality opt-in
+			 * will let local-OK apps stay on the launching terminal.
+			 * If every live CPU is a terminal (standalone terminal,
+			 * no compute), the loop finds nothing eligible and we
+			 * fall through to `return self_procid` below — run local. */
+			if (cpu_is_terminal(candidate)) continue;
 			next_cpu_counter = candidate + 1;
 			return candidate;
 		}
