@@ -860,6 +860,7 @@ static int           sb_drag_active;
 static int           sb_drag_wid;
 static int           sb_drag_grab_off;   /* py(screen) − elevator-top(screen) at grab */
 static int           sb_arrow_dir;       /* 0=none, 1=up / 2=down line-arrow pressed (selected look) */
+static unsigned      sb_repeat_due;      /* wm_time_us() at which a held arrow next auto-repeats */
 
 /* Phase 60 step 8 / step 22 — per-window title bar text storage.
  * Was a single shared buffer through step 21; step 22 added title-bar
@@ -2590,6 +2591,8 @@ paint_window_face(void)
 #define SB_PAGE     (SB_ELEV_H + 8)                            /* cable page step ≈ one elevator */
 #define SB_THIRD    (SB_ELEV_H / 3)                            /* 15 — elevator third (line/drag/line) */
 #define SB_LINE     6                                          /* line step (decorative; no scrollback) */
+#define SB_REPEAT_DELAY_US 500000                              /* hold an arrow: 500 ms before auto-repeat */
+#define SB_REPEAT_US       100000                              /* ...then a line-step every 100 ms */
 
 /* point_in_scrollbar region codes.  The elevator splits into thirds: top =
  * line-up arrow, middle = drag, bottom = line-down arrow (OPEN LOOK). */
@@ -4289,9 +4292,13 @@ alloc_wait_set(void)
  * wait-set offset, so this is straight-line OREFLD/OREFST — no
  * computed offsets (which pcc-orisc rejects) and no switch tables.
  * Empty/freed per-window slots copy through as null/stale refs that
- * WaitAnyQueue skips, so we always pass the full fixed count. */
+ * WaitAnyQueue skips, so we always pass the full fixed count.
+ *
+ * timeout_us bounds the block (WaitAnyQueue R6, microseconds): 0 = forever
+ * (the normal idle case); >0 wakes us with E_TIMEOUT after that wall-clock
+ * span so a held scrollbar arrow can auto-repeat without busy-polling. */
 static int
-wm_block_until_ready(void)
+wm_block_until_ready(int timeout_us)
 {
 	int status;
 
@@ -4396,12 +4403,12 @@ wm_block_until_ready(void)
 	 * which scrollbar auto-repeat will use, so we MUST pin it to 0 here). */
 	asm volatile(
 		"addiu r5, r0, %1\n"           /* count */
-		"addiu r6, r0, 0\n"            /* timeout = 0 → infinite */
+		"addu  r6, r0, %2\n"           /* timeout µs (0 → infinite) */
 		"call  #0x206\n"               /* WaitAnyQueue */
 		"nop\n"
 		"addu  %0, r2, r0"
 		: "=r"(status)
-		: "i"(WM_WAITSET_COUNT)
+		: "i"(WM_WAITSET_COUNT), "r"(timeout_us)
 		: "r1", "r2", "r5", "r6"
 	);
 
@@ -4410,6 +4417,25 @@ wm_block_until_ready(void)
 	 * same dance ReceiveQueuePoll needed. */
 	wm_restore_boot_or();
 	return status;
+}
+
+/* Wall-clock microseconds since boot (TimeNow #0x400, low 32 bits — wraps at
+ * ~71 min, immaterial for the sub-second scrollbar auto-repeat deltas, which
+ * we compute with signed differences so a wrap is harmless).  TimeNow touches
+ * no object registers, so no boot-OR restore is needed. */
+static unsigned
+wm_time_us(void)
+{
+	unsigned us;
+	asm volatile(
+		"call #0x400\n"
+		"nop\n"
+		"addu %0, r3, r0"
+		: "=r"(us)
+		:
+		: "r1", "r2", "r3"
+	);
+	return us;
 }
 
 /* Non-blocking poll of the main service queue (timeout = 0): the
@@ -5804,6 +5830,23 @@ sb_repaint(int wid)
 	set_active_window(wid);
 	paint_scrollbar();
 	composite_window_region(SB_X, SB_TOP, SCROLLBAR_W_PX, SB_BOT - SB_TOP);
+#ifdef SB_DEBUG
+	/* -DSB_DEBUG only: lets the headless scrollbar test observe each elevator
+	 * move (drag / line-step / page / anchor) without an FB capture. */
+	WM_PRINT("oriscwm: sb elev="); WM_PRINT_INT(window_sb_elev[wid - 1]); WM_PRINT("\n");
+#endif
+}
+
+/* One line-step in `dir` (1 = up, 2 = down) on wid's elevator, clamped, then
+ * repaint.  Shared by the arrow click and its auto-repeat. */
+static void
+sb_line_step(int wid, int dir)
+{
+	int elev = window_sb_elev[wid - 1] + ((dir == 1) ? -SB_LINE : SB_LINE);
+	if (elev < SB_ELEV_MIN) elev = SB_ELEV_MIN;
+	if (elev > SB_ELEV_MAX) elev = SB_ELEV_MAX;
+	window_sb_elev[wid - 1] = elev;
+	sb_repaint(wid);
 }
 
 /* A SELECT-press on wid's scrollbar region `hit`: grab the elevator (middle
@@ -5821,16 +5864,23 @@ sb_press(int wid, int hit, int px, int py)
 		sb_repaint(wid);   /* show the selected (dimple) look on grab */
 		return;
 	}
-	if      (hit == SB_HIT_LINEUP)   { elev -= SB_LINE; sb_drag_wid = wid; sb_arrow_dir = 1; }
-	else if (hit == SB_HIT_LINEDOWN) { elev += SB_LINE; sb_drag_wid = wid; sb_arrow_dir = 2; }
-	else if (hit == SB_HIT_TOP)  elev = SB_ELEV_MIN;
+	if (hit == SB_HIT_LINEUP || hit == SB_HIT_LINEDOWN) {
+		/* line-step now + arm auto-repeat: the held arrow lights its box, and
+		 * the main loop re-fires sb_line_step every SB_REPEAT_US (after an
+		 * initial SB_REPEAT_DELAY_US) until SELECT is released. */
+		sb_drag_wid   = wid;
+		sb_arrow_dir  = (hit == SB_HIT_LINEUP) ? 1 : 2;
+		sb_repeat_due = wm_time_us() + SB_REPEAT_DELAY_US;
+		sb_line_step(wid, sb_arrow_dir);
+		return;
+	}
+	/* page (cable above/below) / anchor (end cap): a one-shot jump */
+	if      (hit == SB_HIT_TOP)  elev = SB_ELEV_MIN;
 	else if (hit == SB_HIT_BOT)  elev = SB_ELEV_MAX;
 	else if (hit == SB_HIT_UP)   elev -= SB_PAGE;
 	else if (hit == SB_HIT_DOWN) elev += SB_PAGE;
 	if (elev < SB_ELEV_MIN) elev = SB_ELEV_MIN;
 	if (elev > SB_ELEV_MAX) elev = SB_ELEV_MAX;
-	/* always repaint — the arrow press must show its selected box even when the
-	 * elevator is already pinned to the travel limit. */
 	window_sb_elev[wid - 1] = elev;
 	sb_repaint(wid);
 }
@@ -6906,8 +6956,17 @@ main(void)
 	for (;;) {
 		int op, wid_or_zero, arg;
 		int status;
+		int sb_timeout = 0;       /* 0 = block forever (the idle case) */
 
-		wm_block_until_ready();
+		/* While a scrollbar arrow is held, bound the block so we wake to
+		 * fire the next auto-repeat.  Signed delta tolerates the µs wrap;
+		 * an overdue repeat asks for the minimum 1 µs so we wake at once. */
+		if (sb_arrow_dir) {
+			int rem = (int)(sb_repeat_due - wm_time_us());
+			sb_timeout = (rem > 0) ? rem : 1;
+		}
+
+		wm_block_until_ready(sb_timeout);
 
 		status = poll_one_request(&op, &wid_or_zero, &arg);
 		if (status == 0) {
@@ -6948,5 +7007,17 @@ main(void)
 		poll_pointer_events();
 		poll_keyboard_subscribes();
 		poll_keyboard_events();
+
+		/* Auto-repeat: poll_pointer_events above cleared sb_arrow_dir if
+		 * SELECT was released; if an arrow is still held and its deadline has
+		 * passed, fire another line-step and re-arm SB_REPEAT_US from now (so
+		 * a laggy loop never bursts to catch up). */
+		if (sb_arrow_dir) {
+			unsigned now = wm_time_us();
+			if ((int)(now - sb_repeat_due) >= 0) {
+				sb_line_step(sb_drag_wid, sb_arrow_dir);
+				sb_repeat_due = now + SB_REPEAT_US;
+			}
+		}
 	}
 }
