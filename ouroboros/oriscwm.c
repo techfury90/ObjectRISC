@@ -861,6 +861,7 @@ static int           sb_drag_wid;
 static int           sb_drag_grab_off;   /* py(screen) − elevator-top(screen) at grab */
 static int           sb_arrow_dir;       /* 0=none, 1=up / 2=down line-arrow pressed (selected look) */
 static unsigned      sb_repeat_due;      /* wm_time_us() at which a held arrow next auto-repeats */
+static int           sb_anchor_dir;      /* 0=none, 1=top / 2=bottom anchor pressed (pushed-in look) */
 
 /* Phase 60 step 8 / step 22 — per-window title bar text storage.
  * Was a single shared buffer through step 21; step 22 added title-bar
@@ -2637,6 +2638,11 @@ paint_scrollbar(void)
 	int elev_y   = window_sb_elev[active_wid - 1];
 	int selected = (sb_drag_active && sb_drag_wid == active_wid);
 	int arrow    = (sb_arrow_dir && sb_drag_wid == active_wid) ? sb_arrow_dir : 0;
+	/* a pressed anchor draws recessed (BEVEL_FILL, no RAISED) — pushed in */
+	int anch_top = (sb_anchor_dir == 1 && sb_drag_wid == active_wid)
+	             ? BEVEL_FILL : (BEVEL_RAISED | BEVEL_FILL);
+	int anch_bot = (sb_anchor_dir == 2 && sb_drag_wid == active_wid)
+	             ? BEVEL_FILL : (BEVEL_RAISED | BEVEL_FILL);
 
 	/* erase the whole travel column to the window face, then the thin DARK
 	 * cable, then the elevator over it — the elevator (14) is wider than the
@@ -2644,9 +2650,9 @@ paint_scrollbar(void)
 	fill_rect_window(((SB_X & 0xFFFF) << 16) | (SB_CY0 & 0xFFFF),
 	                 ((SB_BODY_W & 0xFFFF) << 16) | ((SB_CY1 - SB_CY0) & 0xFFFF), WM_FACE_BG1);
 	draw_bevel_box(((SB_X & 0xFFFF) << 16) | (SB_TOP & 0xFFFF),
-	               ((SB_BODY_W & 0xFFFF) << 16) | (SB_ANCH & 0xFFFF), BEVEL_RAISED | BEVEL_FILL);
+	               ((SB_BODY_W & 0xFFFF) << 16) | (SB_ANCH & 0xFFFF), anch_top);
 	draw_bevel_box(((SB_X & 0xFFFF) << 16) | ((SB_BOT - SB_ANCH) & 0xFFFF),
-	               ((SB_BODY_W & 0xFFFF) << 16) | (SB_ANCH & 0xFFFF), BEVEL_RAISED | BEVEL_FILL);
+	               ((SB_BODY_W & 0xFFFF) << 16) | (SB_ANCH & 0xFFFF), anch_bot);
 	fill_rect_window((((SB_X + SB_CABLE_OFF) & 0xFFFF) << 16) | (SB_CY0 & 0xFFFF),
 	                 ((SB_CABLE_W & 0xFFFF) << 16) | ((SB_CY1 - SB_CY0) & 0xFFFF), WM_FACE_BG3);
 	/* elevator: BG1 face + the olgl emboss (cp 54/55 = 3D edges + up/down arrows
@@ -5874,9 +5880,10 @@ sb_press(int wid, int hit, int px, int py)
 		sb_line_step(wid, sb_arrow_dir);
 		return;
 	}
-	/* page (cable above/below) / anchor (end cap): a one-shot jump */
-	if      (hit == SB_HIT_TOP)  elev = SB_ELEV_MIN;
-	else if (hit == SB_HIT_BOT)  elev = SB_ELEV_MAX;
+	/* anchor (end cap): jump to the end + light the cap pushed-in until release.
+	 * page (cable above/below): a one-shot jump, no pressed state. */
+	if      (hit == SB_HIT_TOP)  { elev = SB_ELEV_MIN; sb_drag_wid = wid; sb_anchor_dir = 1; }
+	else if (hit == SB_HIT_BOT)  { elev = SB_ELEV_MAX; sb_drag_wid = wid; sb_anchor_dir = 2; }
 	else if (hit == SB_HIT_UP)   elev -= SB_PAGE;
 	else if (hit == SB_HIT_DOWN) elev += SB_PAGE;
 	if (elev < SB_ELEV_MIN) elev = SB_ELEV_MIN;
@@ -6475,9 +6482,10 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 	}
 
 	if (evt_type == PTR_EVT_UP) {
-		if ((sb_drag_active || sb_arrow_dir) && button == PTR_BTN_LEFT) {
+		if ((sb_drag_active || sb_arrow_dir || sb_anchor_dir) && button == PTR_BTN_LEFT) {
 			sb_drag_active = 0;
 			sb_arrow_dir   = 0;
+			sb_anchor_dir  = 0;
 			sb_repaint(sb_drag_wid);   /* clear the selected look on release */
 			return 1;
 		}
