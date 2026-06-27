@@ -1196,6 +1196,24 @@ alloc_local_framebuffer(void)
 	return status;
 }
 
+/* M3 co-residency — if the boot chain (firmware → supervisor → sysinit)
+ * forwarded its display-backed framebuffer into our O5, ADOPT it: stash the ref
+ * into WM_SURF_FRAMEBUFFER_SLOT_OFFSET and report success.  Drawing into the
+ * firmware's existing FB object is what makes splash → desktop ONE seamless Tk
+ * window — allocating our own display-backed FB would open a second window.
+ * Returns 0 if adopted, -1 if O5 is null (no inherited FB; caller allocs its
+ * own, the separate-CPU path). */
+static int
+adopt_inherited_framebuffer(void)
+{
+	int o5_null;
+	asm volatile("oisn %0, o5" : "=r"(o5_null));
+	if (o5_null)
+		return -1;
+	asm volatile("orefst o5, %0(o12)" :: "i"(WM_SURF_FRAMEBUFFER_SLOT_OFFSET));
+	return 0;
+}
+
 /* Phase 2c step 1 — the desktop menu's offscreen backing FB.  Screen-sized
  * (so the menu draws at its absolute screen position straight into it) and
  * OFFSCREEN (flag 1 = no display mirror; it reaches the screen only via the
@@ -7062,6 +7080,9 @@ main(void)
 		WM_PRINT("\n");
 		return 1;
 	}
+	WM_PRINT("oriscwm: self-registered at ");
+	WM_PRINT(path_self_register);
+	WM_PRINT("\n");
 
 	/* Phase B — load luRS from /fonts now that DIR_SLOT is up (after
 	 * self_register, before the slow per-surface setup).  Non-fatal: on any
@@ -7075,13 +7096,23 @@ main(void)
 	 * queues), framebuffer via #0x10A ObjAllocFramebuffer.
 	 * forward_console_write replies to the client's reply_cap
 	 * directly — no underlying CONSOLE service to forward to. */
-	status = alloc_local_framebuffer();
+	/* M3 co-residency: adopt the firmware's inherited framebuffer (O5) if the
+	 * boot chain forwarded one; otherwise allocate our own (separate-CPU path).
+	 * Adopting reuses the firmware's FB object = the same Tk window. */
+	if (adopt_inherited_framebuffer() == 0) {
+		WM_PRINT("oriscwm: adopted inherited framebuffer (O5) — co-resident\n");
+		status = 0;
+	} else {
+		status = alloc_local_framebuffer();
+		if (status == 0) {
+			WM_PRINT("oriscwm: framebuffer allocated locally (");
+			WM_PRINT_INT(FB_W);
+			WM_PRINT("x");
+			WM_PRINT_INT(FB_H);
+			WM_PRINT(")\n");
+		}
+	}
 	if (status == 0) {
-		WM_PRINT("oriscwm: framebuffer allocated locally (");
-		WM_PRINT_INT(FB_W);
-		WM_PRINT("x");
-		WM_PRINT_INT(FB_H);
-		WM_PRINT(")\n");
 		/* Offscreen backing FB for the composited desktop menu surface.
 		 * Non-fatal on failure — desktop_menu_show checks the slot and
 		 * simply won't pop a menu rather than scribbling on a null FB. */
