@@ -63,6 +63,8 @@
 #define WM_OP_SET_TITLE          6
 #define WM_OP_FONT_OPEN          7
 #define WM_OP_MEASURE_TEXT       8
+#define WM_OP_FONT_WIDTHS        9
+#define WM_OP_SET_SCROLL         10
 
 /* WM error codes — also surface in liborisc.h. Mirrored locally for
  * the no-WM fallback short-circuit. */
@@ -419,6 +421,47 @@ wm_measure_text(int face, const char *s)
 	if (wm_send_recv(OBJ_SRC_STACK, WM_OP_MEASURE_TEXT, face, packed, rep) != 0)
 		return -1;
 	return rep[0];   /* R3 = width in px (>=0) or -errno */
+}
+
+/* wm_font_widths: fetch the glyph advances of 16 codepoints (start_cp ..
+ * start_cp+15) for `face` into out16[].  Lets a client build a LOCAL width table
+ * and wrap proportional text with no further WM round-trips — measure each
+ * face's printable range in ~6 calls instead of one measure_text per word.
+ * Returns 0, or a negative WM error. */
+int
+wm_font_widths(int face, int start_cp, unsigned char *out16)
+{
+	int rc = wm_ensure();
+	if (rc != 0) return rc;
+	int rep[4];
+	if (wm_send_recv(OBJ_SRC_NONE, WM_OP_FONT_WIDTHS, face, start_cp, rep) != 0)
+		return -1;
+	int j, i;
+	for (j = 0; j < 4; j++)
+		for (i = 0; i < 4; i++)
+			out16[j * 4 + i] = (unsigned char)((rep[j] >> (i * 8)) & 0xFF);
+	return 0;
+}
+
+/* wm_set_scroll: report a window's content height and current scroll offset to
+ * the WM so its OPEN LOOK scrollbar elevator (the "cable car") rides the cable
+ * to the matching position.  total_px = full content height, offset = pixels
+ * scrolled past the top; both are clamped to 16 bits (the wire packs them 16:16,
+ * good for content up to 65535 px).  Returns 0, or a negative WM error. */
+int
+wm_set_scroll(int wid, int total_px, int offset)
+{
+	int rc = wm_ensure();
+	if (rc != 0) return rc;
+	if (total_px < 0)      total_px = 0;
+	if (total_px > 0xFFFF) total_px = 0xFFFF;
+	if (offset < 0)        offset = 0;
+	if (offset > 0xFFFF)   offset = 0xFFFF;
+	int packed = ((total_px & 0xFFFF) << 16) | (offset & 0xFFFF);
+	int rep[4];
+	if (wm_send_recv(OBJ_SRC_NONE, WM_OP_SET_SCROLL, wid, packed, rep) != 0)
+		return -1;
+	return rep[0];
 }
 
 /* OP_SUBSCRIBE_EVENTS. Milestone-2 stub with no callers; events don't
