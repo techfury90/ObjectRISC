@@ -5949,6 +5949,55 @@ point_in_scrollbar(int wid, int px, int py)
 	return (ly < elev_y) ? SB_HIT_UP : SB_HIT_DOWN;
 }
 
+/* WM->client scroll PUSH.  When the user drives the scrollbar, SEND the new
+ * content offset to the window's pointer subscriber as a PTR_EVT_SCROLL event so
+ * the client (Markdown viewer) re-renders.  Targets the SPECIFIC window via its
+ * ptr_sub slot — the same per-window routing dispatch_pointer_event uses — so a
+ * drag on window W's scrollbar scrolls exactly W's document. */
+static void
+dispatch_scroll_event(int wid, int offset)
+{
+	if (wid < 1 || wid > MAX_WINDOWS) return;
+	load_ptr_sub_to_o1(wid);
+	int sub_isn;
+	asm volatile("oisn %0, o1" : "=r"(sub_isn));
+	if (sub_isn) return;                 /* no subscriber for this window */
+	/* Stage both inputs into r8/r9 before consuming (the dispatch_pointer_event
+	 * idiom) so pcc's r2..r7 input placement can't be clobbered mid-build. */
+	asm volatile(
+		"addu   r8, %0, r0\n"           /* stage evt_type */
+		"addu   r9, %1, r0\n"           /* stage offset   */
+		"onull  o2\n"
+		"onull  o3\n"
+		"addu   r4, r8, r0\n"           /* R4 = PTR_EVT_SCROLL */
+		"addu   r5, r9, r0\n"           /* R5 = offset         */
+		"addu   r6, r0, r0\n"           /* R6 = 0 */
+		"addu   r7, r0, r0\n"           /* R7 = 0 */
+		"send   o1"
+		:
+		: "r"(PTR_EVT_SCROLL), "r"(offset)
+		: "r1", "r4", "r5", "r6", "r7", "r8", "r9"
+	);
+	wm_restore_boot_or();                /* SEND nulled O2/O3 — restore boot ORs */
+}
+
+/* Convert wid's elevator position to a content offset and push it to the client.
+ * The inverse of handle_set_scroll's offset->elevator map.  No-op until the
+ * client has reported a content height (else there's nothing to scroll to). */
+static void
+sb_push_offset(int wid)
+{
+	int slot   = wid - 1;
+	int maxoff = window_content_px[slot] - CELL_AREA_H_PX;
+	if (maxoff <= 0) return;
+	int span   = SB_ELEV_MAX - SB_ELEV_MIN;
+	int travel = window_sb_elev[slot] - SB_ELEV_MIN;
+	int offset = (span > 0) ? (travel * maxoff) / span : 0;
+	if (offset < 0)      offset = 0;
+	if (offset > maxoff) offset = maxoff;
+	dispatch_scroll_event(wid, offset);
+}
+
 /* Repaint just wid's scrollbar column and composite it to screen (the elevator
  * moved).  Leaves active_wid = wid, like the other chrome repaints. */
 static void
@@ -5974,6 +6023,10 @@ sb_line_step(int wid, int dir)
 	if (elev > SB_ELEV_MAX) elev = SB_ELEV_MAX;
 	window_sb_elev[wid - 1] = elev;
 	sb_repaint(wid);
+	/* No content push here: the elevator slides (cheap, WM-local), but the
+	 * client redraw is DEFERRED during auto-repeat — the press does one redraw,
+	 * then nothing until release commits the final offset (the OPEN LOOK way,
+	 * and it keeps rapid repeats from racing content renders into corruption). */
 }
 
 /* A SELECT-press on wid's scrollbar region `hit`: grab the elevator (middle
@@ -5999,6 +6052,7 @@ sb_press(int wid, int hit, int px, int py)
 		sb_arrow_dir  = (hit == SB_HIT_LINEUP) ? 1 : 2;
 		sb_repeat_due = wm_time_us() + SB_REPEAT_DELAY_US;
 		sb_line_step(wid, sb_arrow_dir);
+		sb_push_offset(wid);   /* one redraw on press; auto-repeat defers the rest */
 		return;
 	}
 	/* anchor (end cap): jump to the end + light the cap pushed-in until release.
@@ -6011,6 +6065,7 @@ sb_press(int wid, int hit, int px, int py)
 	if (elev > SB_ELEV_MAX) elev = SB_ELEV_MAX;
 	window_sb_elev[wid - 1] = elev;
 	sb_repaint(wid);
+	sb_push_offset(wid);
 }
 
 /* Elevator drag motion: keep the grab point under the pointer, clamped to the
@@ -6027,6 +6082,7 @@ sb_motion(int px, int py)
 	if (elev == window_sb_elev[wid - 1]) return;
 	window_sb_elev[wid - 1] = elev;
 	sb_repaint(wid);
+	sb_push_offset(wid);
 }
 
 /* WM_OP_SET_SCROLL — the client (Markdown viewer) reports its full content
@@ -6053,8 +6109,14 @@ handle_set_scroll(int wid, int arg)
 	if (elev < SB_ELEV_MIN) elev = SB_ELEV_MIN;
 	if (elev > SB_ELEV_MAX) elev = SB_ELEV_MAX;
 	window_content_px[slot] = total_px;
-	window_sb_elev[slot]    = elev;
-	sb_repaint(wid);
+	/* If the user is actively dragging THIS window's elevator, the drag owns the
+	 * position — don't let a (keyboard-driven) client echo fight it; just record
+	 * the content height.  Otherwise track the reported offset.  Scrollbar-driven
+	 * scrolls don't echo at all (the client renders without reporting back). */
+	if (!(sb_drag_active && sb_drag_wid == wid)) {
+		window_sb_elev[slot] = elev;
+		sb_repaint(wid);
+	}
 	wm_reply(0, 0, 0, 0);
 }
 
@@ -6633,10 +6695,14 @@ wm_handle_pointer(int evt_type, int packed_xy, int button, int btn_state)
 
 	if (evt_type == PTR_EVT_UP) {
 		if ((sb_drag_active || sb_arrow_dir || sb_anchor_dir) && button == PTR_BTN_LEFT) {
+			int was_arrow = sb_arrow_dir;   /* a held arrow deferred its scroll */
+			int rwid      = sb_drag_wid;
 			sb_drag_active = 0;
 			sb_arrow_dir   = 0;
 			sb_anchor_dir  = 0;
-			sb_repaint(sb_drag_wid);   /* clear the selected look on release */
+			sb_repaint(rwid);   /* clear the selected look on release */
+			if (was_arrow)
+				sb_push_offset(rwid);   /* commit: scroll content to the final target */
 			return 1;
 		}
 		if (drag_active && button == PTR_BTN_LEFT) {

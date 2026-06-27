@@ -490,3 +490,12 @@ term_pollkey(int *out_code, int *out_mods)
 	if (out_mods) *out_mods = out[1];          /* R4 = mods */
 	return 0;
 }
+
+/* Expose the keyboard-event mailbox handle so a client can fold it into an
+ * obj_waitset_* set (block on keys AND another source at once).  < 0 until
+ * term_init has run. */
+obj_t
+term_kbd_mbox(void)
+{
+	return kbd_mbox_h;
+}

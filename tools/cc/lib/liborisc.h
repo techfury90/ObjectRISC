@@ -334,6 +334,7 @@ int  raster_clear(void);
 #define PTR_EVT_MOTION  0x00
 #define PTR_EVT_DOWN    0x01
 #define PTR_EVT_UP      0x02
+#define PTR_EVT_SCROLL  0x03   /* WM→client: R4 = new scroll offset (px) from the scrollbar */
 
 #define PTR_BTN_LEFT   1
 #define PTR_BTN_MIDDLE 2
@@ -360,6 +361,12 @@ int  pointer_getevent(int *evt_type, int *packed_xy,
  * mailbox is live, 0 otherwise. Lets helpers (menu_run) decide
  * whether the mouse is available before polling it. */
 int  pointer_subscribed(void);
+
+/* Event-mailbox handle getters — fold the keyboard and pointer queues into one
+ * obj_waitset_* set to block on both at once (an event-driven client loop).
+ * Return the handle, or < 0 if the source hasn't been initialised. */
+int  term_kbd_mbox(void);
+int  pointer_event_mbox(void);
 
 /* term_getkey: blocks until the next keystroke arrives. Returns
  * the codepoint (ASCII for printable, ≥0x100 for special — see

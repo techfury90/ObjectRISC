@@ -113,3 +113,11 @@ pointer_getevent(int *evt_type, int *packed_xy,
 	_ptr_restore_or();
 	return 0;
 }
+
+/* Expose the pointer-event mailbox handle for obj_waitset_* (block on pointer
+ * events alongside other sources).  < 0 until pointer_subscribe has run. */
+obj_t
+pointer_event_mbox(void)
+{
+	return ptr_mbox_h;
+}

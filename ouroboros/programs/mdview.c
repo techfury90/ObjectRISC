@@ -16,6 +16,7 @@
  */
 
 #include "liborisc.h"
+#include "obj.h"     /* obj_waitset_* — block on keyboard + scrollbar at once */
 
 #define CONTENT_W   640
 #define CONTENT_H   384
@@ -256,6 +257,23 @@ render(int offset)
 	}
 }
 
+/* Map a scroll key to a new clamped offset; returns -1 to request quit. */
+static int
+scroll_key(int code, int offset, int maxoff)
+{
+	if (should_quit(code)) return -1;
+	int noff = offset;
+	if      (code == TK_DOWN)                     noff += LH;
+	else if (code == TK_UP)                       noff -= LH;
+	else if (code == TK_PAGE_DOWN || code == ' ') noff += CONTENT_H - LH;
+	else if (code == TK_PAGE_UP)                  noff -= CONTENT_H - LH;
+	else if (code == TK_HOME)                     noff  = 0;
+	else if (code == TK_END)                      noff  = maxoff;
+	if (noff < 0)      noff = 0;
+	if (noff > maxoff) noff = maxoff;
+	return noff;
+}
+
 int
 main(void)
 {
@@ -294,27 +312,64 @@ main(void)
 	render(offset);
 	wm_set_scroll(wid, total_px, offset);   /* park the cable car at the top */
 
-	/* Scroll on arrows / page / space / Home / End; quit on q / Esc.  Blocking
-	 * term_getkey (edit.c's path — its arrow keys work; term_pollkey did not
-	 * deliver the special keys reliably here).  3c will move to a non-blocking
-	 * poll once the viewer also listens for scrollbar-driven scroll events. */
+	/* Bind a pointer surface + subscribe so the WM can PUSH scrollbar-driven
+	 * scrolls (PTR_EVT_SCROLL) to us.  Best-effort: the keyboard still scrolls
+	 * without it. */
+	int have_ptr = (wm_bind_surface(wid, WSURF_POINTER) == 0
+	                && pointer_init_from_dir_result() == 0
+	                && pointer_subscribe() == 0);
+
+	/* Block on the keyboard AND (if subscribed) the pointer mailbox at once via a
+	 * WaitAnyQueue set — event-driven, no busy-poll.  Keyboard scrolls move the
+	 * elevator (we report back with wm_set_scroll); scrollbar pushes move the
+	 * content (the WM already moved the elevator, so we DON'T report back — no
+	 * echo loop). */
+	obj_t qs[2];
+	int   nq = 0;
+	qs[nq++] = term_kbd_mbox();
+	if (have_ptr) qs[nq++] = pointer_event_mbox();
+	obj_t waitset = obj_waitset_new(qs, nq);
+
+	if (waitset < 0) {
+		/* Wait-set alloc failed — keyboard-only blocking fallback. */
+		for (;;) {
+			int m = 0, n = scroll_key(term_getkey(&m), offset, maxoff);
+			if (n < 0) break;
+			if (n != offset) {
+				offset = n; render(offset);
+				wm_set_scroll(wid, total_px, offset);
+			}
+		}
+		goto out;
+	}
+
 	for (;;) {
-		int mods = 0;
-		int code = term_getkey(&mods);
-		if (should_quit(code)) break;
-		int noff = offset;
-		if      (code == TK_DOWN)                     noff += LH;
-		else if (code == TK_UP)                       noff -= LH;
-		else if (code == TK_PAGE_DOWN || code == ' ') noff += CONTENT_H - LH;
-		else if (code == TK_PAGE_UP)                  noff -= CONTENT_H - LH;
-		else if (code == TK_HOME)                     noff  = 0;
-		else if (code == TK_END)                      noff  = maxoff;
-		if (noff < 0)       noff = 0;
-		if (noff > maxoff)  noff = maxoff;
+		obj_waitset_wait(waitset, nq, 0);   /* block until a source is ready */
+
+		/* keyboard: drain all pending keys, coalesce into one render */
+		int code = 0, mods = 0, noff = offset, quit = 0;
+		while (term_pollkey(&code, &mods) == 0) {
+			int n = scroll_key(code, noff, maxoff);
+			if (n < 0) { quit = 1; break; }
+			noff = n;
+		}
+		if (quit) break;
 		if (noff != offset) {
-			offset = noff;
-			render(offset);
-			wm_set_scroll(wid, total_px, offset);   /* cable car follows */
+			offset = noff; render(offset);
+			wm_set_scroll(wid, total_px, offset);   /* keyboard moves the elevator */
+		}
+
+		/* pointer: drain scrollbar pushes, coalesce to the latest offset */
+		if (have_ptr) {
+			int et = 0, pxy = 0, btn = 0, bs = 0, got = 0, soff = offset;
+			while (pointer_getevent(&et, &pxy, &btn, &bs) == 0)
+				if (et == PTR_EVT_SCROLL) { got = 1; soff = pxy; }
+			if (got) {
+				if (soff < 0)      soff = 0;
+				if (soff > maxoff) soff = maxoff;
+				if (soff != offset) { offset = soff; render(offset); }
+				/* no wm_set_scroll — the WM already positioned the elevator */
+			}
 		}
 	}
 
