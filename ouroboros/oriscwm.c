@@ -103,6 +103,8 @@
 #define WM_OP_SET_TITLE          6
 #define WM_OP_FONT_OPEN          7
 #define WM_OP_MEASURE_TEXT       8
+#define WM_OP_FONT_WIDTHS        9
+#define WM_OP_SET_SCROLL         10   /* client reports content-px + scroll offset (16:16) */
 #define WM_MEASURE_MAX           128   /* longest run measure_text accepts */
 
 #define WIN_TYPE_CONSOLE   1
@@ -854,10 +856,13 @@ static int           drag_outline_x, drag_outline_y;
 /* OPEN LOOK scrollbar interaction state.  window_sb_elev[wid-1] is the
  * elevator's top in window-LOCAL px, clamped to [SB_ELEV_MIN, SB_ELEV_MAX].
  * The sb_drag_* trio mirrors the window-move drag above (grab the elevator,
- * keep the grab point under the pointer).  Decorative for now — the WM keeps
- * no scrollback, so moving the elevator scrolls nothing; a client (the
- * Markdown viewer) will eventually drive + read this. */
+ * keep the grab point under the pointer).  A client (the Markdown viewer) now
+ * DRIVES the elevator position by reporting its content height + scroll offset
+ * (WM_OP_SET_SCROLL → handle_set_scroll): the fixed-size cable car rides the
+ * cable to indicate scroll LOCATION.  Reading it back (drag/arrow → scroll the
+ * client) is the next step. */
 static int           window_sb_elev[MAX_WINDOWS];
+static int           window_content_px[MAX_WINDOWS];  /* client's full content height, px (0 = none) */
 static int           sb_drag_active;
 static int           sb_drag_wid;
 static int           sb_drag_grab_off;   /* py(screen) − elevator-top(screen) at grab */
@@ -2181,29 +2186,52 @@ draw_bevel_box_screen(int packed_xy, int packed_wh, int packed_mode)
  * (The terminal body strip in flush_strip keeps its own inline emitter:
  * its text is on the boot STACK, O11, not boot data, and it is the one
  * latency-critical render path — see flush_strip.) */
+/* Glyph-blit clip rectangle in absolute window-FB pixels, consumed by the two
+ * EXTENDED win-FB blitters below (handed to ObjBlitGlyphs in R8/R9).  0 = no
+ * clip (the whole window FB) — the default, used for ALL chrome (title bars,
+ * menu marks).  forward_vector_write sets it to the content rect around each
+ * content text op so a partially-scrolled line is clipped to the pane instead
+ * of bleeding onto the title bar / border, then restores 0. */
+static int wm_glyph_clip_lo = 0;   /* (x0<<16)|y0 */
+static int wm_glyph_clip_hi = 0;   /* (x1<<16)|y1 */
+
+#define WM_VEC_CLIP_LO  ((CONTENT_X_OFF_PX << 16) | CONTENT_Y_OFF_PX)
+#define WM_VEC_CLIP_HI  (((CONTENT_X_OFF_PX + CELL_AREA_W_PX) << 16) | \
+                         (CONTENT_Y_OFF_PX + CELL_AREA_H_PX))
+
 static void
 blit_glyphs_winfb(int packed_xy, int packed_shape, int font_off, int text_off)
 {
 	asm volatile(
+		/* Stage ALL six inputs into the disjoint r8..r13 range FIRST, before
+		 * any clobber.  pcc allocates the "r" inputs sequentially into r2..r7
+		 * (ignoring the clobber list), so capturing them into r8..r13 up front
+		 * is collision-free; copying the clip LAST (after r6/r7 were already
+		 * overwritten with font_off/text_off) silently shipped garbage. */
 		"addu   r8,  %0, r0\n"
 		"addu   r9,  %1, r0\n"
 		"addu   r10, %2, r0\n"
 		"addu   r11, %3, r0\n"
-		"orefld o1, %4(o12)\n"      /* O1 = active window FB */
+		"addu   r12, %4, r0\n"
+		"addu   r13, %5, r0\n"
+		"orefld o1, %6(o12)\n"      /* O1 = active window FB */
 		"omov   o2, o15\n"          /* O2 = boot data (font) */
 		"omov   o3, o15\n"          /* O3 = boot data (text) */
 		"addu   r4, r8,  r0\n"
 		"addu   r5, r9,  r0\n"
 		"addu   r6, r10, r0\n"
 		"addu   r7, r11, r0\n"
+		"addu   r8, r12, r0\n"      /* R8 = clip lo (x0<<16|y0); 0 = no clip */
+		"addu   r9, r13, r0\n"      /* R9 = clip hi (x1<<16|y1) */
 		"call   #0x10C\n"           /* ObjBlitGlyphs */
 		"nop"
 		:
 		: "r"(packed_xy), "r"(packed_shape),
 		  "r"(font_off),  "r"(text_off),
+		  "r"(wm_glyph_clip_lo), "r"(wm_glyph_clip_hi),
 		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
 		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
-		  "r8", "r9", "r10", "r11"
+		  "r8", "r9", "r10", "r11", "r12", "r13"
 	);
 }
 
@@ -2258,22 +2286,30 @@ blit_glyphs_winfb_dyn(int packed_xy, int packed_shape, int text_off, int slot)
 	default: return;
 	}
 	asm volatile(
+		/* Stage inputs into the disjoint r8/r9/r11/r12/r13 range before any
+		 * clobber (pcc allocates the five "r" inputs into r2..r6); copying the
+		 * clip last would read r5/r6 after they were already overwritten. */
 		"addu   r8,  %0, r0\n"
 		"addu   r9,  %1, r0\n"
 		"addu   r11, %2, r0\n"
-		"orefld o1, %3(o12)\n"      /* O1 = active window FB */
+		"addu   r12, %3, r0\n"
+		"addu   r13, %4, r0\n"
+		"orefld o1, %5(o12)\n"      /* O1 = active window FB */
 		"omov   o3, o15\n"          /* O3 = boot data (text); O2 = font (above) */
 		"addu   r4, r8,  r0\n"
 		"addu   r5, r9,  r0\n"
 		"addu   r6, r0,  r0\n"      /* font_off = 0 (blob at object start) */
 		"addu   r7, r11, r0\n"
+		"addu   r8, r12, r0\n"      /* R8 = clip lo (x0<<16|y0); 0 = no clip */
+		"addu   r9, r13, r0\n"      /* R9 = clip hi (x1<<16|y1) */
 		"call   #0x10C\n"           /* ObjBlitGlyphs */
 		"nop"
 		:
 		: "r"(packed_xy), "r"(packed_shape), "r"(text_off),
+		  "r"(wm_glyph_clip_lo), "r"(wm_glyph_clip_hi),
 		  "i"(WM_ACTIVE_FB_SLOT_OFFSET)
 		: "r1", "r2", "r3", "r4", "r5", "r6", "r7",
-		  "r8", "r9", "r11"
+		  "r8", "r9", "r11", "r12", "r13"
 	);
 }
 
@@ -4134,6 +4170,32 @@ handle_measure_text(int face, int packed_len_off)
 	wm_reply(w, 0, 0, 0);
 }
 
+/* WM_OP_FONT_WIDTHS — bulk glyph-advance fetch so a client can build a LOCAL
+ * width table and wrap proportional text without a WM round-trip per word (the
+ * Markdown viewer's load was dominated by them).  Wire: R4 = face id, R5 = start
+ * codepoint; reply R3..R6 = the advances of the 16 codepoints start..start+15,
+ * packed 4 per int (low byte = lowest cp).  ~6 calls/face covers printable
+ * ASCII, vs hundreds of per-word measure_text calls. */
+static void
+handle_font_widths(int face, int start_cp)
+{
+	int packed[4];
+	int j, i;
+	if (face < 0 || face >= WM_NDYNFONT) { wm_reply(E_INVAL, 0, 0, 0); return; }
+	for (j = 0; j < 4; j++) {
+		int p = 0;
+		for (i = 0; i < 4; i++) {
+			int cp  = start_cp + j * 4 + i;
+			int adv = (cp >= 0 && cp < 256) ? font_advance(dyn_face(face), cp) : 0;
+			if (adv < 0)   adv = 0;
+			if (adv > 255) adv = 255;
+			p |= (adv & 0xFF) << (i * 8);
+		}
+		packed[j] = p;
+	}
+	wm_reply(packed[0], packed[1], packed[2], packed[3]);
+}
+
 /* WM_OP_QUERY_GEOMETRY — read back a window's pixel + cell extents.
  *   R5 = wid (or 0 to use the first live window — the typical
  *           leader-spawn shell that didn't open its own window
@@ -5440,9 +5502,13 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		int ay = window_text_y[slot] + CONTENT_Y_OFF_PX;
 		wm_text_scratch[0] = (unsigned char)cp;
 		int pxy = ((ax & 0xFFFF) << 16) | (ay & 0xFFFF);
+		wm_glyph_clip_lo = WM_VEC_CLIP_LO;   /* clip content text to the pane */
+		wm_glyph_clip_hi = WM_VEC_CLIP_HI;
 		win_draw_string(face, pxy,
 		                font_shape(1, cur_vec_color, WM_BG_COLOR, 1),
 		                wm_text_scratch);
+		wm_glyph_clip_lo = 0;                /* chrome stays unclipped */
+		wm_glyph_clip_hi = 0;
 		window_text_x[slot] += adv;
 		/* Dirty just the glyph cell (composite deferred to the drain end).
 		 * Width = face->cell_w (the max glyph box) so a proportional glyph
@@ -5472,9 +5538,13 @@ forward_vector_write(int wid, int op, int packed1, int packed2)
 		/* ONE firmware call renders the whole batch (the firmware advances the
 		 * pen per glyph from the width table); the composite is deferred to the
 		 * drain end, so a page of text is one screen update, not one per run. */
+		wm_glyph_clip_lo = WM_VEC_CLIP_LO;   /* clip content text to the pane */
+		wm_glyph_clip_hi = WM_VEC_CLIP_HI;
 		win_draw_string(face, pxy,
 		                font_shape(n, cur_vec_color, WM_BG_COLOR, 1),
 		                wm_text_scratch);
+		wm_glyph_clip_lo = 0;                /* chrome stays unclipped */
+		wm_glyph_clip_hi = 0;
 		window_text_x[slot] += w;
 		/* Dirty the run's pixel span (ax .. ax+w), + one cell so the final
 		 * proportional glyph's ink overhang is covered.  mark clamps to the
@@ -5957,6 +6027,35 @@ sb_motion(int px, int py)
 	if (elev == window_sb_elev[wid - 1]) return;
 	window_sb_elev[wid - 1] = elev;
 	sb_repaint(wid);
+}
+
+/* WM_OP_SET_SCROLL — the client (Markdown viewer) reports its full content
+ * height and current scroll offset, packed 16:16.  The WM maps the offset onto
+ * the elevator's cable travel [SB_ELEV_MIN, SB_ELEV_MAX] and repaints: the
+ * fixed-size cable car rides the cable to show scroll LOCATION (OPEN LOOK —
+ * position, not proportion).  The client-side counterpart of sb_press/sb_motion
+ * (those are user-driven; this is document-driven).  Content height is capped at
+ * 65535 px by the packing — ample for any real page. */
+static void
+handle_set_scroll(int wid, int arg)
+{
+	if (wid < 1 || wid > MAX_WINDOWS) { wm_reply(E_INVAL, 0, 0, 0); return; }
+	int slot     = wid - 1;
+	int total_px = (arg >> 16) & 0xFFFF;
+	int offset   =  arg        & 0xFFFF;
+	int viewport = CELL_AREA_H_PX;          /* the content pane is the viewport */
+	int maxoff   = total_px - viewport;
+	int elev     = SB_ELEV_MIN;
+	if (maxoff > 0) {
+		if (offset > maxoff) offset = maxoff;
+		elev = SB_ELEV_MIN + ((SB_ELEV_MAX - SB_ELEV_MIN) * offset) / maxoff;
+	}
+	if (elev < SB_ELEV_MIN) elev = SB_ELEV_MIN;
+	if (elev > SB_ELEV_MAX) elev = SB_ELEV_MAX;
+	window_content_px[slot] = total_px;
+	window_sb_elev[slot]    = elev;
+	sb_repaint(wid);
+	wm_reply(0, 0, 0, 0);
 }
 
 /* Phase 60 step 19 — lazy supervisor cap acquisition.  WM boots with
@@ -7050,6 +7149,10 @@ main(void)
 				handle_font_open(arg);   /* arg = packed name len:src_off */
 			} else if (op == WM_OP_MEASURE_TEXT) {
 				handle_measure_text(wid_or_zero, arg);  /* wid_or_zero = face */
+			} else if (op == WM_OP_FONT_WIDTHS) {
+				handle_font_widths(wid_or_zero, arg);   /* face, arg = start cp */
+			} else if (op == WM_OP_SET_SCROLL) {
+				handle_set_scroll(wid_or_zero, arg);    /* wid, (content<<16)|offset */
 			} else {
 				wm_reply(E_INVAL, 0, 0, 0);
 			}

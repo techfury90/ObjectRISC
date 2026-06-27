@@ -63,7 +63,7 @@ def _ref(index, caps):
 
 
 def run_blit(fb_w, fb_h, font_bytes, text_bytes, r4, r5,
-             font_off=0, text_off=0):
+             font_off=0, text_off=0, clip_lo=0, clip_hi=0):
     """Set up descriptors [None, fb, font, text] and run the primitive.
     Returns (status, rendered, fb_storage)."""
     fb_storage = bytearray(fb_w * fb_h)
@@ -81,6 +81,8 @@ def run_blit(fb_w, fb_h, font_bytes, text_bytes, r4, r5,
     cpu.set_gpr(5, r5)
     cpu.set_gpr(6, font_off)
     cpu.set_gpr(7, text_off)
+    cpu.set_gpr(8, clip_lo)   # extended clip rect (x0<<16)|y0; 0 = no clip
+    cpu.set_gpr(9, clip_hi)   #                     (x1<<16)|y1
     sim.primitive_ObjBlitGlyphs(cpu)
     return cpu.get_gpr(2), cpu.get_gpr(3), fb_storage
 
@@ -183,6 +185,42 @@ def test_out_of_range_codepoint():
     print(f"  out-of-range codepoint: blank + advance {cw}  OK")
 
 
+def test_content_clip():
+    """A clip rectangle (R8/R9) confines glyph ink to a sub-pane: rows above the
+    clip top and at/below the clip bottom are never written, even though the
+    glyph cell straddles BOTH edges.  This is the firmware half of the fix that
+    stops a partially-scrolled content line from scribbling onto window chrome.
+    With the clip absent the same glyph paints those rows — proving the clip,
+    not the geometry, is what confines it."""
+    blob, _ = face_blob(f"{BDF}/75dpi/luRS12.bdf", 32, 95, (12, 16), True)
+    fb_w, fb_h = 32, 48
+    cy0, cy1 = 16, 20                      # a 4px band; the glyph is 16px tall
+    clip_lo = (0 << 16) | cy0
+    clip_hi = (fb_w << 16) | cy1
+    pen_y = 12                             # glyph spans rows 12..27 -> straddles
+                                           # both the top (16) and bottom (20)
+    st, rn, fb = run_blit(fb_w, fb_h, blob, b"H", (4 << 16) | pen_y,
+                          shape_ext(1, 1, 0), clip_lo=clip_lo, clip_hi=clip_hi)
+    assert st == sim.ERR_OK and rn == 1, (st, rn)
+    for y in range(0, cy0):                # nothing above the clip top
+        assert all(fb[y * fb_w + x] == 0 for x in range(fb_w)), \
+            f"ink above clip top at row {y}"
+    for y in range(cy1, fb_h):             # nothing at/below the clip bottom
+        assert all(fb[y * fb_w + x] == 0 for x in range(fb_w)), \
+            f"ink at/below clip bottom at row {y}"
+    band_ink = any(fb[y * fb_w + x] == 1
+                   for y in range(cy0, cy1) for x in range(fb_w))
+    assert band_ink, "clip band should contain glyph ink"
+
+    # Same glyph, NO clip: rows above the band now DO get ink (control).
+    _, _, fb2 = run_blit(fb_w, fb_h, blob, b"H", (4 << 16) | pen_y,
+                         shape_ext(1, 1, 0))
+    above = any(fb2[y * fb_w + x] == 1
+                for y in range(0, cy0) for x in range(fb_w))
+    assert above, "unclipped glyph should paint above the band (control)"
+    print("  content clip: ink confined to the pane band  OK")
+
+
 def test_legacy_path_unchanged():
     """R5 bit 31 clear → the legacy 8x16 cell-grid path.  Build a tiny 8x16
     font where glyph for 'A' (code 65) is a full top row, render at cell
@@ -238,6 +276,7 @@ if __name__ == "__main__":
     test_pixel_position_and_clip()
     test_transparent_vs_opaque()
     test_out_of_range_codepoint()
+    test_content_clip()
     test_legacy_path_unchanged()
     render_sample_ppm()
     print("\nALL FONT BLIT TESTS PASSED")

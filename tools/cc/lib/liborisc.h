@@ -249,6 +249,17 @@ int  font_open(const char *name);
  * negative WM error. */
 int  wm_measure_text(int face, const char *s);
 
+/* wm_font_widths: fetch the glyph advances of 16 codepoints (start_cp ..
+ * start_cp+15) for `face` into out16[].  Build a local width table this way
+ * (~6 calls per face), then wrap proportional text with no further WM
+ * round-trips.  Returns 0, or a negative WM error. */
+int  wm_font_widths(int face, int start_cp, unsigned char *out16);
+
+/* wm_set_scroll: tell the WM a window's content height + scroll offset so its
+ * OPEN LOOK scrollbar elevator rides to the matching position (the cable car).
+ * Both clamp to 16 bits.  Returns 0, or a negative WM error. */
+int  wm_set_scroll(int wid, int total_px, int offset);
+
 int  vec_init_from_dir_result(void);                 /* adopt DIR_RESULT_SLOT cap into the VECTOR handle */
 int  vec_line(int x1, int y1, int x2, int y2);
 int  vec_rect_fill(int x, int y, int w, int h);

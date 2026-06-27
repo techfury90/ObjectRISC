@@ -81,6 +81,14 @@ main(void)
 	if (wm_measure_text(FONT_FACE_MONO, "") != 0)      { fail("measure empty", 0);  return 13; }
 	WP("font_smoke: measure_text OK\n");
 
+	/* WM_OP_FONT_WIDTHS — bulk advances for a client-built width table.  Fetch
+	 * cp 96..111: lutRS mono 'a'(97) advances 8; luRS proportional 'a' > 0. */
+	unsigned char wbuf[16];
+	if (wm_font_widths(FONT_FACE_MONO, 96, wbuf) != 0)                 { fail("font_widths", 0);         return 14; }
+	if (wbuf[1] != 8)                                                  { fail("widths mono a", wbuf[1]); return 15; }
+	if (wm_font_widths(FONT_FACE_PROP, 96, wbuf) != 0 || wbuf[1] <= 0) { fail("widths prop a", wbuf[1]); return 16; }
+	WP("font_smoke: font_widths OK\n");
+
 	WP("font_smoke: PASS\n");
 
 	rc = wm_destroy_window(wid);

@@ -3537,7 +3537,7 @@ def _font_u16(storage, off):
 
 def _blit_glyphs_extended(cpu, fb_desc, font_desc, text_desc,
                           r4, n_chars, fg, bg, transparent,
-                          font_off, text_off):
+                          font_off, text_off, clip_lo=0, clip_hi=0):
     """Extended ObjBlitGlyphs render path — proportional, pixel-positioned
     chrome.  The font (O2) is a self-describing object the WM's font
     manager bakes (tools/gen_wm_font.py):
@@ -3595,11 +3595,26 @@ def _blit_glyphs_extended(cpu, fb_desc, font_desc, text_desc,
     fb_storage   = fb_desc.storage
     text_storage = text_desc.storage
 
+    # Optional clip rectangle (from R8/R9), so a client compositing into a
+    # sub-surface (e.g. the WM drawing content-pane text) cannot scribble onto
+    # window chrome above/below the pane.  lo = (x0<<16)|y0, hi = (x1<<16)|y1 in
+    # this FB's pixels; hi == 0 (x1 == y1 == 0) means "no clip" -> the whole FB,
+    # which is the legacy / chrome path, byte-identical to before.
+    cx1 = (clip_hi >> 16) & 0xFFFF
+    cy1 =  clip_hi        & 0xFFFF
+    if cx1 == 0 and cy1 == 0:
+        cx0, cy0, cx1, cy1 = 0, 0, fb_w, fb_h
+    else:
+        cx0 = (clip_lo >> 16) & 0xFFFF
+        cy0 =  clip_lo        & 0xFFFF
+        if cx1 > fb_w: cx1 = fb_w
+        if cy1 > fb_h: cy1 = fb_h
+
     pen_x = (r4 >> 16) & 0xFFFF
     pen_y = r4 & 0xFFFF
     rendered = 0
     for g in range(n_chars):
-        if pen_x >= fb_w:
+        if pen_x >= cx1:
             break
         ch = text_storage[text_off + g]
         gi = ch - base
@@ -3610,15 +3625,15 @@ def _blit_glyphs_extended(cpu, fb_desc, font_desc, text_desc,
         gbase = bitmaps_off + gi * glyph_bytes
         for r in range(cell_h):
             row_y = pen_y + r
-            if row_y < 0 or row_y >= fb_h:
+            if row_y < cy0 or row_y >= cy1:
                 continue
             row_off  = gbase + r * bpr
             row_base = row_y * fb_w
             for col in range(cell_w):
                 px = pen_x + col
-                if px < 0:
+                if px < cx0:
                     continue
-                if px >= fb_w:
+                if px >= cx1:
                     break
                 byte = font_storage[row_off + (col >> 3)]
                 if (byte >> (7 - (col & 7))) & 1:
@@ -3730,9 +3745,11 @@ def primitive_ObjBlitGlyphs(cpu: CPU) -> None:
         transparent = (r5 >> 30) & 1
         fg          = (r5 >> 8)  & 0xFF
         bg          =  r5        & 0xFF
+        clip_lo     = cpu.get_gpr(8)   # (x0<<16)|y0, or 0 for no clip
+        clip_hi     = cpu.get_gpr(9)   # (x1<<16)|y1, or 0 for no clip
         _blit_glyphs_extended(cpu, fb_desc, font_desc, text_desc,
                               r4, n_chars, fg, bg, transparent,
-                              font_off, text_off)
+                              font_off, text_off, clip_lo, clip_hi)
         return
 
     # --- legacy 8x16 cell-grid path (terminal body; byte-for-byte
