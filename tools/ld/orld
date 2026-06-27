@@ -28,6 +28,10 @@ from typing import Dict, List, Optional, Tuple
 ORX_MAGIC          = b"ORISC\x00\x00\x00"
 ORX_FORMAT_VERSION = 1
 ORX_HEADER_SIZE    = 0x20
+# .orx header flags word (offset 0x0C).  Bit 0: the program MAY run on the
+# launching terminal's CPU (execution-locality opt-in) instead of defaulting
+# to a compute CPU.  Read by the supervisor at spawn placement (P2b).
+ORX_FLAG_LOCAL_OK  = 0x1
 
 # .oro input container — must agree with asmorisc.
 ORO_MAGIC          = b"ORISCOBJ"
@@ -463,9 +467,9 @@ def _apply_reloc(buf: bytearray, reloc: Reloc, target_va: int,
                      f"0x{reloc.rtype:02x} at offset {o:#x}")
 
 
-def write_orx(text: bytes, data: bytes, entry_offset: int) -> bytes:
+def write_orx(text: bytes, data: bytes, entry_offset: int, flags: int = 0) -> bytes:
     hdr = (ORX_MAGIC
-           + struct.pack(">II", ORX_FORMAT_VERSION, 0)
+           + struct.pack(">II", ORX_FORMAT_VERSION, flags)
            + struct.pack(">III", entry_offset, len(text), len(data))
            + struct.pack(">I", 0))                # stack_size = loader default
     assert len(hdr) == ORX_HEADER_SIZE
@@ -518,6 +522,10 @@ def main(argv) -> int:
                     help="entry symbol name (default: _start)")
     ap.add_argument("--map", type=Path,
                     help="write a section/symbol map to this path")
+    ap.add_argument("--local-ok", action="store_true",
+                    help="set the .orx LOCAL_OK header flag: the program may "
+                         "run on the launching terminal's CPU instead of "
+                         "defaulting to a compute CPU (P2b execution locality)")
     args = ap.parse_args(argv)
 
     out_path = args.output or args.inputs[0].with_suffix(".orx")
@@ -539,7 +547,8 @@ def main(argv) -> int:
 
     objs = resolve_via_archives(objs, archives)
     text, data, entry = link(objs, args.entry)
-    out_path.write_bytes(write_orx(text, data, entry))
+    flags = ORX_FLAG_LOCAL_OK if args.local_ok else 0
+    out_path.write_bytes(write_orx(text, data, entry, flags))
 
     if args.map:
         args.map.write_text(write_map(objs, text, data, entry))

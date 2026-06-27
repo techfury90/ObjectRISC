@@ -133,7 +133,7 @@ $(BUILD)/programs/shell.oro: ouroboros/shell.c | $(BUILD)/programs
 	$(ASMORISC) -r $(@:.oro=.s) -o $@
 
 $(SHELL_ORX): $(BUILD)/programs/shell.oro $(RUNTIME) $(LIBORISC) | $(BUILD)/programs
-	$(ORLD) -o $@ $(RUNTIME) $(BUILD)/programs/shell.oro $(LIBORISC)
+	$(ORLD) --local-ok -o $@ $(RUNTIME) $(BUILD)/programs/shell.oro $(LIBORISC)
 
 # Supervisor — Ouroboros's init / spawn server (Phase 45a). The
 # top-level .orx that CPU 0's leader runs.
@@ -178,8 +178,14 @@ $(BUILD)/programs/%.oro: ouroboros/programs/%.c | $(BUILD)/programs
 	$(CCOM) < $(@:.oro=.i) > $(@:.oro=.s)
 	$(ASMORISC) -r $(@:.oro=.s) -o $@
 
+# Interactive UI apps prefer co-resident (on-terminal) execution — being on the
+# same CPU as the WM avoids a cross-CPU RPC per console/grid op.  Linked with
+# orld --local-ok (sets the .orx LOCAL_OK flag); the supervisor honours it when
+# the app is launched from a terminal.  All other programs default to compute.
+$(BUILD)/programs/mdview.orx $(BUILD)/programs/mouse_paint.orx $(BUILD)/programs/font_demo.orx: ORLD_LOCAL_FLAG := --local-ok
+
 $(BUILD)/programs/%.orx: $(BUILD)/programs/%.oro $(RUNTIME) $(LIBORISC) | $(BUILD)/programs
-	$(ORLD) -o $@ $(RUNTIME) $< $(LIBORISC)
+	$(ORLD) $(ORLD_LOCAL_FLAG) -o $@ $(RUNTIME) $< $(LIBORISC)
 
 # --- output dirs (order-only prereqs) ---------------------------------
 
