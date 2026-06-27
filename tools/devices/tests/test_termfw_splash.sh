@@ -35,7 +35,7 @@ build_termfw() {
 }
 
 # --- 1. normal: self-test passes, banner draws, clean exit 0 ---
-build_termfw "-DDELAY_US=2000 -DBANNER_HOLD_US=2000" "$TMP/termfw.orx"
+build_termfw "-DSTOP_AFTER_SPLASH -DDELAY_US=2000 -DBANNER_HOLD_US=2000" "$TMP/termfw.orx"
 rc=0
 python3 tools/sim/simorisc "$TMP/termfw.orx" > "$TMP/ok.out" 2>&1 || rc=$?
 echo "--- termfw (pass), exit=$rc ---"; cat "$TMP/ok.out"
@@ -47,7 +47,7 @@ if grep -q "FAIL:" "$TMP/ok.out"; then
 fi
 
 # --- 2. forced memtest failure: message renders + nonzero exit ---
-build_termfw "-DDELAY_US=2000 -DBANNER_HOLD_US=2000 -DFORCE_MEMTEST_FAIL" "$TMP/fail.orx"
+build_termfw "-DSTOP_AFTER_SPLASH -DDELAY_US=2000 -DBANNER_HOLD_US=2000 -DFORCE_MEMTEST_FAIL" "$TMP/fail.orx"
 rc=0
 python3 tools/sim/simorisc "$TMP/fail.orx" > "$TMP/fail.out" 2>&1 || rc=$?
 echo "--- termfw (forced memtest fail), exit=$rc ---"; cat "$TMP/fail.out"
