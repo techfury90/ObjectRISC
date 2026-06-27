@@ -893,17 +893,18 @@ static int           window_title_lens[MAX_WINDOWS];
  * buffers with parallel offset arrays because the .word LABEL
  * path resolved to `DATA_BASE + offset_in_obj` at assemble time,
  * ignoring this .oro's actual placement in the linked image. */
-#define DESKTOP_MENU_N 6
+#define DESKTOP_MENU_N 7
 static const char *const desktop_menu_labels[DESKTOP_MENU_N] = {
 	"Shell",
 	"Edit",
 	"Mouse Paint",
 	"Menu Demo",
 	"Font Demo",
+	"Markdown Viewer",
 	"Shut Down",
 };
 static const int desktop_menu_label_lens[DESKTOP_MENU_N] = {
-	5, 4, 11, 9, 9, 9,
+	5, 4, 11, 9, 9, 15, 9,
 };
 /* "Shut Down" has no spawn path — it runs an action (sup_shutdown, exactly
  * what the shell's `exit` does), special-cased in desktop_menu_select. */
@@ -914,6 +915,7 @@ static const char *const desktop_menu_spawn_paths[DESKTOP_MENU_N] = {
 	"/programs/mouse_paint.orx",
 	"/programs/menudemo.orx",
 	"/programs/font_demo.orx",
+	"/programs/mdview.orx",
 	(const char *)0,         /* Shut Down — action, not a spawn */
 };
 /* No "Cancel" item — an OPEN LOOK menu dismisses by clicking off it (the
