@@ -576,48 +576,6 @@ relay_spawn_request(int len, int target_pid, int term_hint_plus_one)
 	return 0;
 }
 
-/* Phase 48: forward an op=2 (shutdown) SEND to the leader supervisor.
- * `exit`/`quit` from a worker's shell wakes its OWN supervisor with
- * op=2, which would otherwise just halt the worker — the leader (and
- * thus oriscrun's --leader watchdog) keeps running, leaving the
- * simulator alive after the user asked it to shut down. By relaying
- * op=2 to /sys/cpu/0/supervisor, the leader processes its own op=2
- * cascade, exits CPU 0, and oriscrun tears down the workers via
- * SIGTERM. (We still cascade-kill our own children before halting,
- * keeping the worker-side teardown deterministic regardless of the
- * leader's response time.) Returns 0 on success, negative on dir_walk
- * failure (no leader registered — exotic, e.g. single-CPU workers
- * built for a different scenario). */
-static int
-relay_shutdown_to_leader(void)
-{
-	char path[PEER_PATH_BUF_SIZE];
-	render_peer_path(0, path);
-	int kind;
-	char remainder[16];
-	int rc = dir_walk(path, &kind, remainder, sizeof(remainder));
-	if (rc < 0 || kind != DIR_KIND_LEAF)
-		return rc < 0 ? rc : -1;
-
-	/* dir_walk parked the leader's spawn-mailbox sub-cap into
-	 * DIR_RESULT_SLOT. Load it into O1 and SEND op=2 with no
-	 * payload — same shape as sup_shutdown's wire op. */
-	asm volatile(
-		"orefld o1, %0(o12)\n"
-		"onull  o2\n"
-		"onull  o3\n"
-		"addiu  r4, r0, 2\n"        /* op = shutdown */
-		"addiu  r5, r0, 0\n"
-		"addiu  r6, r0, 0\n"
-		"addiu  r7, r0, 0\n"
-		"send   o1\n"
-		:
-		: "i"(DIR_RESULT_SLOT_OFFSET)
-		: "r1", "r4", "r5", "r6", "r7"
-	);
-	return 0;
-}
-
 /* Phase 51: round-robin counter, one per supervisor. Initialised in
  * main() to (procid + 1) so the first relay from this supervisor
  * lands on the next live CPU (typically a peer, not self), giving
@@ -635,6 +593,14 @@ relay_shutdown_to_leader(void)
  * Phase-49 contract.) */
 #define MAX_PROCID 16
 static int next_cpu_counter;
+
+/* Set at boot when this supervisor is co-resident with a WM on the same CPU
+ * (termfw forwarded a framebuffer into O5).  When co-resident, the WM mediates
+ * each app's console directly via wm_open_session, so the supervisor must NOT
+ * bind its own WM-mediated console — and crucially must never issue a blocking
+ * RPC back to the WM while servicing a spawn the WM itself requested (that
+ * deadlocks: the WM is blocked in sup_spawn awaiting our reply). */
+static int sup_coresident;
 
 /* Phase 52: per-task name stash for `ps`. Indexed by libc task_t,
  * stores the basename of the .orx path each spawn loaded (e.g.
@@ -790,6 +756,11 @@ wm_leader_grid_isn(void)
 static void
 maybe_lazy_wm_bind(void)
 {
+	/* Co-resident: the WM owns the display and mediates each app's console via
+	 * wm_open_session; we have no WM-mediated console of our own to bind, and a
+	 * wm_new_window RPC here would deadlock — this call is reached from
+	 * handle_spawn_request while the WM is blocked in sup_spawn waiting for us. */
+	if (sup_coresident) return;
 	if (wm_leader_console_isn() == 0) return;  /* already bound */
 	if (wm_init() != 0)               return;  /* WM not up yet */
 
@@ -975,230 +946,21 @@ clear_child_term_slots(void)
 	);
 }
 
-/* --- Phase 52: hot-attach for terminals ----------------------------
- *
- * The leader supervisor's dispatch loop wakes periodically (finite-
- * timeout poll, see poll_one_request_timed) and scans /sys/term for
- * any newly-registered terminal directories. For each one not yet
- * seen, it spawns a fresh login.orx with the appropriate Phase 49
- * terminal-pass-through so the spawned login binds to /sys/term/
- * <new-idx>/{console,keyboard,grid} regardless of which CPU it
- * lands on (round-robin via SUP_TARGET_ANY in plain orx_spawn —
- * actually we use orx_spawn local since hot-attach happens on the
- * leader's CPU; the child still gets the right terminal services
- * via populate_child_term_slots).
- *
- * Why baked into the supervisor instead of a separate session_
- * manager.orx program: an earlier prototype put session_manager in
- * its own .orx, but loading that ~30 KiB file via hf_read on cpu0's
- * boot path widens the leader's startup window enough that a fast
- * peer worker shell can finish its session and relay op=2 BEFORE
- * cpu0's own login has even rendered the welcome banner — and the
- * cascade-kill curtails the leader's shell before it really starts.
- * test_multiterminal demonstrated the regression conclusively.
- * Embedding the hot-attach logic here avoids the .orx load
- * entirely; the supervisor is already loaded.
- *
- * Boot seeding: we mark all terminals registered AT BOOT TIME as
- * already-seen, so the per-supervisor has_terminal block (which
- * spawns a boot login for each CPU's own terminal) doesn't get
- * doubled up by the first hot-attach scan. From then on, only
- * NEWLY-appearing terminals trigger spawns. */
-
-#define HOT_ATTACH_MAX_TERMS 16
-#define HOT_ATTACH_LIST_BUF  256
-static unsigned int hot_attach_seen;
-
-/* Phase 54: tracking for kill-on-detach. terminal_login_task[idx]
- * carries the task_t of the login bound to terminal index idx, or
- * -1 if none. Populated when a login is spawned (either by the
- * has_terminal boot block or by hot_attach_maybe_spawn), consulted
- * when the periodic scan notices /sys/term/<idx> has disappeared
- * — at which point we task_kill the bound login so it doesn't
- * loop forever on ESTALE keyboard reads. */
-static task_t terminal_login_task[HOT_ATTACH_MAX_TERMS];
-
-/* Set by hot_attach_collect during the scan's first pass; consumed
- * by hot_attach_scan in its second-pass diff. */
-static unsigned int hot_attach_present_mask;
-
-typedef void (*visit_fn)(int idx);
-
-/* Parse a leading run of decimal digits in `s` into `*out`. Returns
- * the number of digits consumed; 0 = no digits. Stops at any non-
- * digit (oriscdir suffixes directory names with '/', so "0/" parses
- * as 0 and we stop at the slash). */
-static int
-hot_attach_parse_decimal(const char *s, int *out)
-{
-	int v = 0, n = 0;
-	while (s[n] >= '0' && s[n] <= '9') {
-		v = v * 10 + (s[n] - '0');
-		n++;
-	}
-	if (n == 0) return 0;
-	*out = v;
-	return n;
-}
-
-/* dir_list returns the entry count; the byte length of the NUL-
- * separated names buffer needs to be derived. We trust the count
- * and walk forward, stopping after `count` NUL terminators. */
-static int
-hot_attach_listing_byte_len(const char *buf, int cap, int count)
-{
-	int i = 0, found = 0;
-	while (i < cap && found < count) {
-		while (i < cap && buf[i] != '\0') i++;
-		if (i < cap) {
-			i++;
-			found++;
-		}
-	}
-	return i;
-}
-
-/* Mark `idx` as seen without spawning. Used at boot to seed
- * hot_attach_seen with the terminals the per-supervisor has_terminal
- * block already handled. */
-static void
-hot_attach_mark(int idx)
-{
-	if (idx >= 0 && idx < HOT_ATTACH_MAX_TERMS)
-		hot_attach_seen |= (1u << idx);
-}
-
-/* Spawn login for `idx` if not already seen, then mark it seen. */
-static void
-hot_attach_maybe_spawn(int idx)
-{
-	if (idx < 0 || idx >= HOT_ATTACH_MAX_TERMS) return;
-	if (hot_attach_seen & (1u << idx)) return;
-	hot_attach_seen |= (1u << idx);
-
-	/* Phase 49 pass-through dance: fill ORX_SLOT_CHILD_O5/O6/O7
-	 * from /sys/term/<idx>/* so the spawned login wakes up bound
-	 * to the right terminal services. orx_set_child_terminal_idx
-	 * also stuffs idx+1 into R5 → child's R4 → _orisc_init_r4 so
-	 * its libc task_init reads back my_terminal_idx = idx (for
-	 * any future sup_spawn from that login carrying the right R7
-	 * routing hint). */
-	populate_child_term_slots(idx);
-	orx_set_child_terminal_idx(idx);
-	task_t t = sup_spawn_named(LOGIN_PATH, "", "/");
-	clear_child_term_slots();
-	orx_clear_child_terminal_idx();
-
-	if (t < 0) {
-		SUP_PRINT("supervisor: hot-attach spawn failed for term=");
-		SUP_PRINT_INT(idx);
-		SUP_PRINT(" rc=");
-		SUP_PRINT_INT((int)t);
-		SUP_PRINT("\n");
-		return;
-	}
-	(void)task_resume(t);
-	task_yield();    /* same race-fix discipline as handle_spawn_request */
-	terminal_login_task[idx] = t;     /* Phase 54: record for kill-on-detach */
-	SUP_PRINT("supervisor: hot-attached login for term=");
-	SUP_PRINT_INT(idx);
-	SUP_PRINT("\n");
-}
-
-/* Phase 54: a previously-seen terminal index is no longer present
- * in /sys/term — its oriscterm exited and the directory entries
- * went away. The bound login is still alive but its O5/O6/O7
- * subcaps point at a dead service; its first term_getkey will
- * return ESTALE and login's error path will spin. task_kill
- * deterministically reaps it now. (The slot itself gets reclaimed
- * by reap_exited_tasks on the next pass.) */
-static void
-hot_attach_detach(int idx)
-{
-	if (idx < 0 || idx >= HOT_ATTACH_MAX_TERMS) return;
-	task_t t = terminal_login_task[idx];
-	if (t >= 0) {
-		(void)task_kill(t, 137);
-		terminal_login_task[idx] = -1;
-	}
-	hot_attach_seen &= ~(1u << idx);
-	SUP_PRINT("supervisor: detached login for term=");
-	SUP_PRINT_INT(idx);
-	SUP_PRINT("\n");
-}
-
-/* First-pass collector for hot_attach_scan: record everything
- * currently present in /sys/term. */
-static void
-hot_attach_collect(int idx)
-{
-	if (idx >= 0 && idx < HOT_ATTACH_MAX_TERMS)
-		hot_attach_present_mask |= (1u << idx);
-}
-
-/* Two-pass scan: walk /sys/term once into present_mask, then diff
- * against hot_attach_seen and act on each transition.
- *   present  + seen     → still alive, no-op
- *   present  + !seen    → newly attached, spawn login
- *   !present + seen     → detached, kill login
- *   !present + !seen    → never was, no-op */
-static void
-hot_attach_scan(void)
-{
-	hot_attach_present_mask = 0;
-	hot_attach_walk(hot_attach_collect);
-
-	int t;
-	for (t = 0; t < HOT_ATTACH_MAX_TERMS; t++) {
-		unsigned int bit = 1u << t;
-		int present = (hot_attach_present_mask & bit) != 0;
-		int seen    = (hot_attach_seen         & bit) != 0;
-		if (present && !seen)       hot_attach_maybe_spawn(t);
-		else if (!present && seen)  hot_attach_detach(t);
-	}
-}
-
-/* dir_list /sys/term, walk the names, invoke `visit(idx)` for each
- * integer-named entry. Used by both seed and scan. */
-static void
-hot_attach_walk(visit_fn visit)
-{
-	char buf[HOT_ATTACH_LIST_BUF];
-	int count = dir_list("/sys/term", buf, sizeof(buf));
-	if (count <= 0) return;
-	int total = hot_attach_listing_byte_len(buf, sizeof(buf), count);
-	int i = 0;
-	while (i < total) {
-		int idx;
-		int n = hot_attach_parse_decimal(buf + i, &idx);
-		if (n > 0) visit(idx);
-		while (i < total && buf[i] != '\0') i++;
-		if (i < total) i++;
-	}
-}
-
 /* --- Phase 54: slot-table reaping ----------------------------------
  *
  * Every spawn the supervisor performs allocates a slot in its libc
  * task table (16 slots total — see TASK_MAX_CONCURRENT in task.c).
  * task_register_o1 finds the lowest-numbered free slot. Without
  * reaping, EXITED tasks stay in their slots forever; after enough
- * sessions / hot-attach cycles / `run` invocations, the table fills
- * and orx_spawn returns -6 ("task table is full").
+ * sessions / `run` invocations, the table fills and orx_spawn
+ * returns -6 ("task table is full").
  *
  * shell.c has its own per-shell reap_exited_tasks (called once per
  * prompt iteration); the supervisor needs the same hygiene. We call
- * this from two places:
- *
- *   1. The top of handle_spawn_request — natural moment, since
- *      the next thing we'll do is allocate a slot. Failing alloc
- *      due to leaked EXITED slots would cascade into a confused
- *      "spawn failed -6" reply to the shell.
- *
- *   2. Right before each hot_attach_walk pass — periodic backstop.
- *      Even if no spawn requests come in, the leader's hot-attach
- *      logic itself spawns logins for newly-attached terminals,
- *      and those logins eventually exit (e.g., on `logout`).
+ * this from the top of handle_spawn_request — a natural moment, since
+ * the next thing we'll do is allocate a slot. Failing alloc due to
+ * leaked EXITED slots would cascade into a confused "spawn failed -6"
+ * reply to the shell.
  *
  * orx_unload internally task_waits (no-op for already-exited),
  * ObjFreeDeferreds the manifest entries, and task_frees the slot.
@@ -1248,9 +1010,6 @@ reap_exited_tasks(void)
  * The shell adds a "CPU N:" header when printing. */
 
 #define SUP_OP_LIST_TASKS  5
-#define SUP_OP_DIR_NOTIFY  6   /* Phase 54: oriscdir SENDs this when
-                                * /sys/term mutates; supervisor reacts
-                                * by re-running the hot-attach scan. */
 #define LIST_REPLY_VA      0x00600000   /* matches sup_pack_request's
                                          * scratch VA — only one
                                          * MapObject lives there at a
@@ -1697,16 +1456,15 @@ handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
 
 	/* Yield to give the just-resumed child at least one quantum
 	 * before we loop back to poll. Without this, any SEND already
-	 * queued in our mailbox at this point (most commonly a
-	 * worker's relayed op=2 shutdown — Phase 48
-	 * relay_shutdown_to_leader) is picked up by the very next
-	 * poll and triggers the cascade-kill before the spawned task
-	 * ever ran. The user-visible symptom: the requester's shell
-	 * session never starts because TaskCreate-then-TaskKill lands
-	 * first. Yielding here lets the child run through crt0,
-	 * task_init, term_init's keyboard subscribe, and the welcome
-	 * banner SEND, until it blocks on term_getkey's
-	 * RecvQueuePoll. See test_supervisor_session_manager.sh. */
+	 * queued in our mailbox at this point (most commonly a shell's
+	 * op=2 shutdown) is picked up by the very next poll and triggers
+	 * the cascade-kill before the spawned task ever ran. The
+	 * user-visible symptom: the requester's shell session never
+	 * starts because TaskCreate-then-TaskKill lands first. Yielding
+	 * here lets the child run through crt0, task_init, term_init's
+	 * keyboard subscribe, and the welcome banner SEND, until it
+	 * blocks on term_getkey's RecvQueuePoll. See
+	 * test_supervisor_session_manager.sh. */
 	if (t >= 0) task_yield();
 }
 
@@ -1728,28 +1486,12 @@ handle_spawn_request(int len, int target_pid, int term_hint, int self_procid)
  * console/keyboard/grid (we dir_walk /sys/term/<N>/* before spawn)."
  * Set when a peer relays a spawn from a foreign-terminal'd shell,
  * unset when a child program calls sup_spawn directly. */
-/* Phase 52: the leader's dispatch loop uses a finite timeout so it
- * wakes periodically to scan /sys/term for hot-attached terminals.
- * Workers stay on infinite-timeout polling — they don't run the
- * hot-attach scan, and a timeout wakeup would just cost a wire
- * round-trip with nothing to do.
- *
- * The timeout is in scheduler ticks. simorisc decrements it only
- * when the supervisor is the current task on its CPU, so the
- * effective wall-clock interval is "this many ticks of supervisor
- * being current" — i.e., mostly idle ticks. With idle ticks pacing
- * at ~1ms, HOT_ATTACH_POLL_TICKS = 5000 gives roughly 5-second
- * hot-attach latency under low load, while a busy shell session
- * (where the supervisor is frequently blocked) extends that
- * naturally — exactly the throttling we want.
- *
- * The timeout is delivered to poll_one_request via a static
- * because pcc-orisc trips on a 5th C arg ("adrput: illegal op 57"
- * — same constraint that bit Phase 51's sup_spawn_for_terminal and
- * Phase 52's ps handler). Caller sets poll_timeout_ticks before
- * calling poll_one_request; the default -1 (infinite) is
- * preserved for workers and the legacy contract. */
-#define HOT_ATTACH_POLL_TICKS 5000
+/* The dispatch loop polls with an infinite timeout (-1): it is fully
+ * event-driven, so there's nothing to wake up for between SENDs. The
+ * timeout is delivered to poll_one_request via a static because
+ * pcc-orisc trips on a 5th C arg ("adrput: illegal op 57" — same
+ * constraint that bit Phase 51's sup_spawn_for_terminal and Phase
+ * 52's ps handler). */
 static int poll_timeout_ticks = -1;
 
 static int
@@ -1780,8 +1522,7 @@ poll_one_request(int *out_op, int *out_len, int *out_target_pid,
 	return status;
 }
 
-const char banner_leader[]   = "supervisor: booting (leader)\n";
-const char banner_worker[]   = "supervisor: booting (worker)\n";
+const char banner_booting[]  = "supervisor: booting\n";
 const char shell_done[]      = "supervisor: shell exited; halting\n";
 const char unknown_op[]      = "supervisor: unknown op\n";
 
@@ -1826,7 +1567,6 @@ main(void)
 	 * later self-register / banner / leader-only blocks read it
 	 * too. */
 	int procid    = read_procid();
-	int is_leader = (procid == 0);
 
 	/* M3 co-residency detector.  termfw forwards its display-backed framebuffer
 	 * into our O5; every legacy boot leaves O5 a NULL pad at boot and walks
@@ -1840,6 +1580,7 @@ main(void)
 	int coresident;
 	asm volatile("oisn %0, o5" : "=r"(coresident));
 	coresident = !coresident;   /* OISN sets 1 when O5 is null */
+	sup_coresident = coresident;   /* file-scope copy for maybe_lazy_wm_bind */
 
 	/* Phase 51: declare our terminal_idx (procid in the current
 	 * model) so children spawned via orx_spawn inherit it through
@@ -1856,16 +1597,6 @@ main(void)
 	 * alternating cleanly thereafter. */
 	task_set_my_terminal_idx(procid);
 	next_cpu_counter = procid + 1;
-
-	/* Phase 54: initialise the kill-on-detach mapping. -1 means "no
-	 * login bound to that terminal slot." Populated below when a
-	 * boot login is spawned, and by hot_attach_maybe_spawn for
-	 * hot-attached terminals. */
-	{
-		int i;
-		for (i = 0; i < HOT_ATTACH_MAX_TERMS; i++)
-			terminal_login_task[i] = -1;
-	}
 
 	/* Phase 47: walk the directory for our boot service refs. After
 	 * 45h+47, devices self-register at /sys/term/<N>/* and
@@ -1975,7 +1706,7 @@ main(void)
 	 * ORX_SLOT_CHILD_O8 and does the swap transparently. */
 	install_child_o8_override();
 
-	print_str(is_leader ? banner_leader : banner_worker);
+	print_str(banner_booting);
 
 	/* Phase 45f: register self at /sys/cpu/<procid>/supervisor.
 	 * Peers find us via dir_walk on this path; relay_spawn_request
@@ -2012,40 +1743,6 @@ main(void)
 		}
 	}
 
-	/* Phase 54: leader subscribes to /sys/term so hot-attach can
-	 * react to terminal add/remove events without polling. The
-	 * notify_cap is a fresh R+S sub-cap of our spawn mailbox (O9);
-	 * notifications arrive there with R3 = SUP_OP_DIR_NOTIFY,
-	 * which the dispatch loop routes to a fresh hot-attach scan.
-	 *
-	 * If the subscribe fails (e.g., no oriscdir wired in a
-	 * degenerate test config), the periodic-poll fallback in the
-	 * dispatch loop still picks up changes — just at the longer
-	 * HOT_ATTACH_POLL_TICKS cadence rather than the wire-round-trip
-	 * latency of subscriptions. */
-	if (is_leader) {
-		int derive_status;
-		asm volatile(
-			"omov   o1, o9\n"
-			"addiu  r4, r0, 9\n"          /* CAP_R | CAP_S */
-			"call   #0x103\n"             /* ObjDerive */
-			"nop\n"
-			"addu   %0, r2, r0"
-			: "=r"(derive_status) : : "r1", "r2", "r4"
-		);
-		if (derive_status == 0) {
-			int sub_status = dir_subscribe("/sys/term",
-			                               SUP_OP_DIR_NOTIFY);
-			if (sub_status != 0) {
-				SUP_PRINT("supervisor: /sys/term subscribe failed (");
-				SUP_PRINT_INT(sub_status);
-				SUP_PRINT(") — periodic poll fallback only\n");
-			} else {
-				SUP_PRINT("supervisor: /sys/term subscribed\n");
-			}
-		}
-	}
-
 	/* Phase 55: the /programs MOUNT is no longer the supervisor's
 	 * problem. oriscdir reads its --config file at startup and
 	 * stages the mount as a deferred intent; when hostfsd's
@@ -2060,34 +1757,29 @@ main(void)
 	 * back to direct hf_open, same as the pre-Phase-55 dir_mount-
 	 * failed path did.
 	 *
-	 * Sysinit still spawns here as a one-shot "system setup" hook;
-	 * it currently doesn't do much, but the slot is available for
-	 * late-boot setup work that's CPU-local (i.e., something a
-	 * directory mutation can't express). */
-	if (is_leader) {
-		/* M3: when co-resident, sysinit is the WM launcher.  Hand it O8=directory
-		 * (so it can orx_spawn the WM) + O5=framebuffer (to forward to the WM),
-		 * and signal the launcher role via args="wm".  Restore the spawn-mailbox
-		 * child-O8 + clear child-O5 afterward so later spawns are unaffected. */
-		const char *si_args = "";
-		if (coresident) {
-			asm volatile(
-				"orefld o1, %0(o12)\n"   /* DIR_SLOT (directory) */
-				"orefst o1, %1(o12)\n"   /* -> ORX_SLOT_CHILD_O8 (was spawn-mailbox) */
-				"orefst o5, %2(o12)"     /* O5 (framebuffer) -> ORX_SLOT_CHILD_O5 */
-				:
-				: "i"(DIR_SLOT_OFFSET),
-				  "i"(ORX_SLOT_CHILD_O8_OFFSET),
-				  "i"(ORX_SLOT_CHILD_O5_OFFSET)
-				: "r1");
-			si_args = "wm";
-		}
-		task_t sysinit = sup_spawn_named(SYSINIT_PATH, si_args, "/");
-		if (coresident) {
-			install_child_o8_override();   /* restore spawn-mailbox child-O8 */
-			asm volatile("onull o1\n orefst o1, %0(o12)"
-			             :: "i"(ORX_SLOT_CHILD_O5_OFFSET) : "r1");
-		}
+	 * Co-resident CPUs spawn sysinit as their WM launcher (below).  The old
+	 * leader/worker split that gated this is gone — every supervisor is a
+	 * peer, distinguished only by whether it drives a display.  So EVERY
+	 * terminal CPU launches its own WM, not just procid 0. */
+	if (coresident) {
+		/* Co-resident: sysinit is the WM launcher.  Hand it O8=directory (so
+		 * it can orx_spawn the WM) + O5=framebuffer (to forward to the WM),
+		 * and signal the launcher role via args="wm".  Restore the spawn-
+		 * mailbox child-O8 + clear child-O5 afterward so later spawns are
+		 * unaffected. */
+		asm volatile(
+			"orefld o1, %0(o12)\n"   /* DIR_SLOT (directory) */
+			"orefst o1, %1(o12)\n"   /* -> ORX_SLOT_CHILD_O8 (was spawn-mailbox) */
+			"orefst o5, %2(o12)"     /* O5 (framebuffer) -> ORX_SLOT_CHILD_O5 */
+			:
+			: "i"(DIR_SLOT_OFFSET),
+			  "i"(ORX_SLOT_CHILD_O8_OFFSET),
+			  "i"(ORX_SLOT_CHILD_O5_OFFSET)
+			: "r1");
+		task_t sysinit = sup_spawn_named(SYSINIT_PATH, "wm", "/");
+		install_child_o8_override();   /* restore spawn-mailbox child-O8 */
+		asm volatile("onull o1\n orefst o1, %0(o12)"
+		             :: "i"(ORX_SLOT_CHILD_O5_OFFSET) : "r1");
 		if (sysinit < 0) {
 			SUP_PRINT("supervisor: failed to spawn sysinit: ");
 			SUP_PRINT_INT((int)sysinit);
@@ -2178,79 +1870,44 @@ main(void)
 		                * welcome-banner / shell-spawn cycle; only
 		                * the shell's `exit`/`quit` (which calls
 		                * sup_shutdown) actually halts us. */
-
-		/* Phase 54: record this CPU's boot login so the
-		 * kill-on-detach scan can reap it if its terminal goes
-		 * away. The mapping is by terminal index — and our boot
-		 * terminal IS our procid (per the per-supervisor
-		 * /sys/term/<procid>/* dir-walks above), so the array
-		 * slot is procid. */
-		if (procid >= 0 && procid < HOT_ATTACH_MAX_TERMS) {
-			terminal_login_task[procid] = login;
-		}
-	}
-
-	/* Phase 52: seed hot_attach_seen with the terminals already
-	 * registered at boot time. Per-supervisor has_terminal blocks
-	 * (above) handled them; the dispatch-loop hot-attach scan
-	 * should only act on terminals that appear AFTER this point.
-	 * Leader-only — workers don't run the scan, so they don't need
-	 * the seed either. */
-	if (is_leader) {
-		hot_attach_walk(hot_attach_mark);
-		SUP_PRINT("supervisor: hot-attach seeded\n");
 	}
 
 	/* Dispatch loop. Wake-up is event-driven: each `run`/`edit`
-	 * from a shell SENDs op=1 (spawn), and the leader's shell
-	 * SENDs op=2 (sup_shutdown) right before its TaskExit on
-	 * `exit`/`quit`. The latter unblocks the leader's poll
-	 * deterministically.
+	 * from a shell SENDs op=1 (spawn), and a shell SENDs op=2
+	 * (sup_shutdown) right before its TaskExit on `exit`/`quit`. The
+	 * latter unblocks the poll deterministically.
 	 *
-	 * Worker supervisors get torn down externally when the leader
-	 * exits — oriscrun's `--leader 0` watches CPU 0 and SIGTERMs
-	 * the rest of the process group on its exit. (See
-	 * tools/oriscrun.) Without that external teardown a worker
-	 * would block in poll_one_request forever waiting for a SEND
-	 * that never comes. */
-	/* Leader: enable hot-attach polling. Workers leave the timeout
-	 * at -1 (infinite) — they don't run the scan. */
-	if (is_leader) {
-		poll_timeout_ticks = HOT_ATTACH_POLL_TICKS;
-	}
-
+	 * The whole simulator tears down when any CPU exits — oriscrun
+	 * SIGTERMs the rest of the process group on the first exit (see
+	 * tools/oriscrun). The poll uses an infinite timeout
+	 * (poll_timeout_ticks = -1): there's nothing to wake up for
+	 * between SENDs. */
 	for (;;) {
 		int op, len, target_pid, term_hint;
 		int status = poll_one_request(&op, &len, &target_pid,
 		                              &term_hint);
 		if (status != 0) {
-			/* Either ETIMEOUT (leader's hot-attach pulse fired)
-			 * or some other transient error. On the leader, reap
-			 * any exited tasks (Phase 54) and run the hot-attach
-			 * scan (Phase 52: spawn for new, Phase 54: kill for
-			 * gone); on workers, just try again. */
-			if (is_leader) {
-				reap_exited_tasks();
-				hot_attach_scan();
-			}
+			/* An infinite-timeout poll only returns nonzero on a
+			 * real transient error; just retry. */
 			continue;
 		}
 
 		if (op == 1) {
 			handle_spawn_request(len, target_pid, term_hint, procid);
-		} else if (op == 2 && has_terminal) {
-			/* Cascade-kill every task we own before halting.
-			 * Phase 48: login.orx is parked in task_wait on
-			 * shell, and a clean shell exit (logout) wakes it
-			 * naturally; but `exit`/`quit` SENDs us op=2 from
-			 * the shell and yield-loops, so login is still
-			 * BLOCKED here. Without this kill cascade, login
-			 * would resume after our halt-tear-down — too
-			 * late, but visibly racing the screen wipe in
-			 * real Tk timing. Killing it deterministically
-			 * before we return guarantees the supervisor's
-			 * task table is clean when oriscrun's leader
-			 * watchdog fires SIGTERM. */
+		} else if (op == 2) {
+			/* Shutdown.  Accepted regardless of has_terminal: the
+			 * shutdown anchor is /sys/cpu/0/supervisor, which in the
+			 * co-resident model is a pure COMPUTE supervisor (no
+			 * terminal) — gating on has_terminal made it drop op=2 as
+			 * "unknown op".  Cascade-kill every task we own, then halt;
+			 * post-#181 oriscrun tears the whole process group down when
+			 * any CPU exits.  (Historically op=2 was the leader's
+			 * shell-exit on cpu0 — same anchor, just no longer dependent
+			 * on the leader owning a terminal.)
+			 *
+			 * Phase 48 detail: login.orx may be parked in task_wait on
+			 * the shell; killing the task table deterministically here
+			 * keeps it clean before we return. */
 			unsigned int mask = task_active_mask();
 			int t;
 			for (t = 0; t < TASK_MAX_CONCURRENT; t++) {
@@ -2258,18 +1915,9 @@ main(void)
 					(void)task_kill((task_t)t, 137);
 				}
 			}
-			/* Phase 48: workers relay op=2 to the leader so
-			 * the leader's exit (CPU 0) trips oriscrun's
-			 * --leader watchdog, which SIGTERMs the rest of
-			 * the process group. Without this, `exit` from a
-			 * worker terminal halts only that CPU, and the
-			 * simulator stays alive until --leader-timeout
-			 * (10 minutes by default in boot.sh) runs out.
-			 * Leader skips the relay — its own halt is the
-			 * trigger oriscrun is watching for. */
-			if (procid != 0) {
-				(void)relay_shutdown_to_leader();
-			}
+			/* This CPU's exit is the teardown trigger: oriscrun
+			 * SIGTERMs the rest of the process group when any CPU
+			 * halts, so no relay to a peer is needed. */
 			SUP_PRINT(shell_done);
 			return 0;
 		} else if (op == 4) {
@@ -2312,15 +1960,6 @@ main(void)
 			 * format one line per live slot, send a TAG_DATA
 			 * bytes ref back to the requester. */
 			handle_list_tasks_request();
-		} else if (op == SUP_OP_DIR_NOTIFY) {
-			/* Phase 54: oriscdir tells us /sys/term mutated.
-			 * Re-run the scan so any newly-attached terminal
-			 * gets a login (and any departed terminal's login
-			 * gets killed, once oriscdir grows entry-removal). */
-			if (is_leader) {
-				reap_exited_tasks();
-				hot_attach_scan();
-			}
 		} else {
 			SUP_PRINT(unknown_op);
 		}

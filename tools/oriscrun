@@ -6,10 +6,11 @@ Spawns:
     2. zero or more device processes (currently: oriscterm)
     3. one or more simorisc CPU processes connected to the crossbar
 
-Waits for the "leader" CPU (default: pid 0) to exit, then signals every
-other process to shut down. Forwards each process's stdout/stderr to
-this script's stdout/stderr with a small per-source prefix so it's
-clear what came from where.
+Waits for the FIRST CPU to exit, then signals every other process to shut
+down — there is no designated leader; any CPU's exit (e.g. a terminal's
+"Shut Down") ends the session. Forwards each process's stdout/stderr to
+this script's stdout/stderr with a small per-source prefix so it's clear
+what came from where.
 
 Typical usage (the hello-world-on-terminal demo):
 
@@ -258,11 +259,11 @@ def main(argv) -> int:
                     help="spawn a simorisc CPU; SPEC is "
                          "pid=N:program=PATH[,service=SPEC...][,serve]")
     ap.add_argument("--leader", type=int, default=0,
-                    help="when this CPU exits, all other processes are "
-                         "shut down (default: pid 0)")
+                    help="deprecated/ignored — there is no leader CPU any "
+                         "more; the first CPU to exit tears the group down")
     ap.add_argument("--leader-timeout", type=float, default=30.0,
-                    help="kill everything if the leader hasn't exited "
-                         "after this many seconds (default 30)")
+                    help="force teardown if NO CPU has exited after this "
+                         "many seconds (max runtime; default 30)")
     ap.add_argument("--linger", type=float, default=0.4,
                     help="seconds to wait after the leader exits before "
                          "shutting devices/crossbar down (default 0.4); "
@@ -275,8 +276,6 @@ def main(argv) -> int:
     hf_specs   = [parse_hostfsd_spec(s) for s in args.hostfsd]
     lb_specs   = [parse_linkbootd_spec(s) for s in args.linkbootd]
     dir_specs  = [parse_directory_spec(s) for s in args.directory]
-    if not any(c["pid"] == args.leader for c in cpu_specs):
-        sys.exit(f"oriscrun: --leader pid {args.leader} has no matching --cpu")
 
     if args.socket is None:
         args.socket = tempfile.mktemp(prefix="oriscbar-", suffix=".sock")
@@ -479,7 +478,7 @@ def main(argv) -> int:
         _attach_forwarders(f"lb{lbspec['pid']}", lb)
 
     # ---- 3. Spawn CPUs ----------------------------------------------------
-    leader_proc = None
+    cpu_procs = []
     for cspec in cpu_specs:
         cmd = [sys.executable, str(SIMORISC),
                "--connect", sock_path,
@@ -500,25 +499,33 @@ def main(argv) -> int:
         )
         procs.append((f"cpu{cspec['pid']}", cpu_proc))
         _attach_forwarders(f"cpu{cspec['pid']}", cpu_proc)
-        if cspec["pid"] == args.leader:
-            leader_proc = cpu_proc
+        cpu_procs.append(cpu_proc)
 
-    if leader_proc is None:
-        sys.stderr.write("oriscrun: internal error: leader proc not found\n")
-        return cleanup_and_exit(1)
-
-    # ---- 4. Wait for the leader, then shut down ---------------------------
-    try:
-        leader_rc = leader_proc.wait(timeout=args.leader_timeout)
-    except subprocess.TimeoutExpired:
-        sys.stderr.write(f"oriscrun: leader timed out after "
-                         f"{args.leader_timeout}s; tearing down\n")
-        return cleanup_and_exit(2)
+    # ---- 4. Wait for the FIRST CPU to exit, then tear the group down ------
+    # No leader/worker split: every supervisor is a peer.  A clean "Shut
+    # Down" from any terminal (or a crash) exits that CPU, and the first CPU
+    # to exit brings the whole group down.  Workers idle in their dispatch
+    # loop and never exit on their own, so this only fires on an intentional
+    # shutdown — equivalent to the old leader-watch for single-CPU boots.
+    deadline = time.time() + args.leader_timeout
+    first_rc = None
+    while first_rc is None:
+        for p in cpu_procs:
+            rc = p.poll()
+            if rc is not None:
+                first_rc = rc
+                break
+        if first_rc is None and time.time() >= deadline:
+            sys.stderr.write(f"oriscrun: no CPU exited within "
+                             f"{args.leader_timeout}s; tearing down\n")
+            return cleanup_and_exit(2)
+        if first_rc is None:
+            time.sleep(0.1)
     # Give the rest a brief moment to flush remaining work; with a
     # GUI device this also leaves the window on screen long enough
     # for the human to read it before teardown.
     time.sleep(args.linger)
-    return cleanup_and_exit(leader_rc)
+    return cleanup_and_exit(first_rc)
 
 
 if __name__ == "__main__":
