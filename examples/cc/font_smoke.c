@@ -71,6 +71,16 @@ main(void)
 		    vec_text_char(OLGL_ROW[i])) { fail("olgl", i); return 8; }
 
 	WP("font_smoke: text ops dispatched OK\n");
+
+	/* WM_OP_MEASURE_TEXT — the client asks the WM for text widths (only it holds
+	 * the proportional tables).  lutRS is 8px monospace, so "Hello" = 5*8 = 40
+	 * exactly; the proportional faces are non-zero but variable; "" = 0. */
+	int mw = wm_measure_text(FONT_FACE_MONO, "Hello");
+	if (mw != 40)                                      { fail("measure mono", mw);  return 11; }
+	if (wm_measure_text(FONT_FACE_PROP, "Hello") <= 0) { fail("measure prop", 0);   return 12; }
+	if (wm_measure_text(FONT_FACE_MONO, "") != 0)      { fail("measure empty", 0);  return 13; }
+	WP("font_smoke: measure_text OK\n");
+
 	WP("font_smoke: PASS\n");
 
 	rc = wm_destroy_window(wid);

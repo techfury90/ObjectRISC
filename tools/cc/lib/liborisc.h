@@ -243,6 +243,12 @@ int  menu_run(int col, int row, const char *items, int n);
  * -7 = the WM's font table is full). */
 int  font_open(const char *name);
 
+/* wm_measure_text: pixel width of `s` in face `face` (a FONT_FACE_* or font_open
+ * id).  Only the WM holds the proportional width tables, so a client must ask it
+ * to lay out / wrap proportional text.  Returns the width in px (>= 0), or a
+ * negative WM error. */
+int  wm_measure_text(int face, const char *s);
+
 int  vec_init_from_dir_result(void);                 /* adopt DIR_RESULT_SLOT cap into the VECTOR handle */
 int  vec_line(int x1, int y1, int x2, int y2);
 int  vec_rect_fill(int x, int y, int w, int h);

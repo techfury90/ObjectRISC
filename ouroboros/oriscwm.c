@@ -102,6 +102,8 @@
 #define WM_OP_QUERY_GEOMETRY     5
 #define WM_OP_SET_TITLE          6
 #define WM_OP_FONT_OPEN          7
+#define WM_OP_MEASURE_TEXT       8
+#define WM_MEASURE_MAX           128   /* longest run measure_text accepts */
 
 #define WIN_TYPE_CONSOLE   1
 #define WIN_TYPE_GRAPHICAL 2
@@ -4085,6 +4087,53 @@ handle_font_open(int packed_len_off)
 	wm_reply(id, 0, 0, 0);
 }
 
+/* WM_OP_MEASURE_TEXT — pixel width of a text run in a face, so a client can wrap
+ * PROPORTIONAL text itself (only the WM holds the width tables).  Wire shape:
+ * R4 = face id, R6 = packed (len:high16, src_off:low16), O2 = the caller's text
+ * bytes (OBJ_SRC_STACK).  Reply R3 = width in px (>=0), or -errno.  Same
+ * stack-bounce as handle_font_open (O15 lacks ref-level CAP_W). */
+static void
+handle_measure_text(int face, int packed_len_off)
+{
+	int len     = (packed_len_off >> 16) & 0xFFFF;
+	int src_off = packed_len_off & 0xFFFF;
+	int i, w;
+	unsigned char text[WM_MEASURE_MAX];
+
+	if (len < 0 || len >= WM_MEASURE_MAX) { wm_reply(E_INVAL, 0, 0, 0); return; }
+	if (face < 0 || face >= WM_NDYNFONT)  { wm_reply(E_INVAL, 0, 0, 0); return; }
+	if (len == 0) { wm_reply(0, 0, 0, 0); return; }   /* empty run = 0 px */
+
+	asm volatile("orefst o2, %0(o12)" :: "i"(WM_FORWARD_SRC_SLOT_OFFSET));
+	{
+		unsigned char fetch_buf[WM_MEASURE_MAX];
+		int dst_off = (int)((unsigned int)fetch_buf - STACK_BOTTOM);
+		int fetch_status;
+		asm volatile(
+			"addu  r8, %1, r0\n"
+			"addu  r9, %2, r0\n"
+			"addu  r10, %3, r0\n"
+			"orefld o1, %4(o12)\n"      /* O1 = caller's source */
+			"omov   o2, o11\n"          /* O2 = boot stack (dest) */
+			"addu  r4, r8,  r0\n"
+			"addu  r5, r9,  r0\n"
+			"addu  r6, r10, r0\n"
+			"call  #0x108\n"            /* ObjFetchBytes */
+			"nop\n"
+			"addu  %0, r2, r0"
+			: "=r"(fetch_status)
+			: "r"(src_off), "r"(dst_off), "r"(len),
+			  "i"(WM_FORWARD_SRC_SLOT_OFFSET)
+			: "r1", "r2", "r3", "r4", "r5", "r6", "r8", "r9", "r10"
+		);
+		if (fetch_status != 0) { wm_reply(E_IO, 0, 0, 0); return; }
+		for (i = 0; i < len; i++) text[i] = fetch_buf[i];
+	}
+
+	w = font_measure(dyn_face(face), text, len);
+	wm_reply(w, 0, 0, 0);
+}
+
 /* WM_OP_QUERY_GEOMETRY — read back a window's pixel + cell extents.
  *   R5 = wid (or 0 to use the first live window — the typical
  *           leader-spawn shell that didn't open its own window
@@ -6999,6 +7048,8 @@ main(void)
 				handle_set_title(wid_or_zero, arg);
 			} else if (op == WM_OP_FONT_OPEN) {
 				handle_font_open(arg);   /* arg = packed name len:src_off */
+			} else if (op == WM_OP_MEASURE_TEXT) {
+				handle_measure_text(wid_or_zero, arg);  /* wid_or_zero = face */
 			} else {
 				wm_reply(E_INVAL, 0, 0, 0);
 			}
