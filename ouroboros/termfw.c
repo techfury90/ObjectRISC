@@ -256,6 +256,63 @@ main(void)
 	}
 
 	WP("termfw: self-test PASS\n");
-	delay_us(BANNER_HOLD_US);       /* hold the banner so it's seen before exit */
-	return 0;                       /* M2 replaces this with orx_run(supervisor) */
+
+#ifdef STOP_AFTER_SPLASH
+	delay_us(BANNER_HOLD_US);       /* M1 standalone: hold the banner, then exit */
+	return 0;
+#else
+	/* ---- M2: hand off to the co-resident supervisor ------------------------
+	 * The directory cap (boot O8) is the ONLY wired input; everything else
+	 * derives from it.  (Validated via the M2 spike.)  The banner stays up
+	 * meanwhile — the supervisor draws nothing until the WM comes up (M3). */
+
+	/* Drop our framebuffer from O5 BEFORE spawning.  A child inherits the
+	 * parent's O5, and a non-null O5 makes the supervisor think it has a console
+	 * terminal — it then SENDs to the framebuffer (which lacks the S cap) and
+	 * traps.  At M2 the supervisor has no terminal (the FB→WM handoff is M3); the
+	 * banner stays on screen regardless, since the FB object itself persists. */
+	asm volatile("onull o5");
+
+	/* Promote the boot directory into DIR_SLOT (for our own dir_walks) AND
+	 * forward it into ORX_SLOT_CHILD_O8 so the supervisor task harvests
+	 * O8 = directory (its boot ABI) rather than a spawn-service sub-cap. */
+	asm volatile(
+		"orefld o1, 544(o12)\n"     /* BOOT_PARENT_SLOT = directory */
+		"orefst o1, 584(o12)\n"     /* -> DIR_SLOT */
+		"orefst o1, 560(o12)"       /* -> ORX_SLOT_CHILD_O8 */
+		: : : "r1"
+	);
+
+	/* Derive hostfsd from the directory: walk /sys/hostfsd/0 -> O10, then
+	 * hf_init adopts it (orx_spawn reads the .orx header through it). */
+	{
+		int kind;
+		char rem[16];
+		if (dir_walk("/sys/hostfsd/0", &kind, rem, sizeof(rem)) >= 0)
+			asm volatile("orefld o10, 616(o12)");   /* DIR_RESULT_SLOT -> O10 */
+	}
+	if (hf_init() != 0) { WP("FAIL: hf_init\n"); return 4; }
+	orx_init();                     /* map the args-parent region + orx state */
+
+	/* Wait for oriscdir's DEFERRED /programs mount (applied when hostfsd
+	 * self-registers), then load + run the supervisor as a SAME-CPU task and
+	 * idle-yield so it gets scheduled. */
+	{
+		int kind = 0, attempt;
+		char rem[16];
+		for (attempt = 0; attempt < 400; attempt++) {
+			if (dir_walk("/programs", &kind, rem, sizeof(rem)) >= 0
+			    && kind == DIR_KIND_MOUNT)
+				break;
+			task_yield();
+		}
+	}
+	{
+		task_t sup = orx_spawn("/programs/supervisor.orx", "", "/");
+		if (sup < 0) { WP("FAIL: supervisor load\n"); return 5; }
+	}
+	WP("termfw: system software running\n");
+	for (;;)
+		task_yield();               /* firmware idles; supervisor is co-resident */
+#endif
 }
