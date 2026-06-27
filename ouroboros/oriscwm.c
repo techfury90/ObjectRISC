@@ -1031,6 +1031,7 @@ allocate_service_mailbox(void)
  * configurations and pre-multi-WM tests verbatim. */
 
 static int my_term_idx;
+static int wm_coresident;   /* 1 once we adopt an inherited framebuffer */
 static char path_console[40];        /* /sys/term/<N>/console */
 static char path_keyboard[40];
 /* No path_framebuffer — Phase 60 step 2 dropped the
@@ -6483,9 +6484,9 @@ desktop_menu_select(int item_idx)
 		 * never stop.  Exit now (mirroring the shell's `exit`: sup_shutdown
 		 * THEN TaskExit).  The supervisor still reaps sysinit + every
 		 * sup_spawn'd app; with us gone too, pid 0 drains and oriscrun's
-		 * --leader 0 tears the process group down.  The legacy separate-CPU
-		 * WM (my_terminal_idx >= 0) keeps its old behaviour. */
-		if (task_my_terminal_idx() < 0)
+		 * tears the process group down on any CPU exit.  The legacy
+		 * separate-CPU WM keeps its old behaviour. */
+		if (wm_coresident)
 			task_exit(0);
 		return;
 	}
@@ -7111,12 +7112,16 @@ main(void)
 	 * Adopting reuses the firmware's FB object = the same Tk window. */
 	if (adopt_inherited_framebuffer() == 0) {
 		WM_PRINT("oriscwm: adopted inherited framebuffer (O5) — co-resident\n");
-		/* Co-resident: there is no /sys/term terminal device — the WM owns
-		 * the display directly and mediates each app's console via
-		 * wm_open_session.  Declare "no terminal" so our sup_spawn sends
-		 * term_hint=0; otherwise handle_spawn_request dir-walks a
-		 * nonexistent /sys/term/<N>/{console,keyboard,grid} and wedges. */
-		task_set_my_terminal_idx(-1);
+		/* Co-resident terminal.  KEEP our real terminal index (already set by
+		 * init_per_term_paths from task_my_terminal_idx) — it is the
+		 * /sys/wm/<idx>/0 index we registered at, and sup_spawn must propagate
+		 * it as term_hint so apps (whether they stay LOCAL or get relayed to a
+		 * compute CPU) resolve OUR WM via wm_open_session's /sys/wm/<idx>/0
+		 * walk.  Overwriting it with -1 made every spawned app fall back to
+		 * /sys/wm/0/0 (wm.c), which in a multi-CPU boot is a headless compute
+		 * CPU — the app then SENDs on a null console and traps.  Just record
+		 * co-residency for the shutdown path below. */
+		wm_coresident = 1;
 		status = 0;
 	} else {
 		status = alloc_local_framebuffer();
