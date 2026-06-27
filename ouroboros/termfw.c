@@ -310,9 +310,15 @@ main(void)
 	{
 		task_t sup = orx_spawn("/programs/supervisor.orx", "", "/");
 		if (sup < 0) { WP("FAIL: supervisor load\n"); return 5; }
+		WP("termfw: system software running\n");
+		/* Block (yielding) until the supervisor exits -- e.g. a WM "Shut Down"
+		 * -> sup_shutdown -> the supervisor winds down and returns.  Then we fall
+		 * out of main so the CPU halts and oriscrun tears the boot down, rather
+		 * than idle-yielding forever (which left the simulator running after a
+		 * shutdown). */
+		task_wait(sup);
 	}
-	WP("termfw: system software running\n");
-	for (;;)
-		task_yield();               /* firmware idles; supervisor is co-resident */
+	WP("termfw: system software halted\n");
+	return 0;
 #endif
 }

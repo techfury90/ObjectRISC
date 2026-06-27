@@ -2115,6 +2115,16 @@ main(void)
 	asm volatile("oisn %0, o5" : "=r"(has_terminal));
 	has_terminal = !has_terminal;     /* OISN sets 1 when null */
 
+	/* M3: now that has_terminal is latched, drop the framebuffer from our O5 in
+	 * the co-resident boot.  It was ours only to RELAY to sysinit/the WM; if we
+	 * keep it live, menu-spawned apps (term_hint=0, so handle_spawn_request runs
+	 * no populate_child_term_slots) inherit O5 = the framebuffer and scribble
+	 * directly on the WM's display, wedging it.  Null O5 -> apps inherit null and
+	 * open their own WM window via /sys/wm/0/0.  has_terminal stays latched, so
+	 * op=2 shutdown still works. */
+	if (coresident)
+		asm volatile("onull o5");
+
 	/* Phase 46: any CPU with a terminal spawns its own shell, bound
 	 * to its own boot O5/O6/O7. Multiple oriscterm instances + per-
 	 * CPU terminal wiring (boot.sh launches term pid=16 for CPU 0,

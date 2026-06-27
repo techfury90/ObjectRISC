@@ -6477,6 +6477,16 @@ desktop_menu_select(int item_idx)
 		desktop_menu_dismiss();
 		if (sup_walk_to_slot() == 0) sup_shutdown();
 		wm_restore_boot_or();
+		/* Co-resident (no terminal): the WM is sysinit's child, not the
+		 * supervisor's, so the supervisor's op=2 cascade-kill never reaches
+		 * us — we'd survive its halt and keep pid 0 alive, so the sim would
+		 * never stop.  Exit now (mirroring the shell's `exit`: sup_shutdown
+		 * THEN TaskExit).  The supervisor still reaps sysinit + every
+		 * sup_spawn'd app; with us gone too, pid 0 drains and oriscrun's
+		 * --leader 0 tears the process group down.  The legacy separate-CPU
+		 * WM (my_terminal_idx >= 0) keeps its old behaviour. */
+		if (task_my_terminal_idx() < 0)
+			task_exit(0);
 		return;
 	}
 	const char *path = desktop_menu_spawn_paths[item_idx];
@@ -7101,6 +7111,12 @@ main(void)
 	 * Adopting reuses the firmware's FB object = the same Tk window. */
 	if (adopt_inherited_framebuffer() == 0) {
 		WM_PRINT("oriscwm: adopted inherited framebuffer (O5) — co-resident\n");
+		/* Co-resident: there is no /sys/term terminal device — the WM owns
+		 * the display directly and mediates each app's console via
+		 * wm_open_session.  Declare "no terminal" so our sup_spawn sends
+		 * term_hint=0; otherwise handle_spawn_request dir-walks a
+		 * nonexistent /sys/term/<N>/{console,keyboard,grid} and wedges. */
+		task_set_my_terminal_idx(-1);
 		status = 0;
 	} else {
 		status = alloc_local_framebuffer();
