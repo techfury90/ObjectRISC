@@ -594,6 +594,14 @@ relay_spawn_request(int len, int target_pid, int term_hint_plus_one)
 #define MAX_PROCID 16
 static int next_cpu_counter;
 
+/* Set at boot when this supervisor is co-resident with a WM on the same CPU
+ * (termfw forwarded a framebuffer into O5).  When co-resident, the WM mediates
+ * each app's console directly via wm_open_session, so the supervisor must NOT
+ * bind its own WM-mediated console — and crucially must never issue a blocking
+ * RPC back to the WM while servicing a spawn the WM itself requested (that
+ * deadlocks: the WM is blocked in sup_spawn awaiting our reply). */
+static int sup_coresident;
+
 /* Phase 52: per-task name stash for `ps`. Indexed by libc task_t,
  * stores the basename of the .orx path each spawn loaded (e.g.
  * "shell.orx" out of "/programs/shell.orx"). Used by the op=5
@@ -748,6 +756,11 @@ wm_leader_grid_isn(void)
 static void
 maybe_lazy_wm_bind(void)
 {
+	/* Co-resident: the WM owns the display and mediates each app's console via
+	 * wm_open_session; we have no WM-mediated console of our own to bind, and a
+	 * wm_new_window RPC here would deadlock — this call is reached from
+	 * handle_spawn_request while the WM is blocked in sup_spawn waiting for us. */
+	if (sup_coresident) return;
 	if (wm_leader_console_isn() == 0) return;  /* already bound */
 	if (wm_init() != 0)               return;  /* WM not up yet */
 
@@ -1567,6 +1580,7 @@ main(void)
 	int coresident;
 	asm volatile("oisn %0, o5" : "=r"(coresident));
 	coresident = !coresident;   /* OISN sets 1 when O5 is null */
+	sup_coresident = coresident;   /* file-scope copy for maybe_lazy_wm_bind */
 
 	/* Phase 51: declare our terminal_idx (procid in the current
 	 * model) so children spawned via orx_spawn inherit it through
@@ -1880,19 +1894,20 @@ main(void)
 
 		if (op == 1) {
 			handle_spawn_request(len, target_pid, term_hint, procid);
-		} else if (op == 2 && has_terminal) {
-			/* Cascade-kill every task we own before halting.
-			 * Phase 48: login.orx is parked in task_wait on
-			 * shell, and a clean shell exit (logout) wakes it
-			 * naturally; but `exit`/`quit` SENDs us op=2 from
-			 * the shell and yield-loops, so login is still
-			 * BLOCKED here. Without this kill cascade, login
-			 * would resume after our halt-tear-down — too
-			 * late, but visibly racing the screen wipe in
-			 * real Tk timing. Killing it deterministically
-			 * before we return guarantees the supervisor's
-			 * task table is clean when oriscrun tears down the
-			 * process group. */
+		} else if (op == 2) {
+			/* Shutdown.  Accepted regardless of has_terminal: the
+			 * shutdown anchor is /sys/cpu/0/supervisor, which in the
+			 * co-resident model is a pure COMPUTE supervisor (no
+			 * terminal) — gating on has_terminal made it drop op=2 as
+			 * "unknown op".  Cascade-kill every task we own, then halt;
+			 * post-#181 oriscrun tears the whole process group down when
+			 * any CPU exits.  (Historically op=2 was the leader's
+			 * shell-exit on cpu0 — same anchor, just no longer dependent
+			 * on the leader owning a terminal.)
+			 *
+			 * Phase 48 detail: login.orx may be parked in task_wait on
+			 * the shell; killing the task table deterministically here
+			 * keeps it clean before we return. */
 			unsigned int mask = task_active_mask();
 			int t;
 			for (t = 0; t < TASK_MAX_CONCURRENT; t++) {
