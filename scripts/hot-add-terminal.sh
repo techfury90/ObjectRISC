@@ -20,9 +20,9 @@ cd "$ROOT"
 SOCK="${OROS_SOCK:-/tmp/oros.sock}"
 PID="${1:-2}"
 
-# Headless perf: a HEADLESS terminal (OROS_NODISPLAY) runs its sim under PyPy
-# (~12x) when available; a Tk terminal stays CPython automatically (the simorisc
-# re-exec skips --display tk).  Overridable (ORISC_USE_PYPY=0); graceful w/o pypy3.
+# Perf: the terminal's sim runs under PyPy (~12x) when available — both the Tk
+# WM and a headless (OROS_NODISPLAY) terminal, since PyPy ships tkinter.
+# Overridable (ORISC_USE_PYPY=0); graceful without pypy3.
 export ORISC_USE_PYPY="${ORISC_USE_PYPY:-1}"
 
 if [ ! -S "$SOCK" ]; then

@@ -5673,10 +5673,11 @@ def populate_self_service(cpu: CPU) -> None:
 
 def _maybe_reexec_under_pypy() -> None:
     """Headless perf (simulator-perf-proposals #1): re-exec the sim under PyPy
-    for ~12x throughput when opted in via ORISC_USE_PYPY.  Skipped for
-    --display tk (needs CPython's tkinter), when already on PyPy, when pypy3
-    isn't installed, or when the opt-in isn't set — all fall back to CPython
-    silently.  The re-exec replaces this process (inherits stdio/cwd/env) so it
+    for ~12x throughput when opted in via ORISC_USE_PYPY.  Skipped when already
+    on PyPy, when pypy3 isn't installed, or when the opt-in isn't set — all fall
+    back to CPython silently.  (Tk runs fine under PyPy — it ships tkinter 8.6 —
+    so --display tk is NOT skipped; the WM gets PyPy too, verified pixel-
+    identical against CPython.)  The re-exec replaces this process (inherits stdio/cwd/env) so it
     doesn't return on success; a guard env var prevents an exec loop.  Devices
     (oriscbar/oriscdir/hostfsd) stay on whatever invoked them — they're
     I/O-bound, not JIT-helped, and start faster under CPython."""
@@ -5688,10 +5689,6 @@ def _maybe_reexec_under_pypy() -> None:
     if os.environ.get("_ORISC_PYPY_ACTIVE"):
         return
     argv = sys.argv[1:]
-    for i, a in enumerate(argv):
-        if a == "--display=tk" or (a == "--display" and i + 1 < len(argv)
-                                   and argv[i + 1] == "tk"):
-            return  # Tk display needs CPython's tkinter
     pypy = shutil.which("pypy3")
     if not pypy:
         return

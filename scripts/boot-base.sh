@@ -25,7 +25,7 @@ SOCK="${OROS_SOCK:-/tmp/oros.sock}"
 # (~12x) when available — simorisc re-execs itself when ORISC_USE_PYPY is set.
 # Overridable (ORISC_USE_PYPY=0 forces CPython); graceful if pypy3 is absent.
 # Devices (oriscbar/oriscdir/hostfsd) stay on python3; a hot-added Tk terminal
-# stays CPython automatically (the re-exec skips --display tk).
+# also runs under PyPy (it ships tkinter, so the WM is accelerated too).
 export ORISC_USE_PYPY="${ORISC_USE_PYPY:-1}"
 
 # Shell banner (today minus 40 years), same conceit as boot.sh, so a hot-added
