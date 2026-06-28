@@ -1162,6 +1162,9 @@ class CPU(Port):
     def get_gpr(self, idx: int) -> int:
         return self.gpr[idx] & 0xFFFFFFFF
 
+    def get_sgpr(self, idx: int) -> int:
+        return sext32(self.gpr[idx] & 0xFFFFFFFF)
+
     def set_opr(self, idx: int, val: int) -> None:
         if idx == 0:
             return  # O0 hardwired null
@@ -5124,9 +5127,6 @@ def step(cpu: CPU) -> None:
         pre_hi = pre_lo = 0
 
     branch_target: Optional[int] = None
-    def take_branch(target: int) -> None:
-        nonlocal branch_target
-        branch_target = target & 0xFFFFFFFF
 
     rs = (word >> 21) & 0x1F
     rt = (word >> 16) & 0x1F
@@ -5137,8 +5137,8 @@ def step(cpu: CPU) -> None:
     simm = sext16(imm)
     target26 = word & 0x03FFFFFF
 
-    def gpr(i): return cpu.get_gpr(i)
-    def sgpr(i): return sext32(cpu.get_gpr(i))
+    gpr = cpu.get_gpr
+    sgpr = cpu.get_sgpr
 
     if op == 0x00:  # SPECIAL
         if   fn == 0x00:
@@ -5154,10 +5154,10 @@ def step(cpu: CPU) -> None:
         elif fn == 0x07:
             cpu.set_gpr(rd, to_u32(sgpr(rt) >> (gpr(rs) & 0x1F)))
         elif fn == 0x08:
-            take_branch(gpr(rs))
+            branch_target = gpr(rs) & 0xFFFFFFFF
         elif fn == 0x09:
             cpu.set_gpr(rd if rd else 31, to_u32(pc + 8))
-            take_branch(gpr(rs))
+            branch_target = gpr(rs) & 0xFFFFFFFF
         elif fn == 0x10:
             cpu.set_gpr(rd, cpu.hi)
         elif fn == 0x12:
@@ -5215,22 +5215,22 @@ def step(cpu: CPU) -> None:
             cpu.set_gpr(31, to_u32(pc + 8)); cond = sgpr(rs) >= 0
         else:
             raise Trap(CAUSE_RESERVED_INSTR, pc, f"REGIMM rt {rt:#x}")
-        if cond: take_branch(cond_target)
+        if cond: branch_target = cond_target & 0xFFFFFFFF
     elif op == 0x02:
         ds = pc + 4
-        take_branch((ds & 0xF0000000) | (target26 << 2))
+        branch_target = ((ds & 0xF0000000) | (target26 << 2)) & 0xFFFFFFFF
     elif op == 0x03:
         cpu.set_gpr(31, to_u32(pc + 8))
         ds = pc + 4
-        take_branch((ds & 0xF0000000) | (target26 << 2))
+        branch_target = ((ds & 0xF0000000) | (target26 << 2)) & 0xFFFFFFFF
     elif op == 0x04:
-        if gpr(rs) == gpr(rt): take_branch(to_u32(pc + 4 + simm*4))
+        if gpr(rs) == gpr(rt): branch_target = to_u32(pc + 4 + simm*4)
     elif op == 0x05:
-        if gpr(rs) != gpr(rt): take_branch(to_u32(pc + 4 + simm*4))
+        if gpr(rs) != gpr(rt): branch_target = to_u32(pc + 4 + simm*4)
     elif op == 0x06:
-        if sgpr(rs) <= 0:      take_branch(to_u32(pc + 4 + simm*4))
+        if sgpr(rs) <= 0:      branch_target = to_u32(pc + 4 + simm*4)
     elif op == 0x07:
-        if sgpr(rs) > 0:       take_branch(to_u32(pc + 4 + simm*4))
+        if sgpr(rs) > 0:       branch_target = to_u32(pc + 4 + simm*4)
     elif op == 0x08:
         a = sgpr(rs); b = simm; r = a + b
         if r < -0x80000000 or r > 0x7FFFFFFF:
