@@ -21,6 +21,13 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 SOCK="${OROS_SOCK:-/tmp/oros.sock}"
 
+# Headless perf (simulator-perf-proposals): run the compute CPUs' sim under PyPy
+# (~12x) when available — simorisc re-execs itself when ORISC_USE_PYPY is set.
+# Overridable (ORISC_USE_PYPY=0 forces CPython); graceful if pypy3 is absent.
+# Devices (oriscbar/oriscdir/hostfsd) stay on python3; a hot-added Tk terminal
+# stays CPython automatically (the re-exec skips --display tk).
+export ORISC_USE_PYPY="${ORISC_USE_PYPY:-1}"
+
 # Shell banner (today minus 40 years), same conceit as boot.sh, so a hot-added
 # terminal's shell announces the right alternate-history date.
 if date -v -40y +"%Y" >/dev/null 2>&1; then
