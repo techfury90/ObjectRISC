@@ -5671,7 +5671,40 @@ def populate_self_service(cpu: CPU) -> None:
     cpu.set_opr(4, ref)
 
 
+def _maybe_reexec_under_pypy() -> None:
+    """Headless perf (simulator-perf-proposals #1): re-exec the sim under PyPy
+    for ~12x throughput when opted in via ORISC_USE_PYPY.  Skipped for
+    --display tk (needs CPython's tkinter), when already on PyPy, when pypy3
+    isn't installed, or when the opt-in isn't set — all fall back to CPython
+    silently.  The re-exec replaces this process (inherits stdio/cwd/env) so it
+    doesn't return on success; a guard env var prevents an exec loop.  Devices
+    (oriscbar/oriscdir/hostfsd) stay on whatever invoked them — they're
+    I/O-bound, not JIT-helped, and start faster under CPython."""
+    import os, sys, shutil
+    if os.environ.get("ORISC_USE_PYPY", "") in ("", "0", "no", "false"):
+        return
+    if sys.implementation.name == "pypy":
+        return
+    if os.environ.get("_ORISC_PYPY_ACTIVE"):
+        return
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--display=tk" or (a == "--display" and i + 1 < len(argv)
+                                   and argv[i + 1] == "tk"):
+            return  # Tk display needs CPython's tkinter
+    pypy = shutil.which("pypy3")
+    if not pypy:
+        return
+    os.environ["_ORISC_PYPY_ACTIVE"] = "1"
+    if sys.stderr.isatty():   # interactive only — keep piped/test stderr byte-clean
+        sys.stderr.write("simorisc: re-exec under PyPy for speed "
+                         "(set ORISC_USE_PYPY=0 to disable)\n")
+        sys.stderr.flush()
+    os.execv(pypy, [pypy, os.path.abspath(sys.argv[0])] + argv)
+
+
 def main(argv: List[str]) -> int:
+    _maybe_reexec_under_pypy()
     ap = argparse.ArgumentParser(prog="simorisc",
         description="Object RISC instruction-set simulator")
     ap.add_argument("orx", help="path to .orx binary")

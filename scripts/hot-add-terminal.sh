@@ -20,6 +20,11 @@ cd "$ROOT"
 SOCK="${OROS_SOCK:-/tmp/oros.sock}"
 PID="${1:-2}"
 
+# Headless perf: a HEADLESS terminal (OROS_NODISPLAY) runs its sim under PyPy
+# (~12x) when available; a Tk terminal stays CPython automatically (the simorisc
+# re-exec skips --display tk).  Overridable (ORISC_USE_PYPY=0); graceful w/o pypy3.
+export ORISC_USE_PYPY="${ORISC_USE_PYPY:-1}"
+
 if [ ! -S "$SOCK" ]; then
     echo "hot-add-terminal: no crossbar at $SOCK — run scripts/boot-base.sh first" >&2
     exit 1
