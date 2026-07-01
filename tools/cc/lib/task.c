@@ -15,10 +15,13 @@
  *
  * The table itself is an OR-typed storage object (ObjAllocStore'd
  * by task_init), parked in O12 with R+W caps. Slot index → byte
- * offset is `slot * 8` (each OR ref is 64 bits). A separate in-use
- * bitmap (regular int memory) tracks which slots hold live refs so
- * task_spawn can find a free slot in O(MAX) without scanning the
- * OREF table itself.
+ * offset is `slot * 8` (each OR ref is 64 bits). Slot occupancy is
+ * read directly from the table — a null ref means a free slot (see
+ * task_slot_used) — rather than a shadow bitmap. The table is
+ * genuinely per-task (each task_init ObjAllocStores its own), so
+ * this stays correct even when a task_spawn'd child shares the
+ * parent's data segment; a data-section bitmap did NOT (the child's
+ * task_init zeroed the parent's copy — see task_slot_used's note).
  *
  * Boot-ABI required of callers
  * ----------------------------
@@ -282,9 +285,16 @@
 #define BOOT_PARENT_SLOT_OFFSET   544
 #define SUP_SLOT_OFFSET           BOOT_PARENT_SLOT_OFFSET
 
-/* Bit set when the corresponding table slot holds a live ref. Lives
- * in regular int memory; pcc treats it as a normal global. */
-static unsigned int task_slots_in_use;
+/* Task-table occupancy is derived on demand from the per-task O12
+ * objstore (see task_slot_used), NOT a shadow bitmap. A data-section
+ * bitmap is wrong here: task_spawn'd children share the parent's data
+ * segment (TaskCreate leaves O3 = the parent's data object unless the
+ * caller overrides it — Vol VI #0x000 makes O3 a caller-supplied data
+ * object), so a child's task_init zeroing the bitmap wiped the
+ * parent's record of its own children and broke the parent's
+ * task_wait/free/query. The O12 objstore is genuinely per-task (each
+ * task_init ObjAllocStores its own), so reading occupancy from it is
+ * correct under any data-sharing policy. */
 
 /* Phase 51: terminal_idx propagation. crt0.s parks the initial R4
  * (TaskCreate's init_r4 = parent's R5) into _orisc_init_r4 right
@@ -335,7 +345,8 @@ task_init(void)
 		  "i"(BOOT_PARENT_SLOT_OFFSET)
 		: "r2", "r3", "r4", "r5", "r6"
 	);
-	task_slots_in_use = 0;
+	/* Task-table occupancy now lives in the freshly-zeroed O12
+	 * objstore (task_slot_used), so there is no bitmap to clear. */
 	/* Phase 51: decode terminal_idx from crt0's R4 stash. R4 == 0
 	 * means "no info" (-1 internally); R4 == N+1 maps to terminal
 	 * index N. The supervisor overrides this in main() with its
@@ -440,6 +451,23 @@ task_store_from_o1(int slot)
 	}
 }
 
+/* --- task_slot_used: is O12 table slot `slot` occupied? ---------
+ *
+ * Load the slot's stored ref into O1 (the null ref if the slot is
+ * free) and OISN it. O1 survives from task_load_to_o1 to the next
+ * asm exactly as it does for task_wait's CALL #0x007, so this uses
+ * the same established idiom. Replaces the old shared
+ * task_slots_in_use bitmap, which a task_spawn'd child's task_init
+ * would clobber in the shared data segment. */
+static int
+task_slot_used(int slot)
+{
+	int isn;
+	task_load_to_o1(slot);
+	asm volatile("oisn %0, o1" : "=r"(isn) : : "r1");
+	return !isn;
+}
+
 /* --- task_yield: surrender the rest of the quantum -------------- */
 
 void
@@ -489,7 +517,7 @@ task_spawn(void (*entry)(int), int arg)
 
 	/* Find a free slot. */
 	for (slot = 0; slot < TASK_MAX_CONCURRENT; slot++) {
-		if (!(task_slots_in_use & (1 << slot)))
+		if (!task_slot_used(slot))
 			break;
 	}
 	if (slot >= TASK_MAX_CONCURRENT)
@@ -530,9 +558,9 @@ task_spawn(void (*entry)(int), int arg)
 		return -status;
 	}
 
-	/* O1 now holds the new task ref. Park it in the table at `slot`. */
+	/* O1 now holds the new task ref. Park it in the table at `slot`;
+	 * that OREFST IS the occupancy record now (no shadow bitmap). */
 	task_store_from_o1(slot);
-	task_slots_in_use |= (1 << slot);
 
 	/* TaskResume(O1=task) — O1 still holds the ref from TaskCreate. */
 	asm volatile(
@@ -574,14 +602,22 @@ task_t
 task_register_o1(void)
 {
 	int slot;
+	/* The task ref arrives in O1 — a side-channel the caller set
+	 * unspilled (see obj_register_task / orx_spawn), so pcc doesn't
+	 * know to preserve it. Scanning the O12 table for a free slot
+	 * clobbers O1 (task_slot_used OREFLDs each slot into it), so stash
+	 * the ref in O2 across the scan and restore it before the store.
+	 * Both callers treat O2 as dead after this call. (task_spawn's
+	 * identical scan needs no such dance — its O1 isn't live yet.) */
+	asm volatile("omov o2, o1");
 	for (slot = 0; slot < TASK_MAX_CONCURRENT; slot++) {
-		if (!(task_slots_in_use & (1 << slot)))
+		if (!task_slot_used(slot))
 			break;
 	}
 	if (slot >= TASK_MAX_CONCURRENT)
 		return -1;
+	asm volatile("omov o1, o2");
 	task_store_from_o1(slot);
-	task_slots_in_use |= (1 << slot);
 	return slot;
 }
 
@@ -590,7 +626,7 @@ task_resume(task_t t)
 {
 	int status;
 	if (t < 0 || t >= TASK_MAX_CONCURRENT
-			|| !(task_slots_in_use & (1 << t)))
+			|| !task_slot_used(t))
 		return -1;
 	task_load_to_o1(t);
 	asm volatile(
@@ -620,7 +656,7 @@ task_kill(task_t t, int code)
 	int status;
 
 	if (t < 0 || t >= TASK_MAX_CONCURRENT
-			|| !(task_slots_in_use & (1 << t)))
+			|| !task_slot_used(t))
 		return -1;
 
 	task_load_to_o1(t);
@@ -651,7 +687,7 @@ task_wait(task_t t)
 	int status, code;
 
 	if (t < 0 || t >= TASK_MAX_CONCURRENT
-			|| !(task_slots_in_use & (1 << t)))
+			|| !task_slot_used(t))
 		return -1;
 
 	task_load_to_o1(t);
@@ -677,7 +713,7 @@ task_free(task_t t)
 	int status;
 
 	if (t < 0 || t >= TASK_MAX_CONCURRENT
-			|| !(task_slots_in_use & (1 << t)))
+			|| !task_slot_used(t))
 		return -1;
 
 	task_load_to_o1(t);
@@ -704,12 +740,11 @@ task_free(task_t t)
 	 * reap_exited_tasks fires `[task N done CODE]` again on every
 	 * subsequent prompt iteration forever. */
 	if (status == 0 || status == 11 /* ERR_EREMOTE */) {
-		/* Clear the slot — overwrite with the null ref so any stale
-		 * reuse via task_load_to_o1 reads back as null, and free up
-		 * the bit for the next task_spawn. */
+		/* Free the slot: overwrite the O12 entry with the null ref.
+		 * That OREFST IS the deallocation now — task_slot_used reads
+		 * it back as null (free) for the next task_spawn. */
 		asm volatile("omov o1, o0");
 		task_store_from_o1(t);
-		task_slots_in_use &= ~(1 << t);
 	}
 	return status;
 }
@@ -731,7 +766,7 @@ task_query(task_t t, struct task_info *out)
 	int status, packed;
 
 	if (t < 0 || t >= TASK_MAX_CONCURRENT
-			|| !(task_slots_in_use & (1 << t)))
+			|| !task_slot_used(t))
 		return -1;
 	task_load_to_o1(t);
 	asm volatile(
@@ -754,7 +789,12 @@ task_query(task_t t, struct task_info *out)
 unsigned int
 task_active_mask(void)
 {
-	return task_slots_in_use;
+	unsigned int mask = 0;
+	int slot;
+	for (slot = 0; slot < TASK_MAX_CONCURRENT; slot++)
+		if (task_slot_used(slot))
+			mask |= (1u << slot);
+	return mask;
 }
 
 /* --- task_install_preempt_timer — wire the timer handler --------
