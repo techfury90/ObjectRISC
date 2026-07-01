@@ -758,8 +758,18 @@ run:			while ((ch = qcchar()) == '\t' || ch == ' ')
 			}
 			if (ch  == '#')
 				ppdir();
-			else
+			else if (ch)		/* not at EOF: see below */
 				unch(ch);
+			/*
+			 * Don't unch() the 0 that qcchar() returns at end of
+			 * input: inp is at the buffer base pbeg there, so
+			 * *--inp writes one byte below the allocation.  That
+			 * byte is usually harmless malloc slack, but when the
+			 * buffer base lands on an mmap page boundary the store
+			 * hits an unmapped page -> intermittent SIGBUS in
+			 * fastscan().  EOF is handled by the case 0 return in
+			 * the outer loop, so skipping the pushback is safe.
+			 */
 			break;
 
 		case '\'': /* character constant */
