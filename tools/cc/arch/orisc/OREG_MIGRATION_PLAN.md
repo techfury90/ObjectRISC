@@ -8,6 +8,26 @@
 
 # ⚡ SESSION-5 RECON (2026-06-28): blocker RE-CONFIRMED on main; tight spike plan for the COMPILER fix
 
+> ## ✅ LANDED — approach A (the compiler fix). The spike SUCCEEDED.
+> **Root cause (refined):** NOT the OREFST result flag — pcc's coarse per-block call
+> liveness (`regs.c::insnwalk`) marks ALL four OR `livecall()` regs live at a call and
+> only releases the ones an argument consumes, so a void-arg call (`other()`) leaves OR
+> arg-regs spuriously live to the top of the block; a single OR scratch upstream then
+> interferes with all four → capability byte-spill → "op U*". Harmless on big GPR files,
+> fatal only for the 4-wide OR class.
+> **Fix (`PRUNE_CALLLIVE`, ~60 lines):** after a call's args are walked, clear the OR
+> arg-regs it marked live but the call doesn't consume (a clobbered-unread reg is
+> genuinely dead). RESTRICTED TO CLASSC → integer codegen untouched; target-gated (orisc
+> only); cross-call values stay protected by the call-site interference edges. Files:
+> `mip/regs.c` (PRUNE_CALLLIVE in insnwalk, CALL + UCALL paths), `arch/orisc/macdefs.h`
+> (gate + rationale), `arch/orisc/local.c` (removed the line-143 uerror),
+> `test_oref_spill.sh` + new `examples/cc/oref_callresult.c`.
+> **Verified:** E/g2/E2 compile at K=4; ALL 37 OS translation units + supervisor.orx/
+> shell.orx BYTE-IDENTICAL to baseline (zero runtime change); test_oref_spill/oref_calls/
+> manyargs PASS; independently re-confirmed. NO register migration, NO ABI change.
+> **Follow-on:** build the `__or`-value obj API on obj.h. The recon + spike plan below is
+> retained for history.
+
 techfury90's call: cross the `__or`-native bridge SOON — the handle API's 16-slot `OBJ_NHANDLE` ceiling + manual cap lifecycle is compounding tech debt for the object-dense north-stars (document arch = per-block caps; object-console = typed-OREF pipelines; capability widgets). The old "buildable on handles" finding held only for the *run model* (mdview's offset/len spans), NOT the *object model*.
 
 **Decision: take the COMPILER fix (no OS/API risk), not the K=6 register migration.** This recon re-confirmed the blocker + pinned the sites so a fresh session starts loaded.
