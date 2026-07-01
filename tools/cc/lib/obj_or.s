@@ -172,3 +172,27 @@ orc_ret:
     omov o1, o2              ; return the reply's O2 capability
     jr r31
     nop
+
+;========================================================================
+; inherited-capability adoption (object-register <-> value bridge)
+;
+; The value API can mint caps (alloc/derive) and receive them (recv_cap),
+; but a program's FIRST caps arrive in object registers the loader/parent
+; set up (boot services, or a cap a parent parks for a child it spawns).
+; These two ops bridge such an O-register cap into / out of the value world.
+; They are the same one-instruction OMOV the handle API's obj_adopt_oN /
+; obj_park_oN use; O7 is the conventional spawn-handoff register (TaskCreate
+; copies O1..O15 to the child — see examples/cc/multitask/concurrent.c).
+;========================================================================
+
+; void objor_stash_o7(void *__or o)   ; o=O1 -> O7 (park for a spawned child)
+objor_stash_o7:
+    omov o7, o1
+    jr r31
+    nop
+
+; void *__or objor_adopt_o7(void)   ; O7 -> O1 (adopt the parked/inherited cap)
+objor_adopt_o7:
+    omov o1, o7
+    jr r31
+    nop

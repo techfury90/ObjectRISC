@@ -123,4 +123,24 @@ int objor_send_cap(void *__or recip, void *__or p2,
  * objor_isnull on the result. */
 void *__or objor_recv_cap(void *__or q, int *out_word);
 
+/* --- inherited-capability adoption (O-register <-> value bridge) ----- */
+
+/* The value API can MINT caps (objor_alloc/derive) and RECEIVE them
+ * (objor_recv_cap), but a program's first caps arrive in object registers
+ * the loader or a parent set up — boot services, or a cap a parent parks
+ * for a child it spawns.  These two ops bridge such an O-register cap into
+ * and out of the value world (the same single OMOV the handle API's
+ * obj_adopt_oN / obj_park_oN use).  O7 is the conventional spawn-handoff
+ * register: TaskCreate copies O1..O15 to the child, so a cap parked in O7
+ * before a spawn is inherited by the child (see
+ * examples/cc/multitask/concurrent.c). */
+
+/* Park capability `o` into object-register O7 so a task spawned next
+ * inherits it. */
+void objor_stash_o7(void *__or o);
+
+/* Adopt the capability parked/inherited in O7 (see objor_stash_o7) into a
+ * `void *__or` value. */
+void *__or objor_adopt_o7(void);
+
 #endif /* OBJ_OR_H */
