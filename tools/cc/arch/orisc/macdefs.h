@@ -201,6 +201,29 @@ typedef long long OFFSZ;
 #define	MAXREGS		64
 #define	NUMCLASS	3
 
+/*
+ * PRUNE_CALLLIVE — prune false cross-call liveness of argument registers.
+ *
+ * pcc's per-block backward liveness (regs.c::insnwalk) reserves every
+ * livecall() register across a call by marking it live, then relies on
+ * each argument's register move to release the ones actually used. The
+ * arg registers a given call does NOT pass are never released, so they
+ * stay spuriously live all the way to the top of the block. On most
+ * targets that is harmless (large GPR files absorb it), but Object RISC's
+ * OR class has only four allocatable registers (O1..O4) and livecall()
+ * lists all four — so a single OR scratch (e.g. the OBJSTORE-anchor deref
+ * an `__or` OREFST needs) placed anywhere upstream of a void-argument call
+ * ends up interfering with all four, exceeds the class size, and is forced
+ * to spill. Capabilities cannot be byte-spilled, so codegen aborts.
+ *
+ * With this defined, insnwalk clears the argument registers it marked live
+ * but that the call does not actually consume, once the arguments have been
+ * walked. This is a strict correctness improvement (a clobbered, unread
+ * register is genuinely dead): cross-call values remain protected by the
+ * interference edges added at the call site, independent of this pruning.
+ */
+#define	PRUNE_CALLLIVE
+
 #define	RETREG(x)	(ISOREFT(x) ? O1 : \
 			 DEUNSIGN(x) == LONGLONG ? R2R3 : R2)
 				/* Object RISC: capabilities return in O1 */

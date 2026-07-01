@@ -1070,6 +1070,40 @@ insnwalk(NODE *p)
 #ifdef NEWNEED
 	char *w;
 #endif
+#ifdef PRUNE_CALLLIVE
+	/*
+	 * Bitmap (indexed by physical reg number) of the CLASSC (OR) livecall
+	 * registers that this insnwalk newly marked live for the purpose of
+	 * reserving them across argument evaluation. After the call's args are
+	 * walked, any of these still live are OR argument registers the call
+	 * does NOT actually pass — a clobbered-but-unread register is not
+	 * live, so we clear them to avoid false interference pressure on the
+	 * (small, 4-wide) OR register class upstream of the call. See the
+	 * callop arms below. MAXREGS is a small constant, so a stack array is
+	 * fine.
+	 *
+	 * Deliberately restricted to CLASSC (the GCLASS check below): the
+	 * integer classes are large enough to absorb the conservative call
+	 * liveness with no register pressure problem, and leaving their live
+	 * sets untouched keeps integer codegen byte-identical to before —
+	 * only OR-bearing functions change. The OR class is the sole place
+	 * the coarse over-approximation is fatal.
+	 */
+	char calllive_added[MAXREGS];
+	/*
+	 * Clear the OR argument registers we marked live but the call does
+	 * not consume. Argument moves LIVEDEL the ones actually passed as
+	 * they are walked; whatever we added that is still live is dead
+	 * upstream. Applies to both CALL (with args) and UCALL (no args).
+	 */
+#define	PRUNE_CALLLIVE_AFTER()						\
+	do {								\
+		int pcl_i;						\
+		for (pcl_i = 0; pcl_i < MAXREGS; pcl_i++)		\
+			if (calllive_added[pcl_i] && TESTBIT(live, pcl_i)) \
+				LIVEDEL(pcl_i);				\
+	} while (0)
+#endif
 
 	RDEBUG(("insnwalk %p\n", p));
 
@@ -1269,8 +1303,23 @@ insnwalk(NODE *p)
 	} else if (callop(o)) {
 		int *c;
 
+#ifdef PRUNE_CALLLIVE
+		memset(calllive_added, 0, sizeof(calllive_added));
+#endif
 		for (c = livecall(p); *c != -1; c++) {
 			addalledges(ablock + *c);
+#ifdef PRUNE_CALLLIVE
+			/*
+			 * Remember only the CLASSC (OR) registers we actually
+			 * transition dead->live here; ones already live (e.g. a
+			 * return register whose value is used below the call)
+			 * must be left untouched by the post-argswalk prune, and
+			 * the integer classes are excluded entirely so their
+			 * liveness — and thus their codegen — is unchanged.
+			 */
+			if (GCLASS(*c) == CLASSC && !TESTBIT(live, *c))
+				calllive_added[*c] = 1;
+#endif
 			LIVEADD(*c);
 		}
 	} else if (q->rewrite & (RESC1|RESC2|RESC3)) {
@@ -1298,6 +1347,9 @@ insnwalk(NODE *p)
 			insnwalk(p->n_left);
 			/* Do liveness analysis on arguments (backwards) */
 			argswalk(p->n_right);
+#ifdef PRUNE_CALLLIVE
+			PRUNE_CALLLIVE_AFTER();
+#endif
 		} else if ((p->n_su & DORIGHT) == 0) {
 			setlive(p->n_left, 1, lrv);
 			insnwalk(p->n_right);
@@ -1313,6 +1365,15 @@ insnwalk(NODE *p)
 
 	case UTYPE:
 		insnwalk(p->n_left);
+#ifdef PRUNE_CALLLIVE
+		/*
+		 * A UCALL has no argument list, so none of the livecall
+		 * registers we reserved above are consumed — clear them all
+		 * (the ones we added) now that the callee address is walked.
+		 */
+		if (callop(o))
+			PRUNE_CALLLIVE_AFTER();
+#endif
 		break;
 
 	case LTYPE:

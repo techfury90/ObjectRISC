@@ -127,23 +127,22 @@ clocal(NODE *p)
 	case ASSIGN:
 		/*
 		 * Storing a capability *call result* straight into an `__or`
-		 * home is the one OBJSTORE-memory case the v1 lowering can't yet
-		 * handle: the OREFST needs a base scratch O-reg (the O12 anchor
-		 * deref), but the call clobbers every caller-saved O-reg, and the
-		 * 4-register OR file leaves the result interfering with all its
-		 * sibling clobbers -- so the allocator spills the (capability)
-		 * result, which is impossible for an OR. The real fix is callee-
-		 * saved CLASSC registers (saved via this same per-frame OBJSTORE);
-		 * until then, fail loudly with a workaround rather than emit
-		 * broken code. (Every other form -- param/local load, null, a
-		 * non-call value -- stores fine.)
+		 * home (`void *__or x = f(...);`) used to be rejected here: the
+		 * OREFST needs a base scratch O-reg (the O12 anchor deref), and
+		 * with only four allocatable ORs the store's scratch interfered
+		 * with all of O1..O4 across the call and spilled — impossible for
+		 * a capability. That interference was SPURIOUS: it came from
+		 * pcc's coarse per-block call liveness marking every OR argument
+		 * register live across every call, even those the call does not
+		 * pass. macdefs.h's PRUNE_CALLLIVE now clears that false OR
+		 * liveness (regs.c::insnwalk), so the store's scratch no longer
+		 * collides with the call clobbers and this case lowers correctly.
+		 * The guard is therefore removed. (Genuinely holding more than a
+		 * few `__or` VALUES live across a call at once can still exceed
+		 * the 4-wide OR class and spill — that needs the callee-saved
+		 * CLASSC register work, out of scope here — but the common
+		 * store-a-call-result and value-across-one-call forms now work.)
 		 */
-		if (p->n_left->n_op == OREG && ISOREFT(p->n_left->n_type) &&
-		    (p->n_right->n_op == CALL || p->n_right->n_op == UCALL))
-			uerror("storing an __or call result into a local/param is "
-			    "not yet supported; capture the call result in a "
-			    "separate __or variable passed by the caller, or use "
-			    "inline asm (v1 OBJSTORE-spill limit)");
 		break;
 
 	case FORCE:
