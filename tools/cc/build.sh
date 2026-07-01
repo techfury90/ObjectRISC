@@ -8,6 +8,11 @@
 # builds are fast.
 #
 # Run from anywhere; the script self-locates the source tree.
+#
+# Native is the default and builds/runs fine on macOS. For a reproducible,
+# CI-style Linux toolchain — or on a host whose native toolchain can't build
+# pcc — see tools/cc/build-docker.sh, which builds cpp/ccom in a Debian
+# container and shims them so run_c.sh and `make` work transparently.
 
 set -eu
 
