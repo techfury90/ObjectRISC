@@ -44,9 +44,16 @@
  *
  * Children inherit the parent's OPRs verbatim (TaskCreate copies
  * O1..O15, with O0 forced null) — so they see the same O5..O10
- * service refs the parent had at task_spawn time, the same O11/O15
- * boot saves, etc. That's how a child can call print_str /
- * hf_open / term_print without redoing the init dances.
+ * service refs the parent had at task_spawn time, etc. That's how a
+ * child can call print_str / hf_open / term_print without redoing the
+ * init dances.
+ *
+ * The DATA SEGMENT, however, is NOT shared: task_spawn forks the child
+ * a private byte-copy of the parent's data (see task_fork_data), so a
+ * child's writes to C globals — and its task_init re-initialising the
+ * per-task libc state — stay private. The child boots from a snapshot
+ * of the parent's globals; cross-task data sharing is via explicit OR
+ * objects (see multitask/concurrent.c), not globals.
  */
 
 #include "liborisc.h"
@@ -497,6 +504,84 @@ task_exit(int code)
 	);
 }
 
+/* --- task_fork_data: give the child a PRIVATE data segment --------
+ *
+ * TaskCreate (Vol VI #0x000) maps whatever ref is in O3 as the child's
+ * data at DATA_VA. task_spawn used to leave O3 = the parent's own data
+ * ref (O15, parked by task_init), so parent and child SHARED all C
+ * globals — a child's task_init then clobbered the parent's per-task
+ * libc state (task_slots_in_use, my_terminal_idx, obj.c's obj_inuse,
+ * crt0's _orisc_init_r4, ...). Since the spec makes O3 a caller-
+ * supplied data object, task_spawn instead FORKS: alloc a fresh
+ * TAG_DATA object the size of the parent's data, ObjFetchBytes (#0x108)
+ * a byte-copy of the parent's live data into it, and leave it in O3 for
+ * the imminent TaskCreate. The child boots from a SNAPSHOT of the
+ * parent's globals but its writes are its own — true fork semantics,
+ * no shared globals. (Reads still see what the parent had at spawn, so
+ * this is the least-surprising change over the old shared behaviour.)
+ *
+ * The copy's lifecycle matches the per-child stack task_spawn already
+ * allocates: neither is explicitly freed (ObjFree of the task descriptor
+ * doesn't cascade to its mappings — see primitive_ObjFree), both are
+ * reclaimed at CPU teardown. task_spawn is used only by short-lived
+ * example programs, so this is bounded in practice; a free-on-reap path
+ * (for both stack and data) is a future refinement if a long-lived
+ * task_spawn spawner ever appears.
+ *
+ * Leaves O3 = the private copy (or null if the parent has no data
+ * segment); returns 0, or -errno on ObjAlloc/ObjFetchBytes failure.
+ * Uses O1/O2 as scratch; must not touch O13 (code) / O15 (parent data).
+ */
+static int
+task_fork_data(void)
+{
+	int size, status, isn;
+
+	/* No parent data segment (rare) → the child gets none either. */
+	asm volatile("oisn %0, o15" : "=r"(isn));
+	if (isn) {
+		asm volatile("omov o3, o0");        /* O3 = null */
+		return 0;
+	}
+	asm volatile("olen %0, o15" : "=r"(size));
+
+	/* Alloc the copy: R (TaskCreate requires R on O3) | W (ObjFetchBytes
+	 * destination + the child mutating its own globals). Park it in O3. */
+	asm volatile(
+		"addu  r4, %1, r0\n"
+		"addiu r5, r0, %2\n"
+		"addiu r6, r0, %3\n"
+		"call  #0x100\n"
+		"nop\n"
+		"omov  o3, o1\n"                    /* O3 = private data copy */
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "r"(size), "i"(TAG_DATA), "i"(CAP_R | CAP_W)
+		: "r2", "r3", "r4", "r5", "r6"
+	);
+	if (status != 0)
+		return -status;
+
+	/* Byte-copy parent data (O15) → copy (O3). ObjFetchBytes #0x108:
+	 * O1=src, O2=dst, R4=src offset, R5=dst offset, R6=count. */
+	asm volatile(
+		"omov  o1, o15\n"
+		"omov  o2, o3\n"
+		"addu  r6, %1, r0\n"
+		"addu  r4, r0, r0\n"
+		"addu  r5, r0, r0\n"
+		"call  #0x108\n"
+		"nop\n"
+		"addu  %0, r2, r0"
+		: "=r"(status)
+		: "r"(size)
+		: "r2", "r3", "r4", "r5", "r6"
+	);
+	if (status != 0)
+		return -status;
+	return 0;
+}
+
 /* --- task_spawn: create + resume a child --------------------------
  *
  * Allocates a fresh stack via ObjAlloc, calls TaskCreate with the
@@ -523,6 +608,16 @@ task_spawn(void (*entry)(int), int arg)
 	if (slot >= TASK_MAX_CONCURRENT)
 		return -1;
 
+	/* Fork the child a PRIVATE data segment; leaves it in O3 for the
+	 * TaskCreate below. Must precede the stack ObjAlloc — task_fork_data
+	 * uses O1/O2 as scratch, and O3 then survives (unspilled) across the
+	 * stack alloc to TaskCreate the same way O13/O15 already do. */
+	status = task_fork_data();
+	if (status != 0) {
+		asm volatile("omov o3, o15");   /* restore caller's O3 */
+		return status;
+	}
+
 	/* ObjAlloc(R4=size, R5=TAG_STACK, R6=R|W|C) → O1 = stack ref. */
 	asm volatile(
 		"addiu r4, r0, %1\n"
@@ -535,8 +630,10 @@ task_spawn(void (*entry)(int), int arg)
 		: "i"(DEFAULT_STACK_SIZE), "i"(TAG_STACK), "i"(CAP_R | CAP_W | CAP_C)
 		: "r2", "r3", "r4", "r5", "r6"
 	);
-	if (status != 0)
+	if (status != 0) {
+		asm volatile("omov o3, o15");   /* restore caller's O3 (fork set it) */
 		return -status;
+	}
 
 	/* TaskCreate(O1=code, O2=stack, R4=entry_off, R5=arg) → O1 = task. */
 	asm volatile(
