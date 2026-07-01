@@ -4,6 +4,64 @@
 > blocked by deliberate decision. Read "SESSION-3 FINDINGS" (after the
 > REFINED PLAN) BEFORE attempting either path again.**
 
+---
+
+# ⚡ SESSION-5 RECON (2026-06-28): blocker RE-CONFIRMED on main; tight spike plan for the COMPILER fix
+
+> ## ✅ LANDED — approach A (the compiler fix). The spike SUCCEEDED.
+> **Root cause (refined):** NOT the OREFST result flag — pcc's coarse per-block call
+> liveness (`regs.c::insnwalk`) marks ALL four OR `livecall()` regs live at a call and
+> only releases the ones an argument consumes, so a void-arg call (`other()`) leaves OR
+> arg-regs spuriously live to the top of the block; a single OR scratch upstream then
+> interferes with all four → capability byte-spill → "op U*". Harmless on big GPR files,
+> fatal only for the 4-wide OR class.
+> **Fix (`PRUNE_CALLLIVE`, ~60 lines):** after a call's args are walked, clear the OR
+> arg-regs it marked live but the call doesn't consume (a clobbered-unread reg is
+> genuinely dead). RESTRICTED TO CLASSC → integer codegen untouched; target-gated (orisc
+> only); cross-call values stay protected by the call-site interference edges. Files:
+> `mip/regs.c` (PRUNE_CALLLIVE in insnwalk, CALL + UCALL paths), `arch/orisc/macdefs.h`
+> (gate + rationale), `arch/orisc/local.c` (removed the line-143 uerror),
+> `test_oref_spill.sh` + new `examples/cc/oref_callresult.c`.
+> **Verified:** E/g2/E2 compile at K=4; ALL 37 OS translation units + supervisor.orx/
+> shell.orx BYTE-IDENTICAL to baseline (zero runtime change); test_oref_spill/oref_calls/
+> manyargs PASS; independently re-confirmed. NO register migration, NO ABI change.
+> **Follow-on:** build the `__or`-value obj API on obj.h. The recon + spike plan below is
+> retained for history.
+
+techfury90's call: cross the `__or`-native bridge SOON — the handle API's 16-slot `OBJ_NHANDLE` ceiling + manual cap lifecycle is compounding tech debt for the object-dense north-stars (document arch = per-block caps; object-console = typed-OREF pipelines; capability widgets). The old "buildable on handles" finding held only for the *run model* (mdview's offset/len spans), NOT the *object model*.
+
+**Decision: take the COMPILER fix (no OS/API risk), not the K=6 register migration.** This recon re-confirmed the blocker + pinned the sites so a fresh session starts loaded.
+
+## Re-confirmed repro (rebuild pcc FIRST: `sh tools/cc/build.sh` — /tmp/pcc-build gets cleaned on reboot)
+Minimal standalone-compile cases (decls: `void *__or echo(void *__or o); void other(void);`):
+- **E2** `{ void *__or x=p; return x; }` → COMPILES (baseline).
+- **E** `{ void *__or x=p; other(); return x; }` → FAILS `Cannot generate code, node ... op U*` — the SPURIOUS byte-spill of the OREFTY value across the call (nothing genuinely live; x is objstore-homed, reloaded per use).
+- **g2** `{ void *__or x=echo(p); other(); return x; }` → FAILS at the `local.c:143` uerror (call-result-store guard).
+Compile path: `$CPP -I<dir> ... f.c > f.i; $CCOM < f.i > f.s` (ccom is where codegen + the failure happen; no libc needed for the repro).
+
+## Fix sites (line numbers on main 2026-06-28 — re-grep, code drifts)
+- `arch/orisc/table.c:449-453` — the OREFST store pattern `{ ASSIGN, FOREFF|INCREG, SOREG/TOREF, SCREG/TOREF, NCREG, RDEST, "ZI" }`. **The `NCREG, RDEST` is the phantom** (a CLASSC result allocated even under FOREFF); zzzcode `I` (local2.c) loads the O12 anchor into that scratch then `orefst`.
+- `arch/orisc/local.c:127-147` — the `clocal(ASSIGN)` uerror (line 143) pre-empting g2. **Remove LAST**, only after E compiles.
+- `mip/regs.c` + `mip/reader.c` — the core spiller (`storemod`, `dospill`, `longtemp`/`shorttemp`/`shstore`, interference `addalledges` over `livecall`). Where "op U*" originates. SESSION-3's `MYSTOREMOD`/`spilloff`/`orisc_orhome` hooks are NOT on main (cleanly reverted) — re-land only for approach B.
+
+## Target + two approaches (try A first)
+Goal: **E compiles at K=4** (current register count — no migration). The spurious spill = the OREFST NCREG result treated as live across the call.
+- **(A) Kill the phantom liveness (preferred; no spill-machinery change).** FOREFF→RNULL alone did NOT work (SESSION-3: the phantom is the OREFTY VALUE's live range, not the store's result flag). Work the interference/liveness: an OREFTY node re-materialized (OREFLD) at each use must NOT be in `livecall` across a call. Find why the OREFST scratch/result NCREG lands in the cross-call live set; make the store's scratch dead-after-store (its subtree must not escape).
+- **(B) Route OREFTY spills to the objstore (fallback).** Re-land MYSTOREMOD/storemod override + `spilloff()` (SESSION-3 got the OFFSET right). Remaining bug: the within-block node-result reload mis-classes the spilled OREFTY to a CLASSB GPR pair → "op OREG". Fix the reload to emit `orefld` (CLASSC), not a GPR-pair load.
+
+## Validation ladder (K=4, after EVERY codegen change)
+1. E2 compiles; **E compiles** (the win); then remove local.c:143 → g2 compiles.
+2. Runtime: `test_oref_spill` (exit 42), `test_oref_calls`, `test_manyargs`.
+3. FULL device smoke (rebuild: `rm build/liborisc.ora; make -s lib; make -s -B`). A miscompile SILENTLY breaks the OS — also diff the `.s` of a representative libc file (task.c) before/after; any unexpected change is a red flag.
+4. THEN build the `__or`-value obj API (obj.h → `void *__or` variants of obj_alloc/derive/send/recv) + convert one program as proof (Phase 3 proper).
+
+## Fallback
+If (A)+(B) stall after a bounded effort, the K=6 register migration (SESSION-3 site map, ~230 sites, public OR-ABI change) is the alternative — bigger + mechanical, no compiler-internals risk.
+
+**RUN THE FIX FRESH — not the tail of a long session. OS-critical libc codegen with miscompilation risk.**
+
+---
+
 # REFINED PLAN (superseded — see SESSION-3 FINDINGS): free O15 → callee-saved CLASSC (K=5)
 
 Supersedes the full 10-register migration below for the immediate goal:
