@@ -107,7 +107,7 @@ kill -TERM $TERM_PID 2>/dev/null || true
 kill -TERM $DIR      2>/dev/null || true
 kill -TERM $BAR      2>/dev/null || true
 wait $WM_CPU 2>/dev/null || true
-wait $TERM_PID 2>/dev/null || true
+wait $TERM_PID 2>/dev/null || { echo "FAIL: fake_terminal aborted (boot/input never came up - see term.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
 wait $DIR      2>/dev/null || true
 wait $BAR      2>/dev/null || true
 

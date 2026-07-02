@@ -80,7 +80,7 @@ python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
     "$TMP/shell.orx" >"$TMP/cpu.out" 2>"$TMP/cpu.err" &
 CPU=$!
 
-wait $TERM_PID 2>/dev/null || true
+wait $TERM_PID 2>/dev/null || { echo "FAIL: fake_terminal aborted (boot/input never came up - see term.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
 sleep 0.5
 # After fake_terminal exits, the shell may still be alive — under
 # load some 'exit' keystrokes get dropped (the shared self-svc queue

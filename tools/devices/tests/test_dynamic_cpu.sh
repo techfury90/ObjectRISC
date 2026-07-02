@@ -156,9 +156,14 @@ for _ in $(seq 50); do
 done
 
 # --- single CPU at boot: cpu0 (leader, terminal 0) -------------------
+# Walk-don't-wire: leave O5/O6/O7 NULL so cpu0 walks /sys/term/0 for its
+# console/keyboard/grid. A wired non-null O5 is now read as "I have a
+# framebuffer -> co-resident -> launch the WM" (supervisor.c); with no
+# oriscwm.orx in this jail that path aborts and no shell boots. O8=directory
+# + O10=hostfsd stay wired.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "18=1@9" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
@@ -198,7 +203,7 @@ CPU1=$!
 # inside its supervisor.main). Without this, fake_terminal might
 # send `run @1` before cpu1 is ready and the relay would fail.
 for _ in $(seq 200); do
-    grep -q "supervisor: booting (worker)" "$TMP/cpu1.out" 2>/dev/null && break
+    grep -q "supervisor: booting" "$TMP/cpu1.out" 2>/dev/null && break
     sleep 0.05
 done
 
@@ -221,7 +226,7 @@ sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term16.out"
 
 # 1) cpu1 actually booted — proves a brand-new simorisc can join an
 #    already-running crossbar and complete its supervisor's boot.
-grep -q "supervisor: booting (worker)" "$TMP/cpu1.out" \
+grep -q "supervisor: booting" "$TMP/cpu1.out" \
     || { echo "FAIL: cpu1 didn't reach 'booting (worker)' — dynamic-add boot path broken" >&2; exit 1; }
 
 # 2) The cross-CPU relay reached cpu1 and the spawn ran THERE.

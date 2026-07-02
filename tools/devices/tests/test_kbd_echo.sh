@@ -60,7 +60,7 @@ CPU=$!
 
 # Wait for the demo CPU to exit (it should, on ESC).
 wait $CPU 2>/dev/null || true
-wait $TERM_PID 2>/dev/null || true
+wait $TERM_PID 2>/dev/null || { echo "FAIL: fake_terminal aborted (boot/input never came up - see term.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
 kill -TERM $BAR 2>/dev/null || true
 wait $BAR 2>/dev/null || true
 
