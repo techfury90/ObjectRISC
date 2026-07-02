@@ -74,6 +74,13 @@
 void *__or block_new(int kind, int style, void *__or src, int src_off,
                      int text_len);
 
+/* Producer counterpart of block_new: build a Block whose text is copied from
+ * NORMAL MEMORY (a C string / buffer at `text`, `len` bytes) rather than from
+ * a source object — the natural way for a doc producer to make Blocks from
+ * strings. `text` may be a data-segment or stack address. Returns the block
+ * (R|W|V) or a null reference on failure. */
+void *__or block_from_mem(int kind, int style, const char *text, int len);
+
 int block_kind(void *__or b);      /* header kind field */
 int block_style(void *__or b);     /* header style-id field */
 int block_textlen(void *__or b);   /* header text_len field */

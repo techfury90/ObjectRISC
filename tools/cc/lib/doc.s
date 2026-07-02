@@ -60,6 +60,60 @@ bn_fail:
     jr    r31
     nop
 
+; void *__or block_from_mem(int kind, int style, const char *text, int len)
+;   kind=R4, style=R5, text=R6 (a normal-memory VA), len=R7  ->  O1 = block.
+;   The producer counterpart of block_new: copies `len` bytes from NORMAL
+;   MEMORY (a C string / buffer) into a new Block's text region, classifying
+;   the VA by segment — >= STACK_BOTTOM (0x001f0000) is the boot stack (O11),
+;   below it is the data segment (base DATA_VA 0x00040000, O15) — exactly as
+;   host_io.c does. So doc producers can build Blocks straight from strings.
+block_from_mem:
+    addu  r8, r4, r0       ; save kind
+    addu  r9, r5, r0       ; save style
+    addu  r10, r6, r0      ; save text VA
+    addu  r11, r7, r0      ; save len
+    addiu r4, r11, 16      ; alloc size = BLOCK_HDR + len
+    addiu r5, r0, 0x4211   ; TAG_BLOCK
+    addiu r6, r0, 0x13     ; R|W|V
+    call #0x100            ; ObjAlloc -> O1 = block
+    nop
+    oisn  r2, o1
+    bnez  r2, bfm_fail
+    nop
+    omov  o6, o1           ; save block
+    osw   r8, 0(o1)        ; header: kind
+    osw   r9, 4(o1)        ; style
+    osw   r11, 8(o1)       ; text_len
+    osw   r0, 12(o1)       ; reserved
+    beqz  r11, bfm_done    ; no text -> skip copy
+    nop
+    lui   r12, 0x001f      ; r12 = STACK_BOTTOM (0x001f0000)
+    sltu  r2, r10, r12     ; text < STACK_BOTTOM ? (data : stack)
+    bnez  r2, bfm_data
+    nop
+    omov  o1, o11          ; stack segment
+    subu  r4, r10, r12     ; src_off = text - STACK_BOTTOM
+    j     bfm_copy
+    nop
+bfm_data:
+    omov  o1, o15          ; data segment
+    lui   r12, 0x0004      ; r12 = DATA_VA (0x00040000)
+    subu  r4, r10, r12     ; src_off = text - DATA_VA
+bfm_copy:
+    omov  o2, o6           ; dst = block
+    addiu r5, r0, 16       ; dst_off = BLOCK_HDR
+    addu  r6, r11, r0      ; count = len
+    call #0x108            ; ObjFetchBytes(seg -> block)
+    nop
+bfm_done:
+    omov  o1, o6           ; return block
+    jr    r31
+    nop
+bfm_fail:
+    onull o1
+    jr    r31
+    nop
+
 ; int block_kind(void *__or b)        b=O1 -> R2
 block_kind:
     olw  r2, 0(o1)
