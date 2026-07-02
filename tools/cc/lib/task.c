@@ -63,6 +63,7 @@
 #define TAG_STACK          0x4101
 #define CAP_R              0x01
 #define CAP_W              0x02
+#define CAP_V              0x10   /* verify/own — required to ObjFree an object */
 #define CAP_C              0x40
 #define DEFAULT_STACK_SIZE 0x1000   /* 4 KiB — fine for leaf children */
 
@@ -267,15 +268,24 @@
 /* 1568 libc + 8 compiler OR-spill anchor + 128 obj.c handle table (16
  * 8-byte capability slots at byte offset 1704 = OBJ_TABLE_OFFSET in
  * obj.h, just past the anchor at 1696; obj.c stores capabilities there
- * so handle-based code needn't hold an `__or` value across a call). The
- * handle table is the LAST region in the O12 allocation, so growing it
- * (8 -> 16 slots in Phase 4, once the full libc migration made 8 too
- * tight for a fat caller like the WM-session shell + a multi-handle op
- * such as sup_spawn / dir_walk) just extends ORX_STATE_BYTES by 64; the
- * anchor at 1696 sits before it and is unaffected. Keep the slot count
- * in sync with OBJ_NHANDLE in obj.h. */
-#define ORX_STATE_BYTES   1704
+ * so handle-based code needn't hold an `__or` value across a call) +
+ * 256 for the two per-child resource-ref arrays (TASK_RES_STACK/DATA
+ * below): task_spawn's stack ref and private data-copy ref, 16 slots
+ * each, which task_free reclaims on reap instead of leaking them to CPU
+ * teardown. The handle table WAS the last region; the resource arrays
+ * now follow it (1832..2087), so IF OBJ_NHANDLE ever grows past 16 those
+ * offsets must move past the enlarged handle table. Keep the handle slot
+ * count in sync with OBJ_NHANDLE in obj.h. */
+#define ORX_STATE_BYTES   1960
 #define ALLOC_BYTES       (TABLE_BYTES + ORX_STATE_BYTES)
+
+/* Per-child resource-ref arrays (16 x 8 bytes each), just past obj.c's
+ * handle table (1704..1831). task_spawn stores the child's stack ref at
+ * TASK_RES_STACK_OFFSET + slot*8 and its private data-copy ref at
+ * TASK_RES_DATA_OFFSET + slot*8; task_free ObjFrees both on reap
+ * (task_store_res / task_free_res). */
+#define TASK_RES_STACK_OFFSET   1832
+#define TASK_RES_DATA_OFFSET    1960
 
 /* Compiler-owned OR-spill anchor slot (see macdefs.h ORSPILL_ANCHOR). */
 #define OR_SPILL_ANCHOR_OFFSET   1696
@@ -458,6 +468,65 @@ task_store_from_o1(int slot)
 	}
 }
 
+/* --- task_store_res / task_free_res: per-child stack+data reclaim ----
+ *
+ * task_spawn allocates a stack and (post-fork) a private data copy per
+ * child. task_store_res records both refs in per-child O12 slots at
+ * spawn — reading O2 (the stack ref) and O3 (the data copy), which both
+ * survive from TaskCreate to the call — so task_free_res can ObjFree
+ * them on reap instead of leaking them to CPU teardown. Both switch on
+ * `slot` because OREFLD/OREFST take a static immediate offset.
+ *
+ * task_free_res ignores ObjFree status by design: an unused slot reads
+ * the null ref (EFAULT) and a stale ref — a task_register_o1 task that
+ * never stored resources, or a reused slot — reads generation-mismatched
+ * (ESTALE); both are harmless no-ops, so the slots need no nulling. */
+static void
+task_store_res(int slot)
+{
+	switch (slot) {
+	case  0: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+0),   "i"(TASK_RES_DATA_OFFSET+0));   break;
+	case  1: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+8),   "i"(TASK_RES_DATA_OFFSET+8));   break;
+	case  2: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+16),  "i"(TASK_RES_DATA_OFFSET+16));  break;
+	case  3: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+24),  "i"(TASK_RES_DATA_OFFSET+24));  break;
+	case  4: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+32),  "i"(TASK_RES_DATA_OFFSET+32));  break;
+	case  5: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+40),  "i"(TASK_RES_DATA_OFFSET+40));  break;
+	case  6: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+48),  "i"(TASK_RES_DATA_OFFSET+48));  break;
+	case  7: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+56),  "i"(TASK_RES_DATA_OFFSET+56));  break;
+	case  8: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+64),  "i"(TASK_RES_DATA_OFFSET+64));  break;
+	case  9: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+72),  "i"(TASK_RES_DATA_OFFSET+72));  break;
+	case 10: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+80),  "i"(TASK_RES_DATA_OFFSET+80));  break;
+	case 11: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+88),  "i"(TASK_RES_DATA_OFFSET+88));  break;
+	case 12: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+96),  "i"(TASK_RES_DATA_OFFSET+96));  break;
+	case 13: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+104), "i"(TASK_RES_DATA_OFFSET+104)); break;
+	case 14: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+112), "i"(TASK_RES_DATA_OFFSET+112)); break;
+	case 15: asm volatile("orefst o2, %0(o12)\n orefst o3, %1(o12)" :: "i"(TASK_RES_STACK_OFFSET+120), "i"(TASK_RES_DATA_OFFSET+120)); break;
+	}
+}
+
+static void
+task_free_res(int slot)
+{
+	switch (slot) {
+	case  0: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+0),   "i"(TASK_RES_DATA_OFFSET+0)   : "r2","r3"); break;
+	case  1: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+8),   "i"(TASK_RES_DATA_OFFSET+8)   : "r2","r3"); break;
+	case  2: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+16),  "i"(TASK_RES_DATA_OFFSET+16)  : "r2","r3"); break;
+	case  3: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+24),  "i"(TASK_RES_DATA_OFFSET+24)  : "r2","r3"); break;
+	case  4: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+32),  "i"(TASK_RES_DATA_OFFSET+32)  : "r2","r3"); break;
+	case  5: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+40),  "i"(TASK_RES_DATA_OFFSET+40)  : "r2","r3"); break;
+	case  6: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+48),  "i"(TASK_RES_DATA_OFFSET+48)  : "r2","r3"); break;
+	case  7: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+56),  "i"(TASK_RES_DATA_OFFSET+56)  : "r2","r3"); break;
+	case  8: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+64),  "i"(TASK_RES_DATA_OFFSET+64)  : "r2","r3"); break;
+	case  9: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+72),  "i"(TASK_RES_DATA_OFFSET+72)  : "r2","r3"); break;
+	case 10: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+80),  "i"(TASK_RES_DATA_OFFSET+80)  : "r2","r3"); break;
+	case 11: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+88),  "i"(TASK_RES_DATA_OFFSET+88)  : "r2","r3"); break;
+	case 12: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+96),  "i"(TASK_RES_DATA_OFFSET+96)  : "r2","r3"); break;
+	case 13: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+104), "i"(TASK_RES_DATA_OFFSET+104) : "r2","r3"); break;
+	case 14: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+112), "i"(TASK_RES_DATA_OFFSET+112) : "r2","r3"); break;
+	case 15: asm volatile("orefld o1, %0(o12)\n call #0x101\n nop\n orefld o1, %1(o12)\n call #0x101\n nop" :: "i"(TASK_RES_STACK_OFFSET+120), "i"(TASK_RES_DATA_OFFSET+120) : "r2","r3"); break;
+	}
+}
+
 /* --- task_slot_used: is O12 table slot `slot` occupied? ---------
  *
  * Load the slot's stored ref into O1 (the null ref if the slot is
@@ -546,7 +615,8 @@ task_fork_data(void)
 	asm volatile("olen %0, o15" : "=r"(size));
 
 	/* Alloc the copy: R (TaskCreate requires R on O3) | W (ObjFetchBytes
-	 * destination + the child mutating its own globals). Park it in O3. */
+	 * destination + the child mutating its own globals) | V (so task_free
+	 * can reclaim it on reap — see task_free_res). Park it in O3. */
 	asm volatile(
 		"addu  r4, %1, r0\n"
 		"addiu r5, r0, %2\n"
@@ -556,7 +626,7 @@ task_fork_data(void)
 		"omov  o3, o1\n"                    /* O3 = private data copy */
 		"addu  %0, r2, r0"
 		: "=r"(status)
-		: "r"(size), "i"(TAG_DATA), "i"(CAP_R | CAP_W)
+		: "r"(size), "i"(TAG_DATA), "i"(CAP_R | CAP_W | CAP_V)
 		: "r2", "r3", "r4", "r5", "r6"
 	);
 	if (status != 0)
@@ -618,7 +688,8 @@ task_spawn(void (*entry)(int), int arg)
 		return status;
 	}
 
-	/* ObjAlloc(R4=size, R5=TAG_STACK, R6=R|W|C) → O1 = stack ref. */
+	/* ObjAlloc(R4=size, R5=TAG_STACK, R6=R|W|C|V) → O1 = stack ref.
+	 * V so task_free can reclaim the stack on reap (task_free_res). */
 	asm volatile(
 		"addiu r4, r0, %1\n"
 		"addiu r5, r0, %2\n"
@@ -627,7 +698,7 @@ task_spawn(void (*entry)(int), int arg)
 		"nop\n"
 		"addu  %0, r2, r0"
 		: "=r"(status)
-		: "i"(DEFAULT_STACK_SIZE), "i"(TAG_STACK), "i"(CAP_R | CAP_W | CAP_C)
+		: "i"(DEFAULT_STACK_SIZE), "i"(TAG_STACK), "i"(CAP_R | CAP_W | CAP_C | CAP_V)
 		: "r2", "r3", "r4", "r5", "r6"
 	);
 	if (status != 0) {
@@ -658,6 +729,12 @@ task_spawn(void (*entry)(int), int arg)
 	/* O1 now holds the new task ref. Park it in the table at `slot`;
 	 * that OREFST IS the occupancy record now (no shadow bitmap). */
 	task_store_from_o1(slot);
+
+	/* Record the child's stack (O2) + data-copy (O3) refs so task_free
+	 * reclaims them on reap. O2 = stack (TaskCreate's omov o2,o1) and
+	 * O3 = the fork copy still hold here — task_store_from_o1 only
+	 * touched O1. */
+	task_store_res(slot);
 
 	/* TaskResume(O1=task) — O1 still holds the ref from TaskCreate. */
 	asm volatile(
@@ -837,6 +914,11 @@ task_free(task_t t)
 	 * reap_exited_tasks fires `[task N done CODE]` again on every
 	 * subsequent prompt iteration forever. */
 	if (status == 0 || status == 11 /* ERR_EREMOTE */) {
+		/* Reclaim the child's stack + private data copy (task_spawn
+		 * recorded their refs). Harmless for tasks that stored none —
+		 * a task_register_o1 / remote task's slots read null or a
+		 * generation-stale ref, both ignored (see task_free_res). */
+		task_free_res(t);
 		/* Free the slot: overwrite the O12 entry with the null ref.
 		 * That OREFST IS the deallocation now — task_slot_used reads
 		 * it back as null (free) for the next task_spawn. */
