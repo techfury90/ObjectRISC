@@ -49,6 +49,12 @@ void *__or orbuf_append(void *__or buf, int len, void *__or src,
 /* Copy `n` bytes from the buffer at `off` into `dst[dst_off]`. */
 void orbuf_read(void *__or buf, int off, void *__or dst, int dst_off, int n);
 
+/* Copy `n` bytes from `src[src_off]` into the buffer at `off` — a random-offset
+ * write over existing content (the inverse of orbuf_read), e.g. to update a
+ * fixed-size record in place. Does NOT grow the buffer; `off + n` must be
+ * within the current capacity. */
+void orbuf_write(void *__or buf, int off, void *__or src, int src_off, int n);
+
 /* Capacity (allocated size) of the buffer in bytes. */
 int orbuf_cap(void *__or buf);
 

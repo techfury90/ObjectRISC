@@ -59,6 +59,24 @@ orbuf_read:
     jr   r31
     nop
 
+; void orbuf_write(void *__or buf, int off, void *__or src, int src_off, int n)
+;   buf=O1, off=R4, src=O2, src_off=R5, n=R6. Copy n bytes from src[src_off]
+;   into buf[off] — a random-offset WRITE (the inverse of orbuf_read), for
+;   updating an existing span in place (e.g. a freeze locator entry). Here buf
+;   is the DESTINATION, so ObjFetchBytes wants O1=src, O2=buf, R4=src_off,
+;   R5=off; swap the object regs and the two offsets.
+orbuf_write:
+    omov o5, o1             ; save buf (dst)
+    omov o1, o2             ; O1 = src
+    omov o2, o5             ; O2 = buf (dst)
+    addu r8, r4, r0         ; r8 = off (dst offset)
+    addu r4, r5, r0         ; R4 = src_off
+    addu r5, r8, r0         ; R5 = off
+    call #0x108             ; ObjFetchBytes
+    nop
+    jr   r31
+    nop
+
 ; void *__or orbuf_append(void *__or buf, int len, void *__or src,
 ;                         int src_off, int n)
 ;   buf=O1, len=R4, src=O2, src_off=R5, n=R6  ->  O1 = buf (maybe grown); null
