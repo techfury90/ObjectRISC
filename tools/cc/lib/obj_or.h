@@ -143,4 +143,14 @@ void objor_stash_o7(void *__or o);
  * `void *__or` value. */
 void *__or objor_adopt_o7(void);
 
+/* O9 is the cross-PROCESS handoff register: unlike O7 (the task_spawn
+ * handoff, and the terminal-grid slot for orx_spawn'd children), O9 is
+ * callee-saved and untouched by the spawn call tree, so a cap parked here
+ * survives an orx_spawn (a separate .orx program) to the child's TaskCreate
+ * O1..O15 copy — no ORX_SLOT_CHILD injection slot needed. Used by the
+ * object-console result-sink handoff: a launcher parks a command's sink
+ * send-cap in O9, orx_spawns the command, and the command adopts it. */
+void objor_stash_o9(void *__or o);
+void *__or objor_adopt_o9(void);
+
 #endif /* OBJ_OR_H */
