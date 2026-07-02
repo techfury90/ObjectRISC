@@ -2048,6 +2048,37 @@ main(void)
 				task_yield();
 			}
 		}
+#ifdef CONSOLE_PROOF
+		/* Object-console Phase-2 proof (compile-gated — production boots
+		 * NEVER define CONSOLE_PROOF; this branch does not exist there).
+		 * Instead of login/shell, spawn the cross-process launcher with
+		 * O8=directory injected — exactly as the sysinit spawn above does —
+		 * so it inherits the orx_spawn environment; block on it; report its
+		 * exit code; halt the CPU so the test's `wait $CPU0` returns. The
+		 * launcher exits 42 iff it collected + verified the command's
+		 * streamed results (examples/cc/objor_console_xproc.c). */
+		asm volatile(
+			"orefld o1, %0(o12)\n"   /* DIR_SLOT (directory) */
+			"orefst o1, %1(o12)"     /* -> ORX_SLOT_CHILD_O8 = directory */
+			: : "i"(DIR_SLOT_OFFSET), "i"(ORX_SLOT_CHILD_O8_OFFSET) : "r1");
+		{
+			task_t pl = sup_spawn_named("/programs/console_launcher.orx", "", "/");
+			install_child_o8_override();   /* restore the spawn-mailbox child-O8 */
+			if (pl < 0) {
+				SUP_PRINT("console-proof: FAIL spawn launcher ");
+				SUP_PRINT_INT((int)pl);
+				SUP_PRINT("\n");
+			} else if (task_resume(pl) == 0) {
+				int prc = task_wait(pl);   /* block until it FINISHES, then
+				                            * print — so the launcher's own
+				                            * output can't interleave mid-line */
+				SUP_PRINT("console-proof: launcher exited ");
+				SUP_PRINT_INT(prc);
+				SUP_PRINT("\n");
+			}
+		}
+		return 0;   /* halt the CPU */
+#else
 		task_t login = sup_spawn_named(LOGIN_PATH, "", "/");
 		if (login < 0) {
 			SUP_PRINT("supervisor: failed to spawn login: ");
@@ -2064,6 +2095,7 @@ main(void)
 		                * welcome-banner / shell-spawn cycle; only
 		                * the shell's `exit`/`quit` (which calls
 		                * sup_shutdown) actually halts us. */
+#endif
 	}
 
 	/* Dispatch loop. Wake-up is event-driven: each `run`/`edit`

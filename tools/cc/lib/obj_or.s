@@ -196,3 +196,19 @@ objor_adopt_o7:
     omov o1, o7
     jr r31
     nop
+
+; void objor_stash_o9(void *__or o)   ; o=O1 -> O9 (park for an orx_spawn'd child)
+; O9 is callee-saved and unused by the spawn call tree (orx/vfs/task/dir), so a
+; cap parked here survives orx_spawn to the child's TaskCreate O1..O15 copy —
+; the object-console cross-process result-sink handoff (a launcher hands a
+; command program its sink cap without an ORX_SLOT_CHILD injection slot).
+objor_stash_o9:
+    omov o9, o1
+    jr r31
+    nop
+
+; void *__or objor_adopt_o9(void)   ; O9 -> O1 (adopt the inherited sink cap)
+objor_adopt_o9:
+    omov o1, o9
+    jr r31
+    nop
