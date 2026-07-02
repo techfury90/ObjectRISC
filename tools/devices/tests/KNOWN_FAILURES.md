@@ -33,7 +33,7 @@ by accident.**
 
 ## REAL-TIME-LOAD FLAKY (green on a quiet box, red under load)
 
-### `test_wm_boot`, `test_multiterminal`
+### `test_wm_boot`
 The fake terminal injects keystrokes on a **fixed wall-clock schedule** while
 `simorisc` runs unbounded; under host load the emulated CPU falls behind and
 input lands outside the shell's input window → spurious FAIL. Proven
@@ -41,9 +41,19 @@ environmental (fails on `main` too under load). Real fix (deferred): poll for
 a prompt/marker instead of a fixed `sleep`/`--delay`. Before blaming a diff,
 re-run on `main` under the same load.
 
+> `test_multiterminal` was formerly listed here as load-flaky, but its 240s
+> "timeout" was not load — it was the same **wired-O5 co-resident trap** #197
+> fixed for `run_at`: both CPUs wired `O5=terminal`, the supervisor read that
+> as co-resident and tried to launch a WM that isn't in the jail, and the boot
+> hung. Fixed by walk-don't-wire on both CPUs (each walks `/sys/term/<procid>`
+> for its own terminal). Now green + stable (3/3 on a quiet box).
+
 ---
 _Last reviewed 2026-07-01. Every other `test_*.sh` is green + fast on a quiet
-box; the cross-CPU-spawn tests (`run_at`, `dynamic_cpu`, `logout`) were revived
-in #197/#198, and a fail-fast guard now makes a misconfigured terminal test
-abort in ~11s instead of hanging. See the `[[device-test-suite-gotchas]]`
-memory for the deeper history._
+box. The cross-CPU-spawn tests (`run_at`, `dynamic_cpu`, `logout`) were revived
+in #197/#198; `test_supervisor`, `test_round_robin`, and `test_multiterminal`
+were revived alongside a fake-terminal **SIGTERM fix** — a #197 regression that
+had broken the 5 WM/graphics smoke tests (`wm/ptr/raster/vec/font_smoke`) by
+treating the teardown-SIGTERM'd terminal (exit 143) as a failure. A fail-fast
+guard makes a misconfigured terminal test abort in ~11s instead of hanging. See
+the `[[device-test-suite-gotchas]]` memory for the deeper history._

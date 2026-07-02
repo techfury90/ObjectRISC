@@ -96,14 +96,27 @@ python3 tools/ld/orld -o "$TMP/supervisor.orx" \
     "$TMP/crt0.oro" "$TMP/cio.oro" "$TMP/sup.oro" \
     build/liborisc.ora
 
-# --- launch oriscbar + hostfsd + fake_terminal ----------------------
+# --- launch oriscbar + oriscdir + hostfsd + fake_terminal -----------
 SOCK="$TMP/oriscbar.sock"
 
 python3 tools/sim/oriscbar --socket "$SOCK" >/dev/null 2>&1 &
 BAR=$!
 for _ in $(seq 50); do [ -S "$SOCK" ] && break; sleep 0.05; done
 
-python3 tools/devices/hostfsd \
+# Phase 47: oriscdir must be live before the self-registering devices
+# (hostfsd, fake_terminal) SEND their DIR_OP_REG_INLINE, and before the
+# supervisor walks /sys/term/0 for its console (walk-don't-wire, below).
+python3 tools/devices/oriscdir \
+    --socket "$SOCK" --pid 18 -v \
+    --config tools/devices/oriscdir.default.conf \
+    > "$TMP/dir.out" 2>&1 &
+DIR=$!
+for _ in $(seq 50); do
+    grep -q "oriscdir READY" "$TMP/dir.out" 2>/dev/null && break
+    sleep 0.05
+done
+
+python3 tools/devices/hostfsd --directory-pid 18 --instance 0 \
     --socket "$SOCK" --pid 17 --root "$TMP/jail" \
     > "$TMP/hf.out" 2>&1 &
 HF=$!
@@ -120,6 +133,7 @@ done
 #        exit<RET>
 python3 tools/devices/tests/fake_terminal.py \
     --socket "$SOCK" --pid 16 \
+    --directory-pid 18 --instance 0 \
     --event key:0x10D \
     --event key:r --event key:u --event key:n --event key:0x20 \
     --event key:0x2f --event key:p --event key:r --event key:o --event key:g --event key:r --event key:a --event key:m --event key:s \
@@ -136,12 +150,15 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# Supervisor as CPU 0 leader. Service order matches scripts/boot.sh:
-#   O5=console, O6=keyboard, O7=grid, O8/O9=null pads (supervisor
-#   allocates its own mailbox in O9), O10=hostfsd.
+# Supervisor as CPU 0 leader. Walk-don't-wire (matches run_at /
+# session_manager): leave O5/O6/O7 NULL so CPU 0 walks /sys/term/0 for its
+# console/keyboard/grid. A wired, non-null O5 is now read as "I have a
+# framebuffer -> co-resident -> launch the WM" (supervisor.c's coresident
+# detector); with no oriscwm.orx in this jail that path aborts and no shell
+# ever comes up. O8=directory + O10=hostfsd stay wired.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
@@ -149,8 +166,8 @@ CPU0=$!
 wait $TERM_PID 2>/dev/null || { echo "FAIL: fake_terminal aborted (boot/input never came up - see term.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
 sleep 0.5
 wait $CPU0 2>/dev/null || true
-for p in $HF $BAR; do kill -KILL $p 2>/dev/null || true; done
-for p in $HF $BAR; do wait $p 2>/dev/null || true; done
+for p in $HF $DIR $BAR; do kill -KILL $p 2>/dev/null || true; done
+for p in $HF $DIR $BAR; do wait $p 2>/dev/null || true; done
 
 echo "--- hostfsd log ---"
 cat "$TMP/hf.out"

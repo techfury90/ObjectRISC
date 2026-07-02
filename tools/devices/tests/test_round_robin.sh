@@ -168,9 +168,15 @@ for _ in $(seq 50); do
 done
 
 # --- two CPUs --------------------------------------------------------
+# CPU 0 (leader, terminal 0). Walk-don't-wire: leave O5/O6/O7 NULL so the
+# supervisor walks /sys/term/0 for its console/keyboard/grid. A wired,
+# non-null O5 is now read as "I have a framebuffer -> co-resident -> launch
+# the WM" (supervisor.c's coresident detector); with no oriscwm.orx in this
+# jail that path aborts and no shell ever comes up (the boot hangs).
+# O8=directory + O10=hostfsd stay wired.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "18=1@9" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
@@ -185,7 +191,7 @@ python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
     "$TMP/supervisor.orx" >"$TMP/cpu1.out" 2>"$TMP/cpu1.err" &
 CPU1=$!
 
-wait $TERM16_PID 2>/dev/null || true
+wait $TERM16_PID 2>/dev/null || { echo "FAIL: fake_terminal aborted (boot/input never came up - see term16.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
 sleep 0.5
 wait $CPU0 2>/dev/null || true
 kill -KILL $CPU1 2>/dev/null || true
@@ -198,9 +204,13 @@ cat "$TMP/cpu0.out"
 echo "--- cpu1 stdout ---"
 cat "$TMP/cpu1.out"
 
-# 1) Supervisor on cpu 0 came up and shut down via shell `exit`.
-grep -q "supervisor: booting (leader)" "$TMP/cpu0.out" \
-    || { echo "FAIL: cpu0 didn't announce as leader" >&2; exit 1; }
+# 1) Supervisor on cpu 0 came up and shut down via shell `exit`. The
+#    leader/worker split is gone (every supervisor is a peer), so the
+#    retired "booting (leader)" tag is no longer printed — assert the
+#    boot itself; roles are shown by who runs the shell (cpu0) vs. the
+#    relayed spawn (cpu1). Matches #197's run_at/dynamic_cpu fix.
+grep -q "supervisor: booting" "$TMP/cpu0.out" \
+    || { echo "FAIL: cpu0 supervisor didn't boot" >&2; exit 1; }
 grep -q "supervisor: shell exited; halting" "$TMP/cpu0.out" \
     || { echo "FAIL: cpu0 supervisor didn't shut down" >&2; exit 1; }
 
