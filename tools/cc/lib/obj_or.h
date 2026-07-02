@@ -153,4 +153,21 @@ void *__or objor_adopt_o7(void);
 void objor_stash_o9(void *__or o);
 void *__or objor_adopt_o9(void);
 
+/* --- indexed OREF-array access (register-indexed OREFLD/OREFST) ------ */
+
+/* An OR-typed object (objor_alloc_store) is an array of 8-byte OREF slots.
+ * These index it at a RUNTIME element index in O(1) via the CPU's
+ * register-indexed OREFLD/OREFST — no per-slot switch ladder. The index is
+ * scaled by 8 and bounds-checked by the firmware, so an out-of-range index
+ * TRAPS rather than reading or forging a neighbouring OREF. The base must be
+ * OR-typed and carry R (get) / W (set). These are the raw slot accessors the
+ * higher-level growable orvec is built on. */
+
+/* Return element `i` of the OREF array `vec` (i.e. vec[i]). Needs CAP_R. */
+void *__or objor_vget(void *__or vec, int i);
+
+/* Store `ref` into element `i` of the OREF array `vec` (vec[i] = ref).
+ * Needs CAP_W. */
+void objor_vset(void *__or vec, void *__or ref, int i);
+
 #endif /* OBJ_OR_H */

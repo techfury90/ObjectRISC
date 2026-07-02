@@ -426,6 +426,8 @@ MAJOR = {
     "olb":    0x31, "olh":    0x32, "olw":    0x33,
     "olbu":   0x34, "olhu":   0x35,
     "orefld": 0x36, "orefst": 0x37,
+    # Register-indexed OREF access: same opcodes, I-bit set (see encode_oref).
+    "orefldx": 0x36, "orefstx": 0x37,
     "osb":    0x38, "osh":    0x39, "osw":    0x3B,
     "send":   0x3C, "call":   0x3D,
 }
@@ -501,13 +503,19 @@ def encode_o_ls(opcode: int, os: int, rt: int, offset16: int) -> int:
             (offset16 & 0xFFFF))
 
 
-def encode_oref(opcode: int, os: int, od: int, offset16: int) -> int:
+def encode_oref(opcode: int, os: int, od: int, offset16: int,
+                index_mode: int = 0) -> int:
     """OREFLD/OREFST layout (opcodes 0x36/0x37):
-    [opcode:6 | os:4 | od:4 | rsv:2 | offset:16]. Both os and od are
-    object registers (4 bits each)."""
+    [opcode:6 | os:4 | od:4 | rsv:1 | I:1 | offset:16]. Both os and od are
+    object registers (4 bits each). Bit 16 (`I`) selects register-indexed
+    addressing (orefldx/orefstx): when set, the low 5 bits of the offset
+    field name a general register whose value, scaled by 8 (the OREF slot
+    size), is the byte offset; the remaining offset bits are reserved-zero.
+    Bit 17 is reserved-zero. I=0 is the immediate form (unchanged)."""
     return ((opcode & 0x3F) << 26 |
             (os & 0xF) << 22 |
             (od & 0xF) << 18 |
+            (index_mode & 0x1) << 16 |
             (offset16 & 0xFFFF))
 
 
@@ -1187,7 +1195,7 @@ def handle_instruction(asm: Assembler, section: str, src: SourceLine,
         if name in ("olb", "olh", "olw", "olbu", "olhu", "osb", "osh", "osw"):
             encode_obj_ls(asm, section, src, name, op, operands)
             return
-        if name in ("orefld", "orefst"):
+        if name in ("orefld", "orefst", "orefldx", "orefstx"):
             encode_obj_oref(asm, section, src, name, op, operands)
             return
         if name == "send":
@@ -1551,12 +1559,27 @@ def encode_obj_ls(asm: Assembler, section: str, src: SourceLine,
 def encode_obj_oref(asm: Assembler, section: str, src: SourceLine,
                     name: str, op: int, operands) -> None:
     file, line = src.file, src.line
+    indexed = name.endswith("x")   # orefldx / orefstx: register-indexed
+    shape = "od, rindex(os)" if indexed else "od, offset(os)"
     if len(operands) != 2:
-        raise AsmError(f"{name} expects `od, offset(os)`", file, line, 1)
+        raise AsmError(f"{name} expects `{shape}`", file, line, 1)
     od = parse_obj(_need_one_token(operands[0], file, line, "od").text,
                    file, line, operands[0][0].col)
     offset_toks, base_tok = parse_mem_operand(operands[1], file, line)
     os_ = parse_obj(base_tok.text, file, line, base_tok.col)
+
+    if indexed:
+        # The offset position holds a general register: the element index,
+        # which the CPU scales by 8 (the OREF slot size) at execution.
+        rtok = _need_one_token(offset_toks, file, line, "index register")
+        rx = parse_gpr(rtok.text, file, line, rtok.col)
+
+        def enc(inst, asm):
+            return encode_oref(op, os_, od, rx & 0x1F, index_mode=1)
+
+        emit(asm, section, file, line, 1, name, [], enc)
+        return
+
     if offset_toks:
         off_expr = parse_expression(offset_toks, file, line)
         off_col = offset_toks[0].col

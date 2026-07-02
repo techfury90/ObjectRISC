@@ -5053,8 +5053,10 @@ def fmt_instr(pc: int, word: int, cpu: CPU) -> str:
     if op in (0x36, 0x37):
         os_ = (word >> 22) & 0xF
         od  = (word >> 18) & 0xF
-        off = sext16(word & 0xFFFF)
         m = "orefld" if op == 0x36 else "orefst"
+        if (word >> 16) & 0x1:   # register-indexed form
+            return f"{m}x o{od}, r{word & 0x1F}(o{os_})"
+        off = sext16(word & 0xFFFF)
         return f"{m} o{od}, {off}(o{os_})"
     if op == 0x3C:
         os_ = (word >> 22) & 0xF
@@ -5434,10 +5436,21 @@ def step(cpu: CPU) -> None:
     elif op in (0x36, 0x37):  # OREFLD / OREFST
         os_  = (word >> 22) & 0xF
         od   = (word >> 18) & 0xF
-        rsv  = (word >> 16) & 0x3
-        if rsv != 0:
-            raise Trap(CAUSE_RESERVED_INSTR, pc, "OREF rsv must be zero")
-        offset = sext16(word & 0xFFFF)
+        i_mode = (word >> 16) & 0x1   # bit 16: 1 = register-indexed (orefldx/orefstx)
+        if (word >> 17) & 0x1:        # bit 17 is still reserved
+            raise Trap(CAUSE_RESERVED_INSTR, pc, "OREF reserved bit 17 must be zero")
+        if i_mode:
+            if (word >> 5) & 0x7FF:    # bits 15:5 reserved in the indexed form
+                raise Trap(CAUSE_RESERVED_INSTR, pc,
+                           "OREFx reserved bits 15:5 must be zero")
+            # Element index in a GPR, scaled by the 8-byte OREF slot size.
+            # The <<3 makes the byte offset inherently 8-aligned; deref_obj
+            # then applies the identical bounds/caps/objstore/generation
+            # checks as the immediate form (an out-of-range index traps
+            # bounds, so no OREF can be forged from adjacent storage).
+            offset = cpu.get_gpr(word & 0x1F) << 3
+        else:
+            offset = sext16(word & 0xFFFF)
         if op == 0x36:  # OREFLD Od, offset(Os)
             desc, off, _ = cpu.deref_obj(os_, offset, 8, CAP_R, pc,
                                          expect_objstore=True)
