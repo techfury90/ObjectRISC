@@ -31,12 +31,13 @@ BUILD     := build
 LIBORISC_SRCS_C  := $(wildcard tools/cc/lib/*.c)
 LIBORISC_OBJS_C  := $(patsubst tools/cc/lib/%.c,$(BUILD)/lib/%.oro,$(LIBORISC_SRCS_C))
 # Hand-written asm members: the preempt handler, obj_or.s (the `void *__or`
-# capability-value object API), and orvec.s (the growable capability array).
-# The latter two are bare asm because their ops take `__or` params (and
-# orvec_push loops over them), which would trigger pcc-orisc's per-frame
-# OBJSTORE prologue — and that miscompiles here (see orvec.s / obj_or.h).
+# capability-value object API), orvec.s (the growable capability array), and
+# orbuf.s (the growable byte buffer). The value-API ones are bare asm because
+# their ops take `__or` params (and orvec_push/orbuf_append loop over them),
+# which would trigger pcc-orisc's per-frame OBJSTORE prologue — and that
+# miscompiles here (see orvec.s / orbuf.s / obj_or.h).
 LIBORISC_OBJS_S  := $(BUILD)/lib/preempt_handler.oro $(BUILD)/lib/obj_or.oro \
-                    $(BUILD)/lib/orvec.oro
+                    $(BUILD)/lib/orvec.oro $(BUILD)/lib/orbuf.oro
 LIBORISC_OBJS    := $(LIBORISC_OBJS_C) $(LIBORISC_OBJS_S)
 
 LIBORISC := $(BUILD)/liborisc.ora
@@ -122,6 +123,9 @@ $(BUILD)/lib/obj_or.oro: tools/cc/lib/obj_or.s | $(BUILD)/lib
 	$(ASMORISC) -r $< -o $@
 
 $(BUILD)/lib/orvec.oro: tools/cc/lib/orvec.s | $(BUILD)/lib
+	$(ASMORISC) -r $< -o $@
+
+$(BUILD)/lib/orbuf.oro: tools/cc/lib/orbuf.s | $(BUILD)/lib
 	$(ASMORISC) -r $< -o $@
 
 $(LIBORISC): $(LIBORISC_OBJS) | $(BUILD)
