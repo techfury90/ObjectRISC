@@ -136,14 +136,17 @@ for _ in $(seq 50); do
 done
 
 # --- one CPU, one terminal -------------------------------------------
+# Walk-don't-wire: null O5/O6/O7 so the supervisor walks /sys/term/0 for its
+# console and takes the direct-shell path, not the co-resident WM launcher
+# (which aborts — no oriscwm.orx in this jail). O8=dir + O10=hostfsd stay wired.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "18=1@9" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
 
-wait $TERM16_PID 2>/dev/null || true
+wait $TERM16_PID 2>/dev/null || { echo "FAIL: fake_terminal aborted (boot/input never came up - see term.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
 sleep 0.3
 wait $CPU0 2>/dev/null || true
 for p in $DIR $HF $BAR; do kill -KILL $p 2>/dev/null || true; done
@@ -156,9 +159,10 @@ sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term16.out"
 
 RENDER16=$(sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term16.out")
 
-# 1) Supervisor came up and shut down cleanly.
-grep -q "supervisor: booting (leader)" "$TMP/cpu0.out" \
-    || { echo "FAIL: cpu0 didn't announce as leader" >&2; exit 1; }
+# 1) Supervisor came up and shut down cleanly. (The leader/worker split is
+#    gone — every supervisor just prints "supervisor: booting".)
+grep -q "supervisor: booting" "$TMP/cpu0.out" \
+    || { echo "FAIL: cpu0 supervisor didn't boot" >&2; exit 1; }
 grep -q "supervisor: shell exited; halting" "$TMP/cpu0.out" \
     || { echo "FAIL: cpu0 supervisor didn't shut down" >&2; exit 1; }
 
