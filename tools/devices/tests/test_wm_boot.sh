@@ -167,7 +167,7 @@ TERM_PID=$!
 # shell's `exit` (op=2 SEND).  Bounded — in --connect mode simorisc runs
 # unbounded (no --max-cycles), so a missed halt must become a fast
 # assertion failure below, not an infinite hang.
-wait $TERM_PID 2>/dev/null || true
+wait $TERM_PID 2>/dev/null || { echo "FAIL: fake_terminal aborted (boot/input never came up - see term.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
 for _ in $(seq 150); do
     kill -0 $CPU0 2>/dev/null || break
     sleep 0.1

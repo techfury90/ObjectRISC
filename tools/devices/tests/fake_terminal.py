@@ -662,9 +662,15 @@ def main():
         need_kbd = any(e[0] == "key" for e in events)
         need_ptr = any(e[0] in ("motion", "down", "up") for e in events)
         if not term.wait_for(need_kbd, need_ptr, args.subscribe_timeout):
-            sys.exit(f"fake_terminal: required subscriptions did not arrive "
-                     f"(kbd={'ok' if term.kbd_subs else 'pending'}, "
-                     f"ptr={'ok' if term.ptr_sub else 'pending'})")
+            sys.exit(
+                f"fake_terminal: FATAL — no program subscribed to "
+                f"keyboard/pointer within {args.subscribe_timeout:.0f}s "
+                f"(kbd={'ok' if term.kbd_subs else 'MISSING'}, "
+                f"ptr={'ok' if term.ptr_sub else 'MISSING'}).\n"
+                f"fake_terminal: the shell/WM almost certainly failed to boot — "
+                f"check the cpuN.out logs for a spawn/launch error "
+                f"(e.g. 'FAIL launch WM'). Aborting fast instead of driving a "
+                f"session that will never receive input.")
     # WM-mediated (inject) mode: there is no subscriber to wait for — the
     # caller sequences us after the WM + session are up (see the test's
     # wait-for-"oriscwm: ready" + login-prompt gating).

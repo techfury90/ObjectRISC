@@ -210,9 +210,14 @@ done
 # DIR_SLOT at boot and uses dir_register to publish its own
 # mailbox under /sys/cpu/<procid>/supervisor; relay_spawn_request
 # does dir_walk for the peer's ref.
+# Walk-don't-wire (matches session_manager): leave O5/O6/O7 NULL so CPU 0
+# walks /sys/term/0 for its console/keyboard/grid. A wired, non-null O5 is
+# now read as "I have a framebuffer -> co-resident -> launch the WM"
+# (supervisor.c's coresident detector); with no oriscwm.orx in this jail that
+# path aborts and no shell ever comes up. O8=directory + O10=hostfsd stay wired.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "18=1@9" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
@@ -228,7 +233,7 @@ python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
     "$TMP/supervisor.orx" >"$TMP/cpu1.out" 2>"$TMP/cpu1.err" &
 CPU1=$!
 
-wait $TERM_PID 2>/dev/null || true
+wait $TERM_PID 2>/dev/null || { echo "FAIL: fake_terminal aborted (boot/input never came up - see term.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
 sleep 0.5
 wait $CPU0 2>/dev/null || true
 kill -KILL $CPU1 2>/dev/null || true
@@ -249,11 +254,14 @@ cat "$TMP/cpu1.err"
 echo "--- rendered ---"
 sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term.out"
 
-# 1) Boot announcements with the right roles.
-grep -q "supervisor: booting (leader)" "$TMP/cpu0.out" \
-    || { echo "FAIL: cpu0 didn't announce as leader" >&2; exit 1; }
-grep -q "supervisor: booting (worker)" "$TMP/cpu1.out" \
-    || { echo "FAIL: cpu1 didn't announce as worker" >&2; exit 1; }
+# 1) Both supervisors boot. (The old leader/worker split is gone —
+#    every supervisor is a peer and just prints "supervisor: booting";
+#    the roles are distinguished below by who runs the shell (CPU 0)
+#    vs. who executes the relayed spawn (CPU 1).)
+grep -q "supervisor: booting" "$TMP/cpu0.out" \
+    || { echo "FAIL: cpu0 supervisor didn't boot" >&2; exit 1; }
+grep -q "supervisor: booting" "$TMP/cpu1.out" \
+    || { echo "FAIL: cpu1 supervisor didn't boot" >&2; exit 1; }
 
 # 2) The spawn happened on CPU 1 (peer), not CPU 0.
 grep -q "hello-from-supervised-spawn" "$TMP/cpu1.out" \
