@@ -242,3 +242,12 @@ objor_vset:
     orefstx o2, r4(o1)
     jr r31
     nop
+
+; void objor_vclear(void *__or vec, int i)
+;   vec=O1, i=R4  ->  vec[i] = null   (store a null reference into slot i, e.g.
+;   to mark a position absent / frozen away). Needs CAP_W.
+objor_vclear:
+    onull o2
+    orefstx o2, r4(o1)
+    jr r31
+    nop

@@ -170,4 +170,9 @@ void *__or objor_vget(void *__or vec, int i);
  * Needs CAP_W. */
 void objor_vset(void *__or vec, void *__or ref, int i);
 
+/* Null element `i` of `vec` (vec[i] = a null reference), marking the position
+ * absent or frozen away. Needs CAP_W. `objor_isnull(objor_vget(vec, i))` is
+ * then true. */
+void objor_vclear(void *__or vec, int i);
+
 #endif /* OBJ_OR_H */
