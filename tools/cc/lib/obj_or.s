@@ -212,3 +212,33 @@ objor_adopt_o9:
     omov o1, o9
     jr r31
     nop
+
+;========================================================================
+; indexed OREF-array access (register-indexed OREFLD/OREFST)
+;
+; An ObjAllocStore object is an array of contiguous 8-byte OREF slots.
+; orefldx/orefstx index it at a RUNTIME element index (the CPU scales the
+; index by 8, the slot size), so these are O(1) — no per-slot switch ladder
+; like task.c's task_slot. The firmware bounds-checks the scaled offset
+; against the object's length exactly as the immediate OREFLD/OREFST do, so
+; an out-of-range index TRAPS rather than reading or forging an OREF from
+; neighbouring storage. The base must be OR-typed (objor_alloc_store) and
+; carry R (get) / W (set). These are the raw slot accessors the growable
+; orvec is built on.
+;========================================================================
+
+; void *__or objor_vget(void *__or vec, int i)
+;   vec=O1, i=R4  ->  O1 = vec[i]   (OREFLD indexed, needs CAP_R). The nop is
+;   the load-delay slot (mirrors objor_loadw).
+objor_vget:
+    orefldx o1, r4(o1)
+    nop
+    jr r31
+    nop
+
+; void objor_vset(void *__or vec, void *__or ref, int i)
+;   vec=O1, ref=O2, i=R4  ->  vec[i] = ref   (OREFST indexed, needs CAP_W)
+objor_vset:
+    orefstx o2, r4(o1)
+    jr r31
+    nop

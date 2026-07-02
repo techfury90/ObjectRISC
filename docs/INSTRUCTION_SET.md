@@ -393,6 +393,8 @@ load-use delay to the compiler.
 |--------------------------------|----------------------------------------------|
 | `OREFLD Od, offset(Os)`        | load a 64-bit object reference from object storage |
 | `OREFST Od, offset(Os)`        | store a 64-bit object reference into object storage |
+| `OREFLDX Od, rx(Os)`           | load a reference at a runtime element index (`R[rx] << 3`) |
+| `OREFSTX Od, rx(Os)`           | store a reference at a runtime element index (`R[rx] << 3`) |
 
 These two instructions are the architecture's solution to a problem
 the rest of the spec deliberately created: the prohibition on storing
@@ -429,6 +431,27 @@ Volume III's CONTRACT addendum and in Volume V Section 2.6.
 The 8-byte alignment requirement is enforced as
 `address-misaligned-d`. The remaining fault conditions match Section 9
 exactly.
+
+### Register-indexed access (`OREFLDX` / `OREFSTX`)
+
+`OREFLD`/`OREFST` take an *immediate* offset, which suffices for static
+reference fields but cannot index object storage at a value computed at
+run time — and a program may not compute one itself, because capability
+arithmetic (forming "the reference at `base + i`") is exactly what the
+model forbids. `OREFLDX Od, rx(Os)` / `OREFSTX Od, rx(Os)` close that
+gap: the general register `rx` holds an element index, which the CPU
+scales by 8 (the reference-slot size) to form the byte offset, so an
+`OBJSTORE` object is addressed as a flat array of references at a
+runtime index in a single instruction — no unrolled per-slot switch.
+
+The scaled offset is bounds-checked against the object's length exactly
+as an immediate offset is, so an out-of-range index traps
+`bounds-violation`: register indexing supplies the offset dynamically
+but grants access to no reference the immediate form could not already
+reach. The offset is a multiple of 8 by construction, hence always
+aligned. `OREFLDX`/`OREFSTX` share opcodes `0x36`/`0x37` with
+`OREFLD`/`OREFST`, distinguished by the `I` bit; see the CONTRACT
+addendum Section 5.9.1.
 
 ## 11. The SEND Instruction
 

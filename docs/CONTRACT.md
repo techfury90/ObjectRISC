@@ -885,11 +885,11 @@ offset from the start of the object.
 ### 5.9.1 OREFLD/OREFST Layout (opcodes `0x36`, `0x37`)
 
 ```
- 31      26 25 22 21 18 17 16 15                  0
-+----------+----+----+-----+----------------------+
-|  opcode  | os | od | rsv |        offset        |
-+----------+----+----+-----+----------------------+
-     6       4    4    2             16
+ 31      26 25 22 21 18  17  16 15                 0
++----------+----+----+---+---+--------------------+
+|  opcode  | os | od | 0 | I |       offset       |
++----------+----+----+---+---+--------------------+
+     6       4    4    1   1          16
 ```
 
 Both `os` and `od` are object register fields (4 bits each). `OREFLD
@@ -897,18 +897,41 @@ Od, offset(Os)` reads an 8-byte object reference at byte `offset` of
 the object referenced by `Os` and writes it to `Od`. `OREFST Od,
 offset(Os)` reads `Od` and writes its bits to the same location.
 
+The `I` bit (16) selects the addressing mode:
+
+- **`I = 0` — immediate (`orefld` / `orefst`).** Bits 15:0 are a
+  signed 16-bit byte offset. This is the base form and is unchanged
+  from the prior revision.
+- **`I = 1` — register-indexed (`orefldx` / `orefstx`).** Bits 4:0
+  name a general register `rx`; the effective byte offset is
+  `R[rx] << 3`, scaled by the 8-byte reference-slot size, so an
+  `OBJSTORE` object is addressed as a flat array of object references
+  at a *runtime* element index. Bits 15:5 are reserved and must be
+  zero. This is the only way to index object storage at a dynamic
+  index: a program may not perform capability arithmetic, so the
+  offset into a capability's storage must come from the instruction —
+  immediate for static access, a scaled register for dynamic.
+
 The target object must have its `OBJSTORE` flag set in the
 descriptor (allocated through `ObjAllocStore`); the access traps
 `capability-violation` otherwise. Conversely, integer `OL*`/`OS*`
 on an `OBJSTORE` object also traps `capability-violation`. The
 offset must be 8-byte aligned; misalignment traps
-`address-misaligned-d`. Bounds and capability checks are otherwise
+`address-misaligned-d` (the register-indexed form is aligned by
+construction, since `R[rx] << 3` is always a multiple of 8). Bounds
+and capability checks are identical for both addressing modes and
 identical to `OL*`/`OS*` (Section 5.9): `R` is required for
 `OREFLD`, `W` for `OREFST`, plus the live-generation and
-in-bounds-by-8-bytes checks.
+in-bounds-by-8-bytes checks. In particular the register-indexed
+offset is bounds-checked exactly as an immediate one, so an
+out-of-range index traps `bounds-violation` and can neither read nor
+forge a reference outside the object — register indexing grants no
+authority the immediate form lacks; it only supplies the offset
+dynamically.
 
-The `rsv` bits (17:16) must be zero in this revision; non-zero
-traps `reserved-instruction`.
+Bit 17 is reserved and must be zero; non-zero traps
+`reserved-instruction`. In the register-indexed form bits 15:5 are
+likewise reserved-zero.
 
 ### 5.10 SEND Layout (opcode = `0x3C`)
 
