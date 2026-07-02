@@ -1,4 +1,15 @@
 #!/bin/sh
+#
+# ======================= KNOWN-RED (deferred) =======================
+# This test is a DOCUMENTED known failure — see
+# tools/devices/tests/KNOWN_FAILURES.md. Its shell-only, no-supervisor,
+# no-WM premise is stale: the `edit` builtin now spawns the editor via
+# sup_spawn_at (needs a supervisor) and input is WM-owned. Do NOT treat
+# its red as a regression, and do NOT try to fix it unless you are
+# DELIBERATELY reviving it (rebuild the topology the walk-don't-wire way,
+# as run_at/logout were in #197/#198). It is not a quick win.
+# ====================================================================
+#
 # test_shell_edit.sh — backgrounded standalone editor + focus switch.
 #
 # Phase 40: the editor is a standalone /programs/edit.orx that
@@ -30,6 +41,12 @@
 # Asserts /sub/scratch.txt on disk contains the inserted '!'.
 
 set -eu
+
+# Loud runtime notice — this is a documented known-red (see the banner above
+# and tools/devices/tests/KNOWN_FAILURES.md). Printed so a suite sweep makes
+# the expected-ness obvious and nobody chases it as a regression.
+echo "[KNOWN-RED] test_shell_edit is a DOCUMENTED deferred failure (stale shell-only topology) — see tools/devices/tests/KNOWN_FAILURES.md; do NOT treat as a regression." >&2
+
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
 
