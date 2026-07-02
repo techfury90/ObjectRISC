@@ -29,7 +29,7 @@ The script blocks until each event's required subscription has
 arrived (kbd events wait for a kbd subscribe; pointer events wait
 for a pointer subscribe).
 """
-import argparse, errno, selectors, socket, struct, sys, time
+import argparse, errno, selectors, signal, socket, struct, sys, time
 
 HELLO_MAGIC = 0xC0FFEEAA
 PKT_OBJ_READ_REQ   = 0x10
@@ -596,6 +596,15 @@ def parse_event(spec):
 
 
 def main():
+    # A harness kills us with SIGTERM at teardown, once the CPU-under-test has
+    # finished (`kill -TERM $TERM_PID` in the test scripts). That is a clean
+    # shutdown REQUEST, not a failure: exit 0 so a harness's
+    # `wait $TERM_PID || { FAIL }` guard fires ONLY on a real early abort — the
+    # subscribe-timeout FATAL, which sys.exit(1)s of its own accord before any
+    # teardown. Without this, SIGTERM's default disposition (exit 143) tripped
+    # that guard on every run of the WM/graphics smoke + supervisor tests,
+    # whose teardown SIGTERMs the terminal before waiting on it.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     ap = argparse.ArgumentParser()
     ap.add_argument("--socket", required=True)
     ap.add_argument("--pid", type=int, default=16)

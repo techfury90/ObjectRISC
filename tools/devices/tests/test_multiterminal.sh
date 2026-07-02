@@ -162,23 +162,31 @@ for _ in $(seq 50); do
     sleep 0.05
 done
 
-# --- two CPUs, each wired to a different terminal --------------------
+# --- two CPUs, each serving a different terminal --------------------
+# Walk-don't-wire: leave O5/O6/O7 NULL on BOTH CPUs so each supervisor
+# walks /sys/term/<its-own-procid> for its console/keyboard/grid
+# (supervisor.c renders the path under read_procid()). CPU 0 -> term16
+# (registered at /sys/term/0, --instance 0), CPU 1 -> term19 (/sys/term/1,
+# --instance 1). A wired, non-null O5 is now read as "I have a framebuffer
+# -> co-resident -> launch the WM" (supervisor.c's coresident detector);
+# with no oriscwm.orx in this jail that path aborts and the boot hangs.
+# O8=directory + O10=hostfsd stay wired on both.
 python3 tools/sim/simorisc --connect "$SOCK" --pid 0 \
-    --service "16=1@9" --service "16=2@9" \
-    --service "16=3@9" --service "18=1@9" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu0.out" 2>"$TMP/cpu0.err" &
 CPU0=$!
 
 python3 tools/sim/simorisc --connect "$SOCK" --pid 1 \
-    --service "19=1@9" --service "19=2@9" \
-    --service "19=3@9" --service "18=1@9" --service "0=0@0" \
+    --service "0=0@0" --service "0=0@0" \
+    --service "0=0@0" --service "18=1@9" --service "0=0@0" \
     --service "17=1@9" \
     "$TMP/supervisor.orx" >"$TMP/cpu1.out" 2>"$TMP/cpu1.err" &
 CPU1=$!
 
-wait $TERM16_PID 2>/dev/null || true
-wait $TERM19_PID 2>/dev/null || true
+wait $TERM16_PID 2>/dev/null || { echo "FAIL: term16 aborted (boot/input never came up - see term16.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
+wait $TERM19_PID 2>/dev/null || { echo "FAIL: term19 aborted (boot/input never came up - see term19.out and cpu*.out)" >&2; kill -KILL $(jobs -p) 2>/dev/null; exit 1; }
 sleep 0.5
 wait $CPU0 2>/dev/null || true
 wait $CPU1 2>/dev/null || true
@@ -199,11 +207,14 @@ sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term19.out"
 RENDER16=$(sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term16.out")
 RENDER19=$(sed -n '/--- console render ---/,/--- grid render ---/p' "$TMP/term19.out")
 
-# 1) Each supervisor announced and shut down.
-grep -q "supervisor: booting (leader)" "$TMP/cpu0.out" \
-    || { echo "FAIL: cpu0 didn't announce as leader" >&2; exit 1; }
-grep -q "supervisor: booting (worker)" "$TMP/cpu1.out" \
-    || { echo "FAIL: cpu1 didn't announce as worker" >&2; exit 1; }
+# 1) Each supervisor booted and shut down. The leader/worker split is gone
+#    (every supervisor is a peer), so the retired "(leader)"/"(worker)" boot
+#    tags are no longer printed — assert the boot itself; roles are shown by
+#    which terminal each serves. Matches #197's run_at/dynamic_cpu fix.
+grep -q "supervisor: booting" "$TMP/cpu0.out" \
+    || { echo "FAIL: cpu0 supervisor didn't boot" >&2; exit 1; }
+grep -q "supervisor: booting" "$TMP/cpu1.out" \
+    || { echo "FAIL: cpu1 supervisor didn't boot" >&2; exit 1; }
 grep -q "supervisor: shell exited; halting" "$TMP/cpu0.out" \
     || { echo "FAIL: cpu0 supervisor didn't shut down (shell 0 op=2 not received)" >&2; exit 1; }
 grep -q "supervisor: shell exited; halting" "$TMP/cpu1.out" \
